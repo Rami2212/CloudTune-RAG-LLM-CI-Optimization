@@ -104,6 +104,14 @@ For all ten blocked patterns, run `scripts/run_scenario_batch.py`. It runs four 
 
 `OPENROUTER_MODEL` does not determine batch identity in either batch runner. Change it and resume with the same `--batch-id`; existing cases keep their saved model, while new and rerun cases use the selected model and record it in their results.
 
+Build the pattern and experiment-example retrieval dataset with:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\build_rag_dataset.py
+```
+
+This writes `research-data/rag/rag_dataset.json` (patterns grouped with their examples), a flat `rag_dataset.jsonl` for embedding pipelines, and a manifest. It includes literature pattern records, their before/after/diff examples, and saved experiment examples with run metrics and evidence labels. Filter on `retrieval_eligible: true` before indexing. The current build contains 25 patterns and 36 experiment examples; none are approved yet because patterns are drafts and experiment evidence is pending review or synthetic. This workspace has no configured vector-store ingestion step.
+
 The separate experiment runner collects a source snapshot from an existing fork, runs the unchanged CI workflow, applies a pattern-specific proposal in a second branch, runs it again, and archives per-run/job/step metrics and the full before/after workflow and diff.
 
 See [experiment setup and storage](experiments/README.md) and [example config](experiments/experiment.example.json). Copy the example, fill in your fork/workflow/required job names, and provide a GitHub token through your environment before running:
