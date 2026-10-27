@@ -107,6 +107,10 @@ def choose_workflow(github, fork_repo, repository, row, require_dispatch=True):
 
 
 class Batch:
+    supported_patterns = None
+    supported_scenario_patterns = set()
+    measurement_name = "CI"
+
     def __init__(self, batch_id, rows, username, token, model, max_tokens=24000):
         self.batch_id, self.rows, self.username, self.token = batch_id, rows, username, token
         self.model, self.max_tokens = model, max_tokens
@@ -114,16 +118,17 @@ class Batch:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.github = runner.GitHub(token, self.directory / "api_calls.jsonl")
         manifest = self.directory / "selection.json"
-        selection = {"username": username, "rows": rows, "model": model, "max_tokens": max_tokens,
+        selection = {"username": username, "rows": rows, "max_tokens": max_tokens,
                      "repetitions_per_arm": 3, "warmups": 0}
         if manifest.exists():
             saved_selection = runner.read_json(manifest)
+            # Older manifests included the model. It is experiment metadata, not batch identity.
+            saved_identity = {key: value for key, value in saved_selection.items() if key not in {"model", "max_tokens"}}
+            requested_identity = {key: value for key, value in selection.items() if key != "max_tokens"}
+            if saved_identity != requested_identity or max_tokens < saved_selection.get("max_tokens", max_tokens):
+                raise ValueError("Batch selection/settings changed; keep the same repositories and do not lower OPENROUTER_MAX_TOKENS")
             if saved_selection != selection:
-                saved_without_tokens = {key: value for key, value in saved_selection.items() if key != "max_tokens"}
-                requested_without_tokens = {key: value for key, value in selection.items() if key != "max_tokens"}
-                if saved_without_tokens != requested_without_tokens or max_tokens < saved_selection.get("max_tokens", max_tokens):
-                    raise ValueError("Batch selection/settings changed; only an increased OPENROUTER_MAX_TOKENS value can reuse this --batch-id")
-                # Cases already created keep their frozen config; newly appended cases use the larger budget.
+                # Existing experiment configs retain their model; new/rerun cases use the selected model.
                 runner.write_json(manifest, selection)
         else:
             runner.write_json(manifest, selection)
@@ -135,7 +140,7 @@ class Batch:
             self.state["items"].items(),
             key=lambda pair: (pair[1].get("row_position", 10**9), pair[0])))
         runner.write_json(self.directory / "state.json", self.state)
-        fields = ["row_position", "row_key", "source_repo", "pattern_id", "fork_repo", "experiment_id", "status", "reason", "outcome", "updated_at"]
+        fields = ["row_position", "row_key", "source_repo", "pattern_id", "fork_repo", "experiment_id", "model", "status", "reason", "outcome", "updated_at"]
         with (self.directory / "batch_results.csv").open("w", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
             writer.writeheader()
@@ -304,6 +309,9 @@ class Batch:
                     requests[source].update(target=target, status="accepted")
                     self.state["forks"][source] = target
                     self.state.setdefault("created_forks", {})[source] = target
+                    # A recreated fork needs a fresh deletion attempt, even if
+                    # an earlier generation deleted the same repository name.
+                    self.state.setdefault("fork_deletions", {}).pop(source, None)
                     self.save()
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
                     message = redact(str(error))
@@ -396,6 +404,8 @@ class Batch:
         for index, row in enumerate(self.rows, 1):
             if index < start_at:
                 continue
+            if self.supported_patterns is not None and row["pattern_id"] not in self.supported_patterns:
+                continue
             key = row["pattern_id"] + "|" + row["repo_id"]
             item = self.state["items"].get(key, {})
             if item.get("status") == "cleanup_pending":
@@ -443,7 +453,7 @@ class Batch:
             print(f"\n[{index}/{len(self.rows)}] Pattern: {row['pattern_id']} — {row.get('pattern_title', '')}", flush=True)
             print("Repository to fork: https://github.com/" + row["repo_id"], flush=True)
             print("Selection evidence: " + row.get("match_level", "unspecified"), flush=True)
-            if row["pattern_id"] in runner.SCENARIO_PATTERNS:
+            if row["pattern_id"] in runner.SCENARIO_PATTERNS and row["pattern_id"] not in self.supported_scenario_patterns:
                 reason = "Requires an event/history/scenario experiment; ordinary dispatch timing cannot measure this pattern"
                 self.mark(row, "blocked", row_position=index, reason=reason)
                 print("Recorded as blocked: " + reason, flush=True)
@@ -469,16 +479,17 @@ class Batch:
             self.mark(row, "running", row_position=index, fork_repo=target)
             try:
                 with runner.exclusive(experiment.directory / ".lock"):
-                    print("Running unchanged CI up to 3 times; stopping on the first failed attempt...", flush=True)
+                    print("Running baseline " + self.measurement_name + " up to 3 times; stopping on the first unexpected result...", flush=True)
                     experiment.measure("baseline")
                     print("Requesting a free LLM optimization for ONLY " + row["pattern_id"] + "...", flush=True)
                     experiment.optimize()
                     decision = experiment.state["proposal"].get("llm", {}).get("decision")
                     print("LLM decision: " + str(decision) + " (selected pattern: " + row["pattern_id"] + ")", flush=True)
-                    print("Running optimized CI up to 3 times; stopping on the first failed attempt...", flush=True)
+                    print("Running optimized " + self.measurement_name + " up to 3 times; stopping on the first unexpected result...", flush=True)
                     experiment.measure("optimized")
                     case = experiment.report()
-                self.mark(row, "completed", row_position=index, fork_repo=target, outcome=case["outcome"])
+                model_used = experiment.config.get("optimizer", {}).get("model", experiment.config.get("model", getattr(self, "model", "")))
+                self.mark(row, "completed", row_position=index, fork_repo=target, model=model_used, outcome=case["outcome"])
                 print("Saved results: " + str(experiment.directory), flush=True)
                 print("Pattern completed successfully; remaining repositories for this pattern will be skipped.", flush=True)
                 if not self.cleanup_fork(row, target):
@@ -497,7 +508,8 @@ class Batch:
                 pending = bool(experiment.state.get("pending"))
                 llm_unavailable = "OpenRouter HTTP" in message
                 status = "pending_run" if pending else "llm_paused" if llm_unavailable else "failed"
-                self.mark(row, status, row_position=index, fork_repo=target, reason=message)
+                model_used = experiment.config.get("optimizer", {}).get("model", experiment.config.get("model", getattr(self, "model", "")))
+                self.mark(row, status, row_position=index, fork_repo=target, model=model_used, reason=message)
                 print("Recorded: " + message, flush=True)
                 if pending or llm_unavailable:
                     print("Batch paused to preserve this attempt. Resolve the issue and rerun the same command.", flush=True)
@@ -511,11 +523,11 @@ class Batch:
         print("\nBatch progress: " + str(self.directory / "batch_results.csv"), flush=True)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(batch_class=Batch, default_batch_id="interactive-three-runs-v1", description=__doc__):
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--csv", type=Path, default=runner.ROOT / "research-data/pattern_repo_candidates.csv")
     parser.add_argument("--env-file", type=Path, default=runner.ROOT / ".env")
-    parser.add_argument("--batch-id", default="interactive-three-runs-v1")
+    parser.add_argument("--batch-id", default=default_batch_id)
     parser.add_argument("--pattern", help="Optional selected pattern ID")
     parser.add_argument("--limit", type=int, help="Maximum unfinished rows to visit this invocation")
     parser.add_argument("--start-at", type=int, default=1, help="One-based CSV position to start from (default: 1)")
@@ -531,11 +543,15 @@ def main():
             raise ValueError("start-at must be at least 1")
         load_env(args.env_file)
         rows = read_rows(args.csv, args.pattern)
+        if args.pattern and batch_class.supported_patterns is not None and args.pattern not in batch_class.supported_patterns:
+            raise ValueError("This runner supports: " + ", ".join(sorted(batch_class.supported_patterns)))
         if args.start_at > len(rows):
             raise ValueError(f"start-at is {args.start_at}, but the selection has only {len(rows)} rows")
         if args.list:
             end = args.start_at - 1 + args.limit if args.limit else len(rows)
             for index, row in enumerate(rows[args.start_at - 1:end], args.start_at):
+                if batch_class.supported_patterns is not None and row["pattern_id"] not in batch_class.supported_patterns:
+                    continue
                 print(index, row["pattern_id"], row.get("pattern_title", ""), "https://github.com/" + row["repo_id"], row.get("match_level", ""))
             return 0
         username = os.environ.get("GITHUB_USERNAME", "").strip()
@@ -551,7 +567,7 @@ def main():
         max_tokens = int(os.environ.get("OPENROUTER_MAX_TOKENS") or "24000")
         if not 256 <= max_tokens <= 48000:
             raise ValueError("OPENROUTER_MAX_TOKENS must be between 256 and 48000")
-        batch = Batch(args.batch_id, rows, username, token, model, max_tokens)
+        batch = batch_class(args.batch_id, rows, username, token, model, max_tokens)
         with runner.exclusive(batch.directory / ".lock"):
             batch.run(args.limit, args.start_at, args.rerun)
         return 0

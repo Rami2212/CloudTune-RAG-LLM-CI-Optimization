@@ -94,9 +94,15 @@ only after inspecting the pilot output and API usage.
 
    To start from row 20 in the CSV, add `--start-at 20`. Combine it with `--limit 1` to run one row.
 
+   To continue this batch with another model, change `OPENROUTER_MODEL` in `.env` and rerun the same command with the same `--batch-id`. Model choice does not change batch identity. Existing experiment cases keep their recorded model; new or `--rerun` cases use the selected model. The batch results include the model used for each repo.
+
 4. The script creates or reuses your fork, enables Actions, and adds `workflow_dispatch` to an eligible test/build workflow when needed. It then runs the prepared workflow three times, asks the free LLM to apply only the selected pattern, runs it three more times, saves results, deletes forks it created, and moves to the next row. Existing forks are kept.
 
 Rerun the same command to resume. Results are under `research-data/experiments/`; batch progress is in `research-data/batches/`. See [experiment details](experiments/README.md) for workflow restrictions and saved files.
+
+For all ten blocked patterns, run `scripts/run_scenario_batch.py`. It runs four event scenarios and six synthetic service-policy replays using controlled fixture workflows in a separate scenario batch. See [scenario details](experiments/SCENARIOS.md) and [scenario run commands](RUN_SCENARIO_COMMANDS.md).
+
+`OPENROUTER_MODEL` does not determine batch identity in either batch runner. Change it and resume with the same `--batch-id`; existing cases keep their saved model, while new and rerun cases use the selected model and record it in their results.
 
 The separate experiment runner collects a source snapshot from an existing fork, runs the unchanged CI workflow, applies a pattern-specific proposal in a second branch, runs it again, and archives per-run/job/step metrics and the full before/after workflow and diff.
 
