@@ -1,0 +1,86 @@
+on:
+  push:
+    branches:
+      - master
+      - release/*
+  pull_request:
+
+name: Run Tests
+
+jobs:
+
+  linux-tests:
+    name: "Linux Tests"
+    strategy:
+        matrix:
+          container: ["ubuntu:20.04", "ubuntu:22.04", "ubuntu:24.04"]
+          node: [20, 22]
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.container }}
+    env:
+      ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          check-latest: true
+
+      - name: Install Ubuntu dependencies
+        if: ${{ startsWith(matrix.container, 'ubuntu') }}
+        run: |
+          apt update && apt install -y software-properties-common && apt install -y git build-essential
+
+      - name: Install CentOS dependencies
+        if: ${{ startsWith(matrix.container, 'centos') }}
+        run: |
+          yum install -y git gcc gcc-c++ make
+
+      - name: Run tests
+        run: |
+          npm install --global yarn
+          yarn
+          yarn test
+
+  macos-tests:
+    name: "MacOS Tests"
+    strategy:
+        matrix:
+          node: [20, 22]
+    runs-on: macOS-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          check-latest: true
+
+      - run: |
+          npm install --global yarn
+          yarn
+          yarn test
+
+  windows-tests:
+    name: "Windows Tests"
+    strategy:
+        matrix:
+          node: [20, 22]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          check-latest: true
+
+      - run: |
+          npm install --global yarn
+          yarn
+          yarn test

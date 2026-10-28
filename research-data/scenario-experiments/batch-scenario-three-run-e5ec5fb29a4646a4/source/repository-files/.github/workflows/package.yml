@@ -1,0 +1,38 @@
+on:
+  push:
+    branches:
+      - main
+
+
+permissions:
+  contents: write
+  pull-requests: write
+
+name: Package
+
+jobs:
+  check:
+    name: Package distribution file
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        ref: main
+    - name: Package
+      run: |
+        npm ci
+        npm test
+        npm run package
+    - name: Create PR
+      run: |
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+        BRANCH="automated-packaging/update-dist"
+        git checkout -b "$BRANCH"
+        git add dist/
+        git commit -m "chore: Update dist" || exit 0
+        git push --force origin "$BRANCH"
+        gh pr create --title "chore: Update dist" --body "Automated packaging update" --base main --head "$BRANCH" || echo "PR already exists"
+      env:
+        GH_TOKEN: ${{ github.token }}

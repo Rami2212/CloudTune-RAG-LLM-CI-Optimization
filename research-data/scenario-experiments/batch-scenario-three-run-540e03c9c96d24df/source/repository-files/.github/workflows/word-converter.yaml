@@ -1,0 +1,48 @@
+name: Word Converter
+
+# Triggers the workflow on pull request events that update the branch
+on: 
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - "standard/**"
+      - "tools/MarkdownConverter/**"
+      - "tools/run-converter.sh"
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'The reason for running the workflow'
+        required: true
+        default: 'Manual run'
+
+jobs:
+  word-converter:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      DOTNET_NOLOGO: true
+  
+    steps:
+    - name: Check out our repo
+      uses: actions/checkout@v7.0.1
+
+    - name: Setup .NET 10.0
+      uses: actions/setup-dotnet@v6
+      with:
+        dotnet-version: 10.0.x
+
+    - name: Run converter
+      env:
+        DIAGNOSTICS_REPORT_PATH: ${{ runner.temp }}/reports/word-converter.json
+      run: |
+        cd tools
+        ./run-converter.sh
+
+    - name: Upload diagnostics
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: word-converter-diagnostics
+        path: ${{ runner.temp }}/reports/
+        if-no-files-found: warn
