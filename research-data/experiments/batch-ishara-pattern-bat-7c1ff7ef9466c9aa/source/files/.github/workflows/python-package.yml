@@ -1,0 +1,50 @@
+'on':
+  push: null
+  workflow_dispatch: null
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # minor versions only, so each run picks up the latest patch release
+        python-version: ["3.10", "3.13", "3.14"]
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install uv and set the python version
+      uses: astral-sh/setup-uv@v6
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Set up python
+      run: uv python install
+
+    # --upgrade ignores the pins in uv.lock and resolves the newest versions
+    # allowed by pyproject.toml, so that breakage from a new release of a
+    # dependency shows up here rather than in users' environments
+    - name: Install the project with the latest dependencies
+      run: uv sync --dev --upgrade
+
+    - name: Show resolved dependency versions
+      run: uv pip list
+
+    # numba compiles FastRiskScore's and FastSmallTree's search on first use (about 3.5 min);
+    # cache the compiled code between runs. numba checks each source file's mtime, and a
+    # fresh checkout sets it to now, so pin the mtimes first or the cache would never be used.
+    - name: Pin source mtimes for the numba cache
+      run: find imodels -name '*.py' -exec touch -d '2020-01-01 00:00:00' {} +
+
+    - name: Cache numba-compiled code
+      uses: actions/cache@v4
+      with:
+        path: |
+          imodels/**/__pycache__/*.nbi
+          imodels/**/__pycache__/*.nbc
+        key: numba-${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('imodels/algebraic/risk_score/solver.py', 'imodels/tree/optimal_tree/solver.py') }}
+        restore-keys: numba-${{ runner.os }}-py${{ matrix.python-version }}-
+
+    # pytest-xdist: one worker per CPU
+    - name: Run tests
+      run: uv run pytest -n auto tests

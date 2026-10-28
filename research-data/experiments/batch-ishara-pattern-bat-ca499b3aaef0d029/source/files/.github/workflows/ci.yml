@@ -1,0 +1,56 @@
+name: CI
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    env:
+      MIX_ENV: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 1.16 is the floor mix.lock permits: multipart requires ~> 1.16.
+          # The library itself still supports older, but is not tested there.
+          - pair:
+              elixir: "1.16"
+              otp: "26.2"
+          - pair:
+              elixir: "1.19"
+              otp: "28.1"
+            lint: lint
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: erlef/setup-beam@main
+        with:
+          otp-version: ${{matrix.pair.otp}}
+          elixir-version: ${{matrix.pair.elixir}}
+
+      - uses: actions/cache@v3
+        with:
+          path: deps
+          key: mix-deps-${{ hashFiles('**/mix.lock') }}
+
+      - run: mix deps.get
+
+      - run: mix format --check-formatted
+        if: ${{ matrix.lint }}
+
+      - run: mix deps.unlock --check-unused
+        if: ${{ matrix.lint }}
+
+      - run: mix deps.compile
+
+      - run: mix compile --warnings-as-errors
+        if: ${{ matrix.lint }}
+
+      - run: mix test
+        if: ${{ ! matrix.lint }}
+
+      - run: mix test --warnings-as-errors
+        if: ${{ matrix.lint }}
