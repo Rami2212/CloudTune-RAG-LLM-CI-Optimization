@@ -10,18 +10,21 @@ notepad .env
 # Run or resume the batch
 .\.venv\Scripts\python.exe scripts\run_pattern_batch.py
 
-# Start at row 20 and run one repository
+# Inclusive CSV ranges (new 500-repository dataset)
 
-Ramitha
-.\.venv\Scripts\python.exe scripts\run_pattern_batch.py --start-at 1 --limit 125 --rerun
+# Ramitha
+.\.venv\Scripts\python.exe scripts\run_pattern_batch.py --start-at 1 --stop-at 125
 
-Ishara
-.\.venv\Scripts\python.exe scripts\run_pattern_batch.py --start-at 126 --limit 250 --rerun
+# Ishara
+.\.venv\Scripts\python.exe scripts\run_pattern_batch.py --start-at 126 --stop-at 250
 
-Isuru
-.\.venv\Scripts\python.exe scripts\run_pattern_batch.py --start-at 251 --limit 375 --rerun
+# Isuru
+.\.venv\Scripts\python.exe scripts\run_pattern_batch.py --start-at 251 --stop-at 375
 
-Hiruni
-.\.venv\Scripts\python.exe scripts\run_pattern_batch.py --start-at 376 --limit 500 --rerun
+# Hiruni
+.\.venv\Scripts\python.exe scripts\run_pattern_batch.py --start-at 376 --stop-at 500
+
+# Repeat a finished row in the same batch
+.\.venv\Scripts\python.exe scripts\run_pattern_batch.py --start-at 20 --stop-at 20 --rerun
 
 ```

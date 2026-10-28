@@ -200,6 +200,7 @@ class RunnerTests(unittest.TestCase):
         experiment.optimize()
         experiment.measure("optimized")
         case = experiment.report()
+        self.assertTrue(case["pattern_satisfied"])
         self.assertEqual(experiment.github.dispatches, 10)
         self.assertEqual(len(experiment.state["records"]), 10)
         self.assertEqual((experiment.directory / "before.yml").read_bytes(), WORKFLOW)
@@ -238,12 +239,15 @@ class RunnerTests(unittest.TestCase):
         experiment = self.experiment()
         experiment.prepare()
         experiment.github.fail_next = True
-        experiment.measure("baseline")
+        with self.assertRaisesRegex(RuntimeError, "stopping this repository after the first failed attempt"):
+            experiment.measure("baseline")
         self.assertEqual(experiment.state["records"][0]["conclusion"], "failure")
         self.assertFalse(experiment.state["records"][0]["required_checks_pass"])
-        with self.assertRaisesRegex(ValueError, "Baseline is not reproducibly successful"):
+        with self.assertRaisesRegex(ValueError, "Complete the configured baseline measurements"):
             experiment.optimize()
-        self.assertEqual(experiment.report()["outcome"], "inconclusive")
+        case = experiment.report()
+        self.assertEqual(case["outcome"], "inconclusive")
+        self.assertFalse(case["pattern_satisfied"])
 
     def test_missing_dispatch_fails_before_any_remote_mutation(self):
         experiment = self.experiment()

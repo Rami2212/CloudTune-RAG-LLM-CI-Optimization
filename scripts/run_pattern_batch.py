@@ -15,7 +15,9 @@ from pathlib import Path
 import run_ci_experiment as runner
 from experiment_environment import load_env, redact
 from openrouter_optimizer import DEFAULT_FREE_MODEL, validate_free_model
-from workflow_history import collect as collect_workflow_history
+
+DEFAULT_CANDIDATES = runner.ROOT / "research-data/zenodo_20340547/pattern_repo_candidates_20.csv"
+EXAMPLES_PER_PATTERN = 2
 
 TERMINAL = {"completed", "failed", "blocked", "skipped", "baseline_failed", "proposal_rejected",
             "preparation_failed", "pattern_satisfied"}
@@ -118,20 +120,15 @@ class Batch:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.github = runner.GitHub(token, self.directory / "api_calls.jsonl")
         manifest = self.directory / "selection.json"
-        selection = {"username": username, "rows": rows, "max_tokens": max_tokens,
-                     "repetitions_per_arm": 3, "warmups": 0}
+        selection = {"username": username, "rows": rows, "model": model, "max_tokens": max_tokens,
+                     "repetitions_per_arm": 3, "warmups": 0, "examples_per_pattern": EXAMPLES_PER_PATTERN,
+                     "source_version": "current"}
         if manifest.exists():
             saved_selection = runner.read_json(manifest)
-            # Older manifests included the model. It is experiment metadata, not batch identity.
-            saved_identity = {key: value for key, value in saved_selection.items() if key not in {"model", "max_tokens"}}
-            requested_identity = {key: value for key, value in selection.items() if key != "max_tokens"}
-            if saved_identity != requested_identity or max_tokens < saved_selection.get("max_tokens", max_tokens):
-                raise ValueError("Batch selection/settings changed; keep the same repositories and do not lower OPENROUTER_MAX_TOKENS")
             if saved_selection != selection:
-                # Existing experiment configs retain their model; new/rerun cases use the selected model.
-                runner.write_json(manifest, selection)
-        else:
-            runner.write_json(manifest, selection)
+                runner.append_json(self.directory / "selection_history.jsonl",
+                                   {"at": runner.stamp(), "selection": saved_selection})
+        runner.write_json(manifest, selection)
         state_path = self.directory / "state.json"
         self.state = runner.read_json(state_path) if state_path.exists() else {"items": {}, "forks": {}}
 
@@ -140,11 +137,20 @@ class Batch:
             self.state["items"].items(),
             key=lambda pair: (pair[1].get("row_position", 10**9), pair[0])))
         runner.write_json(self.directory / "state.json", self.state)
-        fields = ["row_position", "row_key", "source_repo", "pattern_id", "fork_repo", "experiment_id", "model", "status", "reason", "outcome", "updated_at"]
+        fields = ["row_position", "row_key", "source_repo", "pattern_id", "fork_repo", "experiment_id", "model", "status", "reason", "outcome", "example_satisfied", "updated_at"]
+        active_keys = {row["pattern_id"] + "|" + row["repo_id"] for row in self.rows}
         with (self.directory / "batch_results.csv").open("w", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
             writer.writeheader()
-            writer.writerows(sorted(self.state["items"].values(), key=lambda item: item.get("row_position", 10**9)))
+            writer.writerows(sorted((item for key, item in self.state["items"].items() if key in active_keys),
+                                    key=lambda item: item.get("row_position", 10**9)))
+        with (self.directory / "pattern_progress.csv").open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["pattern_id", "successful_examples", "target", "satisfied"])
+            writer.writeheader()
+            for pattern in dict.fromkeys(row["pattern_id"] for row in self.rows):
+                count = len(self.successful_examples(pattern))
+                writer.writerow({"pattern_id": pattern, "successful_examples": count,
+                                 "target": EXAMPLES_PER_PATTERN, "satisfied": count >= EXAMPLES_PER_PATTERN})
 
     def generation(self, row):
         key = row["pattern_id"] + "|" + row["repo_id"]
@@ -180,20 +186,7 @@ class Batch:
             repository = validate_fork(self.github, row["repo_id"], target)
             self.enable_actions(target)
             workflow = choose_workflow(self.github, target, repository, row, require_dispatch=False)
-            history_dir = runner.ROOT / "research-data/experiments" / self.case_id(row) / "history"
-            try:
-                history = collect_workflow_history(self.github, row["repo_id"], workflow,
-                                                   row["pattern_id"], history_dir, runner)
-                print("Historical workflow scan: " + history["status"], flush=True)
-                if history.get("status") == "transition_found":
-                    print("Historical before/after versions and available original CI runs saved to: " + str(history_dir), flush=True)
-            except (OSError, ValueError, RuntimeError, KeyError, TypeError, runner.yaml.YAMLError) as history_error:
-                # Historical evidence is supplemental; preserve the live experiment if history cannot be fetched.
-                runner.write_json(history_dir / "manifest.json", {
-                    "record_kind": "historical_ci_pattern_transition", "source_repo": row["repo_id"],
-                    "workflow_path": workflow, "pattern_id": row["pattern_id"], "status": "collection_error",
-                    "reason": redact(str(history_error))})
-                print("Historical workflow scan unavailable: " + redact(str(history_error)), flush=True)
+            print("Using the fork's current default-branch workflow (no history scan).", flush=True)
             self.add_workflow_dispatch(target, repository["default_branch"], workflow)
             repository = self.github.request("GET", "/repos/" + target)
             workflow = choose_workflow(self.github, target, repository, row)
@@ -201,9 +194,9 @@ class Batch:
             if config_path.exists():
                 config = runner.load_config(config_path)
                 if config["fork_repo"].lower() != target.lower():
-                    raise ValueError("Existing case uses a different fork; use a new --batch-id")
+                    raise ValueError("Existing attempt uses a different fork; use --rerun in this batch")
                 if config["workflow_path"] != workflow:
-                    raise ValueError("Existing case uses a different workflow; use a new --batch-id")
+                    raise ValueError("Existing attempt uses a different workflow; use --rerun in this batch")
             else:
                 raw_config = {"experiment_id": self.case_id(row), "fork_repo": target,
                               "source_ref": "HEAD", "workflow_path": workflow, "pattern_id": row["pattern_id"],
@@ -397,47 +390,54 @@ class Batch:
             print("Deleted fork: https://github.com/" + target, flush=True)
         return record.get("status") == "deleted"
 
-    def run(self, limit=None, start_at=1, rerun=False):
+    def successful_examples(self, pattern_id):
+        active_keys = {row["pattern_id"] + "|" + row["repo_id"] for row in self.rows}
+        return {item["source_repo"] for key, item in self.state["items"].items()
+                if key in active_keys and item.get("pattern_id") == pattern_id
+                and (item.get("status") == "completed" or
+                     item.get("status") == "cleanup_pending" and item.get("finished_status") == "completed")
+                and item.get("example_satisfied", item.get("outcome") in {"safe_success", "scenario_passed"}) is True}
+
+    def run(self, stop_at=None, start_at=1, rerun=False):
         self.backfill_row_positions()
-        visited = 0
         announced_patterns = set()
         for index, row in enumerate(self.rows, 1):
             if index < start_at:
+                continue
+            if stop_at is not None and index > stop_at:
+                break
+            if getattr(self, "pattern_filter", None) and row["pattern_id"] != self.pattern_filter:
                 continue
             if self.supported_patterns is not None and row["pattern_id"] not in self.supported_patterns:
                 continue
             key = row["pattern_id"] + "|" + row["repo_id"]
             item = self.state["items"].get(key, {})
             if item.get("status") == "cleanup_pending":
-                if limit is not None and visited >= limit:
-                    break
-                visited += 1
                 print(f"\n[{index}/{len(self.rows)}] Retrying fork cleanup for {row['repo_id']}...", flush=True)
                 if not self.cleanup_fork(row, item["fork_repo"]):
                     print("Cleanup is still pending. Fix the GitHub permission or connection, then rerun.", flush=True)
                     return
                 self.mark(row, item.get("finished_status", "completed"), fork_repo=item["fork_repo"],
-                          outcome=item.get("outcome"), reason=item.get("reason"))
+                          outcome=item.get("outcome"), reason=item.get("reason"),
+                          model=item.get("model"), example_satisfied=item.get(
+                              "example_satisfied", item.get("outcome") in {"safe_success", "scenario_passed"}))
                 continue
-            winner = next((saved for saved in self.state["items"].values()
-                           if saved.get("pattern_id") == row["pattern_id"] and
-                           (saved.get("status") == "completed" or
-                            (saved.get("status") == "cleanup_pending" and
-                             saved.get("finished_status") == "completed"))), None)
-            if winner and winner["row_key"] != key:
+            successes = self.successful_examples(row["pattern_id"])
+            if len(successes) >= EXAMPLES_PER_PATTERN and not (rerun and row["repo_id"] in successes):
                 if item.get("status") in {"running", "pending_run", "llm_paused"}:
                     print("Pattern already completed, but another case has unfinished work: " +
                           item["experiment_id"] + ". Resolve that case before continuing.", flush=True)
                     return
-                reason = "Pattern already completed by " + winner["source_repo"]
+                reason = f"Pattern has {len(successes)}/{EXAMPLES_PER_PATTERN} successful examples: " + ", ".join(sorted(successes))
                 if row["pattern_id"] not in announced_patterns:
                     print(reason + "; skipping remaining candidates for " + row["pattern_id"], flush=True)
                     announced_patterns.add(row["pattern_id"])
                 if not item:
                     self.mark(row, "pattern_satisfied", row_position=index, reason=reason)
                 continue
-            if rerun and item.get("status") in TERMINAL and limit is not None and visited >= limit:
-                break
+            # Old quota skips become runnable when fewer than two examples qualify.
+            if item.get("status") == "pattern_satisfied":
+                item = {}
             if item.get("status") in TERMINAL:
                 if not rerun:
                     continue
@@ -447,9 +447,6 @@ class Batch:
                 generations = self.state.setdefault("generations", {})
                 generations[key] = generations.get(key, 1) + 1
                 self.save()
-            if limit is not None and visited >= limit:
-                break
-            visited += 1
             print(f"\n[{index}/{len(self.rows)}] Pattern: {row['pattern_id']} — {row.get('pattern_title', '')}", flush=True)
             print("Repository to fork: https://github.com/" + row["repo_id"], flush=True)
             print("Selection evidence: " + row.get("match_level", "unspecified"), flush=True)
@@ -489,12 +486,16 @@ class Batch:
                     experiment.measure("optimized")
                     case = experiment.report()
                 model_used = experiment.config.get("optimizer", {}).get("model", experiment.config.get("model", getattr(self, "model", "")))
-                self.mark(row, "completed", row_position=index, fork_repo=target, model=model_used, outcome=case["outcome"])
+                satisfied = case.get("pattern_satisfied", False) is True
+                self.mark(row, "completed", row_position=index, fork_repo=target, model=model_used,
+                          outcome=case["outcome"], example_satisfied=satisfied)
                 print("Saved results: " + str(experiment.directory), flush=True)
-                print("Pattern completed successfully; remaining repositories for this pattern will be skipped.", flush=True)
+                count = len(self.successful_examples(row["pattern_id"]))
+                print(f"Pattern examples: {count}/{EXAMPLES_PER_PATTERN}; this attempt satisfied the pattern: {satisfied}.", flush=True)
                 if not self.cleanup_fork(row, target):
                     self.mark(row, "cleanup_pending", row_position=index, fork_repo=target, finished_status="completed",
-                              outcome=case["outcome"], reason="Fork deletion failed; rerun to retry cleanup")
+                              outcome=case["outcome"], model=model_used, example_satisfied=satisfied,
+                              reason="Fork deletion failed; rerun to retry cleanup")
                     print("Results are saved; cleanup is pending. Fix the GitHub permission or connection, then rerun.", flush=True)
                     return
             except (OSError, ValueError, RuntimeError, KeyError, TypeError, runner.yaml.YAMLError) as exc:
@@ -520,16 +521,18 @@ class Batch:
                     print("Experiment ended; fork cleanup is pending. Fix the GitHub permission or connection, then rerun.", flush=True)
                     return
                 print("This repository is finished; continuing to the next candidate.", flush=True)
+        self.save()
         print("\nBatch progress: " + str(self.directory / "batch_results.csv"), flush=True)
+        print("Per-pattern example counts: " + str(self.directory / "pattern_progress.csv"), flush=True)
 
 
 def main(batch_class=Batch, default_batch_id="interactive-three-runs-v1", description=__doc__):
     parser = argparse.ArgumentParser(description=description)
-    parser.add_argument("--csv", type=Path, default=runner.ROOT / "research-data/pattern_repo_candidates.csv")
+    parser.add_argument("--csv", type=Path, default=DEFAULT_CANDIDATES)
     parser.add_argument("--env-file", type=Path, default=runner.ROOT / ".env")
     parser.add_argument("--batch-id", default=default_batch_id)
     parser.add_argument("--pattern", help="Optional selected pattern ID")
-    parser.add_argument("--limit", type=int, help="Maximum unfinished rows to visit this invocation")
+    parser.add_argument("--stop-at", type=int, help="Inclusive ending position in the original CSV (default: last row)")
     parser.add_argument("--start-at", type=int, default=1, help="One-based CSV position to start from (default: 1)")
     parser.add_argument("--rerun", action="store_true", help="Rerun terminal rows in the selected range; replace their batch summary and keep prior experiment evidence")
     parser.add_argument("--list", action="store_true", help="Preview repository links and patterns without API calls or prompts")
@@ -537,19 +540,25 @@ def main(batch_class=Batch, default_batch_id="interactive-three-runs-v1", descri
     try:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", args.batch_id):
             raise ValueError("batch-id must be 1-64 letters, digits, underscores or hyphens")
-        if args.limit is not None and args.limit < 1:
-            raise ValueError("limit must be positive")
+        if args.stop_at is not None and args.stop_at < args.start_at:
+            raise ValueError("stop-at must be at least start-at")
         if args.start_at < 1:
             raise ValueError("start-at must be at least 1")
         load_env(args.env_file)
-        rows = read_rows(args.csv, args.pattern)
+        rows = read_rows(args.csv)
+        if args.pattern and not any(row["pattern_id"] == args.pattern for row in rows):
+            raise ValueError("No matching rows in candidate CSV")
         if args.pattern and batch_class.supported_patterns is not None and args.pattern not in batch_class.supported_patterns:
             raise ValueError("This runner supports: " + ", ".join(sorted(batch_class.supported_patterns)))
         if args.start_at > len(rows):
             raise ValueError(f"start-at is {args.start_at}, but the selection has only {len(rows)} rows")
+        if args.stop_at is not None and args.stop_at > len(rows):
+            raise ValueError(f"stop-at is {args.stop_at}, but the selection has only {len(rows)} rows")
         if args.list:
-            end = args.start_at - 1 + args.limit if args.limit else len(rows)
+            end = args.stop_at if args.stop_at is not None else len(rows)
             for index, row in enumerate(rows[args.start_at - 1:end], args.start_at):
+                if args.pattern and row["pattern_id"] != args.pattern:
+                    continue
                 if batch_class.supported_patterns is not None and row["pattern_id"] not in batch_class.supported_patterns:
                     continue
                 print(index, row["pattern_id"], row.get("pattern_title", ""), "https://github.com/" + row["repo_id"], row.get("match_level", ""))
@@ -568,8 +577,9 @@ def main(batch_class=Batch, default_batch_id="interactive-three-runs-v1", descri
         if not 256 <= max_tokens <= 48000:
             raise ValueError("OPENROUTER_MAX_TOKENS must be between 256 and 48000")
         batch = batch_class(args.batch_id, rows, username, token, model, max_tokens)
+        batch.pattern_filter = args.pattern
         with runner.exclusive(batch.directory / ".lock"):
-            batch.run(args.limit, args.start_at, args.rerun)
+            batch.run(stop_at=args.stop_at, start_at=args.start_at, rerun=args.rerun)
         return 0
     except (KeyboardInterrupt, EOFError):
         print("\nStopped. Saved progress can be resumed with the same command.")

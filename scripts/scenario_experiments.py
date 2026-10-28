@@ -134,9 +134,7 @@ class ScenarioExperiment:
         frozen = self.directory / "config.json"
         if frozen.exists():
             saved = runner.read_json(frozen)
-            if {k: v for k, v in saved.items() if k not in {"model", "max_tokens"}} != {
-                    k: v for k, v in config.items() if k not in {"model", "max_tokens"}}:
-                raise ValueError("Scenario settings changed; use another --batch-id")
+            # Resume the frozen attempt; new/rerun generations use new settings.
             config = saved
         else:
             runner.write_json(frozen, config)
@@ -159,7 +157,7 @@ class ScenarioExperiment:
             if self.pattern in replay.PATTERNS:
                 engine = self.directory / "source/replay_engine.py"
                 if engine.read_text(encoding="utf-8") != Path(replay.__file__).read_text(encoding="utf-8"):
-                    raise ValueError("Replay engine changed; use a new --batch-id to keep evidence reproducible")
+                    raise ValueError("Replay engine changed; use --rerun in the same batch to create a fresh attempt")
             return
         repository = self.github.request("GET", self.prefix)
         commit = self.github.request("GET", self.prefix + "/commits/" + urllib.parse.quote(repository["default_branch"], safe=""))
@@ -574,11 +572,17 @@ class ScenarioExperiment:
                 for metric in ("simulated_work_seconds", "missed_failures", "missed_failure_rate", "held_out_mae_seconds"):
                     values = [r[metric] for r in records if r.get(metric) is not None]
                     arms[arm]["median_" + metric] = statistics.median(values) if values else None
-        passed = all(stats["passing_repeats"] == 3 for stats in arms.values())
+        passed = all(stats["total_repeats"] == 3 and stats["passing_repeats"] == 3 for stats in arms.values())
+        proposal = self.state.get("proposal", {})
+        pattern_satisfied = bool(passed and proposal.get("before_sha256") and
+                                 proposal.get("after_sha256") and
+                                 proposal["before_sha256"] != proposal["after_sha256"])
         case = {"case_id": self.config["experiment_id"], "record_kind": "controlled_pattern_scenario",
                 "evidence_scope": "synthetic_fixture_on_dedicated_fork", "source_repo_id": self.config["source_repo"],
                 "fork_repo": self.config["fork_repo"], "pattern_id": self.pattern, "model": self.config["model"],
                 "outcome": "scenario_passed" if passed else "inconclusive", "arms": arms,
+                "pattern_satisfied": pattern_satisfied,
+                "pattern_satisfaction_scope": "controlled scenario assertions only; repository applicability remains unverified",
                 "real_repo_optimization_verified": False, "required_status_validated": False,
                 "rag_admission": "controlled_scenario_only_pending_applicability_review",
                 "absence_window_seconds": self.settings["absence_seconds"],
@@ -626,7 +630,8 @@ class ScenarioBatch(Batch):
         self.scenario_settings = settings_from_env()
         frozen = self.directory / "scenario_settings.json"
         if frozen.exists() and runner.read_json(frozen) != self.scenario_settings:
-            raise ValueError("Scenario settings changed; use another --batch-id")
+            runner.append_json(self.directory / "scenario_settings_history.jsonl",
+                               {"at": runner.stamp(), "settings": runner.read_json(frozen)})
         runner.write_json(frozen, self.scenario_settings)
 
     def ready_experiment(self, row):
@@ -653,8 +658,6 @@ class ScenarioBatch(Batch):
             config_path = self.directory / "configs" / (self.case_id(row) + ".json")
             if config_path.exists():
                 saved = runner.read_json(config_path)
-                if {k: v for k, v in saved.items() if k not in {"max_tokens", "model"}} != {k: v for k, v in config.items() if k not in {"max_tokens", "model"}}:
-                    raise ValueError("Scenario config changed; use another --batch-id")
                 config = saved
             else:
                 runner.write_json(config_path, config)
