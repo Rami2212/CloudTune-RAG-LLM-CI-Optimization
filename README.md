@@ -88,11 +88,13 @@ only after inspecting the pilot output and API usage.
 3. Preview the repository order, then start the pipeline:
 
    ```powershell
-   .\.venv\Scripts\python.exe scripts\run_pattern_batch.py --list --limit 5
+   .\.venv\Scripts\python.exe scripts\run_pattern_batch.py --list --stop-at 5
    .\.venv\Scripts\python.exe scripts\run_pattern_batch.py
    ```
 
-   To start from row 20 in the CSV, add `--start-at 20`. Combine it with `--limit 1` to run one row.
+   Both runners default to `research-data/zenodo_20340547/pattern_repo_candidates_20.csv` (25 patterns, 20 distinct repositories each). Use `--start-at 20 --stop-at 20` for row 20, or `--start-at 20 --stop-at 100` for rows 20 through 100 inclusive. Positions always refer to the original CSV, including with `--pattern`.
+
+   The main runner uses the current default-branch workflow without scanning history. Both runners seek two examples per pattern with validated changes and three passing measurements per arm; remaining candidates are skipped after two qualify. Scenario qualifications cover controlled fixtures, not real repository savings. Model, token, and scenario settings may change within the same batch. Existing attempts retain their original configuration; new cases and `--rerun` generations use the latest settings while preserving old evidence.
 
    To continue this batch with another model, change `OPENROUTER_MODEL` in `.env` and rerun the same command with the same `--batch-id`. Model choice does not change batch identity. Existing experiment cases keep their recorded model; new or `--rerun` cases use the selected model. The batch results include the model used for each repo.
 

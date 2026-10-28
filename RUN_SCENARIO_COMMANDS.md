@@ -14,11 +14,11 @@ notepad .env
 .\.venv\Scripts\python.exe scripts\run_scenario_batch.py
 # Change OPENROUTER_MODEL in .env, then rerun the same command to continue this batch with that model
 
-# Visit one candidate starting from an original CSV position
-.\.venv\Scripts\python.exe scripts\run_scenario_batch.py --start-at 1 --limit 1
+# Run supported scenarios in inclusive original CSV positions
+.\.venv\Scripts\python.exe scripts\run_scenario_batch.py --start-at 1 --stop-at 500
 
 # Repeat a finished case in the same batch
-.\.venv\Scripts\python.exe scripts\run_scenario_batch.py --start-at 1 --limit 1 --rerun
+.\.venv\Scripts\python.exe scripts\run_scenario_batch.py --start-at 21 --stop-at 21 --rerun
 
 # Optional: independent batch for one pattern
 .\.venv\Scripts\python.exe scripts\run_scenario_batch.py --pattern P-LIT-FAIL-FAST --batch-id scenario-fail-fast-v1

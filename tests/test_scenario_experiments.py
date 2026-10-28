@@ -177,12 +177,12 @@ class DurabilityTests(unittest.TestCase):
         second = batch_module.Batch("same-batch", rows, "owner", "token", "provider/model-b:free")
         manifest = first.directory / "selection.json"
         self.assertEqual(first.directory, second.directory)
-        self.assertNotIn("model", scenarios.runner.read_json(manifest))
+        self.assertEqual(scenarios.runner.read_json(manifest)["model"], "provider/model-b:free")
         legacy = {**scenarios.runner.read_json(manifest), "model": "provider/old-model:free"}
         scenarios.runner.write_json(manifest, legacy)
         migrated = batch_module.Batch("same-batch", rows, "owner", "token", "provider/model-c:free")
         self.assertEqual(migrated.directory, first.directory)
-        self.assertNotIn("model", scenarios.runner.read_json(manifest))
+        self.assertEqual(scenarios.runner.read_json(manifest)["model"], "provider/model-c:free")
 
     def test_scenario_config_model_is_not_scenario_identity(self):
         config = {**self.config, "pattern_id": "P-LIT-CHANGE-FILTER"}
@@ -226,12 +226,12 @@ class DurabilityTests(unittest.TestCase):
         batch.directory = Path(self.temp.name)
         batch.state = {"items": {}, "forks": {}}
         batch.rows = [{"repo_id": f"source/repo{i}", "pattern_id": pattern} for i, pattern in enumerate(
-            ["P-LIT-GHA-CACHE", "P-LIT-FAIL-FAST", "P-LIT-FAIL-FAST", "P-LIT-CANCEL-STALE"], 1)]
+            ["P-LIT-GHA-CACHE", "P-LIT-FAIL-FAST", "P-LIT-FAIL-FAST", "P-LIT-FAIL-FAST", "P-LIT-CANCEL-STALE"], 1)]
         batch.save = lambda: None
         exp = Mock()
         exp.directory = Path(self.temp.name)
         exp.state = {"proposal": {"llm": {"decision": "APPLY"}}}
-        exp.report.return_value = {"outcome": "scenario_passed"}
+        exp.report.return_value = {"outcome": "scenario_passed", "pattern_satisfied": True}
         attempted = []
         def prepare(row):
             attempted.append(row["repo_id"])
@@ -241,10 +241,10 @@ class DurabilityTests(unittest.TestCase):
         with patch.object(scenarios.runner, "exclusive", side_effect=lambda path: nullcontext()):
             batch.run()
             batch.run()
-        self.assertEqual(attempted, ["source/repo2", "source/repo4"])
-        skipped = batch.state["items"]["P-LIT-FAIL-FAST|source/repo3"]
+        self.assertEqual(attempted, ["source/repo2", "source/repo3", "source/repo5"])
+        skipped = batch.state["items"]["P-LIT-FAIL-FAST|source/repo4"]
         self.assertEqual(skipped["status"], "pattern_satisfied")
-        self.assertEqual(skipped["row_position"], 3)
+        self.assertEqual(skipped["row_position"], 4)
 
     def test_all_scenario_drivers_build_passing_control_sets(self):
         for pattern in scenarios.SUPPORTED:
