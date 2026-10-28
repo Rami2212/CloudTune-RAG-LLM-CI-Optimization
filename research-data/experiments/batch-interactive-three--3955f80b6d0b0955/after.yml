@@ -1,0 +1,78 @@
+'on':
+  push: null
+  pull_request: null
+  workflow_dispatch: null
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Cache bundler dependencies
+      uses: actions/cache@v4
+      with:
+        path: vendor/bundle
+        key: ${{ runner.os }}-ruby-3.4-bundler-${{ hashFiles('Gemfile.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-ruby-3.4-bundler-
+
+    - name: Set up Ruby
+      uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: "3.4"
+        bundler-cache: true
+
+    - name: Lint
+      run: bundle exec rake rubocop
+
+  test:
+    name: Test Ruby ${{ matrix.ruby }} on ActiveModel ${{ matrix.activemodel }}
+    strategy:
+      matrix:
+        ruby: ["3.4"]
+        activemodel: ["8.1"]
+        include:
+          - activemodel: "8.0"
+            ruby: "3.4"
+          - activemodel: "7.2"
+            ruby: "3.3"
+          - activemodel: "7.1"
+            ruby: "3.3"
+          - activemodel: "7.0"
+            ruby: "3.2"
+          - activemodel: "6.1"
+            ruby: "3.1"
+          - activemodel: "6.0"
+            ruby: "3.0"
+          - activemodel: "5.2"
+            ruby: "2.7"
+
+    runs-on: ubuntu-latest
+    env:
+      BUNDLE_GEMFILE: gemfiles/rails-${{ matrix.activemodel }}.gemfile
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Prerequisites
+      run: sudo apt install libsqlite3-dev
+
+    - name: Cache bundler dependencies
+      uses: actions/cache@v4
+      with:
+        path: vendor/bundle
+        key: ${{ runner.os }}-ruby-${{ matrix.ruby }}-bundler-${{ hashFiles(format('gemfiles/rails-{0}.gemfile.lock', matrix.activemodel)) }}
+        restore-keys: |
+          ${{ runner.os }}-ruby-${{ matrix.ruby }}-bundler-
+
+    - name: Set up Ruby ${{ matrix.ruby }}
+      uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: ${{ matrix.ruby }}
+        bundler-cache: true
+
+    - name: Test
+      run: bundle exec rake spec
