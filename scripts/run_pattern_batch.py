@@ -396,7 +396,29 @@ class Batch:
                 if key in active_keys and item.get("pattern_id") == pattern_id
                 and (item.get("status") == "completed" or
                      item.get("status") == "cleanup_pending" and item.get("finished_status") == "completed")
-                and item.get("example_satisfied", item.get("outcome") in {"safe_success", "scenario_passed"}) is True}
+                and item.get("example_satisfied", item.get("outcome") in {"safe_success", "scenario_passed"}) is True
+                and self.case_has_runtime_improvement(item)}
+
+    def case_has_runtime_improvement(self, item):
+        experiment_id = item.get("experiment_id")
+        if not experiment_id:
+            return False
+        for parent in ("experiments", "scenario-experiments"):
+            path = runner.ROOT / "research-data" / parent / experiment_id / "case.json"
+            try:
+                case = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if case.get("pattern_satisfied") is not True:
+                return False
+            arms = case.get("arms", {})
+            metric = "median_elapsed_seconds" if parent == "experiments" else "median_job_runtime_seconds"
+            baseline = arms.get("baseline", {}).get(metric)
+            optimized = arms.get("optimized", {}).get(metric)
+            return (isinstance(baseline, (int, float)) and not isinstance(baseline, bool)
+                    and isinstance(optimized, (int, float)) and not isinstance(optimized, bool)
+                    and optimized < baseline)
+        return False
 
     def run(self, stop_at=None, start_at=1, rerun=False):
         self.backfill_row_positions()

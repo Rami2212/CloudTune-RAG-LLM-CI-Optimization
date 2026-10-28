@@ -574,7 +574,11 @@ class ScenarioExperiment:
                     arms[arm]["median_" + metric] = statistics.median(values) if values else None
         passed = all(stats["total_repeats"] == 3 and stats["passing_repeats"] == 3 for stats in arms.values())
         proposal = self.state.get("proposal", {})
-        pattern_satisfied = bool(passed and proposal.get("before_sha256") and
+        baseline_time = arms["baseline"]["median_job_runtime_seconds"]
+        optimized_time = arms["optimized"]["median_job_runtime_seconds"]
+        runtime_improved = bool(baseline_time is not None and optimized_time is not None and
+                                optimized_time < baseline_time)
+        pattern_satisfied = bool(passed and runtime_improved and proposal.get("before_sha256") and
                                  proposal.get("after_sha256") and
                                  proposal["before_sha256"] != proposal["after_sha256"])
         case = {"case_id": self.config["experiment_id"], "record_kind": "controlled_pattern_scenario",
@@ -582,7 +586,8 @@ class ScenarioExperiment:
                 "fork_repo": self.config["fork_repo"], "pattern_id": self.pattern, "model": self.config["model"],
                 "outcome": "scenario_passed" if passed else "inconclusive", "arms": arms,
                 "pattern_satisfied": pattern_satisfied,
-                "pattern_satisfaction_scope": "controlled scenario assertions only; repository applicability remains unverified",
+                "pattern_satisfaction_scope": "controlled assertions passed and optimized median summed job runtime is lower than baseline; repository applicability remains unverified",
+                "runtime_improved": runtime_improved,
                 "real_repo_optimization_verified": False, "required_status_validated": False,
                 "rag_admission": "controlled_scenario_only_pending_applicability_review",
                 "absence_window_seconds": self.settings["absence_seconds"],

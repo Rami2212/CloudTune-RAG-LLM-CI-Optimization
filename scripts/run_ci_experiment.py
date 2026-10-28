@@ -853,17 +853,23 @@ class Experiment:
                 reasons.append("Change-specific behavioral evidence pending (for caching: cold, warm, changed lockfile, invalidation)")
             if not reasons and savings is not None:
                 outcome = "safe_success" if not proposal.get("no_change") and savings > 0 and savings >= self.config["min_savings_percent"] else "safe_no_gain"
-        # Execution qualification is separate from independent safety review
-        # and from whether the change improved timing.
+        runtime_improved = bool(
+            baseline["median_elapsed_seconds"] is not None
+            and optimized["median_elapsed_seconds"] is not None
+            and optimized["median_elapsed_seconds"] < baseline["median_elapsed_seconds"])
+        # A pattern example must show a real elapsed-time improvement, in
+        # addition to a valid change and complete successful measurements.
         pattern_satisfied = bool(
             proposal and not proposal.get("no_change", True) and not proposal.get("structural_errors")
             and all(stats["total_runs"] == self.config["repetitions"] and
                     stats["usable_successes"] == self.config["repetitions"] for stats in arms.values())
+            and runtime_improved
             and workflow_doc((self.directory / "before.yml").read_bytes()) !=
                 workflow_doc((self.directory / "after.yml").read_bytes()))
         case = {"case_id": self.config["experiment_id"], "record_kind": "verified_experiment_case",
                 "pattern_satisfied": pattern_satisfied,
-                "pattern_satisfaction_scope": "changed YAML passed selected-pattern scope checks and all paired CI runs; independent review remains separate",
+                "pattern_satisfaction_scope": "changed YAML passed selected-pattern scope checks, all paired CI runs, and optimized median workflow elapsed time is lower than baseline; independent review remains separate",
+                "runtime_improved": runtime_improved,
                 "split": self.config["split"], "source_repo_id": self.repo, "family_id": self.state.get("family_id"),
                 "source_commit_sha": self.state.get("source_sha"), "workflow_path": self.config["workflow_path"],
                 "pattern_id": self.config["pattern_id"], "outcome": outcome, "reasons": reasons,
