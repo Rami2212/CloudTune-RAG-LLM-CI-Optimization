@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - master
+  push:
+    branches:
+      - master
+      - topic/**
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        java: [ '8', '11', '17', '21', '25'  ]
+        compiler: [ 'javac', 'ecj' ]
+        extra: [ 'none', 'errorprone' ]
+        exclude:
+          - java: 25
+            compiler: ecj
+    steps:
+    - uses: actions/checkout@v5
+    - name: Set up JDK
+      uses: actions/setup-java@v5
+      with:
+        distribution: temurin
+        java-version: ${{ matrix.java }}
+        cache: maven
+    - name: print Java version
+      run: java -version
+    - name: Run tests
+      run: ./mvnw --batch-mode --no-transfer-progress clean test -P${{ matrix.compiler }} -Dextra=${{ matrix.extra }}
