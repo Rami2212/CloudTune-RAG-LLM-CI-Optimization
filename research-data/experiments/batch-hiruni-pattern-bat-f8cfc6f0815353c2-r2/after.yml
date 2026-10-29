@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master, legacy]
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions: {}
+
+jobs:
+  build:
+    name: Testing on ${{ matrix.os }} with Python version ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.11', '3.12', '3.13', '3.14', 'pypy3.11']
+        os: ['ubuntu-latest']
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  #v6.2.0
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install requirements
+        run: pip install -r requirements.txt
+        if: ${{ !startsWith(matrix.python, 'pypy') }}
+
+      - name: Install requirements
+        run: pip install .
+        if: ${{ startsWith(matrix.python, 'pypy') }}
+
+      - name: Run tests with coverage and create report as xml file
+        run: make test
+        if: ${{ !startsWith(matrix.python, 'pypy') }}
+
+      - name: Run tests with coverage and create report as xml file
+        run: python -m unittest discover
+        if: ${{ startsWith(matrix.python, 'pypy') }}
+
+      - name: Run Flake8
+        run: flake8
+        if: ${{ !startsWith(matrix.python, 'pypy') }}
+
+      - name: Run Mypy
+        run: mypy --strict ./pyais
+        if: ${{ !startsWith(matrix.python, 'pypy') }}

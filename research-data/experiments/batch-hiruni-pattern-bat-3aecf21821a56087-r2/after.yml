@@ -1,0 +1,93 @@
+on:
+  push: null
+  pull_request: null
+  workflow_dispatch: null
+
+# TODO we need an out-of-tree build, need tests to work
+
+jobs:
+  linux-x86_64:
+    name: "Linux x86_64 Machine Code"
+    runs-on: ubuntu-latest   # this should force x86_64 when it becomes an option
+    steps:
+      - uses: actions/checkout@main
+      - uses: actions/cache@v4
+        with:
+          path: output/
+          key: ${{ runner.os }}-build-${{ hashFiles('**/configure.sh', '**/build.sh') }}
+      - run: ./configure.sh --strict
+      - run: ./build.sh
+      - run: test/test-final.sh
+
+  test-platform:
+    name: "Linux Platform-Specific Tests"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+      - uses: actions/cache@v4
+        with:
+          path: output/
+          key: ${{ runner.os }}-build-${{ hashFiles('**/configure.sh', '**/build.sh') }}
+      - run: test/test-platform.sh
+
+  test-native:
+    name: "Native Build"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+      - uses: actions/cache@v4
+        with:
+          path: output/
+          key: ${{ runner.os }}-build-${{ hashFiles('**/configure.sh', '**/build.sh') }}
+      - run: ./configure.sh --native
+      - run: ./build.sh
+
+  test-core:
+    name: "Core Tests"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+      - uses: actions/cache@v4
+        with:
+          path: output/
+          key: ${{ runner.os }}-build-${{ hashFiles('**/configure.sh', '**/build.sh') }}
+      - run: ./configure.sh --dev
+      - run: test/test-core.sh
+
+  test-bootstrapped:
+    name: "Bootstrapped Tests"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+      - uses: actions/cache@v4
+        with:
+          path: output/
+          key: ${{ runner.os }}-build-${{ hashFiles('**/configure.sh', '**/build.sh') }}
+      - run: ./configure.sh --dev --test
+      - run: ./build.sh
+
+  test-bootstrapped-short-read:
+    name: "Bootstrapped Tests w/ Short Read"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+      - uses: actions/cache@v4
+        with:
+          path: output/
+          key: ${{ runner.os }}-build-${{ hashFiles('**/configure.sh', '**/build.sh') }}
+      - run: EXTRA_CFLAGS=-DMAX_READ_SIZE=1 platform/vm/c-debugger/configure.sh
+      - run: ./configure.sh --vm manual --test
+      - run: ./build.sh
+
+  test-bootstrapped-short-write:
+    name: "Bootstrapped Tests w/ Short Write"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+      - uses: actions/cache@v4
+        with:
+          path: output/
+          key: ${{ runner.os }}-build-${{ hashFiles('**/configure.sh', '**/build.sh') }}
+      - run: EXTRA_CFLAGS=-DMAX_WRITE_SIZE=1 platform/vm/c-debugger/configure.sh
+      - run: ./configure.sh --vm manual --test
+      - run: ./build.sh

@@ -1,0 +1,84 @@
+name: Code checks
+
+# `push` is limited to master because a PR branch in this repo would otherwise fire
+# both `push` and `pull_request` for the same commit, queueing two identical runs of
+# the five-way Python matrix. Branch pushes are still covered — via `pull_request`
+# once a PR is open.
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+  pull_request:
+
+# Superseded runs are pointless once a newer commit exists on the same ref, and they
+# hold runners that the newest commit is waiting on.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  POETRY_VERSION: 1.8.5
+
+jobs:
+  Tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        PYTHON_VERSION: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.PYTHON_VERSION }}
+          allow-prereleases: true
+
+      - name: Install and configure Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: "${{env.POETRY_VERSION}}"
+
+      - name: Set up micromamba
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: environment.yaml
+          # `environment.yaml` carries `python >=3.10,<3.15`; this narrows the
+          # solve to one specific version per matrix entry.
+          create-args: >-
+            python=${{ matrix.PYTHON_VERSION }}
+          micromamba-version: latest
+          init-shell: bash
+          cache-environment: true
+          post-cleanup: 'all'
+
+      # Runtime deps are installed by `setup-micromamba` from environment.yaml so we
+      # get conda-forge wheels (which cover newer Pythons — notably cp314 — that PyPI
+      # doesn't yet ship wheels for). We then install pixy itself with `--no-deps`
+      # to avoid re-resolving them from PyPI, and use poetry only for the dev-tool
+      # group (ruff, mypy, pytest, etc.) since those are pure-Python and trivially
+      # wheel-available everywhere.
+      - name: Install the library
+        shell: micromamba-shell {0}
+        run: |
+          poetry config virtualenvs.create false
+          pip install --no-deps -e .
+          poetry install --only dev --no-root
+
+      # Run each check as its own step so a failure in (e.g.) ruff isn't masked by a
+      # passing `pytest` at the end of a single multi-line `run:` block.
+      - name: Check formatting (ruff format)
+        shell: micromamba-shell {0}
+        run: poetry run ruff format --check --diff
+
+      - name: Lint (ruff check)
+        shell: micromamba-shell {0}
+        run: poetry run ruff check
+
+      - name: Type check (mypy)
+        shell: micromamba-shell {0}
+        run: poetry run mypy
+
+      - name: Run tests
+        shell: micromamba-shell {0}
+        run: poetry run pytest
