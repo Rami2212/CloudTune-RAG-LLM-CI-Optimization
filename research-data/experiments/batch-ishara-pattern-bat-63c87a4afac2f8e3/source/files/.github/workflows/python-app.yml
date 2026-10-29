@@ -1,0 +1,113 @@
+name: Python application
+
+on:
+  pull_request:
+    branches: [ "master" ]
+    paths:
+      - '.github/workflows/python-app.yml'
+      - 'pymobiledevice3/**'
+      - 'tests/**'
+      - 'pytest.ini'
+      - 'pyproject.toml'
+  release:
+    types: [ created ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    if: '! github.event.pull_request.draft'
+    runs-on: ${{ matrix.os }}
+    # A healthy job takes a few minutes. Without a cap, a hung test holds its runner for GitHub's
+    # 6-hour default and starves every other workflow run of runners.
+    timeout-minutes: 20
+
+    # Pin uv to the interpreter it provisioned. Without this it prefers an already-installed
+    # system Python, and macOS runners ship 3.9.6 linked against LibreSSL 2.8.3 -- urllib3 v2
+    # then emits NotOpenSSLWarning on import, which pytest's `filterwarnings = error` turns
+    # into a collection failure for the whole 3.9 job.
+    env:
+      UV_PYTHON_PREFERENCE: only-managed
+
+    strategy:
+      matrix:
+        # 3.15 exercises the PEP 810 lazy-imports path enabled by pymobiledevice3/_lazy_imports.py,
+        # which is a no-op below 3.15.
+        python-version: [ "3.9", "3.10", "3.11", "3.12", "3.13", "3.14", "3.15" ]
+        os: [ ubuntu-latest, macos-latest, windows-latest ]
+
+    steps:
+      - uses: actions/checkout@v4
+      # uv provisions the interpreter (python-build-standalone): unlike actions/setup-python,
+      # it still provides 3.9 on current runner images (ubuntu-24.04, arm64 macOS).
+      - name: Install uv and Python ${{ matrix.python-version }}
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+      - name: Run pre-commit hooks
+        # pyright needs the project's dependencies installed; it runs in the dedicated job below.
+        env:
+          SKIP: pyright
+        run: uvx pre-commit run --all-files
+      - name: Run device-free tests
+        run: uv run --extra test pytest -m "not device"
+      - name: CLI smoke
+        # The test suite never imports every runtime dependency (e.g. chardet via ASGIWebDAV),
+        # so a dependency whose wheel crashes on import can pass CI while breaking the CLI —
+        # exactly what chardet 7.6.0's cp315 wheel did. One bare invocation catches that class.
+        # No output redirect: pwsh on the Windows runners has no /dev/null.
+        run: uv run pymobiledevice3 -h
+
+  # The doctor's daemon identification reads what a real usbmuxd links, which no fake can stand in
+  # for. Nothing here needs a device -- identifying the daemon is about the daemon.
+  usbmuxd:
+    if: '! github.event.pull_request.draft'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+      - name: Install stock usbmuxd
+        # libimobiledevice's usbmuxd: no network discovery, which is precisely what the doctor
+        # must report about it. usbmuxd2 (which links Avahi and does) is not packaged.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y usbmuxd
+          sudo systemctl start usbmuxd || sudo usbmuxd -v || true
+      - name: Identify the daemon
+        run: uv run --extra test pytest tests/test_doctor_real_daemon.py -rs
+      - name: Report on this host
+        # A doctor that crashes on a host with a daemon but no device is worse than no doctor.
+        run: uv run pymobiledevice3 doctor || true
+
+  pyright:
+    if: '! github.event.pull_request.draft'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+      - name: Install dependencies
+        run: |
+          uv venv
+          uv pip install -e ".[test]"
+      # Runs the same pre-commit hook contributors get locally (pinned in .pre-commit-config.yaml).
+      - name: Run pyright
+        run: uvx pre-commit run pyright --all-files
