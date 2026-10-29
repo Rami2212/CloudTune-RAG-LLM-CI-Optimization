@@ -1,0 +1,125 @@
+buildscript {
+    repositories {
+        def artifactRepoUrl = System.getenv("ARTIFACTORY_URL")
+        if (artifactRepoUrl != null) {
+            maven {
+                url artifactRepoUrl
+                credentials {
+                    username = System.getenv("ARTIFACTORY_USER")
+                    password = System.getenv("ARTIFACTORY_PASS")
+                }
+            }
+        }
+        else {
+            mavenCentral()
+            maven { url = "https://plugins.gradle.org/m2/" }
+        }
+    }
+    dependencies {
+        classpath("com.google.protobuf:protobuf-gradle-plugin:0.10.0")
+    }
+}
+
+apply plugin: "java"
+apply plugin: "idea"
+apply plugin: 'kotlin'
+apply plugin: 'kotlin-spring'
+apply plugin: 'io.spring.dependency-management'
+apply plugin: "com.google.protobuf"
+
+apply from: "${rootDir.toPath()}/kotlin.gradle"
+apply from: "${rootDir.toPath()}/ktlint.gradle"
+apply from: "${rootDir.toPath()}/checkstyle-config.gradle"
+apply from: "${rootDir.toPath()}/pmd-config.gradle"
+
+dependencies {
+    implementation project(":components:constants")
+    implementation project(":components:errors")
+    implementation project(":components:string-utilities")
+    implementation project(":components:time-support")
+
+    testImplementation project(path: ":components:test-support", configuration: "testOutput")
+
+    implementation("org.springframework.boot:spring-boot-starter-webmvc")
+    implementation("org.springframework.boot:spring-boot-starter-data-jpa")
+    testImplementation("org.springframework.boot:spring-boot-starter-test")
+
+    implementation('tools.jackson.module:jackson-module-kotlin')
+    implementation("org.jetbrains.kotlin:kotlin-reflect")
+
+
+    // Other
+    implementation("org.apache.commons:commons-lang3")
+
+    //gRPC
+    implementation 'jakarta.annotation:jakarta.annotation-api'
+    implementation "com.google.api.grpc:proto-google-common-protos:2.78.0"
+    implementation "io.grpc:grpc-services:${grpcVersion}"
+    implementation "io.grpc:grpc-protobuf:${grpcVersion}"
+
+    //gRPC - Netty
+    implementation "io.grpc:grpc-netty:${grpcVersion}"
+
+    //Netty
+    implementation "io.netty:netty-transport-native-unix-common"
+    implementation "io.netty:netty-all"
+    implementation "io.netty:netty-codec-http2"
+
+    //tcnative
+    implementation "io.netty:netty-tcnative-boringssl-static:2.0.84.Final"
+}
+
+dependencyManagement {
+    imports {
+        mavenBom("org.springframework.boot:spring-boot-dependencies:${springBootVersion}")
+    }
+}
+
+sourceSets {
+    main {
+        proto {
+            srcDir "$project/src/main/proto"
+        }
+        java {
+            srcDirs 'build/generated/source/proto/main/grpc'
+            srcDirs 'build/generated/source/proto/main/java'
+        }
+    }
+    test {
+        resources {
+            srcDirs += [
+                    project(":applications:credhub-api").sourceSets.main.resources,
+                    project(":applications:credhub-api").sourceSets.test.resources
+            ]
+        }
+    }
+}
+
+assemble.mustRunAfter("clean")
+protobuf {
+    protoc {
+        artifact = "com.google.protobuf:protoc:${protobufVersion}"
+    }
+    plugins {
+        grpc {
+            artifact = "io.grpc:protoc-gen-grpc-java:${grpcVersion}"
+        }
+    }
+    generateProtoTasks {
+        all()*.plugins {
+            grpc {}
+        }
+    }
+}
+
+test {
+    testLogging {
+        events "started", "passed", "failed", "skipped"
+        exceptionFormat = "full"
+    }
+
+    systemProperties = System.properties
+    systemProperties["spring.profiles.active"] = System.getProperty("spring.profiles.active", "unit-test-h2")
+    systemProperties["java.security.egd"] = System.getProperty("java.security.egd", "file:/dev/urandom")
+    outputs.upToDateWhen { false }
+}

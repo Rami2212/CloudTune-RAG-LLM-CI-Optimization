@@ -1,0 +1,97 @@
+name: Stage Versioned Javadocs (Manual Trigger)
+
+# This workflow is triggered manually via Workflow Dispatch on GitHub.
+# It automatically extracts the project version from the root pom.xml 
+# of the branch or tag that you trigger this workflow from.
+# It compiles the modules, and packages the javadocs into a structured ZIP.
+#
+# To deploy:
+# 1. Kick off the workflow on your chosen branch or tag.
+# 2. Download the resulting versioned-javadocs-*.zip from the run summary.
+# 3. You have 30 days to download before they are deleted from the server.
+# 4. Extract it directly into your local gh-pages repository clone and push.
+#
+# (Note: this is much safer than having to manage granting write permissions 
+# to the runners to access remote production branches)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-and-package-javadoc:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: 1. Checkout Current (triggered) Workspace Context
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+
+      - name: 2a. Provision JDK 11 Toolchain
+        uses: actions/setup-java@v6.0.0
+        with:
+         java-version: '11'
+         distribution: 'temurin'
+         java-package: jdk
+         architecture: x64
+
+      - name: 2b. Provision JDK 17 Toolchain
+        uses: actions/setup-java@v6.0.0
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          java-package: jdk
+          architecture: x64
+
+      - name: 2c. Provision JDK 25 (Host Runtime)
+        uses: actions/setup-java@v6.0.0
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+          java-package: jdk
+          architecture: x64
+          cache: 'maven'
+
+      - name: 3. Extract POM Project Version
+        id: get-version
+        shell: bash
+        run: |
+          POM_VERSION=$(mvn help:evaluate -B -Dexpression=project.version -q -DforceStdout)
+          echo "Discovered Project Version: $POM_VERSION"
+          echo "POM_VERSION=$POM_VERSION" >> $GITHUB_ENV
+
+      - name: 4. Compile and Generate Java 11 Module Javadoc
+        shell: bash
+        run: |
+          echo "Generating Javadoc for Java 11 Module..."
+          mvn clean compile javadoc:javadoc -B -pl datasketches-memory-java11
+
+      - name: 5. Compile and Generate Java 17_25 Module Javadoc
+        shell: bash
+        run: |
+          echo "Generating Javadoc for Java 17_25 Module..."
+          mvn compile javadoc:javadoc -B -pl datasketches-memory-java17_25
+
+      - name: 6. Stage Artifacts for Review
+        shell: bash
+        run: |
+          STAGE_DIR="javadoc-staging/docs/${{ env.POM_VERSION }}"
+          echo "Creating structured staging directories for version ${{ env.POM_VERSION }}..."
+          mkdir -p "${STAGE_DIR}/datasketches-memory-java11-${{ env.POM_VERSION }}"
+          mkdir -p "${STAGE_DIR}/datasketches-memory-java17_25-${{ env.POM_VERSION }}"
+                
+          echo "Copying generated HTML assets into staging..."
+          cp -r datasketches-memory-java11/target/site/apidocs/* \
+            "${STAGE_DIR}/datasketches-memory-java11-${{ env.POM_VERSION }}/"
+          cp -r datasketches-memory-java17_25/target/site/apidocs/* \
+            "${STAGE_DIR}/datasketches-memory-java17_25-${{ env.POM_VERSION }}/"
+
+      - name: 7. Upload Generated Javadocs as Workflow Zip Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: versioned-javadocs-${{ env.POM_VERSION }}
+          path: javadoc-staging/
+          retention-days: 30
