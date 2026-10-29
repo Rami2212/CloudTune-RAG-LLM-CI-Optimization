@@ -1,0 +1,81 @@
+'on':
+  push: null
+  workflow_dispatch: null
+name: ci
+
+jobs:
+  go_build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Run
+        uses: ./.github/actions/cached-docker-build
+        id: cached-docker-build
+        with:
+          target: docker_build
+      - name: List build artifacts
+        run: ls -lah build/
+      - name: Archive build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: |
+            build/
+  go_lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Run
+        uses: ./.github/actions/cached-docker-build
+        id: cached-docker-build
+        with:
+          target: docker_lint
+  go_test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Run
+        uses: ./.github/actions/cached-docker-build
+        id: cached-docker-build
+        with:
+          target: docker_test
+      - name: Archive build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: testlogs
+          path: |
+            internal/pkg/stitch/testdata/*.mkv.log
+  go_bench:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Run
+        uses: ./.github/actions/cached-docker-build
+        id: cached-docker-build
+        with:
+          target: docker_bench
+  frontend_build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Docker buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Run
+        uses: ./.github/actions/cached-docker-build
+        id: cached-docker-build
+        with:
+          chdir: frontend
+          target: docker_build
+      - name: List build artifacts
+        run: ls -lah frontend/dist/
+      - name: Archive build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: |
+            frontend/dist/

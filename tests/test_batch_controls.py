@@ -89,6 +89,13 @@ class BatchControlTests(unittest.TestCase):
         self.assertEqual(output.call_count, 1)
         self.assertEqual(output.call_args.args[0], 3)
 
+    def test_limit_counts_rows_from_start_and_caps_at_csv_end(self):
+        args = ["batch", "--list", "--start-at", "4", "--limit", "500"]
+        with patch.object(sys, "argv", args), patch.object(batch_module, "load_env"), \
+             patch.object(batch_module, "read_rows", return_value=self.rows), patch("builtins.print") as output:
+            self.assertEqual(batch_module.main(), 0)
+        self.assertEqual([call.args[0] for call in output.call_args_list], [4, 5, 6])
+
 
 if __name__ == "__main__":
     unittest.main()

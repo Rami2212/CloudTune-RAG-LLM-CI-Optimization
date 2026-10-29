@@ -1,0 +1,47 @@
+{
+  "id": "gen-1793203915-M17DH97KekDaPJuhmHfe",
+  "object": "chat.completion",
+  "created": 1793203915,
+  "model": "google/gemma-4-26b-a4b-it:free",
+  "provider": "Google AI Studio",
+  "system_fingerprint": null,
+  "service_tier": "default",
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "stop",
+      "native_finish_reason": "STOP",
+      "message": {
+        "role": "assistant",
+        "content": "{\n  \"pattern_id\": \"P-LIT-SMELL-REPAIR\",\n  \"decision\": \"APPLY\",\n  \"rationale\": \"The workflow performs multiple builds and tests across different .NET versions. Implementing a cache for the NuGet package directory (~/.nuget/packages) using actions/cache@v4, keyed by the runner OS and the hash of the project files (.csproj), provides a mechanism to speed up the 'dotnet restore' step across runs. This follows the requirement to implement the pattern even if the benefit is uncertain.\",\n  \"workflow_yaml\": \"name: Build and test\\n\\non:\\n  workflow_dispatch:\\n  push:\\n    branches:\\n      - main\\n    paths-ignore:\\n      - \\\"**.md\\\"\\n  pull_request:\\n    paths-ignore:\\n      - \\\"**.md\\\"\\n\\nenv:\\n  # Stop wasting time caching packages\\n  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true\\n  # Disable sending usage data to Microsoft\\n  DOTNET_CLI_TELEMETRY_OPTOUT: true\\n\\n# Kill other jobs when we trigger this workflow by sending new commits\\n# to the PR.\\n# https://stackoverflow.com/a/72408109\\nconcurrency:\\n  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}\\n  cancel-in-progress: true\\n\\njobs:\\n  build:\\n    runs-on: ubuntu-latest\\n    steps:\\n      - name: Checkout\\n        uses: actions/checkout@v5\\n      - name: Setup .NET Core\\n        uses: actions/setup-dotnet@v4\\n        with:\\n          dotnet-version: |\\n            8.x\\n            9.x\\n            10.x\\n      - name: Cache NuGet packages\\n        uses: actions/cache@v4\\n        with:\\n          path: ~/.nuget/packages\\n          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}\\n          restore-keys: |\\n            ${{ runner.os }}-nuget-\\n      - name: Restore\\n        working-directory: src/\\n        run: dotnet restore\\n\\n      - name: Start containers\\n        working-directory: src/.devcontainer\\n        run: docker compose up -d --wait mssql postgresql orcl\\n      - name: Generated SqlFn matches pg_proc\\n        run: dotnet fsi src/SqlHydra.Query/codegen/NpgsqlSqlFn.fsx --check\\n      - name: Build\\n        working-directory: src/\\n        run: dotnet build --no-restore\\n      # After Build: the sqlite tomls load a codegen extension from the compiled Tests assembly.\\n      - name: Regenerate AdventureWorks schemas\\n        working-directory: src/Build\\n        run: dotnet run -- Regen\\n      - name: Generated code is current\\n        run: |\\n          if [ -n \\\"$(git status --porcelain -- ':(glob)src/Tests/**/AdventureWorks*.fs')\\\" ]; then\\n            git diff -- ':(glob)src/Tests/**/AdventureWorks*.fs'\\n            echo \\\"::error::Generated AdventureWorks files are stale. Run 'dotnet run -- Regen' from src/Build (or src/Tests/regen-all.bat) and commit the result.\\\"\\n            exit 1\\n          fi\\n      - name: Test net8.0\\n        working-directory: src/\\n        run: dotnet test --framework net8.0\\n\\n      - name: Stop and Start containers\\n        working-directory: src/.devcontainer\\n        run: docker compose down && docker compose up -d --wait mssql postgresql orcl\\n      - name: Build\\n        working-directory: src/\\n        run: dotnet build --no-restore\\n      - name: Test net9.0\\n        working-directory: src/\\n        run: dotnet test --framework net9.0\\n\\n      - name: Stop and Start containers\\n        working-directory: src/.devcontainer\\n        run: docker compose down && docker compose up -d --wait mssql postgresql orcl\\n      - name: Build\\n        working-directory: src/\\n        run: dotnet build --no-restore\\n      - name: Test net10.0\\n        working-directory: src/\\n        run: dotnet test --framework net10.0\\n\"\n}",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 4514,
+    "completion_tokens": 1034,
+    "total_tokens": 5548,
+    "cost": 0,
+    "is_byok": true,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 0,
+      "upstream_inference_prompt_cost": 0,
+      "upstream_inference_completions_cost": 0
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  },
+  "cloudtune_latency_seconds": 23.541
+}

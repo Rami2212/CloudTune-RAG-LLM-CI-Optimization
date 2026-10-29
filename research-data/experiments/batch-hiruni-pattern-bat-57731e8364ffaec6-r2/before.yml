@@ -1,0 +1,64 @@
+name: Continuous Integration
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      matrix:
+        node-version: [22, 24, 26] # Maintenance, Active LTS & Current
+      fail-fast: false
+    services:
+      postgres:
+        image: postgres:latest
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@v7
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+      - run: npm ci
+      - name: Configure database
+        run: node pretest.js
+      - name: Run test
+        run: npm test --ignore-scripts
+    env:
+      PGUSER: postgres
+
+  code-lint:
+    name: Code Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22 # LTS
+      - run: npm ci --ignore-scripts
+      - name: Verify code linting
+        run: npx --no eslint .
+
+  commit-lint:
+    name: Commit Lint
+    runs-on: ubuntu-latest
+    if: ${{ github.event.pull_request }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22 # LTS
+      - run: npm ci --ignore-scripts
+      - name: Verify commit linting
+        run: npx --no -p @commitlint/cli commitlint --from origin/master --to HEAD --verbose

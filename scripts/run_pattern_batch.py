@@ -556,12 +556,17 @@ def main(batch_class=Batch, default_batch_id="interactive-three-runs-v1", descri
     parser.add_argument("--pattern", help="Optional selected pattern ID")
     parser.add_argument("--stop-at", type=int, help="Inclusive ending position in the original CSV (default: last row)")
     parser.add_argument("--start-at", type=int, default=1, help="One-based CSV position to start from (default: 1)")
+    parser.add_argument("--limit", type=int, help="Maximum number of rows to visit from start-at")
     parser.add_argument("--rerun", action="store_true", help="Rerun terminal rows in the selected range; replace their batch summary and keep prior experiment evidence")
     parser.add_argument("--list", action="store_true", help="Preview repository links and patterns without API calls or prompts")
     args = parser.parse_args()
     try:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", args.batch_id):
             raise ValueError("batch-id must be 1-64 letters, digits, underscores or hyphens")
+        if args.limit is not None and args.limit < 1:
+            raise ValueError("limit must be at least 1")
+        if args.stop_at is not None and args.limit is not None:
+            raise ValueError("stop-at and limit cannot be used together")
         if args.stop_at is not None and args.stop_at < args.start_at:
             raise ValueError("stop-at must be at least start-at")
         if args.start_at < 1:
@@ -578,6 +583,8 @@ def main(batch_class=Batch, default_batch_id="interactive-three-runs-v1", descri
             raise ValueError(f"stop-at is {args.stop_at}, but the selection has only {len(rows)} rows")
         if args.list:
             end = args.stop_at if args.stop_at is not None else len(rows)
+            if args.limit is not None:
+                end = min(args.start_at + args.limit - 1, len(rows))
             for index, row in enumerate(rows[args.start_at - 1:end], args.start_at):
                 if args.pattern and row["pattern_id"] != args.pattern:
                     continue
@@ -600,8 +607,11 @@ def main(batch_class=Batch, default_batch_id="interactive-three-runs-v1", descri
             raise ValueError("OPENROUTER_MAX_TOKENS must be between 256 and 48000")
         batch = batch_class(args.batch_id, rows, username, token, model, max_tokens)
         batch.pattern_filter = args.pattern
+        stop_at = args.stop_at
+        if args.limit is not None:
+            stop_at = min(args.start_at + args.limit - 1, len(rows))
         with runner.exclusive(batch.directory / ".lock"):
-            batch.run(stop_at=args.stop_at, start_at=args.start_at, rerun=args.rerun)
+            batch.run(stop_at=stop_at, start_at=args.start_at, rerun=args.rerun)
         return 0
     except (KeyboardInterrupt, EOFError):
         print("\nStopped. Saved progress can be resumed with the same command.")
