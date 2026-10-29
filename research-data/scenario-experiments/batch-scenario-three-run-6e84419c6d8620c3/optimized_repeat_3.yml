@@ -1,0 +1,261 @@
+name: CloudTune controlled scenario
+'on':
+  push:
+    branches:
+    - ct-scenario/**
+permissions:
+  contents: read
+jobs:
+  probe:
+    name: probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+    - name: Controlled workload
+      shell: bash
+      run: "python3 - <<'CLOUDTUNE_REPLAY_ENGINE'\n\"\"\"Deterministic service-policy\
+        \ replays, also executed inside the hosted CI fixture.\n\nAll times and outcomes\
+        \ here are synthetic. They are never repository speedups.\nOnly previously\
+        \ observed outcomes are exposed to a scheduling/selection policy.\n\"\"\"\n\
+        import json\nimport os\nimport statistics\n\n\nPATTERNS = {\n    \"P-LIT-FAIL-SCHEDULE\"\
+        , \"P-LIT-IDLE-SCHEDULE\", \"P-LIT-FAILED-JOB-FIRST\",\n    \"P-LIT-BUILD-PRIORITY\"\
+        , \"P-LIT-BUILD-SELECT\", \"P-LIT-DURATION-PREDICTION\",\n}\n\n\ndef policy(pattern,\
+        \ optimized=False):\n    values = {\n        \"P-LIT-FAIL-SCHEDULE\": {\"\
+        pause_after_failures\": 2 if optimized else 0,\n                         \
+        \       \"notify_on_pause\": optimized, \"recovery\": \"explicit_owner_reset\"\
+        },\n        \"P-LIT-IDLE-SCHEDULE\": {\"suppress_unchanged_inputs\": optimized,\n\
+        \                                \"meaningful_inputs\": [\"user_source\",\
+        \ \"external_dependency\"]},\n        \"P-LIT-FAILED-JOB-FIRST\": {\"order\"\
+        : \"previous_failure_ancestors_first\" if optimized else \"declared\",\n \
+        \                                   \"cancel_other_jobs\": False},\n     \
+        \   \"P-LIT-BUILD-PRIORITY\": {\"order\": \"priority_with_aging\" if optimized\
+        \ else \"fifo\", \"max_wait\": 12},\n        \"P-LIT-BUILD-SELECT\": {\"skip_docs_after_observed_success\"\
+        : optimized,\n                               \"always_build\": [\"source\"\
+        , \"lockfile\", \"setup\"]},\n        \"P-LIT-DURATION-PREDICTION\": {\"predictor\"\
+        : \"past_feature_mean\" if optimized else \"past_global_mean\",\n        \
+        \                             \"initial_estimate\": 20, \"train_count\": 6},\n\
+        \    }\n    return values[pattern]\n\n\ndef dataset(pattern, repeat):\n  \
+        \  \"\"\"Three reproducible workloads; repeat changes durations, never visibility\
+        \ rules.\"\"\"\n    if repeat not in (1, 2, 3):\n        raise ValueError(\"\
+        Replay repeat must be 1, 2 or 3\")\n    scale = repeat\n    if pattern ==\
+        \ \"P-LIT-FAIL-SCHEDULE\":\n        return [{\"id\": i, \"kind\": kind, \"\
+        outcome\": outcome, \"duration\": 5 * scale}\n                for i, (kind,\
+        \ outcome) in enumerate([\n                    (\"scheduled\", \"failure\"\
+        ), (\"scheduled\", \"failure\"), (\"scheduled\", \"failure\"),\n         \
+        \           (\"scheduled\", \"failure\"), (\"owner_reset\", None), (\"scheduled\"\
+        , \"success\"),\n                    (\"scheduled\", \"failure\"), (\"scheduled\"\
+        , \"success\"),\n                    (\"scheduled\", \"failure\"), (\"scheduled\"\
+        , \"success\")])]\n    if pattern == \"P-LIT-IDLE-SCHEDULE\":\n        return\
+        \ [{\"id\": i, \"kind\": kind, \"duration\": 5 * scale} for i, kind in enumerate([\n\
+        \            \"tick\", \"tick\", \"generated_commit\", \"tick\", \"external_dependency\"\
+        , \"tick\",\n            \"tick\", \"user_source\", \"tick\", \"tick\"])]\n\
+        \    if pattern == \"P-LIT-FAILED-JOB-FIRST\":\n        jobs = [{\"id\": \"\
+        lint\", \"needs\": [], \"duration\": 30 * scale},\n                {\"id\"\
+        : \"compile\", \"needs\": [], \"duration\": 10 * scale},\n               \
+        \ {\"id\": \"test\", \"needs\": [\"compile\"], \"duration\": 5 * scale},\n\
+        \                {\"id\": \"package\", \"needs\": [\"test\"], \"duration\"\
+        : 3 * scale}]\n        return {\"previous_failures\": [\"test\"], \"jobs\"\
+        : jobs,\n                \"cases\": [{\"id\": \"fails_again\", \"failure\"\
+        : \"test\"},\n                          {\"id\": \"recovered\", \"failure\"\
+        : None},\n                          {\"id\": \"artifact_dependency\", \"failure\"\
+        : None}]}\n    if pattern == \"P-LIT-BUILD-PRIORITY\":\n        return {\"\
+        no_contention\": [{\"id\": \"a\", \"arrival\": 0, \"duration\": 2, \"priority\"\
+        : 1},\n                                   {\"id\": \"b\", \"arrival\": 10,\
+        \ \"duration\": 2, \"priority\": 5}],\n                \"contended\": [{\"\
+        id\": \"blocker\", \"arrival\": 0, \"duration\": 8, \"priority\": 0},\n  \
+        \                            {\"id\": \"old\", \"arrival\": 1, \"duration\"\
+        : 6, \"priority\": 0},\n                              {\"id\": \"ordinary\"\
+        , \"arrival\": 1, \"duration\": 6, \"priority\": 0},\n                   \
+        \           {\"id\": \"urgent\", \"arrival\": 2, \"duration\": 1, \"priority\"\
+        : 10},\n                              *[{\"id\": \"new-\" + str(i), \"arrival\"\
+        : 9 + i, \"duration\": 3, \"priority\": 9}\n                             \
+        \   for i in range(6)]]}\n    if pattern == \"P-LIT-BUILD-SELECT\":\n    \
+        \    return [{\"id\": i, \"change\": change, \"outcome\": outcome, \"duration\"\
+        : 5 * scale,\n                 \"failure_cause\": \"external_setup_failure\"\
+        \ if i == 2 else \"build_failure\" if outcome == \"failure\" else None}\n\
+        \                for i, (change, outcome) in enumerate([\n               \
+        \     (\"source\", \"success\"), (\"docs\", \"success\"), (\"docs\", \"failure\"\
+        ),\n                    (\"lockfile\", \"failure\"), (\"docs\", \"success\"\
+        ), (\"setup\", \"success\"),\n                    (\"docs\", \"success\"),\
+        \ (\"source\", \"failure\")])]\n    if pattern == \"P-LIT-DURATION-PREDICTION\"\
+        :\n        return [{\"id\": i, \"feature\": feature, \"duration\": duration\
+        \ * scale}\n                for i, (feature, duration) in enumerate([\n  \
+        \                  (\"small\", 10), (\"large\", 90), (\"small\", 12), (\"\
+        large\", 92),\n                    (\"small\", 11), (\"large\", 91), (\"small\"\
+        , 12), (\"large\", 93),\n                    (\"small\", 10), (\"large\",\
+        \ 90)])]\n    raise ValueError(\"Unsupported replay pattern: \" + pattern)\n\
+        \n\ndef schedule_failures(data, settings):\n    failures, paused, trace, notifications\
+        \ = 0, False, [], []\n    for row in data:\n        if row[\"kind\"] == \"\
+        owner_reset\":\n            failures, paused = 0, False\n            trace.append({\"\
+        id\": row[\"id\"], \"action\": \"owner_reset\"})\n            continue\n \
+        \       if paused:\n            trace.append({\"id\": row[\"id\"], \"action\"\
+        : \"suppressed\"})\n            continue\n        trace.append({**row, \"\
+        action\": \"run\"})\n        failures = failures + 1 if row[\"outcome\"] ==\
+        \ \"failure\" else 0\n        if settings[\"pause_after_failures\"] and failures\
+        \ >= settings[\"pause_after_failures\"]:\n            paused = True\n    \
+        \        if settings[\"notify_on_pause\"]:\n                notifications.append({\"\
+        after_event\": row[\"id\"], \"recipient\": \"synthetic_owner\"})\n    return\
+        \ {\"trace\": trace, \"notifications\": notifications,\n            \"simulated_work_seconds\"\
+        : sum(r.get(\"duration\", 0) for r in trace if r[\"action\"] == \"run\")}\n\
+        \n\ndef schedule_idle(data, settings):\n    version, built, trace = 0, None,\
+        \ []\n    for row in data:\n        if row[\"kind\"] in settings[\"meaningful_inputs\"\
+        ]:\n            version += 1\n        if row[\"kind\"] != \"tick\":\n    \
+        \        trace.append({\"id\": row[\"id\"], \"action\": \"input\", \"kind\"\
+        : row[\"kind\"], \"version\": version})\n            continue\n        run\
+        \ = not settings[\"suppress_unchanged_inputs\"] or built != version\n    \
+        \    trace.append({**row, \"version\": version, \"action\": \"run\" if run\
+        \ else \"suppressed\"})\n        if run:\n            built = version\n  \
+        \  return {\"trace\": trace, \"simulated_work_seconds\": sum(r.get(\"duration\"\
+        , 0) for r in trace if r[\"action\"] == \"run\")}\n\n\ndef order_jobs(data,\
+        \ settings):\n    jobs = data[\"jobs\"]\n    preferred = set(data[\"previous_failures\"\
+        ])\n    while True:\n        expanded = preferred | {dep for job in jobs if\
+        \ job[\"id\"] in preferred for dep in job[\"needs\"]}\n        if expanded\
+        \ == preferred:\n            break\n        preferred = expanded\n    cases\
+        \ = []\n    for case in data[\"cases\"]:\n        done, trace, clock, feedback\
+        \ = {}, [], 0, None\n        while len(done) < len(jobs):\n            ready\
+        \ = [job for job in jobs if job[\"id\"] not in done and all(dep in done for\
+        \ dep in job[\"needs\"])]\n            if not ready:\n                raise\
+        \ ValueError(\"Invalid replay dependency graph\")\n            if settings[\"\
+        order\"] == \"previous_failure_ancestors_first\":\n                ready.sort(key=lambda\
+        \ job: job[\"id\"] not in preferred)\n            job = ready[0]\n       \
+        \     skipped = any(done[dep] != \"success\" for dep in job[\"needs\"])\n\
+        \            status = \"skipped\" if skipped else \"failure\" if job[\"id\"\
+        ] == case[\"failure\"] else \"success\"\n            started = clock\n   \
+        \         clock += 0 if skipped else job[\"duration\"]\n            if status\
+        \ == \"failure\" and feedback is None:\n                feedback = clock\n\
+        \            done[job[\"id\"]] = status\n            trace.append({\"id\"\
+        : job[\"id\"], \"needs\": job[\"needs\"], \"start\": started, \"end\": clock,\
+        \ \"outcome\": status})\n        cases.append({\"id\": case[\"id\"], \"trace\"\
+        : trace, \"first_failure_seconds\": feedback,\n                      \"simulated_work_seconds\"\
+        : clock})\n    return {\"cases\": cases, \"simulated_work_seconds\": sum(c[\"\
+        simulated_work_seconds\"] for c in cases)}\n\n\ndef queue_builds(data, settings):\n\
+        \    cases = {}\n    for name, rows in data.items():\n        pending, trace,\
+        \ clock = list(rows), [], 0\n        while pending:\n            clock = max(clock,\
+        \ min(row[\"arrival\"] for row in pending))\n            ready = [row for\
+        \ row in pending if row[\"arrival\"] <= clock]\n            aged = [row for\
+        \ row in ready if clock - row[\"arrival\"] >= settings[\"max_wait\"]]\n  \
+        \          reason = \"fifo\"\n            if settings[\"order\"] == \"priority_with_aging\"\
+        :\n                ready = aged if aged else ready\n                reason\
+        \ = \"aging\" if aged else \"priority\"\n                ready.sort(key=lambda\
+        \ row: (row[\"arrival\"], rows.index(row)) if aged else\n                \
+        \           (-row[\"priority\"], row[\"arrival\"], rows.index(row)))\n   \
+        \         else:\n                ready.sort(key=lambda row: (row[\"arrival\"\
+        ], rows.index(row)))\n            row = ready[0]\n            trace.append({**row,\
+        \ \"start\": clock, \"wait\": clock - row[\"arrival\"], \"reason\": reason})\n\
+        \            clock += row[\"duration\"]\n            pending.remove(row)\n\
+        \        cases[name] = {\"trace\": trace, \"max_wait_seconds\": max(row[\"\
+        wait\"] for row in trace),\n                       \"urgent_wait_seconds\"\
+        : next((row[\"wait\"] for row in trace if row[\"id\"] == \"urgent\"), None)}\n\
+        \    return {\"cases\": cases, \"simulated_work_seconds\": sum(r[\"duration\"\
+        ] for rows in data.values() for r in rows)}\n\n\ndef select_builds(data, settings):\n\
+        \    observed, trace, missed = None, [], []\n    for row in data:\n      \
+        \  # Decision sees only the change and last executed build outcome.\n    \
+        \    run = not (settings[\"skip_docs_after_observed_success\"] and row[\"\
+        change\"] == \"docs\" and observed == \"success\")\n        trace.append({\"\
+        id\": row[\"id\"], \"change\": row[\"change\"], \"action\": \"run\" if run\
+        \ else \"suppressed\",\n                      \"last_observed_outcome\": observed,\n\
+        \                      \"observed_outcome\": row[\"outcome\"] if run else\
+        \ None})\n        if run:\n            observed = row[\"outcome\"]\n     \
+        \   elif row[\"outcome\"] == \"failure\":\n            missed.append({\"id\"\
+        : row[\"id\"], \"cause\": row.get(\"failure_cause\")})  # Evaluator-only oracle.\n\
+        \    work = sum(row[\"duration\"] for row, decision in zip(data, trace) if\
+        \ decision[\"action\"] == \"run\")\n    return {\"trace\": trace, \"missed_failures\"\
+        : len(missed), \"missed_failure_details\": missed,\n            \"missed_failure_rate\"\
+        : len(missed) / max(1, sum(r[\"outcome\"] == \"failure\" for r in data)),\n\
+        \            \"simulated_work_seconds\": work, \"simulated_saved_seconds\"\
+        : sum(r[\"duration\"] for r in data) - work}\n\n\ndef predict_duration(data,\
+        \ settings):\n    history, trace = [], []\n    for index, row in enumerate(data):\n\
+        \        pool = history\n        if settings[\"predictor\"] == \"past_feature_mean\"\
+        :\n            pool = [past for past in history if past[\"feature\"] == row[\"\
+        feature\"]] or history\n        predicted = statistics.mean(p[\"duration\"\
+        ] for p in pool) if pool else settings[\"initial_estimate\"]\n        trace.append({\"\
+        id\": row[\"id\"], \"prediction\": predicted, \"actual\": row[\"duration\"\
+        ],\n                      \"training_ids\": [p[\"id\"] for p in pool], \"\
+        held_out\": index >= settings[\"train_count\"]})\n        history.append(row)\n\
+        \    held = [r for r in trace if r[\"held_out\"]]\n    return {\"trace\":\
+        \ trace, \"held_out_mae_seconds\": statistics.mean(abs(r[\"prediction\"] -\
+        \ r[\"actual\"]) for r in held),\n            \"simulated_work_seconds\":\
+        \ sum(r[\"duration\"] for r in data), \"direct_speedup_claimed\": False}\n\
+        \n\ndef run(pattern, settings, data):\n    engines = {\"P-LIT-FAIL-SCHEDULE\"\
+        : schedule_failures, \"P-LIT-IDLE-SCHEDULE\": schedule_idle,\n           \
+        \    \"P-LIT-FAILED-JOB-FIRST\": order_jobs, \"P-LIT-BUILD-PRIORITY\": queue_builds,\n\
+        \               \"P-LIT-BUILD-SELECT\": select_builds, \"P-LIT-DURATION-PREDICTION\"\
+        : predict_duration}\n    return engines[pattern](data, settings)\n\n\ndef\
+        \ validate(pattern, settings, data, result):\n    \"\"\"Check known scenario\
+        \ controls separately from the policy implementation.\"\"\"\n    optimized\
+        \ = settings == policy(pattern, True)\n    checks = {\"known_policy\": optimized\
+        \ or settings == policy(pattern)}\n    trace = result.get(\"trace\", [])\n\
+        \    if pattern == \"P-LIT-FAIL-SCHEDULE\":\n        actions = {r[\"id\"]:\
+        \ r[\"action\"] for r in trace}\n        checks.update(threshold_not_early=actions[0]\
+        \ == actions[1] == \"run\",\n                      threshold_pause=all(actions[i]\
+        \ == (\"suppressed\" if optimized else \"run\") for i in (2, 3)),\n      \
+        \                notification=len(result[\"notifications\"]) == (1 if optimized\
+        \ else 0),\n                      explicit_recovery=actions[4] == \"owner_reset\"\
+        \ and actions[5] == \"run\",\n                      success_resets_counter=all(actions[i]\
+        \ == \"run\" for i in (6, 7, 8, 9)))\n    elif pattern == \"P-LIT-IDLE-SCHEDULE\"\
+        :\n        actions = {r[\"id\"]: r[\"action\"] for r in trace}\n        checks.update(initial_runs=actions[0]\
+        \ == \"run\", external_change_resumes=actions[5] == \"run\",\n           \
+        \           source_change_resumes=actions[8] == \"run\",\n               \
+        \       idle_and_generated_suppressed=all(actions[i] == (\"suppressed\" if\
+        \ optimized else \"run\")\n                                              \
+        \         for i in (1, 3, 6, 9)))\n    elif pattern == \"P-LIT-FAILED-JOB-FIRST\"\
+        :\n        checks[\"case_set_preserved\"] = {c[\"id\"] for c in result[\"\
+        cases\"]} == {c[\"id\"] for c in data[\"cases\"]}\n        for case in result[\"\
+        cases\"]:\n            order = {r[\"id\"]: i for i, r in enumerate(case[\"\
+        trace\"])}\n            statuses = {r[\"id\"]: r[\"outcome\"] for r in case[\"\
+        trace\"]}\n            checks[case[\"id\"] + \"_dependencies\"] = all(order[d]\
+        \ < order[r[\"id\"]] for r in case[\"trace\"] for d in r[\"needs\"])\n   \
+        \         checks[case[\"id\"] + \"_jobs_preserved\"] = set(order) == {j[\"\
+        id\"] for j in data[\"jobs\"]}\n            checks[case[\"id\"] + \"_outcomes\"\
+        ] = statuses == ({\"lint\": \"success\", \"compile\": \"success\", \"test\"\
+        : \"failure\", \"package\": \"skipped\"}\n                if case[\"id\"]\
+        \ == \"fails_again\" else {j[\"id\"]: \"success\" for j in data[\"jobs\"]})\n\
+        \            checks[case[\"id\"] + \"_order\"] = list(order) == ([\"compile\"\
+        , \"test\", \"lint\", \"package\"] if optimized else\n                   \
+        \                                        [\"lint\", \"compile\", \"test\"\
+        , \"package\"])\n    elif pattern == \"P-LIT-BUILD-PRIORITY\":\n        for\
+        \ name, rows in data.items():\n            observed = result[\"cases\"][name][\"\
+        trace\"]\n            checks[name + \"_no_drops\"] = sorted(r[\"id\"] for\
+        \ r in observed) == sorted(r[\"id\"] for r in rows)\n            checks[name\
+        \ + \"_valid_serial_queue\"] = all(r[\"start\"] >= r[\"arrival\"] and\n  \
+        \              (i == 0 or r[\"start\"] >= observed[i-1][\"start\"] + observed[i-1][\"\
+        duration\"])\n                for i, r in enumerate(observed))\n        checks[\"\
+        no_contention_control\"] = [r[\"wait\"] for r in result[\"cases\"][\"no_contention\"\
+        ][\"trace\"]] == [0, 0]\n        contended = result[\"cases\"][\"contended\"\
+        ][\"trace\"]\n        checks[\"urgent_priority\"] = contended[1][\"id\"] ==\
+        \ (\"urgent\" if optimized else \"old\")\n        checks[\"aging_prevents_starvation\"\
+        ] = (any(r[\"reason\"] == \"aging\" for r in contended) and\n            result[\"\
+        cases\"][\"contended\"][\"max_wait_seconds\"] <= settings[\"max_wait\"] +\
+        \ 2 * max(r[\"duration\"] for r in data[\"contended\"])) if optimized else\
+        \ True\n    elif pattern == \"P-LIT-BUILD-SELECT\":\n        checks.update(chronological_order=[r[\"\
+        id\"] for r in trace] == [r[\"id\"] for r in data],\n                    \
+        \  required_changes_run=all(r[\"action\"] == \"run\" for r in trace if r[\"\
+        change\"] in settings[\"always_build\"]),\n                      skipped_outcomes_hidden=all(r[\"\
+        observed_outcome\"] is None for r in trace if r[\"action\"] == \"suppressed\"\
+        ),\n                      setup_failure_accounted=result[\"missed_failures\"\
+        ] == (1 if optimized else 0),\n                      selection_occurs=any(r[\"\
+        action\"] == \"suppressed\" for r in trace) == optimized,\n              \
+        \        recovery_after_observed_failure=trace[4][\"action\"] == \"run\")\n\
+        \    elif pattern == \"P-LIT-DURATION-PREDICTION\":\n        checks.update(no_future_training=all(all(t\
+        \ < r[\"id\"] for t in r[\"training_ids\"]) for r in trace),\n           \
+        \           held_out_count=sum(r[\"held_out\"] for r in trace) == len(data)\
+        \ - settings[\"train_count\"],\n                      error_measured=result[\"\
+        held_out_mae_seconds\"] >= 0,\n                      no_speedup_claim=result[\"\
+        direct_speedup_claimed\"] is False,\n                      all_builds_preserved=len(trace)\
+        \ == len(data))\n    return checks\n\n\nif __name__ == \"__main__\":\n   \
+        \ selected = os.environ[\"CT_PATTERN\"]\n    settings = json.loads(os.environ[\"\
+        CT_POLICY\"])\n    inputs = json.loads(os.environ[\"CT_DATA\"])\n    result\
+        \ = run(selected, settings, inputs)\n    checks = validate(selected, settings,\
+        \ inputs, result)\n    print(json.dumps({\"evidence_scope\": \"synthetic_service_policy_replay\"\
+        , \"assertions\": checks, \"result\": result}, sort_keys=True))\n    if not\
+        \ checks or not all(checks.values()):\n        raise SystemExit(\"Replay assertions\
+        \ failed: \" + str(checks))\n\nCLOUDTUNE_REPLAY_ENGINE\n"
+      env:
+        CT_PATTERN: P-LIT-FAILED-JOB-FIRST
+        CT_POLICY: '{"cancel_other_jobs": false, "order": "previous_failure_ancestors_first"}'
+        CT_DATA: '{"cases": [{"failure": "test", "id": "fails_again"}, {"failure":
+          null, "id": "recovered"}, {"failure": null, "id": "artifact_dependency"}],
+          "jobs": [{"duration": 90, "id": "lint", "needs": []}, {"duration": 30, "id":
+          "compile", "needs": []}, {"duration": 15, "id": "test", "needs": ["compile"]},
+          {"duration": 9, "id": "package", "needs": ["test"]}], "previous_failures":
+          ["test"]}'

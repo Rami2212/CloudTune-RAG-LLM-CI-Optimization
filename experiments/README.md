@@ -2,7 +2,9 @@
 
 ## Interactive pattern/repository batch
 
-The batch tries candidates until one repository per pattern completes all three baseline and three optimized CI runs successfully. It then skips remaining candidates for that pattern, including when resumed. This means successful CI execution; performance gain and safety review remain separate report outcomes. Failed CI or preparation attempts advance to the next candidate. Uncertain active runs, unavailable LLM service, and pending fork cleanup still pause the batch. Results retain their original CSV positions. `--rerun` can repeat the successful repository; other repositories for an already completed pattern stay skipped. Existing historical results are preserved.
+Both runners use `research-data/zenodo_20340547/pattern_repo_candidates_20.csv`: 25 patterns with 20 distinct repositories each. They try candidates until two distinct repositories per supported pattern have validated pattern changes and three passing baseline and optimized measurements. Remaining candidates for that pattern are skipped, including on resume. Performance gain and independent safety review remain separate report outcomes. Scenario examples validate controlled fixtures, not original repository CI savings. Failed CI or preparation attempts advance to the next candidate. Uncertain runs, unavailable LLM service, and pending fork cleanup still pause the batch. `pattern_progress.csv` records each pattern's count and target; a target is not guaranteed if candidates fail. Results retain original CSV positions, with inclusive `--start-at 20 --stop-at 100` selecting rows 20 through 100. Use `--rerun` to replace a finished row's summary while preserving its previous experiment directory.
+
+Changing the model, token budget, candidate selection, or scenario settings keeps the same batch ID. Selection and scenario settings revisions are archived. An existing attempt keeps its frozen configuration; new and rerun attempts use current settings.
 
 Fill the local `.env` file in the project root:
 
@@ -22,13 +24,13 @@ Run from the project root:
 .\.venv\Scripts\python.exe scripts\run_pattern_batch.py
 ```
 
-For each row in `research-data/pattern_repo_candidates.csv`, the terminal shows the selected pattern, source repository link and fork URL under `GITHUB_USERNAME`. The script reuses an existing fork or creates one automatically under your account, then waits up to five minutes for its Git objects. It enables Actions and selects an eligible test/build workflow. If that workflow lacks `workflow_dispatch`, the script adds that trigger to the fork's default branch before collecting the baseline. No terminal setup prompt is needed. The batch stops and records a preparation failure if GitHub rejects a required change.
+For each row in the selected dataset, the terminal shows the selected pattern, source repository link and fork URL under `GITHUB_USERNAME`. The script reuses an existing fork or creates one automatically under your account, then waits up to five minutes for its Git objects. It enables Actions and selects an eligible test/build workflow. If that workflow lacks `workflow_dispatch`, the script adds that trigger to the fork's default branch before collecting the baseline. No terminal setup prompt is needed. The batch stops and records a preparation failure if GitHub rejects a required change.
 
 Fork creation requests are saved before submission. If a response is lost, restarting checks the saved target without resending the creation request; an unrelated repository with the same name is never reused.
 
 After preparation, the runner verifies fork-family membership and push access, chooses the eligible CI workflow, and freezes the source snapshot. It executes **three baseline runs, one selected-pattern OpenRouter proposal, and three comparison runs**. There are **no warmups**, with a maximum of **six CI dispatches per case**. Required job display names are inferred from the first baseline run and then frozen; this observation is recorded separately from an owner-approved required-check policy. For a workflow that lacked manual dispatch, the only preparation edit is adding `workflow_dispatch` before the baseline snapshot; measured optimization changes remain constrained to the selected pattern.
 
-During fork preparation, the batch also scans the **source repository's workflow history** for the nearest commit that introduced the selected cache pattern. For `P-LIT-GHA-CACHE`, detection is deterministic and checks `actions/cache`, setup-action cache inputs, and Ruby bundler cache configuration; it uses no LLM. If found, it saves the workflow immediately before and after that commit plus the diff and fetches existing Actions runs for both commit SHAs. These are historical source-repository runs, not new runs in the fork. They may be unavailable if GitHub no longer retains them. Other pattern IDs are recorded as unsupported until a dedicated detector is added. This historical collection is supplemental and does not block the normal batch experiment.
+The batch uses the fork's current default-branch workflow and does not scan repository history. Each attempt still pins its source commit so its baseline and optimized measurements compare the same code.
 
 Collect this historical evidence by itself, without forking or calling an LLM:
 
