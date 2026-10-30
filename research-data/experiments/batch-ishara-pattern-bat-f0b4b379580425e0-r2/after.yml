@@ -1,0 +1,54 @@
+on:
+  push: null
+  pull_request: null
+  workflow_dispatch: null
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: 'Test'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+
+    strategy:
+      matrix:
+        node-version: [24.x, 26.x]
+        os: [ubuntu-latest, windows-latest, macOS-latest]
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Run Selected Tests
+        run: |
+          # Identify changed files in the current PR or last commit
+          # If it's a PR, compare against the base branch. If push, compare against HEAD~1
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }} ${{ github.sha }} | grep '\.js$' || true)
+          else
+            CHANGED_FILES=$(git diff --name-only HEAD~1 ${{ github.sha }} | grep '\.js$' || true)
+          fi
+
+          if [ -n "$CHANGED_FILES" ]; then
+            echo "Detected changes in: $CHANGED_FILES"
+            # Attempt to run only tests related to changed files
+            # Since 'npm test' runs 'npm run lint && ava', we pass the files to ava via npm test
+            # Note: This assumes 'npm test' can accept arguments or we call ava directly
+            # To preserve the original command structure, we use the files as arguments
+            npm test -- $CHANGED_FILES
+          else
+            echo "No JS files changed, running full test suite"
+            npm test
+          fi

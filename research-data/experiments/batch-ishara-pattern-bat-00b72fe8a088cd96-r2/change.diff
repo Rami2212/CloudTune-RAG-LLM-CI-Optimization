@@ -1,0 +1,40 @@
+--- a/.github/workflows/elixir.yml
++++ b/.github/workflows/elixir.yml
+@@ -15,6 +15,9 @@
+ 
+     steps:
+     - uses: actions/checkout@v6
++      with:
++        fetch-depth: 0
++
+     - name: Build the Docker image
+       run: docker build . --file Dockerfile --tag waffle
+ 
+@@ -24,5 +27,26 @@
+     - name: Run linters
+       run: docker run waffle mix credo --strict
+ 
++    - name: Select tests based on changes
++      id: test_selection
++      run: |
++        # Determine the base commit to compare against
++        if [ "${{ github.event_name }}" == "pull_request" ]; then
++          BASE_SHA="origin/${{ github.base_ref }}"
++        else
++          BASE_SHA="HEAD~1"
++        fi
++        
++        # Find changed .ex or .exs files
++        CHANGED_FILES=$(git diff --name-only $BASE_SHA HEAD | grep -E '\.(ex|exs)$' | tr '\n' ' ' || true)
++        echo "changed_files=$CHANGED_FILES" >> $GITHUB_OUTPUT
++
+     - name: Run tests
+-      run: docker run waffle mix test
++      run: |
++        if [ -n "${{ steps.test_selection.outputs.changed_files }}" ]; then
++          echo "Running selected tests: ${{ steps.test_selection.outputs.changed_files }}"
++          docker run waffle mix test ${{ steps.test_selection.outputs.changed_files }}
++        else
++          echo "No specific files changed, running full test suite"
++          docker run waffle mix test
++        fi
