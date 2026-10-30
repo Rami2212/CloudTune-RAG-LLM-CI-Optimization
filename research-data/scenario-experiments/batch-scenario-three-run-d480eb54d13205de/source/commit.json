@@ -1,0 +1,101 @@
+{
+  "author": {
+    "avatar_url": "https://avatars.githubusercontent.com/u/9582?v=4",
+    "events_url": "https://api.github.com/users/josevalim/events{/privacy}",
+    "followers_url": "https://api.github.com/users/josevalim/followers",
+    "following_url": "https://api.github.com/users/josevalim/following{/other_user}",
+    "gists_url": "https://api.github.com/users/josevalim/gists{/gist_id}",
+    "gravatar_id": "",
+    "html_url": "https://github.com/josevalim",
+    "id": 9582,
+    "login": "josevalim",
+    "node_id": "MDQ6VXNlcjk1ODI=",
+    "organizations_url": "https://api.github.com/users/josevalim/orgs",
+    "received_events_url": "https://api.github.com/users/josevalim/received_events",
+    "repos_url": "https://api.github.com/users/josevalim/repos",
+    "site_admin": false,
+    "starred_url": "https://api.github.com/users/josevalim/starred{/owner}{/repo}",
+    "subscriptions_url": "https://api.github.com/users/josevalim/subscriptions",
+    "type": "User",
+    "url": "https://api.github.com/users/josevalim",
+    "user_view_type": "public"
+  },
+  "comments_url": "https://api.github.com/repos/ramitha1111/ct-scenario-a0e49fdc4f37bd32/commits/575a8454a216c47c940304d01287dcf62dfbe280/comments",
+  "commit": {
+    "author": {
+      "date": "2026-10-29T17:50:33Z",
+      "email": "jose.valim@gmail.com",
+      "name": "José Valim"
+    },
+    "comment_count": 0,
+    "committer": {
+      "date": "2026-10-29T17:50:33Z",
+      "email": "jose.valim@gmail.com",
+      "name": "José Valim"
+    },
+    "message": "Collapse cookie updates",
+    "tree": {
+      "sha": "d5b3529867496aa18164a62f37f79ad427e5ae34",
+      "url": "https://api.github.com/repos/ramitha1111/ct-scenario-a0e49fdc4f37bd32/git/trees/d5b3529867496aa18164a62f37f79ad427e5ae34"
+    },
+    "url": "https://api.github.com/repos/ramitha1111/ct-scenario-a0e49fdc4f37bd32/git/commits/575a8454a216c47c940304d01287dcf62dfbe280",
+    "verification": {
+      "payload": null,
+      "reason": "unsigned",
+      "signature": null,
+      "verified": false,
+      "verified_at": null
+    }
+  },
+  "committer": {
+    "avatar_url": "https://avatars.githubusercontent.com/u/9582?v=4",
+    "events_url": "https://api.github.com/users/josevalim/events{/privacy}",
+    "followers_url": "https://api.github.com/users/josevalim/followers",
+    "following_url": "https://api.github.com/users/josevalim/following{/other_user}",
+    "gists_url": "https://api.github.com/users/josevalim/gists{/gist_id}",
+    "gravatar_id": "",
+    "html_url": "https://github.com/josevalim",
+    "id": 9582,
+    "login": "josevalim",
+    "node_id": "MDQ6VXNlcjk1ODI=",
+    "organizations_url": "https://api.github.com/users/josevalim/orgs",
+    "received_events_url": "https://api.github.com/users/josevalim/received_events",
+    "repos_url": "https://api.github.com/users/josevalim/repos",
+    "site_admin": false,
+    "starred_url": "https://api.github.com/users/josevalim/starred{/owner}{/repo}",
+    "subscriptions_url": "https://api.github.com/users/josevalim/subscriptions",
+    "type": "User",
+    "url": "https://api.github.com/users/josevalim",
+    "user_view_type": "public"
+  },
+  "files": [
+    {
+      "additions": 8,
+      "blob_url": "https://github.com/ramitha1111/ct-scenario-a0e49fdc4f37bd32/blob/575a8454a216c47c940304d01287dcf62dfbe280/lib%2Fplug%2Fconn.ex",
+      "changes": 13,
+      "contents_url": "https://api.github.com/repos/ramitha1111/ct-scenario-a0e49fdc4f37bd32/contents/lib%2Fplug%2Fconn.ex?ref=575a8454a216c47c940304d01287dcf62dfbe280",
+      "deletions": 5,
+      "filename": "lib/plug/conn.ex",
+      "patch": "@@ -1722,7 +1722,7 @@ defmodule Plug.Conn do\n     {to_send_value, opts} = Plug.Conn.Cookies.sign_or_encrypt(conn, key, value, opts)\n     cookie = [{:value, to_send_value} | opts] |> Map.new() |> maybe_secure_cookie(scheme)\n     resp_cookies = Map.put(resp_cookies, key, cookie)\n-    update_cookies(%{conn | resp_cookies: resp_cookies}, &Map.put(&1, key, value))\n+    update_cookies(conn, resp_cookies, &Map.put(&1, key, value))\n   end\n \n   defp maybe_secure_cookie(cookie, :https), do: Map.put_new(cookie, :secure, true)\n@@ -1741,7 +1741,7 @@ defmodule Plug.Conn do\n     opts = opts ++ [universal_time: @epoch, max_age: 0]\n     cookie = opts |> Map.new() |> maybe_secure_cookie(scheme)\n     resp_cookies = Map.put(resp_cookies, key, cookie)\n-    update_cookies(%{conn | resp_cookies: resp_cookies}, &Map.delete(&1, key))\n+    update_cookies(conn, resp_cookies, &Map.delete(&1, key))\n   end\n \n   @doc \"\"\"\n@@ -1953,12 +1953,15 @@ defmodule Plug.Conn do\n     validate_header_key_value!(\"set-cookie\", cookie)\n   end\n \n-  defp update_cookies(%Conn{state: state}, _fun) when state not in @unsent do\n+  defp update_cookies(%Conn{state: state}, _resp_cookies, _fun) when state not in @unsent do\n     raise AlreadySentError\n   end\n \n-  defp update_cookies(%Conn{cookies: %Unfetched{}} = conn, _fun), do: conn\n-  defp update_cookies(%Conn{cookies: cookies} = conn, fun), do: %{conn | cookies: fun.(cookies)}\n+  defp update_cookies(%Conn{cookies: %Unfetched{}} = conn, resp_cookies, _fun),\n+    do: %{conn | resp_cookies: resp_cookies}\n+\n+  defp update_cookies(%Conn{cookies: cookies} = conn, resp_cookies, fun),\n+    do: %{conn | resp_cookies: resp_cookies, cookies: fun.(cookies)}\n \n   defp session_key(binary) when is_binary(binary), do: binary\n   defp session_key(atom) when is_atom(atom), do: Atom.to_string(atom)",
+      "raw_url": "https://github.com/ramitha1111/ct-scenario-a0e49fdc4f37bd32/raw/575a8454a216c47c940304d01287dcf62dfbe280/lib%2Fplug%2Fconn.ex",
+      "sha": "d046ce2e11b2a533e513451262b0c3c59b920524",
+      "status": "modified"
+    }
+  ],
+  "html_url": "https://github.com/ramitha1111/ct-scenario-a0e49fdc4f37bd32/commit/575a8454a216c47c940304d01287dcf62dfbe280",
+  "node_id": "C_kwDOVcQLOtoAKDU3NWE4NDU0YTIxNmM0N2M5NDAzMDRkMDEyODdkY2Y2MmRmYmUyODA",
+  "parents": [
+    {
+      "html_url": "https://github.com/ramitha1111/ct-scenario-a0e49fdc4f37bd32/commit/9f5edc1962e443cabba1b7617d0a29eda0637a5e",
+      "sha": "9f5edc1962e443cabba1b7617d0a29eda0637a5e",
+      "url": "https://api.github.com/repos/ramitha1111/ct-scenario-a0e49fdc4f37bd32/commits/9f5edc1962e443cabba1b7617d0a29eda0637a5e"
+    }
+  ],
+  "sha": "575a8454a216c47c940304d01287dcf62dfbe280",
+  "stats": {
+    "additions": 8,
+    "deletions": 5,
+    "total": 13
+  },
+  "url": "https://api.github.com/repos/ramitha1111/ct-scenario-a0e49fdc4f37bd32/commits/575a8454a216c47c940304d01287dcf62dfbe280"
+}

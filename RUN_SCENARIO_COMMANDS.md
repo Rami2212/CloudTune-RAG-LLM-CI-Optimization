@@ -10,12 +10,15 @@ notepad .env
 # Preview supported rows; no GitHub or LLM requests
 .\.venv\Scripts\python.exe scripts\run_scenario_batch.py --list
 
-# Run all ten supported patterns, or resume the same batch
+# Run all twenty supported patterns, or resume the same batch
 .\.venv\Scripts\python.exe scripts\run_scenario_batch.py
 # Change OPENROUTER_MODEL in .env, then rerun the same command to continue this batch with that model
 
 # Run supported scenarios in inclusive original CSV positions
 .\.venv\Scripts\python.exe scripts\run_scenario_batch.py --start-at 1 --stop-at 500
+
+# Run only the ten new scenarios in the same scenario batch
+.\.venv\Scripts\python.exe scripts\run_new_scenario_batch.py --start-at 1 --stop-at 500
 
 # Repeat a finished case in the same batch
 .\.venv\Scripts\python.exe scripts\run_scenario_batch.py --start-at 21 --stop-at 21 --rerun

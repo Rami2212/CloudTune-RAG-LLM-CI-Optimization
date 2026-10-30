@@ -1,8 +1,30 @@
 # Automated scenario experiments
 
-Run `scripts/run_scenario_batch.py` for all ten blocked patterns. Use the same `.env`, GitHub permissions and pinned OpenRouter free model as the main batch. Commands are in [RUN_SCENARIO_COMMANDS.md](../RUN_SCENARIO_COMMANDS.md).
+Run `scripts/run_scenario_batch.py` for twenty supported patterns. Use `scripts/run_new_scenario_batch.py` for the ten new mechanisms only, using the same default scenario batch. Use the same `.env` and GitHub permissions as the main batch. Commands are in [RUN_SCENARIO_COMMANDS.md](../RUN_SCENARIO_COMMANDS.md) and [RUN_NEW_SCENARIO_COMMANDS.md](../RUN_NEW_SCENARIO_COMMANDS.md).
 
-The runner reads `research-data/pattern_repo_candidates.csv` in its original order. It visits only the ten supported patterns, keeping original row positions. `--start-at`, `--limit`, `--pattern`, `--batch-id`, `--list` and `--rerun` work like the main batch. `--limit` counts visited candidates, not an ending row number. Filtering with `--pattern` uses positions within that filtered selection, as in the main script. A changed CSV selection requires a new batch ID. The model is not part of batch identity: change `OPENROUTER_MODEL` and resume the same batch. Existing experiment cases keep their saved model; new or rerun cases use the model from `.env`. Each result records the model used.
+The default input is `research-data/zenodo_20340547/pattern_repo_candidates_20.csv`. The runner visits supported patterns while preserving original CSV row positions. `--start-at` and `--stop-at` are inclusive original positions, including when filtering with `--pattern`. Model, selection and settings changes can remain in the same batch; saved attempts retain their frozen configurations. `--rerun` creates a fresh generation and preserves earlier evidence. Successful-example quotas still require three passing repeats per arm, a changed policy, and lower optimized hosted job runtime; simulated logical savings alone do not satisfy the quota.
+
+## New synthetic mechanism controls
+
+| Pattern | Controls and measurements |
+| --- | --- |
+| PRIORITIZE | Reorders tests using known past failures, preserves every test/outcome, records first-failure feedback and unchanged total work. |
+| SELECT / UNAFFECTED-STEPS | Direct/transitive dependencies, documentation, mixed changes, setup/lockfile inputs and unknown-input fallback; required affected checks and detected failures remain covered. |
+| UNUSED-DEP-SKIP | Skips only the explicitly unused dependency event; source, documentation, used/transitive dependencies, lockfile, setup and unknown changes keep the full build. |
+| BAZEL-PARALLEL | Schedules a synthetic build DAG with one versus four workers; verifies dependencies, worker limit, task durations, total work and makespan. |
+| SMELL-REPAIR | Removes duplicated pure work while preserving required outputs; the side-effect control retains both executions. |
+| UNUSED-OUTPUTS | Omits an unused documentation output but retains it in the required-consumer control and preserves binary/test outputs. |
+| BAZEL-INCREMENTAL | Models cached build results with source/dependency/environment/toolchain keys; cold, warm, changed-input and invalidation controls compare outputs. |
+| BAZEL-DEPS | Models dependency downloads while retaining compilation/tests; includes a cheap-fetch control where cache overhead makes that event slower. |
+| ENV-CACHE | Models environment reuse keyed by dependency, OS/environment and toolchain, preserving compilation/tests and validating changed-environment misses. |
+
+These are deterministic logical models. They do not invoke Bazel, trace real file accesses, build environment images, or execute the source repository's tests. Both hosted timing and modeled work are stored separately; no source-repository performance claim is made. The LLM receives the exact allowed policy treatment, and the scope checker rejects other edits.
+
+New reports retain simulated elapsed time, first-failure time and cache hits where relevant, in addition to all original metrics. All replay inputs, engine source, policies, traces, actual hosted run IDs, and hashes are archived through the existing structure. The hosted payload is compressed for transport and executes the same frozen standalone engine.
+
+Seven transformations formerly rejected by the main change validator now require the scenario runner: PRIORITIZE, SELECT, BAZEL-PARALLEL, UNAFFECTED-STEPS, SMELL-REPAIR, UNUSED-OUTPUTS and UNUSED-DEP-SKIP. The three cache scenarios also remain available alongside the main runner's bounded cache treatment. Existing BUILD-SELECT and DURATION-PREDICTION scenario code is retained; adding scenarios does not resolve earlier fork/API preparation failures.
+
+Previously prepared replay attempts freeze an earlier engine. If resuming reports an engine mismatch, use `--rerun` on that exact row to retain old evidence and create a new generation.
 
 For each candidate it creates a dedicated `ct-scenario-...` fork, saves the source commit/tree/workflows and pattern, and disables inherited workflows in that dedicated fork. Isolated branches contain a controlled fixture with no source-code execution or third-party actions. Existing forks returned instead of the requested dedicated fork are preserved and that candidate is rejected.
 
@@ -21,7 +43,7 @@ Each experiment runs **three baseline scenario repeats**, asks the free LLM to a
 | Build selection | Execute all chronological build records. | Select using the visible change and last executed outcome. Skipped outcomes remain hidden. Report savings and missed failures together, including a documentation change with an external setup failure. |
 | Duration prediction | Predict using the mean of past build durations. | Use past feature-specific means. Walk forward chronologically, predicting before observing each outcome. Measure MAE on records after the training prefix; execution work remains unchanged. |
 
-The six added scenarios are **synthetic service-policy replays**, executed by a Python engine inside a successful hosted workflow. They exercise logical schedules and queues rather than modifying GitHub's scheduler. The LLM edits only `before_policy.yml` into `after_policy.yml`; the runner validates the exact allowed policy, embeds it in `after.yml`, and retains both the policy diff and `workflow_change.diff`. All three repeat inputs and the standalone engine are frozen under `source/`. Repeats use distinct duration scales. No source repository history is used to train these synthetic scenarios.
+The six original policy scenarios and ten new mechanism scenarios are **synthetic replays**, executed by a Python engine inside a successful hosted workflow. They exercise logical schedules and queues rather than modifying GitHub's scheduler. The LLM edits only `before_policy.yml` into `after_policy.yml`; the runner validates the exact allowed policy, embeds it in `after.yml`, and retains both the policy diff and `workflow_change.diff`. All three repeat inputs and the standalone engine are frozen under `source/`. Repeats use distinct duration scales. No source repository history is used to train these synthetic scenarios.
 
 For replays, `replays/<arm>-<repeat>.json` stores inputs, policy, chronological decisions, assertions, simulated metrics, engine/input hashes, and the hosted run ID. The trace is a local deterministic reproduction of the exact hosted fixture; GitHub run/job success attests that the same hosted engine passed its assertions. Actual hosted job runtime measures replay overhead. Simulated work, failure-feedback latency, queue waits, missed failures, and prediction error are separate logical metrics. `experiment_runs.csv`, `run_records.json`, `case.json`, and `REPORT.md` retain results in the existing scenario experiment directory.
 
@@ -41,7 +63,7 @@ Storage:
 - `research-data/scenario-experiments/<experiment_id>/`: original source evidence, fixture `before.yml`/`after.yml`, policy files when applicable, `change.diff`, LLM requests/responses, operation intents, raw runs/jobs/metrics, bounded no-run observations, assertions, `run_records.json`, `experiment_runs.csv`, `case.json`, `REPORT.md` and hashed artifact manifest.
 - Scenario cases are labelled `controlled_pattern_scenario` with `real_repo_optimization_verified: false`; they are excluded from the ordinary experiment/RAG success catalogs.
 
-Optional `.env` settings (frozen per batch):
+Optional `.env` settings (frozen per experiment attempt):
 
 ```dotenv
 SCENARIO_ABSENCE_SECONDS=120

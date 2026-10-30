@@ -238,7 +238,8 @@ class DurabilityTests(unittest.TestCase):
             return exp, "owner/fork"
         batch.ready_experiment = prepare
         batch.cleanup_fork = lambda row, target: True
-        with patch.object(scenarios.runner, "exclusive", side_effect=lambda path: nullcontext()):
+        with patch.object(scenarios.runner, "exclusive", side_effect=lambda path: nullcontext()), \
+             patch.object(batch, "case_has_runtime_improvement", return_value=True):
             batch.run()
             batch.run()
         self.assertEqual(attempted, ["source/repo2", "source/repo3", "source/repo5"])

@@ -1,0 +1,102 @@
+name: ci/github-actions
+
+on:
+  push:
+    branches: [ '**' ]
+  pull_request:
+    branches: [ '**' ]
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+
+  winBuild:
+    runs-on: windows-2025
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v5
+      with:
+        dotnet-version: 10.0.x
+    - name: Set up JDK 11
+      uses: actions/setup-java@v5
+      with:
+        distribution: 'temurin'
+        java-version: '11'
+    - name: Install workloads
+      shell: pwsh
+      run: dotnet workload install maui
+    - name: Build Plugin.BLE NuGet
+      run: dotnet build Source/Plugin.BLE/Plugin.BLE.csproj -c Release -t:restore,build,pack -p:PackageOutputPath=./nuget -p:Version=$(git describe) -p:ContinuousIntegrationBuild=true -p:DeterministicSourcePaths=false
+    - name: Build MVVMCross.Plugins.BLE NuGet
+      run: dotnet build Source/MvvmCross.Plugins.BLE/MvvmCross.Plugins.BLE.csproj -c Release -t:restore,build,pack -p:PackageOutputPath=./nuget -p:Version=$(git describe) -p:ContinuousIntegrationBuild=true -p:DeterministicSourcePaths=false
+    - name: Upload packages
+      uses: actions/upload-artifact@v7
+      with:
+        name: nupkg
+        path: ./Source/*/nuget/*Plugin.BLE*.nupkg
+    - name: Build MAUI sample
+      run: dotnet build Source/BLE.Client/BLE.Client.Maui/BLE.Client.Maui.csproj -c Debug -t:restore,build -p:Version=$(git describe) -p:ContinuousIntegrationBuild=true -p:DeterministicSourcePaths=false
+    - name: Build WinConsole sample
+      run: dotnet build Source/BLE.Client/BLE.Client.WinConsole/BLE.Client.WinConsole.csproj -c Debug -t:restore,build -p:Version=$(git describe) -p:ContinuousIntegrationBuild=true -p:DeterministicSourcePaths=false
+    - name: Build tests
+      run: dotnet build Source/Plugin.BLE.Tests/Plugin.BLE.Tests.csproj -c Debug -t:restore,build
+    - name: Run tests
+      run: dotnet test Source/Plugin.BLE.Tests/Plugin.BLE.Tests.csproj -c Debug
+
+
+  macBuild:
+    runs-on: xcode-27
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v5
+      with:
+        dotnet-version: 10.0.x
+    - name: Setup XCode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: '27.1'
+    - name: Install workloads
+      run: dotnet workload install maui
+    #- name: Install Android tools
+    #  run: ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager --sdk_root=$ANDROID_SDK_ROOT "platforms;android-34" "platforms;android-33" "build-tools;34.0.0" "platform-tools"
+    - name: Build Plugin.BLE NuGet
+      run: dotnet build Source/Plugin.BLE/Plugin.BLE.csproj -c Release -t:restore,build,pack -p:Version=$(git describe) -p:ContinuousIntegrationBuild=true -p:DeterministicSourcePaths=false
+    - name: Build MVVMCross.Plugins.BLE NuGet
+      run: dotnet build Source/MvvmCross.Plugins.BLE/MvvmCross.Plugins.BLE.csproj -c Release -t:restore,build,pack -p:Version=$(git describe) -p:ContinuousIntegrationBuild=true -p:DeterministicSourcePaths=false
+    - name: Build MAUI sample
+      run: dotnet build Source/BLE.Client/BLE.Client.Maui/BLE.Client.Maui.csproj -c Debug -t:restore,build -p:Version=$(git describe) -p:ContinuousIntegrationBuild=true -p:DeterministicSourcePaths=false
+    - name: Build tests
+      run: dotnet build Source/Plugin.BLE.Tests/Plugin.BLE.Tests.csproj -c Debug -t:restore,build
+    - name: Run tests
+      run: dotnet test Source/Plugin.BLE.Tests/Plugin.BLE.Tests.csproj -c Debug
+
+  linuxBuild:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v5
+      with:
+         dotnet-version: 10.0.x
+    - name: Install workloads
+      run: dotnet workload install maui-android
+    #- name: Install Android tools
+    #  run: ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager --sdk_root=$ANDROID_SDK_ROOT "platform-tools"
+    - name: Build Plugin.BLE NuGet
+      run: dotnet build Source/Plugin.BLE/Plugin.BLE.csproj -c Release -t:restore,build,pack -p:Version=$(git describe) -p:ContinuousIntegrationBuild=true -p:DeterministicSourcePaths=false
+    - name: Build MVVMCross.Plugins.BLE NuGet
+      run: dotnet build Source/MvvmCross.Plugins.BLE/MvvmCross.Plugins.BLE.csproj -c Release -t:restore,build,pack -p:Version=$(git describe) -p:ContinuousIntegrationBuild=true -p:DeterministicSourcePaths=false
+    - name: Build MAUI sample
+      run: dotnet build Source/BLE.Client/BLE.Client.Maui/BLE.Client.Maui.csproj -c Debug -t:restore,build -p:Version=$(git describe) -p:ContinuousIntegrationBuild=true -p:DeterministicSourcePaths=false
+    - name: Build tests
+      run: dotnet build Source/Plugin.BLE.Tests/Plugin.BLE.Tests.csproj -c Debug -t:restore,build
+    - name: Run tests
+      run: dotnet test Source/Plugin.BLE.Tests/Plugin.BLE.Tests.csproj -c Debug

@@ -13,6 +13,48 @@ import scenario_experiments as scenarios
 
 
 class ReplayTests(unittest.TestCase):
+    def test_new_mechanisms_reject_lost_checks_and_outputs(self):
+        for pattern in replay.NEW_PATTERNS:
+            data = replay.dataset(pattern, 2)
+            settings = replay.policy(pattern, True)
+            result = replay.run(pattern, settings, data)
+            result["trace"].pop()
+            self.assertFalse(all(replay.validate(pattern, settings, data, result).values()), pattern)
+
+    def test_dependency_selection_keeps_transitive_and_unknown_controls(self):
+        pattern = "P-LIT-SELECT"
+        data = replay.dataset(pattern, 1)
+        settings = replay.policy(pattern, True)
+        original = replay.run(pattern, settings, data)
+        rows = {r["id"]: r for r in original["trace"]}
+        self.assertEqual(rows["transitive"]["selected"], ["a"])
+        self.assertEqual(rows["unknown"]["selected"], ["a", "b"])
+        changed = copy.deepcopy(data)
+        changed["events"][1]["failures"] = []
+        altered = replay.run(pattern, settings, changed)
+        self.assertEqual([r["selected"] for r in original["trace"]], [r["selected"] for r in altered["trace"]])
+
+    def test_cache_invalidation_and_negative_overhead_control(self):
+        for pattern in ("P-LIT-BAZEL-INCREMENTAL", "P-LIT-BAZEL-DEPS", "P-LIT-ENV-CACHE"):
+            data = replay.dataset(pattern, 1)
+            settings = replay.policy(pattern, True)
+            result = replay.run(pattern, settings, data)
+            self.assertFalse(any(result["trace"][i]["hit"] for i in (0, 3, 4, 5)))
+            result["trace"][3]["hit"] = True
+            self.assertFalse(all(replay.validate(pattern, settings, data, result).values()))
+        data = replay.dataset("P-LIT-BAZEL-DEPS", 1)
+        baseline = replay.run("P-LIT-BAZEL-DEPS", replay.policy("P-LIT-BAZEL-DEPS"), data)
+        candidate = replay.run("P-LIT-BAZEL-DEPS", replay.policy("P-LIT-BAZEL-DEPS", True), data)
+        self.assertGreater(candidate["trace"][1]["cost_seconds"], baseline["trace"][1]["cost_seconds"])
+
+    def test_parallelism_reduces_makespan_not_total_work(self):
+        pattern = "P-LIT-BAZEL-PARALLEL"
+        data = replay.dataset(pattern, 1)
+        before = replay.run(pattern, replay.policy(pattern), data)
+        after = replay.run(pattern, replay.policy(pattern, True), data)
+        self.assertLess(after["simulated_elapsed_seconds"], before["simulated_elapsed_seconds"])
+        self.assertEqual(after["simulated_work_seconds"], before["simulated_work_seconds"])
+
     def test_all_three_workloads_and_both_policies(self):
         for pattern in replay.PATTERNS:
             for repeat in (1, 2, 3):
@@ -98,6 +140,7 @@ class ReplayTests(unittest.TestCase):
                 with self.subTest(pattern=pattern, optimized=optimized):
                     workflow = scenarios.fixture(pattern, scenarios.settings_from_env())
                     step = workflow["jobs"]["probe"]["steps"][0]
+                    self.assertLess(len(step["run"]), 20000)
                     step["env"]["CT_POLICY"] = json.dumps(replay.policy(pattern, optimized))
                     source = step["run"].split("\n", 1)[1].rsplit("\nCLOUDTUNE_REPLAY_ENGINE", 1)[0]
                     process = subprocess.run([sys.executable, "-c", source], env={**os.environ, **step["env"]},

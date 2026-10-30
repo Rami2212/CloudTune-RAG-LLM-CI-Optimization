@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import copy
+import base64
 import csv
 import json
 import os
 import statistics
 import time
 import urllib.parse
+import zlib
 from pathlib import Path
 
 import run_ci_experiment as runner
@@ -20,6 +22,8 @@ SUPPORTED = {"P-LIT-FAIL-FAST", "P-LIT-CANCEL-STALE", "P-LIT-SKIP-WORKFLOW", "P-
 POLICY_PATTERNS = replay.PATTERNS | {"P-LIT-SKIP-WORKFLOW"}
 WORKFLOW = ".github/workflows/cloudtune-scenario.yml"
 NAME = "CloudTune controlled scenario"
+REPLAY_METRICS = ("simulated_work_seconds", "missed_failures", "missed_failure_rate",
+                  "held_out_mae_seconds", "simulated_elapsed_seconds", "first_failure_seconds", "cache_hits")
 
 
 def settings_from_env():
@@ -60,7 +64,10 @@ def fixture(pattern, settings):
             "CT_POLICY": json.dumps(replay.policy(pattern), sort_keys=True),
             "CT_DATA": json.dumps(replay.dataset(pattern, 1), sort_keys=True)}
         engine = Path(replay.__file__).read_text(encoding="utf-8")
-        job["steps"][0]["run"] = "python3 - <<'CLOUDTUNE_REPLAY_ENGINE'\n" + engine + "\nCLOUDTUNE_REPLAY_ENGINE\n"
+        # Keep the hosted step compact as the frozen engine grows.
+        packed = base64.b64encode(zlib.compress(engine.encode("utf-8"))).decode("ascii")
+        payload = "import base64, zlib\nexec(compile(zlib.decompress(base64.b64decode(" + repr(packed) + ")), 'scenario_replay.py', 'exec'))"
+        job["steps"][0]["run"] = "python3 - <<'CLOUDTUNE_REPLAY_ENGINE'\n" + payload + "\nCLOUDTUNE_REPLAY_ENGINE\n"
     return doc
 
 
@@ -515,7 +522,8 @@ class ScenarioExperiment:
                 "simulated_work_seconds": result["simulated_work_seconds"],
                 "missed_failures": result.get("missed_failures"),
                 "missed_failure_rate": result.get("missed_failure_rate"),
-                "held_out_mae_seconds": result.get("held_out_mae_seconds")}
+                "held_out_mae_seconds": result.get("held_out_mae_seconds"),
+                **{key: result.get(key) for key in REPLAY_METRICS}}
 
     def measure(self, arm):
         if arm == "optimized" and not self.state.get("proposal"):
@@ -555,7 +563,7 @@ class ScenarioExperiment:
         runner.write_json(self.directory / "run_records.json", self.state["records"])
         with (self.directory / "experiment_runs.csv").open("w", encoding="utf-8", newline="") as handle:
             fields = ["arm", "repeat_index", "model", "scenario_pass", "sum_job_runtime_seconds", "completed_at",
-                      "simulated_work_seconds", "missed_failures", "missed_failure_rate", "held_out_mae_seconds", "replay_ref"]
+                      *REPLAY_METRICS, "replay_ref"]
             writer = csv.DictWriter(handle, fields, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(self.state["records"])
@@ -569,7 +577,7 @@ class ScenarioExperiment:
             arms[arm] = {"total_repeats": len(records), "passing_repeats": sum(r["scenario_pass"] for r in records),
                          "median_job_runtime_seconds": statistics.median(times) if times else None}
             if self.pattern in replay.PATTERNS:
-                for metric in ("simulated_work_seconds", "missed_failures", "missed_failure_rate", "held_out_mae_seconds"):
+                for metric in REPLAY_METRICS:
                     values = [r[metric] for r in records if r.get(metric) is not None]
                     arms[arm]["median_" + metric] = statistics.median(values) if values else None
         passed = all(stats["total_repeats"] == 3 and stats["passing_repeats"] == 3 for stats in arms.values())
@@ -601,6 +609,10 @@ class ScenarioExperiment:
             case["limitations"] += ["Synthetic service policies replay logical time; hosted job runtime measures only replay execution overhead.",
                 "Replay traces are reproduced locally from the exact hosted inputs/engine; GitHub success attests the hosted assertions.",
                 "No real cron pause, owner notification, GitHub queue priority, build omission, or repository prediction accuracy is established."]
+            if self.pattern in replay.NEW_PATTERNS:
+                case["limitations"].append(
+                    "Mechanisms use deterministic synthetic graphs, inputs, outputs and cost models; "
+                    "no actual Bazel process, environment image, file-access tracing or source-repository test suite is evaluated.")
             if self.pattern == "P-LIT-BUILD-SELECT":
                 case["safe_for_repository_use"] = False
                 case["limitations"].append("The optimized selector deliberately exposes a missed setup failure; scenario_passed does not mean safe selection.")
@@ -614,6 +626,10 @@ class ScenarioExperiment:
                       "| Arm | Median simulated work (s) | Median missed failures | Median missed-failure rate | Held-out MAE (s) |",
                       "|---|---:|---:|---:|---:|"]
             lines += [f"| {arm} | {s['median_simulated_work_seconds']} | {s['median_missed_failures']} | {s['median_missed_failure_rate']} | {s['median_held_out_mae_seconds']} |"
+                      for arm, s in arms.items()]
+            lines += ["", "| Arm | Simulated elapsed (s) | First failure (s) | Cache hits |",
+                      "|---|---:|---:|---:|"]
+            lines += [f"| {arm} | {s['median_simulated_elapsed_seconds']} | {s['median_first_failure_seconds']} | {s['median_cache_hits']} |"
                       for arm, s in arms.items()]
         lines += ["", *["- " + limitation for limitation in case["limitations"]]]
         (self.directory / "REPORT.md").write_text("\n".join(lines) + "\n", encoding="utf-8")

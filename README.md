@@ -102,7 +102,7 @@ only after inspecting the pilot output and API usage.
 
 Rerun the same command to resume. Results are under `research-data/experiments/`; batch progress is in `research-data/batches/`. See [experiment details](experiments/README.md) for workflow restrictions and saved files.
 
-For all ten blocked patterns, run `scripts/run_scenario_batch.py`. It runs four event scenarios and six synthetic service-policy replays using controlled fixture workflows in a separate scenario batch. See [scenario details](experiments/SCENARIOS.md) and [scenario run commands](RUN_SCENARIO_COMMANDS.md).
+Run `scripts/run_scenario_batch.py` for twenty supported scenarios: four event scenarios and sixteen synthetic mechanism/policy replays. Run `scripts/run_new_scenario_batch.py` for only the ten new scenarios in the same scenario batch. The main runner now routes seven unsupported transformations to scenario testing. See [scenario details](experiments/SCENARIOS.md), [scenario run commands](RUN_SCENARIO_COMMANDS.md), and [new scenario commands](RUN_NEW_SCENARIO_COMMANDS.md).
 
 `OPENROUTER_MODEL` does not determine batch identity in either batch runner. Change it and resume with the same `--batch-id`; existing cases keep their saved model, while new and rerun cases use the selected model and record it in their results.
 
