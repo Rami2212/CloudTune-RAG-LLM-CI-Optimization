@@ -37,7 +37,10 @@ VERSION = "1.2.0"
 API = "https://api.github.com"
 SCENARIO_PATTERNS = {"P-LIT-CANCEL-STALE", "P-LIT-SKIP-WORKFLOW", "P-LIT-CHANGE-FILTER",
                      "P-LIT-FAIL-SCHEDULE", "P-LIT-IDLE-SCHEDULE", "P-LIT-FAILED-JOB-FIRST",
-                     "P-LIT-BUILD-PRIORITY", "P-LIT-BUILD-SELECT", "P-LIT-DURATION-PREDICTION", "P-LIT-FAIL-FAST"}
+                     "P-LIT-BUILD-PRIORITY", "P-LIT-BUILD-SELECT", "P-LIT-DURATION-PREDICTION", "P-LIT-FAIL-FAST",
+                     "P-LIT-PRIORITIZE", "P-LIT-SELECT", "P-LIT-BAZEL-PARALLEL",
+                     "P-LIT-UNAFFECTED-STEPS", "P-LIT-SMELL-REPAIR", "P-LIT-UNUSED-OUTPUTS",
+                     "P-LIT-UNUSED-DEP-SKIP"}
 FIELDS = ("experiment_id", "repo_id", "source_commit_sha", "config_commit_sha",
           "workflow_path", "pattern_id", "arm", "repeat_index", "warmup", "cache_regime",
           "run_id", "run_attempt", "event", "status", "conclusion", "started_at_utc",

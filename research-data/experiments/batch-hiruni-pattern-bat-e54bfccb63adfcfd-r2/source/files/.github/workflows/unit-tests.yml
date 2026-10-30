@@ -1,0 +1,166 @@
+# Unit tests run independently of build.yml and integration-tests.yml, with coverage and their own PR summary.
+
+name: Unit Tests
+
+permissions:
+  contents: read
+  pull-requests: write
+  # Needed by the Upload Code Coverage step (actions/upload-code-coverage).
+  code-quality: write
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - main
+      - rel/*
+
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+concurrency:
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: >-
+    test-${{ github.workflow }}-${{
+    github.ref == 'refs/heads/main' && github.run_id ||
+    startsWith(github.ref, 'refs/heads/rel/') && github.run_id ||
+    github.event_name == 'pull_request' &&
+    format('{0}-{1}', github.event.pull_request.head.repo.full_name, github.head_ref) ||
+    format('{0}-{1}', github.repository, github.ref_name) }}
+
+jobs:
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: 📦 Using Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: 'npm'
+          cache-dependency-path: '**/package-lock.json'
+
+      - name: ⬇️ Install Dependencies
+        run: npm ci
+
+      - name: 🧪 Unit Tests
+        id: unit-tests
+        run: npm run vitest:coverage
+
+      - name: 📊 Upload Code Coverage
+        # The coverage service accepts uploads only for the default branch or a PR. Skip release/dev branch
+        # pushes, fork PRs (no token to upload), and runs where unit tests never started.
+        if: >-
+          ${{ !cancelled() && steps.unit-tests.outcome != 'skipped' &&
+          (github.ref_name == github.event.repository.default_branch ||
+          (github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository)) }}
+        uses: actions/upload-code-coverage@2b21a77928be8d5168c2b9581a67f2adbebacc52
+        with:
+          file: coverage/cobertura-coverage.xml
+          language: TypeScript
+          label: code-coverage/vitest
+
+      - name: 📤 Upload Coverage Report
+        id: upload-coverage
+        # Upload the HTML coverage report so it's downloadable from the run. Skip when unit tests never ran.
+        if: ${{ !cancelled() && steps.unit-tests.outcome != 'skipped' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-report
+          path: coverage/
+          if-no-files-found: warn
+
+      - name: 📊 Generate Job Summary
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UNIT_TEST_RESULT: ${{ steps.unit-tests.outcome }}
+          REPO: ${{ github.repository }}
+          COVERAGE_URL: ${{ steps.upload-coverage.outputs.artifact-url }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: |
+          # See build.yml for the rationale behind these helpers — duplicated because GitHub Actions has no
+          # first-class way to share inline shell across workflows. Keep them in sync.
+          result_icon() {
+              case "$1" in
+                  success)   echo "✅" ;;
+                  failure)   echo "❌" ;;
+                  cancelled) echo "⚪" ;;
+                  skipped)   echo "⏭️" ;;
+                  *)         echo "❓" ;;
+              esac
+          }
+
+          post_or_update_comment() {
+              local pr=$1
+              local marker=$2
+              local body_file=$3
+              # When "false", this run produced no real results (every tracked check was skipped, e.g. a
+              # follow-up commit that didn't actually run these checks). In that case we must NOT clobber an
+              # existing comment holding a real success/failure — that would lose the previous state.
+              local meaningful=${4:-true}
+
+              local existing_id
+              existing_id=$(gh api --paginate "repos/${REPO}/issues/${pr}/comments" \
+                  --jq ".[] | select(.body | contains(\"${marker}\")) | .id" 2>/dev/null | head -1)
+
+              if [ "$meaningful" != "true" ] && [ -n "$existing_id" ]; then
+                  echo "ℹ️ All checks skipped — keeping existing PR #${pr} comment ${existing_id} unchanged"
+                  return 0
+              fi
+
+              if [ -n "$existing_id" ]; then
+                  if gh api --method PATCH "repos/${REPO}/issues/comments/${existing_id}" \
+                          --field body=@"${body_file}" >/dev/null 2>&1; then
+                      echo "✅ PR #${pr} comment updated (id ${existing_id})"
+                      return 0
+                  fi
+                  echo "::warning::Failed to PATCH comment ${existing_id}, posting a new one"
+              fi
+
+              if gh pr comment "${pr}" --repo "${REPO}" --body-file "${body_file}" >/dev/null 2>&1; then
+                  echo "✅ PR #${pr} new comment posted"
+                  return 0
+              fi
+
+              echo "::warning::Unable to post PR comment on #${pr} (likely a fork PR with a read-only GITHUB_TOKEN). Skipping."
+              return 0
+          }
+
+          unit_icon=$(result_icon "$UNIT_TEST_RESULT")
+
+          coverage_section=""
+          if [ -n "${COVERAGE_URL:-}" ]; then
+              coverage_section="
+
+          ## 📈 Coverage
+          - [Download HTML report](${COVERAGE_URL})"
+          fi
+
+          MARKER="<!-- ci-summary:unit-tests -->"
+          cat >> "$GITHUB_STEP_SUMMARY" << SUMMARY_EOF
+          ${MARKER}
+          # 🧪 Unit Tests
+
+          ## 🧪 Results
+          - **Unit Tests (vitest):** ${unit_icon} ${UNIT_TEST_RESULT}${coverage_section}
+          SUMMARY_EOF
+
+          echo "✅ Job summary written to: ${GITHUB_STEP_SUMMARY}"
+
+          # Don't overwrite a prior real result with an all-skipped run.
+          comment_meaningful=false
+          case "$UNIT_TEST_RESULT" in
+              success|failure) comment_meaningful=true ;;
+          esac
+
+          if [ "${EVENT_NAME}" = "pull_request" ] && [ -n "${PR_NUMBER:-}" ]; then
+              post_or_update_comment "${PR_NUMBER}" "${MARKER}" "${GITHUB_STEP_SUMMARY}" "${comment_meaningful}"
+          fi

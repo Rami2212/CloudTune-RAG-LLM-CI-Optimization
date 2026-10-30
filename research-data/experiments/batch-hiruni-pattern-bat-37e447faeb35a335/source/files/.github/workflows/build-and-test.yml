@@ -1,0 +1,85 @@
+name: Build and test
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "**.md"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+
+env:
+  # Stop wasting time caching packages
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  # Disable sending usage data to Microsoft
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+# Kill other jobs when we trigger this workflow by sending new commits
+# to the PR.
+# https://stackoverflow.com/a/72408109
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Setup .NET Core
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.x
+            9.x
+            10.x
+      - name: Restore
+        working-directory: src/
+        run: dotnet restore
+
+      - name: Start containers
+        working-directory: src/.devcontainer
+        run: docker compose up -d --wait mssql postgresql orcl
+      - name: Generated SqlFn matches pg_proc
+        run: dotnet fsi src/SqlHydra.Query/codegen/NpgsqlSqlFn.fsx --check
+      - name: Build
+        working-directory: src/
+        run: dotnet build --no-restore
+      # After Build: the sqlite tomls load a codegen extension from the compiled Tests assembly.
+      - name: Regenerate AdventureWorks schemas
+        working-directory: src/Build
+        run: dotnet run -- Regen
+      - name: Generated code is current
+        run: |
+          if [ -n "$(git status --porcelain -- ':(glob)src/Tests/**/AdventureWorks*.fs')" ]; then
+            git diff -- ':(glob)src/Tests/**/AdventureWorks*.fs'
+            echo "::error::Generated AdventureWorks files are stale. Run 'dotnet run -- Regen' from src/Build (or src/Tests/regen-all.bat) and commit the result."
+            exit 1
+          fi
+      - name: Test net8.0
+        working-directory: src/
+        run: dotnet test --framework net8.0
+
+      - name: Stop and Start containers
+        working-directory: src/.devcontainer
+        run: docker compose down && docker compose up -d --wait mssql postgresql orcl
+      - name: Build
+        working-directory: src/
+        run: dotnet build --no-restore
+      - name: Test net9.0
+        working-directory: src/
+        run: dotnet test --framework net9.0
+
+      - name: Stop and Start containers
+        working-directory: src/.devcontainer
+        run: docker compose down && docker compose up -d --wait mssql postgresql orcl
+      - name: Build
+        working-directory: src/
+        run: dotnet build --no-restore
+      - name: Test net10.0
+        working-directory: src/
+        run: dotnet test --framework net10.0

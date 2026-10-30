@@ -1,0 +1,102 @@
+name: Tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master, github ]
+  pull_request:
+    branches: [ master ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        php-versions: ['8.1', '8.2', '8.3', '8.4', '8.5']
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v7
+
+    - name: Start mysql
+      run: |
+        sudo systemctl start mysql
+
+    - name: Prepare the application
+      run: |
+        DBHOST_FLAG=
+        [ -S /var/run/mysqld/mysqld.sock ] || DBHOST_FLAG="--host=127.0.0.1"
+        sudo lib/createdb.sh -u root -proot $DBHOST_FLAG -c test/options.php --batch
+        sudo lib/createdb.sh -u root -proot $DBHOST_FLAG -c test/cdb-options.php --no-dbuser --no-schema --batch
+
+    - name: Set up PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: ${{ matrix.php-versions }}
+        extensions: mbstring, intl, mysqlnd
+        ini-values: opcache.enable_cli=1
+
+    - name: Install poppler
+      run: |
+        sudo apt-get --fix-broken install
+        sudo apt-get install poppler-utils || ( sudo apt-get update && sudo apt-get install poppler-utils )
+
+    - name: Run tests
+      run: php -d error_reporting=E_ALL test/run.php --all
+
+  build-24:
+    runs-on: ubuntu-24.04
+
+    strategy:
+      matrix:
+        php-versions: ['8.1', '8.5']
+        db_image: ['mariadb:10.11', 'mysql:8.0']
+
+    services:
+      db:
+        image: ${{ matrix.db_image }}
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - '3306:3306'
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -proot --silent"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v7
+
+    - name: Prepare the application
+      run: |
+        DBHOST_FLAG=
+        if [ ! -S /var/run/mysqld/mysqld.sock ]; then
+          echo '$Opt["dbHost"] = "127.0.0.1";' >> test/options.php
+          echo '$Opt["dbHost"] = "127.0.0.1";' >> test/cdb-options.php
+          mv test/options.php test/options.php~
+          sed 's/@localhost/@127.0.0.1/' < test/options.php~ > test/options.php
+          DBHOST_FLAG="--grant-host=%"
+        fi
+        sudo lib/createdb.sh -u root -proot $DBHOST_FLAG -c test/options.php --batch --verbose
+        sudo lib/createdb.sh -u root -proot $DBHOST_FLAG -c test/cdb-options.php --no-dbuser --no-schema --batch --verbose
+
+    - name: Set up PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: ${{ matrix.php-versions }}
+        extensions: mbstring, intl, mysqlnd
+        ini-values: opcache.enable_cli=1
+
+    - name: Install poppler
+      run: |
+        sudo apt-get update --allow-releaseinfo-change
+        sudo apt-get --fix-missing install poppler-utils
+
+    - name: Run tests
+      run: php -d error_reporting=E_ALL test/run.php --all

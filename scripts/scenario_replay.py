@@ -8,13 +8,23 @@ import os
 import statistics
 
 
-PATTERNS = {
+NEW_PATTERNS = {
+    "P-LIT-PRIORITIZE", "P-LIT-SELECT", "P-LIT-BAZEL-PARALLEL",
+    "P-LIT-UNAFFECTED-STEPS", "P-LIT-SMELL-REPAIR", "P-LIT-UNUSED-OUTPUTS",
+    "P-LIT-UNUSED-DEP-SKIP", "P-LIT-BAZEL-INCREMENTAL", "P-LIT-BAZEL-DEPS",
+    "P-LIT-ENV-CACHE",
+}
+PATTERNS = NEW_PATTERNS | {
     "P-LIT-FAIL-SCHEDULE", "P-LIT-IDLE-SCHEDULE", "P-LIT-FAILED-JOB-FIRST",
     "P-LIT-BUILD-PRIORITY", "P-LIT-BUILD-SELECT", "P-LIT-DURATION-PREDICTION",
 }
 
 
 def policy(pattern, optimized=False):
+    if pattern in NEW_PATTERNS:
+        return {"pattern": pattern, "enabled": optimized,
+                "workers": 4 if optimized and pattern == "P-LIT-BAZEL-PARALLEL" else 1,
+                "unknown_inputs": "run_all", "preserve_required_outputs": True}
     values = {
         "P-LIT-FAIL-SCHEDULE": {"pause_after_failures": 2 if optimized else 0,
                                 "notify_on_pause": optimized, "recovery": "explicit_owner_reset"},
@@ -36,6 +46,8 @@ def dataset(pattern, repeat):
     if repeat not in (1, 2, 3):
         raise ValueError("Replay repeat must be 1, 2 or 3")
     scale = repeat
+    if pattern in NEW_PATTERNS:
+        return mechanism_dataset(pattern, scale)
     if pattern == "P-LIT-FAIL-SCHEDULE":
         return [{"id": i, "kind": kind, "outcome": outcome, "duration": 5 * scale}
                 for i, (kind, outcome) in enumerate([
@@ -205,7 +217,198 @@ def predict_duration(data, settings):
             "simulated_work_seconds": sum(r["duration"] for r in data), "direct_speedup_claimed": False}
 
 
+def mechanism_dataset(pattern, scale):
+    """Explicit synthetic controls; no repository discovery or historical claims."""
+    if pattern == "P-LIT-PRIORITIZE":
+        return {"tests": [{"id": "slow", "duration": 30 * scale, "outcome": "success"},
+                          {"id": "regression", "duration": 5 * scale, "outcome": "failure"},
+                          {"id": "healthy", "duration": 10 * scale, "outcome": "success"}],
+                "past_failures": ["regression"]}
+    if pattern == "P-LIT-BAZEL-PARALLEL":
+        return {"tasks": [{"id": "a", "needs": [], "duration": 20 * scale},
+                          {"id": "b", "needs": [], "duration": 30 * scale},
+                          {"id": "test", "needs": ["a", "b"], "duration": 5 * scale},
+                          {"id": "package", "needs": ["test"], "duration": 3 * scale}]}
+    if pattern in {"P-LIT-SELECT", "P-LIT-UNAFFECTED-STEPS", "P-LIT-UNUSED-DEP-SKIP"}:
+        inputs = {"durations": {"a": 10 * scale, "b": 20 * scale},
+                "dependencies": {"a": ["src/a", "shared", "used.dep"], "b": ["src/b", "shared"]},
+                "imports": {"transitive.dep": ["used.dep"]},
+                "always": ["lockfile", "setup"],
+                "events": [{"id": "docs", "changed": ["docs"], "required": [], "failures": []},
+                           {"id": "source", "changed": ["src/a"], "required": ["a"], "failures": ["a"]},
+                           {"id": "mixed", "changed": ["src/a", "src/b"], "required": ["a", "b"], "failures": []},
+                           {"id": "transitive", "changed": ["transitive.dep"], "required": ["a"], "failures": []},
+                           {"id": "unused", "changed": ["unused.dep"], "required": [], "failures": []},
+                           {"id": "lock", "changed": ["lockfile"], "required": ["a", "b"], "failures": ["b"]},
+                           {"id": "setup", "changed": ["setup"], "required": ["a", "b"], "failures": []},
+                           {"id": "unknown", "changed": ["unmapped"], "required": ["a", "b"], "failures": []}]}
+        if pattern == "P-LIT-UNUSED-DEP-SKIP":
+            for event in inputs["events"]:
+                event["required"] = [] if event["id"] == "unused" else ["a", "b"]
+        return inputs
+    if pattern in {"P-LIT-SMELL-REPAIR", "P-LIT-UNUSED-OUTPUTS"}:
+        return {"scale": scale, "cases": ["normal", "required_docs", "side_effect"]}
+    return {"scale": scale,
+            "builds": [{"id": str(i), "source": s, "dependency": d, "environment": e, "toolchain": t}
+                       for i, (s, d, e, t) in enumerate([
+                           ("s1", "d1", "linux", "v1"), ("s1", "d1", "linux", "v1"),
+                           ("s2", "d1", "linux", "v1"), ("s2", "d2", "linux", "v1"),
+                           ("s2", "d2", "windows", "v1"), ("s2", "d2", "windows", "v2"),
+                           ("s2", "d2", "windows", "v2")])]}
+
+
+def mechanism_run(pattern, settings, data):
+    enabled = settings["enabled"]
+    if pattern == "P-LIT-PRIORITIZE":
+        tests = list(data["tests"])
+        if enabled:
+            tests.sort(key=lambda t: t["id"] not in data["past_failures"])
+        clock, feedback, trace = 0, None, []
+        for test in tests:
+            clock += test["duration"]
+            if test["outcome"] == "failure" and feedback is None:
+                feedback = clock
+            trace.append({**test, "end": clock})
+        return {"trace": trace, "first_failure_seconds": feedback, "simulated_work_seconds": clock}
+    if pattern == "P-LIT-BAZEL-PARALLEL":
+        pending, running, done, trace, clock = list(data["tasks"]), [], {}, [], 0
+        while pending or running:
+            ready = [t for t in pending if all(n in done for n in t["needs"])]
+            for task in ready[:settings["workers"] - len(running)]:
+                running.append({**task, "start": clock, "end": clock + task["duration"]})
+                pending.remove(task)
+            if not running:
+                raise ValueError("Invalid build DAG")
+            clock = min(t["end"] for t in running)
+            finished = [t for t in running if t["end"] == clock]
+            for task in finished:
+                done[task["id"]] = task["end"]
+                trace.append(task)
+                running.remove(task)
+        return {"trace": trace, "simulated_elapsed_seconds": clock,
+                "simulated_work_seconds": sum(t["duration"] for t in trace)}
+    if pattern in {"P-LIT-SELECT", "P-LIT-UNAFFECTED-STEPS", "P-LIT-UNUSED-DEP-SKIP"}:
+        trace, work = [], 0
+        known = {"docs", "unused.dep", *data["always"], *data["imports"]}
+        known.update(f for deps in data["dependencies"].values() for f in deps)
+        for event in data["events"]:
+            changed = set(event["changed"])
+            while True:
+                expanded = changed | {f for key in changed for f in data["imports"].get(key, [])}
+                if expanded == changed:
+                    break
+                changed = expanded
+            full = not enabled or bool(changed & set(data["always"])) or not changed <= known
+            if pattern == "P-LIT-UNUSED-DEP-SKIP" and changed != {"unused.dep"}:
+                full = True
+            selected = [t for t, deps in data["dependencies"].items() if full or changed & set(deps)]
+            work += sum(data["durations"][t] for t in selected)
+            # Outcomes are inspected only after selection; required is evaluator-only.
+            trace.append({"id": event["id"], "selected": selected,
+                          "detected_failures": [t for t in selected if t in event["failures"]]})
+        return {"trace": trace, "simulated_work_seconds": work}
+    if pattern in {"P-LIT-SMELL-REPAIR", "P-LIT-UNUSED-OUTPUTS"}:
+        trace, work = [], 0
+        for case in data["cases"]:
+            steps = ["compile", "test"]
+            if pattern == "P-LIT-SMELL-REPAIR":
+                if not enabled or case == "side_effect":
+                    steps.append("second_compile")
+            elif not enabled or case == "required_docs":
+                steps.append("docs")
+            produced = ["binary", "test_result"]
+            if "docs" in steps:
+                produced.append("documentation")
+            effects = 1 + int("second_compile" in steps) if case == "side_effect" else 0
+            trace.append({"id": case, "steps": steps, "outputs": produced, "side_effects": effects})
+            work += len(steps) * 10 * data["scale"]
+        return {"trace": trace, "simulated_work_seconds": work}
+    # Explicit cache state: cold, identical, source, dependency, OS and toolchain controls.
+    cache, trace, work = {}, [], 0
+    for build in data["builds"]:
+        key_fields = (["source", "dependency", "environment", "toolchain"]
+                      if pattern == "P-LIT-BAZEL-INCREMENTAL" else
+                      ["dependency", "environment", "toolchain"])
+        key = tuple(build[k] for k in key_fields)
+        hit = enabled and key in cache
+        fresh_output = [build[k] for k in ("source", "dependency", "environment", "toolchain")]
+        output = cache[key] if hit and pattern == "P-LIT-BAZEL-INCREMENTAL" else fresh_output
+        cache[key] = output
+        # Dependency caching retains compilation; environment reuse retains tests.
+        fetch_cost = 1 if pattern == "P-LIT-BAZEL-DEPS" and build["id"] == "1" else 20
+        cost = ((1 if hit else 40) if pattern == "P-LIT-BAZEL-INCREMENTAL" else
+                ((2 if hit else fetch_cost) + 20)) * data["scale"]
+        work += cost
+        trace.append({"id": build["id"], "hit": hit, "key": list(key),
+                      "compiled": pattern != "P-LIT-BAZEL-INCREMENTAL" or not hit,
+                      "tests_executed": True, "cost_seconds": cost, "output": output})
+    return {"trace": trace, "cache_hits": sum(t["hit"] for t in trace), "simulated_work_seconds": work}
+
+
+def mechanism_validate(pattern, settings, data, result):
+    enabled, trace = settings["enabled"], result.get("trace", [])
+    checks = {"known_policy": settings in (policy(pattern), policy(pattern, True))}
+    if pattern == "P-LIT-PRIORITIZE":
+        checks["same_tests_and_outcomes"] = sorted((t["id"], t["outcome"]) for t in trace) == sorted(
+            (t["id"], t["outcome"]) for t in data["tests"])
+        checks["ordering"] = [t["id"] for t in trace] == (["regression", "slow", "healthy"] if enabled else ["slow", "regression", "healthy"])
+        expected_feedback = data["tests"][1]["duration"] if enabled else sum(t["duration"] for t in data["tests"][:2])
+        checks["feedback"] = result.get("first_failure_seconds") == expected_feedback
+        checks["work_preserved"] = result.get("simulated_work_seconds") == sum(t["duration"] for t in data["tests"])
+    elif pattern == "P-LIT-BAZEL-PARALLEL":
+        by_id = {t["id"]: t for t in trace}
+        checks["all_tasks"] = len(trace) == len(data["tasks"]) and set(by_id) == {t["id"] for t in data["tasks"]}
+        checks["dependencies"] = all(t["id"] in by_id and all(n in by_id and by_id[n]["end"] <= by_id[t["id"]]["start"] for n in t["needs"]) for t in data["tasks"])
+        checks["worker_limit"] = all(sum(t["start"] <= time < t["end"] for t in trace) <= settings["workers"] for time in {t["start"] for t in trace})
+        checks["durations"] = all(t["id"] in by_id and by_id[t["id"]]["end"] - by_id[t["id"]]["start"] == t["duration"] for t in data["tasks"])
+        checks["work_preserved"] = result.get("simulated_work_seconds") == sum(t["duration"] for t in data["tasks"])
+        checks["elapsed"] = result.get("simulated_elapsed_seconds") == max((t["end"] for t in trace), default=0)
+    elif pattern in {"P-LIT-SELECT", "P-LIT-UNAFFECTED-STEPS", "P-LIT-UNUSED-DEP-SKIP"}:
+        checks["events_preserved"] = [t["id"] for t in trace] == [e["id"] for e in data["events"]]
+        expected_work = 0
+        for event, actual in zip(data["events"], trace):
+            expected = event["required"] if enabled else list(data["durations"])
+            checks[event["id"] + "_selection"] = sorted(actual["selected"]) == sorted(expected)
+            checks[event["id"] + "_failures"] = sorted(actual["detected_failures"]) == sorted(event["failures"])
+            expected_work += sum(data["durations"][t] for t in expected)
+        checks["work_accounted"] = result.get("simulated_work_seconds") == expected_work
+    elif pattern in {"P-LIT-SMELL-REPAIR", "P-LIT-UNUSED-OUTPUTS"}:
+        checks["controls_preserved"] = [t["id"] for t in trace] == data["cases"]
+        expected_work = 0
+        for row in trace:
+            extra = "second_compile" if pattern == "P-LIT-SMELL-REPAIR" else "docs"
+            retain = not enabled or row["id"] == ("side_effect" if pattern == "P-LIT-SMELL-REPAIR" else "required_docs")
+            checks[row["id"] + "_steps"] = row["steps"] == ["compile", "test"] + ([extra] if retain else [])
+            expected_work += (3 if retain else 2) * 10 * data["scale"]
+            checks[row["id"] + "_required_outputs"] = {"binary", "test_result"} <= set(row["outputs"])
+            if pattern == "P-LIT-SMELL-REPAIR":
+                checks[row["id"] + "_pure_only"] = ("second_compile" in row["steps"]) == (not enabled or row["id"] == "side_effect")
+                checks[row["id"] + "_side_effects"] = row["side_effects"] == (2 if row["id"] == "side_effect" else 0)
+            else:
+                checks[row["id"] + "_consumers"] = ("documentation" in row["outputs"]) == (not enabled or row["id"] == "required_docs")
+        checks["work_accounted"] = result.get("simulated_work_seconds") == expected_work
+    else:
+        checks["builds_preserved"] = [t["id"] for t in trace] == [b["id"] for b in data["builds"]]
+        expected_hits = {1, 6} if pattern == "P-LIT-BAZEL-INCREMENTAL" else {1, 2, 6}
+        for i, (build, row) in enumerate(zip(data["builds"], trace)):
+            checks[str(i) + "_cache"] = row["hit"] == (enabled and i in expected_hits)
+            checks[str(i) + "_outputs"] = row["output"] == [build[k] for k in ("source", "dependency", "environment", "toolchain")]
+            checks[str(i) + "_tests"] = row["tests_executed"] is True
+            if pattern != "P-LIT-BAZEL-INCREMENTAL":
+                checks[str(i) + "_compilation_preserved"] = row["compiled"] is True
+            else:
+                checks[str(i) + "_compilation"] = row["compiled"] == (not row["hit"])
+        checks["hit_count"] = result.get("cache_hits") == (len(expected_hits) if enabled else 0)
+        checks["work_accounted"] = result.get("simulated_work_seconds") == sum(t["cost_seconds"] for t in trace)
+        if pattern == "P-LIT-BAZEL-DEPS":
+            cheap = next((t for t in trace if t["id"] == "1"), {})
+            checks["cache_overhead_control"] = cheap.get("cost_seconds") == (22 if enabled else 21) * data["scale"]
+    return checks
+
+
 def run(pattern, settings, data):
+    if pattern in NEW_PATTERNS:
+        return mechanism_run(pattern, settings, data)
     engines = {"P-LIT-FAIL-SCHEDULE": schedule_failures, "P-LIT-IDLE-SCHEDULE": schedule_idle,
                "P-LIT-FAILED-JOB-FIRST": order_jobs, "P-LIT-BUILD-PRIORITY": queue_builds,
                "P-LIT-BUILD-SELECT": select_builds, "P-LIT-DURATION-PREDICTION": predict_duration}
@@ -214,6 +417,8 @@ def run(pattern, settings, data):
 
 def validate(pattern, settings, data, result):
     """Check known scenario controls separately from the policy implementation."""
+    if pattern in NEW_PATTERNS:
+        return mechanism_validate(pattern, settings, data, result)
     optimized = settings == policy(pattern, True)
     checks = {"known_policy": optimized or settings == policy(pattern)}
     trace = result.get("trace", [])

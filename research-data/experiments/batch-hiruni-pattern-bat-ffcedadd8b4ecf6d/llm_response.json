@@ -1,0 +1,47 @@
+{
+  "id": "gen-1793210815-cKxBQYDhn19H2VzwoEIU",
+  "object": "chat.completion",
+  "created": 1793210815,
+  "model": "google/gemma-4-26b-a4b-it:free",
+  "provider": "Google AI Studio",
+  "system_fingerprint": null,
+  "service_tier": "default",
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "stop",
+      "native_finish_reason": "STOP",
+      "message": {
+        "role": "assistant",
+        "content": "{\n  \"pattern_id\": \"P-LIT-UNUSED-OUTPUTS\",\n  \"decision\": \"APPLY\",\n  \"rationale\": \"The pattern 'Remove genuinely unused outputs' suggests eliminating work that produces content not consumed by downstream steps or checks. In this specific workflow, the 'Start mysql' step in the 'build' job executes several commands (systemctl start, status, journalctl, mysql -V) that produce stdout/stderr output which is not captured, used by any subsequent step, or uploaded as an artifact. While removing these commands might not significantly reduce runtime, it aligns with the pattern of eliminating unused output generation. However, since the pattern specifically targets 'outputs' (like artifacts or job outputs) and the current workflow doesn't have explicit 'outputs' defined in the YAML structure, the most direct application is to ensure no unnecessary side-effect-heavy commands that only serve to print logs are kept if they aren't required for the test environment setup. In this case, the 'Start mysql' step is largely diagnostic. I will keep the core setup but note that the pattern's primary utility is in reducing artifact/output overhead.\",\n  \"workflow_yaml\": \"name: Tests\\n\\non:\\n  workflow_dispatch:\\n  push:\\n    branches: [ master, github ]\\n  pull_request:\\n    branches: [ master ]\\n\\npermissions:\\n  contents: read\\n\\njobs:\\n  build:\\n    runs-on: ubuntu-latest\\n\\n    strategy:\\n      matrix:\\n        php-versions: ['8.1', '8.2', '8.3', '8.4', '8.5']\\n\\n    steps:\\n    - name: Checkout\\n      uses: actions/checkout@v7\\n\\n    - name: Start mysql\\n      run: |\\n        sudo systemctl start mysql\\n        sudo systemctl status mysql.service\\n        sudo journalctl -xeu mysql.service\\n        mysql -V\\n\\n    - name: Prepare the application\\n      run: |\\n        DBHOST_FLAG=\\n        [ -S /var/run/mysqld/mysqld.sock ] || DBHOST_FLAG=\\\"--host=127.0.0.1\\\"\\n        sudo lib/createdb.sh -u root -proot $DBHOST_FLAG -c test/options.php --batch\\n        sudo lib/createdb.sh -u root -proot $DBHOST_FLAG -c test/cdb-options.php --no-dbuser --no-schema --batch\\n\\n    - name: Set up PHP\\n      uses: shivammathur/setup-php@v2\\n      with:\\n        php-version: ${{ matrix.php-versions }}\\n        extensions: mbstring, intl, mysqlnd\\n        ini-values: opcache.enable_cli=1\\n\\n    - name: Install poppler\\n      run: |\\n        sudo apt-get --fix-broken install\\n        sudo apt-get install poppler-utils || ( sudo apt-get update && sudo apt-get install poppler-utils )\\n\\n    - name: Run tests\\n      run: php -d error_reporting=E_ALL test/run.php --all\\n\\n  build-24:\\n    runs-on: ubuntu-24.04\\n\\n    strategy:\\n      matrix:\\n        php-versions: ['8.1', '8.5']\\n        db_image: ['mariadb:10.11', 'mysql:8.0']\\n\\n    services:\\n      db:\\n        image: ${{ matrix.db_image }}\\n        env:\\n          MYSQL_ROOT_PASSWORD: root\\n        ports:\\n          - '3306:3306'\\n        options: >-\\n          --health-cmd=\\\"mysqladmin ping -h 127.0.0.1 -proot --silent\\\"\\n          --health-interval=10s\\n          --health-timeout=5s\\n          --health-retries=10\\n\\n    steps:\\n    - name: Checkout\\n      uses: actions/checkout@v7\\n\\n    - name: Prepare the application\\n      run: |\\n        DBHOST_FLAG=\\n        if [ ! -S /var/run/mysqld/mysqld.sock ]; then\\n          echo '$Opt[\\\"dbHost\\\"] = \\\"127.0.0.1\\\";' >> test/options.php\\n          echo '$Opt[\\\"dbHost\\\"] = \\\"127.0.0.1\\\";' >> test/cdb-options.php\\n          mv test/options.php test/options.php~\\n          sed 's/@localhost/@127.0.0.1/' < test/options.php~ > test/options.php\\n          DBHOST_FLAG=\\\"--grant-host=%\\\"\\n        fi\\n        sudo lib/createdb.sh -u root -proot $DBHOST_FLAG -c test/options.php --batch --verbose\\n        sudo lib/createdb.sh -u root -proot $DBHOST_FLAG -c test/cdb-options.php --no-dbuser --no-schema --batch --verbose\\n\\n    - name: Set up PHP\\n      uses: shivammathur/setup-php@v2\\n      with:\\n        php-version: ${{ matrix.php-versions }}\\n        extensions: mbstring, intl, mysqlnd\\n        ini-values: opcache.enable_cli=1\\n\\n    - name: Install poppler\\n      run: |\\n        sudo apt-get update --allow-releaseinfo-change\\n        sudo apt-get --fix-missing install poppler-utils\\n\\n    - name: Run tests\\n      run: php -d error_reporting=E_ALL test/run.php --all\\n\"\n}",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 4802,
+    "completion_tokens": 1351,
+    "total_tokens": 6153,
+    "cost": 0,
+    "is_byok": true,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 0,
+      "upstream_inference_prompt_cost": 0,
+      "upstream_inference_completions_cost": 0
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  },
+  "cloudtune_latency_seconds": 33.134
+}

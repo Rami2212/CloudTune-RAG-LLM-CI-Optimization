@@ -1,0 +1,49 @@
+name: BitcoinZ Windows
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows-build:
+    name: Windows
+    runs-on: ubuntu-latest
+
+    env:
+      HOST: x86_64-w64-mingw32
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build depends
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            build-essential automake autoconf libtool pkg-config \
+            mingw-w64 \
+            g++-mingw-w64-x86-64 \
+            binutils-mingw-w64-x86-64 \
+            python3 curl git \
+            p7zip-full
+
+      - name: Build depends
+        run: |
+          cd depends
+          make HOST=${HOST} -j$(nproc)
+          cd ..
+
+      - name: Build BitcoinZ
+        run: |
+          CONFIG_SITE=$PWD/depends/${HOST}/share/config.site
+          ./zcutil/build.sh -j$(nproc)
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bitcoinz-windows
+          path: |
+            src/bitcoinzd.exe
+            src/bitcoinz-cli.exe
+            src/bitcoinz-tx.exe

@@ -1,0 +1,130 @@
+name: linux
+
+on: [pull_request, push]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+      shell: bash -l {0}
+
+
+jobs:
+  pip:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.11', '3.12', '3.13']
+        optdeps: [".", ".[actions]", ".[docs]"]
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: pip
+      run: |
+        pip install ${{ matrix.optdeps }}
+  docs:
+    needs: pip
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+      with:
+        python-version: 3.11
+    - name: Install snakePipes
+      run: |
+        pip install .[docs]
+    - name: docs
+      run: |
+        snakePipes config --tempDir /tmp
+        cd docs
+        make html
+  lint:
+    needs: pip
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+      with:
+        python-version: 3.11
+    - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
+  CI:
+    needs: pip
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      with:
+        persist-credentials: false
+    - uses: conda-incubator/setup-miniconda@fc2d68f6413eb2d87b895e92f8584b5b94a10167 # v3.3.0
+      with:
+        environment-file: .github/conda_ci.yml
+        activate-environment: conda_ci
+        condarc-file: .github/condarc.yml
+    - name: Install snakePipes
+      run: |
+        pip install .
+    - name: print_conda_env_export
+      run: |
+        conda env export
+    - name: print_pip_list
+      run: |
+        pip list
+    - name: CI
+      run: |
+        snakePipes config --tempDir /tmp
+  createEnvs:
+    needs: CI
+    strategy:
+      fail-fast: false
+      matrix:
+        envs: [
+          'CONDA_SHARED_ENV',
+          'CONDA_CREATE_INDEX_ENV',
+          'CONDA_RNASEQ_ENV',
+          'CONDA_RMATS_ENV',
+          'CONDA_scRNASEQ_ENV',
+          'CONDA_seurat_ENV',
+          'CONDA_loompy_ENV',
+          'CONDA_alevinqc_ENV',
+          'CONDA_eisaR_ENV',
+          'CONDA_DNA_MAPPING_ENV',
+          'CONDA_CHIPSEQ_ENV',
+          'CONDA_ATAC_ENV',
+          'CONDA_HIC_ENV',
+          'CONDA_WGBS_ENV',
+          'CONDA_DSS_ENV',
+          'CONDA_RMD_ENV',
+          'CONDA_PREPROCESSING_ENV',
+          'CONDA_NONCODING_RNASEQ_ENV',
+          'CONDA_SAMBAMBA_ENV',
+          'CONDA_pysam_ENV',
+          'CONDA_FQLINT_ENV',
+          'CONDA_SMRNA_ENV',
+          'CONDA_CREATE_TEsmall_ENV',
+          'CONDA_REPQUANT_ENV'
+        ]
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      with:
+        persist-credentials: false
+    - uses: conda-incubator/setup-miniconda@fc2d68f6413eb2d87b895e92f8584b5b94a10167 # v3.3.0
+      with:
+        environment-file: .github/conda_ci.yml
+        activate-environment: conda_ci
+        condarc-file: .github/condarc.yml
+    - name: install snakePipes
+      run: |
+        pip install .
+    - name: createEnvs
+      run: |
+        snakePipes config --tempDir /tmp
+        snakePipes createEnvs --only ${{matrix.envs}}

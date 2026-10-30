@@ -1,0 +1,45 @@
+# Copyright (c) 2022 Sebastian Pipping <sebastian@pipping.org>
+# Licensed under GPL v2 or later
+
+name: Run Python test suite
+
+on:
+- pull_request
+- push
+
+jobs:
+  python_test_suite:
+    name: Run Python test suite
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.15"]  # no particular need for in-between versions
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install build dependencies
+        run: |-
+          set -x
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes -V \
+              grub-common \
+              mtools \
+              ovmf \
+              xorriso
+          python3 -m venv venv/
+          source venv/bin/activate
+          pip3 install -r requirements.txt
+          pip3 check
+          diff -u0 <(pip3 freeze | sed 's,_,-,g' | sort -f) <(sed -e '/^#/d' -e '/^$/d' requirements.txt | sort -f)
+
+      - name: Run Python test suite
+        run: |-
+          set -x
+          source venv/bin/activate
+          coverage run -m pytest -v -s
+          coverage report

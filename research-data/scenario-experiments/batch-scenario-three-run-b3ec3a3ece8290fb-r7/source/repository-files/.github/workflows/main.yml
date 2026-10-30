@@ -1,0 +1,220 @@
+name: Rust
+
+on:
+  push:
+    branches: [main]
+    tags: ["*.*.*"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-15]
+        rust: [stable]
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+
+    - name: Build without std
+      run: cargo build --no-default-features --features=libm
+
+    - name: Build with std
+      run: cargo build
+
+    - name: Build library without tracing
+      run: cargo build -p harfrust
+
+    - name: MSRV Build (Rust 1.85)
+      run: cargo +1.85 build
+
+    - name: Run tests
+      run: cargo test --verbose
+
+    - name: Run tests with icu4x
+      run: cargo test --verbose --features icu
+
+    - name: Build core C API without subsetting
+      run: cargo build -p harfrust_capi --no-default-features --target-dir target/capi-default
+
+    - name: Subset C API smoke test
+      run: |
+        cargo build -p harfrust_capi --features subset
+        cargo test -p harfrust_capi --features subset
+        python3 - <<'PY'
+        import ctypes, sys
+        suffix = "dylib" if sys.platform == "darwin" else "so"
+        core = ctypes.CDLL(f"target/capi-default/debug/libharfrust_c.{suffix}")
+        assert hasattr(core, "hr_shape")
+        assert not hasattr(core, "hr_subset_or_fail")
+        subset = ctypes.CDLL(f"target/debug/libharfrust_c.{suffix}")
+        assert hasattr(subset, "hr_shape") and hasattr(subset, "hr_subset_or_fail")
+        PY
+        cc -std=c99 -pedantic-errors -Werror \
+          -Iharfrust_capi/include \
+          harfrust_capi/examples/subset.c -Ltarget/debug \
+          -lharfrust_c -Wl,-rpath,"$PWD/target/debug" \
+          -o /tmp/hr-subset
+        /tmp/hr-subset harfrust/tests/fonts/rb_custom/PT_Sans-Caption-Web-Regular.ttf
+
+    - name: HarfBuzz C++ ownership helpers
+      run: |
+        for standard in c++11 c++17; do
+          for order in CORE SUBSET_FIRST SUBSET_LAST; do
+            library_directory=target/debug
+            if [ "$order" = CORE ]; then
+              library_directory=target/capi-default/debug
+            fi
+            c++ -std="$standard" -pedantic-errors -Wall -Wextra -Werror \
+              -D"HR_TEST_$order" \
+              -Iharfrust_capi/include \
+              harfrust_capi/tests/cplusplus.cc -L"$library_directory" \
+              -lharfrust_c -Wl,-rpath,"$PWD/$library_directory" \
+              -o /tmp/hr-cplusplus
+            /tmp/hr-cplusplus harfrust/tests/fonts/rb_custom/PT_Sans-Caption-Web-Regular.ttf
+          done
+        done
+
+    - name: Checkout HarfBuzz reference
+      if: runner.os == 'Linux'
+      uses: actions/checkout@v6
+      with:
+        repository: harfbuzz/harfbuzz
+        ref: 811d9a4d3e1b62899843119eda7a78ba1bb97c2c
+        path: .ci/harfbuzz
+        persist-credentials: false
+
+    - name: Compare subset behavior with HarfBuzz
+      if: runner.os == 'Linux'
+      run: |
+        python3 -m venv .ci/venv
+        .ci/venv/bin/pip install fonttools==4.60.1 meson==1.9.1
+        .ci/venv/bin/meson setup .ci/harfbuzz-build .ci/harfbuzz \
+          --auto-features=disabled --buildtype=release \
+          -Dsubset=enabled -Dtests=disabled -Dutilities=disabled -Ddocs=disabled \
+          -Draster=disabled -Dvector=disabled -Dgpu=disabled
+        .ci/venv/bin/meson compile -C .ci/harfbuzz-build
+        for test in compare_skia_hb compare_controls_hb; do
+          .ci/venv/bin/python "harfrust_capi/tests/subset/$test.py" \
+            target/debug/libharfrust_c.so \
+            .ci/harfbuzz-build/src/libharfbuzz.so \
+            .ci/harfbuzz-build/src/libharfbuzz-subset.so
+        done
+
+    - name: Rustfmt
+      run: cargo fmt --all -- --check
+
+    - name: Draw and paint C API
+      run: |
+        cargo build -p harfrust_capi --features draw --target-dir target/capi-draw
+        cargo test -p harfrust_capi --features draw
+        cargo +1.85 check -p harfrust_capi --features draw,paint
+        cargo build -p harfrust_capi --features subset,paint
+        cargo test -p harfrust_capi --features subset,paint
+        python3 - <<'PY'
+        import ctypes, sys
+        suffix = "dylib" if sys.platform == "darwin" else "so"
+        for directory, draw, paint, subset in [
+            ("capi-default", False, False, False),
+            ("capi-draw", True, False, False),
+            (None, True, True, True),
+        ]:
+            base = f"target/{directory}/debug" if directory else "target/debug"
+            lib = ctypes.CDLL(f"{base}/libharfrust_c.{suffix}")
+            assert hasattr(lib, "hr_shape")
+            assert hasattr(lib, "hr_font_draw_glyph_or_fail") == draw
+            assert hasattr(lib, "hr_font_paint_glyph_or_fail") == paint
+            assert hasattr(lib, "hr_subset_or_fail") == subset
+        PY
+        cc -std=c99 -pedantic-errors -Wall -Wextra -Werror \
+          -Iharfrust_capi/include harfrust_capi/examples/rendering.c \
+          -Ltarget/debug -lharfrust_c -Wl,-rpath,"$PWD/target/debug" \
+          -o /tmp/hr-rendering
+        /tmp/hr-rendering harfrust_capi/tests/fonts/Rendering.ttf
+        c++ -x c++ -std=c++11 -pedantic-errors -Wall -Wextra -Werror \
+          -Iharfrust_capi/include harfrust_capi/examples/rendering.c \
+          -Ltarget/debug -lharfrust_c -Wl,-rpath,"$PWD/target/debug" \
+          -o /tmp/hr-rendering-cpp
+        /tmp/hr-rendering-cpp harfrust_capi/tests/fonts/Rendering.ttf
+
+    - name: AAT C++ source compatibility
+      run: |
+        c++ -std=c++11 -pedantic-errors -Wall -Wextra -Werror \
+          -Iharfrust_capi/include -fsyntax-only harfrust_capi/tests/aat_source_compat.cc
+
+    - name: C++ source compatibility
+      run: |
+        for standard in c++11 c++17; do
+          c++ -std="$standard" -pedantic-errors -Wall -Wextra -Werror \
+            -Iharfrust_capi/include -fsyntax-only harfrust_capi/tests/source_compat.cc
+        done
+
+    - name: Clippy
+      run: cargo clippy --all-features --all-targets -- -D warnings
+
+    # hr-shape enables tracing, so the workspace build above always has it.
+    - name: Clippy without tracing
+      run: cargo clippy -p harfrust_capi --all-targets -- -D warnings
+
+  windows-c-api:
+    name: Windows C API optional subset feature
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build default and subset-enabled DLLs
+        shell: pwsh
+        run: |
+          cargo build -p harfrust_capi --no-default-features --target-dir target/capi-default
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build -p harfrust_capi --features subset
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run C and C++ consumers
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          & "$vs/Common7/Tools/Launch-VsDevShell.ps1" -SkipAutomaticLocation -Arch amd64 -HostArch amd64
+          $env:PATH = "$PWD/target/debug;$env:PATH"
+          $includes = @('-Iharfrust_capi/include')
+          $libraries = @('target/debug/harfrust_c.dll.lib')
+          $font = 'harfrust/tests/fonts/rb_custom/PT_Sans-Caption-Web-Regular.ttf'
+          clang -std=c99 -pedantic-errors -Werror @includes harfrust_capi/examples/subset.c @libraries -o target/debug/hr-subset.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & target/debug/hr-subset.exe $font
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # The MSVC standard library requires C++14 or later.
+          foreach ($standard in @('c++14', 'c++17')) {
+            foreach ($order in @('CORE', 'SUBSET_FIRST', 'SUBSET_LAST')) {
+              $directory = if ($order -eq 'CORE') { 'target/capi-default/debug' } else { 'target/debug' }
+              [string[]]$linked = @("$directory/harfrust_c.dll.lib")
+              clang++ "-std=$standard" -pedantic-errors -Wall -Wextra -Werror "-DHR_TEST_$order" @includes harfrust_capi/tests/cplusplus.cc @linked -o "$directory/hr-cplusplus.exe"
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              & "$directory/hr-cplusplus.exe" $font
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+          }
+
+  check-no-std:
+    name: cargo check no std (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: [libm, "libm,tracing"]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85
+          # Use a target without `std` to make sure we don't link to `std`
+          target: thumbv7em-none-eabihf
+
+      - name: cargo build harfrust
+        run: cargo build -p harfrust --target thumbv7em-none-eabihf --no-default-features --features=${{ matrix.features }}
