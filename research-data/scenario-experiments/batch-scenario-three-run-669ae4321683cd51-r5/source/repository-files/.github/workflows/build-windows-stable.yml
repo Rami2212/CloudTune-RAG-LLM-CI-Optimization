@@ -1,0 +1,54 @@
+name: Build stable (Windows)
+
+on: [push, workflow_dispatch]
+
+jobs:
+  build-windows-stable:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+
+      - name: Sync dependencies
+        run: uv sync --dev --extra gui
+
+      - name: Get OutWiker version
+        shell: bash
+        run: |
+          OUTWIKER_VERSION=$(uv run python -c "import outwiker; print(outwiker.__version_str__)")
+          echo "OUTWIKER_VERSION=$OUTWIKER_VERSION" >> $GITHUB_ENV
+
+      - name: Check OutWiker version
+        shell: bash
+        run: |
+          echo "OutWiker version: ${{ env.OUTWIKER_VERSION }}"
+
+      - name: Build OutWiker (Windows)
+        run: |
+          uv run python -m invoke win --is-stable
+
+      - name: Upload all artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: outwiker_windows_all_${{ env.OUTWIKER_VERSION }}
+          path: |
+            build/${{ env.OUTWIKER_VERSION }}/windows/*
+
+      - name: Upload exe only
+        uses: actions/upload-artifact@v7
+        with:
+          name: outwiker_windows_exe_${{ env.OUTWIKER_VERSION }}
+          path: |
+            build/${{ env.OUTWIKER_VERSION }}/windows/outwiker_exe

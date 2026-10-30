@@ -1,0 +1,51 @@
+name: BitcoinZ Linux (aarch64)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  linux-aarch64-build:
+    name: Linux (aarch64)
+    runs-on: ubuntu-latest
+
+    env:
+      HOST: aarch64-linux-gnu
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          
+
+      - name: Install build dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            build-essential pkg-config libc6-dev m4 \
+            g++-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            autoconf libtool libncurses-dev unzip git python3 \
+            zlib1g-dev wget bsdmainutils automake cmake
+
+
+      - name: Build depends
+        run: |
+          cd depends
+          make HOST=${HOST} -j$(nproc)
+          cd ..
+
+
+      - name: Build BitcoinZ
+        run: |
+          CONFIG_SITE=$PWD/depends/${HOST}/share/config.site
+          ./zcutil/build.sh -j$(nproc)
+
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bitcoinz-linux-aarch64
+          path: |
+            src/bitcoinzd
+            src/bitcoinz-cli
+            src/bitcoinz-tx

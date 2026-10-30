@@ -1,0 +1,60 @@
+name: BitcoinZ macOS (ARM64)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  macos-cross-build:
+    name: macOS (ARM64)
+    runs-on: ubuntu-latest
+
+    env:
+      HOST: arm64-apple-darwin
+      SDK_URL: https://github.com/ezzygarmyz/btcz-tools/releases/download/v2.2.0/Xcode-15.0-15A240d-extracted-SDK-with-libcxx-headers.tar.gz
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install depends
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            clang lld llvm g++ zip cmake automake autoconf libtool \
+            pkg-config curl wget python3 git p7zip-full
+
+
+      - name: Xcode SDK
+        run: |
+          mkdir -p depends/SDKs
+          wget -O depends/SDKs/Xcode15-SDK.tar.gz $SDK_URL
+          # Verify checksum
+          echo "c0c2e7bb92c1fee0c4e9f3a485e4530786732d6c6dd9e9f418c282aa6892f55d  depends/SDKs/Xcode15-SDK.tar.gz" | sha256sum -c -
+          # Extract SDK
+          tar -xzf depends/SDKs/Xcode15-SDK.tar.gz -C depends/SDKs
+          export SDK_PATH=$PWD/depends/SDKs
+          echo "SDK_PATH=$SDK_PATH" >> $GITHUB_ENV
+
+
+      - name: Build depends
+        run: |
+          cd depends
+          make HOST=${HOST} -j$(nproc)
+          cd ..
+
+      - name: Build BitcoinZ
+        run: |
+          CONFIG_SITE=$PWD/depends/${HOST}/share/config.site
+          ./zcutil/build.sh -j$(nproc)
+
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bitcoinz-macos-arm64
+          path: |
+            src/bitcoinzd
+            src/bitcoinz-cli
+            src/bitcoinz-tx

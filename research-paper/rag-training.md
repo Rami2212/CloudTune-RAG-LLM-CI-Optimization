@@ -1,6 +1,6 @@
 # RAG knowledge preparation: patterns, evaluation, and results
 
-Snapshot: 29 October 2026. This document describes the scripts and the experiment evidence currently retained locally. Missing or deleted runs are not reconstructed from batch labels. Literature citations and their role in the research are in [citations.md](<C:/Users/LOQ/Downloads/Uni/Research/Repositories/CloudTune-RAG-LLM-CI-Optimization/research-paper/citations.md>).
+Snapshot: 30 October 2026. This document describes the scripts and the experiment evidence currently retained locally. Missing or deleted runs are not reconstructed from batch labels. Literature citations and their role in the research are in [citations.md](<C:/Users/LOQ/Downloads/Uni/Research/Repositories/CloudTune-RAG-LLM-CI-Optimization/research-paper/citations.md>).
 
 ## 1. What we identified and measured
 
@@ -10,14 +10,14 @@ The inspected experiment scripts supply the selected pattern directly to the LLM
 
 | Retained evidence | Case reports | Patterns with reports | Faster | Equal | Slower | No paired timing |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Main repository workflows | 31 | 4 | 6 | 0 | 5 | 20 |
-| Synthetic scenario fixtures/replays | 22 | 8 | 15 | 5 | 2 | 0 |
+| Main repository workflows | 100 | 10 | 10 | 0 | 9 | 81 |
+| Synthetic scenario fixtures/replays | 62 | 13 | 21 | 26 | 13 | 2 |
 
-The main reports contain **105 measured run records**: 72 baseline and 33 optimized. Of these, 93 succeeded, six failed, and six were cancelled. Eleven cases have complete three-versus-three successful comparisons. Six ran faster, across three patterns: dependency caching, custom timeout, and history-derived timeout.
+The 100 main case reports contain **277 run records**: 220 baseline and 57 optimized. There are 184 usable baseline successes and 57 usable optimized successes. Nineteen cases have complete three-versus-three successful comparisons: 10 are faster, 0 equal, and 9 slower by workflow elapsed time. Final outcomes are 64 inconclusive and 36 unsafe; none is yet `safe_success` because independent safety review remains pending.
 
-The scenario reports contain **132 repeat records**, 66 per arm. A scenario repeat can involve several hosted workflow runs. All 22 cases pass their behavior assertions; 15 also have a lower median scenario job runtime. Scenario fixtures hosted under different source-repository labels are not independent optimizations of those projects.
+The 62 scenario reports contain **361 repeat records**, 181 baseline and 180 optimized. Sixty cases pass their behavior assertions and two are inconclusive. Among the 60 complete paired timings, 21 have lower, 26 equal, and 13 higher median scenario job runtime. These synthetic fixture results do not measure speedups on the source repositories.
 
-Across both routes, **21 retained cases have pattern_satisfied=true, spanning 11 patterns**. Ten patterns have at least two retained qualifying cases; BUILD-PRIORITY has one. Main final outcomes remain **23 inconclusive and eight unsafe**, with **zero safe_success** cases. All scenario final outcomes are scenario_passed. The meaning of these labels is explained below.
+Across both routes, **31 reports have `pattern_satisfied=true`, spanning 16 patterns**; 15 patterns have at least two qualifying reports. These automated gates do not replace independent safety or applicability review. The meaning of these labels is explained below.
 
 ## 2. What the scripts do
 
@@ -37,7 +37,7 @@ Implemented in `scripts/run_pattern_batch.py`, `scripts/run_ci_experiment.py`, a
 2. Add `workflow_dispatch` when necessary **before pinning the baseline**. The measured baseline is therefore the prepared workflow, not necessarily byte-identical to the upstream YAML. Freeze the source commit, workflow, repository tree, selected pattern, and relevant context files.
 3. Run up to **three sequential baseline measurements with zero warmups**. Required job names are inferred from observed baseline jobs; they are not an owner-approved branch-protection contract. Stop on the first unexpected failure/cancellation or unusable result.
 4. Send the selected pattern, baseline records, required job names, workflow YAML, and bounded relevant manifest/path context to a specific free OpenRouter model. The prompt requests one concrete **APPLY** change even when expected benefit is uncertain. Save request, response, model/usage, proposal, before/after YAML, diff, and hashes.
-5. Parse YAML and enforce the protected workload structure plus selected-pattern scope checks. Cache and timeout mechanisms have bounded validators. Seven other main mechanisms currently lack dedicated supported change validation. Run `actionlint` when installed; otherwise record that it was unavailable. All 19 retained main proposals record actionlint as not installed, so their automatic checks used YAML parsing and bounded structural validation.
+5. Parse YAML and enforce the protected workload structure plus selected-pattern scope checks. Cache and timeout mechanisms have bounded validators. Seven other main mechanisms currently lack dedicated supported change validation. Run `actionlint` when installed; otherwise record that it was unavailable. All 55 retained main proposals record actionlint as not installed, so their automatic checks used YAML parsing and bounded structural validation.
 6. Create a candidate revision on an isolated experiment branch, preserving non-workflow source, and run up to **three optimized measurements**. Correlate the workflow path/ID, branch, commit SHA, run attempt, and run ID. Retain failures and cancellations. Stop the case on the first unexpected result.
 7. Report medians, timing change, validation findings, satisfaction, overall outcome, and admission status. Trials run in baseline and optimized blocks, rather than randomized/interleaved order. Cache state is explicitly uncontrolled.
 
@@ -66,7 +66,7 @@ Scenario timing compares **median summed job runtime across each repetition's ev
 | `unsafe` | Structural/workload/scope gate rejected the proposal; it can be rejected before optimized execution. | Scope/assertion errors stop the attempt; none of the retained scenario cases has this outcome. |
 | `safe_success` | All review/behavior gates pass and a real change meets the minimum saving, configured as 5% in these cases. No retained case currently qualifies. | Not assigned to synthetic cases. |
 | `scenario_passed` | Not a main outcome. | All six repeat records pass assertions, irrespective of timing direction. |
-| RAG admission | All 31 cases are `pending_review`. | All 22 are `controlled_scenario_only_pending_applicability_review`. |
+| RAG admission | All 100 cases are `pending_review`. | All 62 are `controlled_scenario_only_pending_applicability_review`. |
 
 The main satisfaction expression is a narrower automatic gate than final independent safety approval. It does not itself establish owner-approved required checks or semantic equivalence. The generic pending behavior-review reason mentions caching even on timeout cases; it should not be read as evidence that cache tests were executed.
 
@@ -75,7 +75,7 @@ The main satisfaction expression is a narrower automatic gate than final indepen
 The following sections are calculated from retained `case.json`, `run_records.json`, `proposal.json`, scenario replay traces, and batch CSVs. “Saved cases” excludes preparation failures, quota skips, blocked rows, and missing reports. Main tables use successful/recorded run counts; scenario tables use passing/recorded repeat-suite counts. B/O means baseline/optimized. Missing timings are shown as —.
 
 | # | Pattern | Route | Saved | Faster / equal / slower | Unpaired | Satisfied / target |
-| ---: | --- | --- | ---: | --- | ---: | ---: |
+| ---: | --- | --- | ---: | --- | ---: | --- |
 | 1 | P-LIT-GHA-CACHE | Main | 4 | 2 / 0 / 2 | 0 | 2 / 2 |
 | 2 | P-LIT-FAIL-FAST | Scenario | 2 | 2 / 0 / 0 | 0 | 2 / 2 |
 | 3 | P-LIT-CANCEL-STALE | Scenario | 3 | 2 / 1 / 0 | 0 | 2 / 2 |
@@ -86,21 +86,41 @@ The following sections are calculated from retained `case.json`, `run_records.js
 | 8 | P-LIT-IDLE-SCHEDULE | Scenario | 2 | 2 / 0 / 0 | 0 | 2 / 2 |
 | 9 | P-LIT-FAILED-JOB-FIRST | Scenario | 4 | 2 / 2 / 0 | 0 | 2 / 2 |
 | 10 | P-LIT-HISTORY-TIMEOUT | Main | 10 | 2 / 0 / 2 | 6 | 2 / 2 |
-| 11 | P-LIT-PRIORITIZE | Main | 14 | 0 / 0 / 0 | 14 | 0 / 2 |
+| 11 | P-LIT-PRIORITIZE | Both | 18 | 2 / 1 / 1 | 14 | 2 / 2 |
 | 12 | P-LIT-BUILD-PRIORITY | Scenario | 5 | 1 / 2 / 2 | 0 | 1 / 2 |
-| 13 | P-LIT-SELECT | Main | 0 | 0 / 0 / 0 | 0 | 0 / 2 |
+| 13 | P-LIT-SELECT | Scenario | 9 | 0 / 3 / 6 | 0 | 0 / 2 |
 | 14 | P-LIT-BUILD-SELECT | Scenario | 0 | 0 / 0 / 0 | 0 | 0 / 2 |
-| 15 | P-LIT-BAZEL-PARALLEL | Main | 0 | 0 / 0 / 0 | 0 | 0 / 2 |
-| 16 | P-LIT-BAZEL-INCREMENTAL | Main | 0 | 0 / 0 / 0 | 0 | 0 / 2 |
-| 17 | P-LIT-BAZEL-DEPS | Main | 0 | 0 / 0 / 0 | 0 | 0 / 2 |
-| 18 | P-LIT-ENV-CACHE | Main | 0 | 0 / 0 / 0 | 0 | 0 / 2 |
-| 19 | P-LIT-UNAFFECTED-STEPS | Main | 0 | 0 / 0 / 0 | 0 | 0 / 2 |
-| 20 | P-LIT-SMELL-REPAIR | Main | 0 | 0 / 0 / 0 | 0 | 0 / 2 |
+| 15 | P-LIT-BAZEL-PARALLEL | Scenario | 6 | 0 / 5 / 1 | 0 | 0 / 2 |
+| 16 | P-LIT-BAZEL-INCREMENTAL | Scenario | 0 | 0 / 0 / 0 | 0 | 0 / 2 |
+| 17 | P-LIT-BAZEL-DEPS | Scenario | 8 | 2 / 5 / 1 | 0 | 2 / 2 |
+| 18 | P-LIT-ENV-CACHE | Scenario | 13 | 2 / 7 / 2 | 2 | 2 / 2 |
+| 19 | P-LIT-UNAFFECTED-STEPS | Main | 8 | 0 / 0 / 0 | 8 | 0 / 2 |
+| 20 | P-LIT-SMELL-REPAIR | Main | 21 | 0 / 0 / 0 | 21 | 0 / 2 |
 | 21 | P-LIT-DURATION-PREDICTION | Scenario | 0 | 0 / 0 / 0 | 0 | 0 / 2 |
-| 22 | P-LIT-UNUSED-OUTPUTS | Main | 0 | 0 / 0 / 0 | 0 | 0 / 2 |
-| 23 | P-LIT-DISTRIBUTED-CACHE | Main | 0 | 0 / 0 / 0 | 0 | 0 / 2 |
-| 24 | P-LIT-CONFIG-REUSE | Main | 0 | 0 / 0 / 0 | 0 | 0 / 2 |
-| 25 | P-LIT-UNUSED-DEP-SKIP | Main | 0 | 0 / 0 / 0 | 0 | 0 / 2 |
+| 22 | P-LIT-UNUSED-OUTPUTS | Main | 17 | 0 / 0 / 1 | 16 | 0 / 2 |
+| 23 | P-LIT-DISTRIBUTED-CACHE | Main | 7 | 2 / 0 / 3 | 2 | 2 / 2 |
+| 24 | P-LIT-CONFIG-REUSE | Main | 5 | 2 / 0 / 0 | 3 | 2 / 2 |
+| 25 | P-LIT-UNUSED-DEP-SKIP | Main | 11 | 0 / 0 / 0 | 11 | 0 / 2 |
+
+### 3.1 Additional case reports since the previous snapshot
+
+The refreshed inventory adds 69 main reports (148 baseline and 24 optimized runs) and 40 scenario reports (115 baseline and 114 optimized repeats). These are case reports and attempts, not necessarily distinct repositories. Main additions include 8 complete three-versus-three comparisons (4 faster and 4 slower); the other 61 lack a complete paired timing. Scenario additions include 38 passing complete suites and 2 inconclusive cases; among 38 paired timings, 6 are lower, 21 equal, and 11 higher. Six new scenario cases and four new main cases meet the current automatic `pattern_satisfied` gate, pending their required reviews.
+
+| Pattern | Route | New reports | Outcomes | Faster / equal / slower / no paired timing | Satisfied |
+| --- | --- | ---: | --- | --- | ---: |
+| P-LIT-PRIORITIZE | Scenario | 4 | 4 scenario_passed; 0 inconclusive | 2 / 1 / 1 / 0 | 2 |
+| P-LIT-SELECT | Scenario | 9 | 9 scenario_passed; 0 inconclusive | 0 / 3 / 6 / 0 | 0 |
+| P-LIT-BAZEL-PARALLEL | Scenario | 6 | 6 scenario_passed; 0 inconclusive | 0 / 5 / 1 / 0 | 0 |
+| P-LIT-BAZEL-DEPS | Scenario | 8 | 8 scenario_passed; 0 inconclusive | 2 / 5 / 1 / 0 | 2 |
+| P-LIT-ENV-CACHE | Scenario | 13 | 11 scenario_passed; 2 inconclusive | 2 / 7 / 2 / 2 | 2 |
+| P-LIT-UNAFFECTED-STEPS | Main | 8 | 2 unsafe; 6 inconclusive | 0 / 0 / 0 / 8 | 0 |
+| P-LIT-SMELL-REPAIR | Main | 21 | 10 unsafe; 11 inconclusive | 0 / 0 / 0 / 21 | 0 |
+| P-LIT-UNUSED-OUTPUTS | Main | 17 | 13 unsafe; 4 inconclusive | 0 / 0 / 1 / 16 | 0 |
+| P-LIT-DISTRIBUTED-CACHE | Main | 7 | 0 unsafe; 7 inconclusive | 2 / 0 / 3 / 2 | 2 |
+| P-LIT-CONFIG-REUSE | Main | 5 | 1 unsafe; 4 inconclusive | 2 / 0 / 0 / 3 | 2 |
+| P-LIT-UNUSED-DEP-SKIP | Main | 11 | 2 unsafe; 9 inconclusive | 0 / 0 / 0 / 11 | 0 |
+
+Scenario paired timings are synthetic fixture/replay measurements; they are not original-repository speedup evidence. All new case records remain pending review or applicability review.
 
 ### 1. P-LIT-GHA-CACHE — Cache dependency downloads
 
@@ -677,28 +697,25 @@ The following sections are calculated from retained `case.json`, `run_records.js
 
 ## 4. Batch coverage, incomplete evidence, and models
 
-| Batch | Recorded row statuses |
-| --- | --- |
-| [interactive-three-runs-v1](<C:/Users/LOQ/Downloads/Uni/Research/Repositories/CloudTune-RAG-LLM-CI-Optimization/research-data/batches/interactive-three-runs-v1/batch_results.csv>) | blocked: 85; completed: 8; pattern_satisfied: 30; preparation_failed: 1; running: 1 |
-| [ishara-pattern-batch-v2](<C:/Users/LOQ/Downloads/Uni/Research/Repositories/CloudTune-RAG-LLM-CI-Optimization/research-data/batches/ishara-pattern-batch-v2/batch_results.csv>) | blocked: 75; completed: 4; failed: 20; pattern_satisfied: 3; preparation_failed: 23 |
-| [scenario-three-runs-v1](<C:/Users/LOQ/Downloads/Uni/Research/Repositories/CloudTune-RAG-LLM-CI-Optimization/research-data/batches/scenario-three-runs-v1/batch_results.csv>) | completed: 22; pattern_satisfied: 123; preparation_failed: 55 |
+| Batch | Rows | Recorded statuses |
+| --- | ---: | --- |
+| [hiruni-pattern-batch-v1](<C:/Users/LOQ/Downloads/Uni/Research/Repositories/CloudTune-RAG-LLM-CI-Optimization/research-data/batches/hiruni-pattern-batch-v1/batch_results.csv>) | 125 | blocked: 20; failed: 13; preparation_failed: 92 |
+| [hiruni-pattern-batch-v2](<C:/Users/LOQ/Downloads/Uni/Research/Repositories/CloudTune-RAG-LLM-CI-Optimization/research-data/batches/hiruni-pattern-batch-v2/batch_results.csv>) | 125 | blocked: 20; completed: 8; failed: 40; llm_paused: 3; pending_run: 2; preparation_failed: 52 |
+| [interactive-three-runs-v1](<C:/Users/LOQ/Downloads/Uni/Research/Repositories/CloudTune-RAG-LLM-CI-Optimization/research-data/batches/interactive-three-runs-v1/batch_results.csv>) | 241 | blocked: 105; cleanup_pending: 6; completed: 9; failed: 6; llm_paused: 1; pattern_satisfied: 30; pending_run: 1; preparation_failed: 72; running: 11 |
+| [ishara-pattern-batch-v2](<C:/Users/LOQ/Downloads/Uni/Research/Repositories/CloudTune-RAG-LLM-CI-Optimization/research-data/batches/ishara-pattern-batch-v2/batch_results.csv>) | 125 | blocked: 75; completed: 4; failed: 20; pattern_satisfied: 3; preparation_failed: 23 |
+| [scenario-three-runs-v1](<C:/Users/LOQ/Downloads/Uni/Research/Repositories/CloudTune-RAG-LLM-CI-Optimization/research-data/batches/scenario-three-runs-v1/batch_results.csv>) | 400 | completed: 60; failed: 1; pattern_satisfied: 139; preparation_failed: 198; running: 2 |
 
-The 450 recorded rows are not 450 executed experiments. They include 156 quota skips, 160 main-runner scenario blocks, 79 preparation failures, and one running row. There are 34 completed row summaries, but only 33 corresponding retained completed-case reports; one completed row has a missing report. Twenty additional retained reports belong to attempts marked failed in their batch. No timing is inferred for a blocked/skipped/preparation-failed row.
+Across the five batch CSVs, **1016 rows are recorded**: 81 completed, 172 quota skips, 437 preparation failures, 220 blocked, 80 failed, 13 running, 6 cleanup pending, 4 LLM paused, and 3 pending run. These statuses are not experiment counts. The current case inventory contains 100 main reports and 62 scenario reports; retries, skips, failed rows, and case reports do not map one-to-one.
 
-| Unavailable detailed case | Saved row status | Treatment in this report |
-| --- | --- | --- |
-| interactive-three-runs-v1; row 1; 11ty/webc; batch-interactive-three--a89fcec9afd931cc-r2 | completed | Excluded from measured totals because the referenced case report is absent. |
-| interactive-three-runs-v1; row 2; 24pullrequests/24pullrequests; batch-interactive-three--f695fe956e67995f | running | Excluded from measured totals because the referenced case report is absent. |
+Preparation-failure rows often retain only a generic failure summary, so a specific cause cannot be inferred unless the saved terminal/API log records it. Preparation failure is not evidence that an optimization was ineffective.
 
-Preparation summaries retain the generic reason “Automatic fork preparation failed; see the terminal output above.” A specific network/API/configuration cause cannot be established from that text alone. Preparation failure is not evidence that the optimization is ineffective.
-
-Saved main LLM responses identify seven nvidia/nemotron-3-ultra-550b-a55b:free cases and 12 google/gemma-4-26b-a4b-it:free cases. Twelve other main reports have no saved successful LLM response. All 22 scenario case model fields name nvidia/nemotron-3-ultra-550b-a55b:free. The default model currently in the code/README can differ from these recorded historical choices. Use the case model, prompt, and usage fields when comparing outcomes; sharing a batch ID does not make this a single-model experiment.
+The main case model fields record 48 `google/gemma-4-26b-a4b-it:free`, 7 `nvidia/nemotron-3-ultra-550b-a55b:free`, and 45 with no model recorded. All 62 scenario case fields record `nvidia/nemotron-3-ultra-550b-a55b:free`. All 55 retained main `proposal.json` files state that actionlint was not installed. Use each case's model, prompt, and usage fields when comparing outcomes; sharing a batch ID does not make it a single-model experiment.
 
 ## 5. What is stored for RAG and what remains to be admitted
 
 The builder is [build_rag_dataset.py](<C:/Users/LOQ/Downloads/Uni/Research/Repositories/CloudTune-RAG-LLM-CI-Optimization/scripts/build_rag_dataset.py>). It creates a literature-pattern document for each registry pattern and an experiment-example document for each retained recognized case, linking examples back to their pattern. Its output includes available before/after content, diffs, run records, replay policies/traces, model/outcome/metrics, and artifact hashes. Default outputs are research-data/rag/rag_dataset.jsonl, rag_dataset.json, and rag_dataset_manifest.json.
 
-No generated research-data/rag corpus files are present in this snapshot. The current source inventory could supply 25 pattern documents plus 53 experiment-example documents when rebuilt. With the saved draft/admission flags, zero records would currently be automatically retrieval-eligible. Patterns require review, main cases are pending_review, and scenarios require applicability review. Building a JSON corpus does not approve its documents, embed them in an index, or train an LLM.
+No generated research-data/rag corpus files are present in this snapshot. The current builder would include 25 pattern documents plus 162 experiment-example documents (100 main and 62 scenario). With the saved draft/admission flags, zero records are automatically retrieval-eligible. Patterns require review, main cases are pending_review, and scenarios require applicability review. Building a JSON corpus does not approve its documents, embed them in an index, or train an LLM.
 
 | Information to retain | Existing evidence/artifact | Why it matters |
 | --- | --- | --- |
@@ -728,8 +745,8 @@ The present scripts use the selected registry pattern directly. These reports do
 
 ## 7. Evidence sources and reproducibility
 
-The counts and tables were derived directly from [the pattern registry](<C:/Users/LOQ/Downloads/Uni/Research/Repositories/CloudTune-RAG-LLM-CI-Optimization/knowledge/extracted_patterns.jsonl>), [the paper registry](<C:/Users/LOQ/Downloads/Uni/Research/Repositories/CloudTune-RAG-LLM-CI-Optimization/knowledge/papers.jsonl>), the three batch CSV files linked above, and 53 retained case JSON files. Detailed interpretations also use linked run records, proposal errors/diffs, and replay traces. The existing derived analysis/per_repo_results.csv was not used as the authority because summaries can become stale.
+The counts and tables were derived from the two registries, all 5 available batch CSV files, and all 162 retained `case.json` files. Detailed interpretations also use saved run records, proposal errors/diffs, and replay traces. The derived `analysis/per_repo_results.csv` was not used as authority because summaries can become stale.
 
 Script behavior was read from [run_pattern_batch.py](<C:/Users/LOQ/Downloads/Uni/Research/Repositories/CloudTune-RAG-LLM-CI-Optimization/scripts/run_pattern_batch.py>), [run_ci_experiment.py](<C:/Users/LOQ/Downloads/Uni/Research/Repositories/CloudTune-RAG-LLM-CI-Optimization/scripts/run_ci_experiment.py>), [openrouter_optimizer.py](<C:/Users/LOQ/Downloads/Uni/Research/Repositories/CloudTune-RAG-LLM-CI-Optimization/scripts/openrouter_optimizer.py>), [run_scenario_batch.py](<C:/Users/LOQ/Downloads/Uni/Research/Repositories/CloudTune-RAG-LLM-CI-Optimization/scripts/run_scenario_batch.py>), [scenario_experiments.py](<C:/Users/LOQ/Downloads/Uni/Research/Repositories/CloudTune-RAG-LLM-CI-Optimization/scripts/scenario_experiments.py>), [scenario_replay.py](<C:/Users/LOQ/Downloads/Uni/Research/Repositories/CloudTune-RAG-LLM-CI-Optimization/scripts/scenario_replay.py>), [build_rag_dataset.py](<C:/Users/LOQ/Downloads/Uni/Research/Repositories/CloudTune-RAG-LLM-CI-Optimization/scripts/build_rag_dataset.py>). This document records the implementation and results; no new GitHub runs, LLM requests, or corpus build were executed to create it.
 
-Snapshot SHA-256 over sorted input paths and bytes (two registries, three batch CSVs, 53 case JSON files): 68e1ec71060346d7d27b5c22bb0f08f7cdeba0cad9194c721be24ce5ae165d8b.
+Snapshot SHA-256 over sorted relative paths and bytes (NUL-delimited; two registries, 5 batch CSV files, 162 case JSON files): 799081fc91d953dd7cd1116f0c24f3baa13c867a677cefd96137f9461e221f4f.

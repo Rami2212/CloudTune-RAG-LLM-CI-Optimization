@@ -1,0 +1,56 @@
+name: Continuous Integration
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron:  '0 0 * * 1'
+
+jobs:
+  formatting:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v2
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: 3.14
+      - name: Setup
+        run: ./ci/setup.sh
+      - name: Check formatting
+        run: ./ci/format.sh
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v2
+      - name: Set up Python ${{matrix.python-version}}
+        uses: actions/setup-python@v2
+        with:
+          python-version: ${{matrix.python-version}}
+      - name: Setup
+        run: ./ci/setup.sh
+      - name: Create local settings
+        run: cat cppquiz/local_settings_example.py | sed 's_/path/to/your/code/cppquiz_'"$PWD"'_'> cppquiz/local_settings.py
+      - name: Test
+        run: pytest --verbose
+  required-checks:
+    name: Required checks
+    if: ${{ always() }}
+    runs-on: ubuntu-22.04
+    needs:
+      - test
+      - formatting
+    steps:
+      - run: |
+          if [[ "${{ needs.test.result }}" != "success" ]]; then
+            exit 1
+          fi
+          if [[ "${{ needs.formatting.result }}" != "success" ]]; then
+            exit 1
+          fi
+          exit 0
