@@ -1,0 +1,90 @@
+name: CI
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+    - main
+  push:
+    branches:
+    - main
+jobs:
+  derive-minimum:
+    name: Derive minimum Node version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.calc.outputs.version }}
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Derive lowest Node that matches package.json
+      id: calc
+      run: |
+        npm install --no-save semver
+        MIN=$(node - <<'JS'
+          'use strict';
+          const semver = require('semver');
+          const range  = require('./package.json').engines.node;
+          const v = semver.minVersion(range);
+          if (!v) { throw new Error(`Cannot resolve minimum for "${range}"`); }
+          console.log(v.version);
+        JS
+        )
+        echo "version=$MIN" >>"$GITHUB_OUTPUT"
+
+  test:
+    needs: derive-minimum
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node_version:
+          - ${{ needs.derive-minimum.outputs.version }}
+          - 'latest'
+    name: Test on Node ${{ matrix.node_version }}
+    steps:
+    - uses: actions/checkout@v7
+
+    - uses: actions/setup-node@v7
+      with:
+        node-version: ${{ matrix.node_version }}
+        cache: 'npm'
+
+    - run: npm ci
+
+    - run: npm run lint
+
+    - run: npm test
+
+    # CI would take too long if we did the download every time too. So, we cache it. This does mean we're vulnerable to
+    # source changes exposing problems in our code, but those are pretty infrequent. If they occur, we need to bump the
+    # cache key.
+    - uses: actions/cache@v6
+      with:
+        key: worm-scraper-cache-2026-05-12
+        path: ./cache
+
+    - run: node ./lib/worm-scraper.js --book=ward
+
+    - run: node ./lib/worm-scraper.js --book=worm
+
+    - run: node ./lib/worm-scraper.js --book=glow-worm
+
+    - uses: actions/setup-java@v5
+      with:
+        distribution: zulu
+        java-version: 25
+        java-package: jre
+
+    - name: Get EPUBCheck
+      run: |
+        curl https://github.com/w3c/epubcheck/releases/download/v5.3.0/epubcheck-5.3.0.zip --location --output epubcheck.zip
+        unzip epubcheck.zip
+
+    - name: Check Worm.epub
+      run: java -jar epubcheck-5.3.0/epubcheck.jar --failonwarnings Worm.epub
+
+    - name: Check Glow-worm.epub
+      run: java -jar epubcheck-5.3.0/epubcheck.jar --failonwarnings Glow-worm.epub
+
+    - name: Check Ward.epub
+      run: java -jar epubcheck-5.3.0/epubcheck.jar --failonwarnings Ward.epub

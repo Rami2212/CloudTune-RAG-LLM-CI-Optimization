@@ -1,0 +1,183 @@
+name: Build & Ship
+on:
+  workflow_dispatch:
+  pull_request:
+  merge_group:
+jobs:
+  compose-ui-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          java-version: 17
+          distribution: 'adopt'
+          cache: 'gradle'
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Set up Emulator, Build and Run Tests
+        uses: ReactiveCircus/android-emulator-runner@v2.37.0
+        with:
+          api-level: 29
+          script: |
+            adb devices
+            ./gradlew assembleDebug
+            ./gradlew connectedCheck -PtestBuildType=debug --info
+
+      - name: Retry Tests if Failed
+        uses: nick-fields/retry@v4
+        if: failure()
+        with:
+          timeout_minutes: 15
+          max_attempts: 2
+          command: |
+            adb devices
+            ./gradlew connectedCheck -PtestBuildType=debug --info
+
+      - name: Upload Compose UI Test Results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: compose-ui-test-results
+          path: '**/build/reports/androidTests/'
+
+  unit-tests-and-detekt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          java-version: 17
+          distribution: 'adopt'
+          cache: 'gradle'
+
+      - name: Run Detekt
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 15
+          max_attempts: 2
+          command: ./gradlew detekt
+
+      - name: Run Unit Tests
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 15
+          max_attempts: 2
+          command: ./gradlew test --stacktrace
+
+      - name: Upload Unit Test Results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: unit-test-results
+          path: '**/build/reports/tests/'
+
+      - name: Upload Detekt Results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: detekt-results
+          path: '**/build/reports/detekt/'
+
+  iOS-build:
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'zulu'
+          java-version: 17
+
+      - name: Build macOS shared code
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 20
+          max_attempts: 2
+          command: ./gradlew :shared:compileKotlinIosSimulatorArm64
+
+      - name: iOS set up
+        uses: ./.github/actions/ios-action
+
+      - name: Build iOS app
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 25
+          max_attempts: 2
+          command: xcodebuild build -workspace iosApp/iosApp.xcworkspace -configuration Debug -scheme iosApp -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 16' CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO
+
+  desktop-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'zulu'
+          java-version: 17
+
+      - name: Build desktop app
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 20
+          max_attempts: 2
+          command: ./gradlew :desktop:packageDistributionForCurrentOS
+
+  web-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'zulu'
+          java-version: 17
+
+      - name: Build web app
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 20
+          max_attempts: 2
+          command: ./gradlew :webApp:jsBrowserDevelopmentExecutableDistribution
+
+  wasm-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'zulu'
+          java-version: 17
+
+      - name: Build wasm app
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 20
+          max_attempts: 2
+          command: ./gradlew :wasmApp:wasmBrowserDevelopmentExecutableDistribution

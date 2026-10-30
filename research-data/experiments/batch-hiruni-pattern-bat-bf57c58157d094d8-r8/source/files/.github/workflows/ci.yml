@@ -1,0 +1,58 @@
+## INSTALL, BUILD and LINT a local clone of the repository, with the recommended dependencies.
+## Will run on every push to master, every PR to master, and once a day at 2:20 UTC.
+## Also allow manual triggering.
+name: CI Pipeline
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  schedule:
+    - cron: '20 2 * * *'
+      # every day at 2:20 UTC
+  workflow_dispatch: # Allow manual triggering
+
+jobs:
+  ci:
+    name: (master) CI Pipeline - install, build & lint
+    runs-on: ubuntu-latest
+    permissions: 
+      contents: read
+      security-events: write
+      actions: read
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Fish Shell
+        uses: fish-actions/install-fish@v1.2.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          # node-version: 22.14.0
+          node-version-file: .nvmrc
+
+      - name: Install Yarn
+        shell: fish {0}
+        run: npm install -g yarn@1.22.22
+
+      - name: Install Dependencies
+        shell: fish {0}
+        run: yarn install
+
+      - name: Build Development
+        shell: fish {0}
+        run: yarn build
+
+      - name: Check Binary
+        shell: fish {0}
+        run: fish-lsp --help
+
+      - name: Run Lint
+        shell: fish {0}
+        run: yarn lint:fix

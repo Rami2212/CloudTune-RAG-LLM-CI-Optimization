@@ -1,0 +1,97 @@
+name: Update spec on merge
+
+# Triggers the workflow on push to spec version branches.
+# test-branch can be used to test this workflow.
+on: 
+  push:
+    branches:
+      - standard-v6
+      - standard-v7
+      - draft-v8
+      - draft-v9
+      - draft-v11
+      - draft-v11
+      - draft-v12
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'The reason for running the workflow'
+        required: true
+        default: 'Manual run'
+
+jobs:
+  create-pull-request-for-sections-and-grammar:
+    runs-on: windows-2022
+    permissions:
+      statuses: write
+      contents: write
+      pull-requests: write    
+    env:
+      DOTNET_NOLOGO: true
+
+    steps:
+    - name: Check out our repo
+      uses: actions/checkout@v7.0.1
+
+    - name: Setup .NET 10.0
+      uses: actions/setup-dotnet@v6
+      with:
+        dotnet-version: 10.0.x
+
+    - name: Set up JDK 15
+      uses: actions/setup-java@v6
+      with:
+        java-version: 15.0
+        distribution: zulu
+
+    - name: Smarten quotes
+      id: smarten-quote
+      run: | 
+        cd tools
+        ./run-smarten.sh
+      shell: bash
+
+    - name: Renumber sections
+      id: renumber-sections
+      env:
+        DIAGNOSTICS_REPORT_PATH: ${{ runner.temp }}/reports/renumber-sections.json
+      run: |
+        cd tools
+        ./run-section-renumber.sh
+      shell: bash
+
+    - name: Create pull request
+      uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1
+      if: ${{ steps.renumber-sections.outputs.status }} == 'success' && ${{ steps.update-grammar.outputs.status }} == 'success'
+      with:
+        title: "Automated Section renumber and grammar extraction"
+        body: "renumber sections. Add grammar"
+        branch: renumber-sections-and-grammar-${{ github.ref_name }}
+
+    - name: Run converter
+      id: run-converter
+      env:
+        DIAGNOSTICS_REPORT_PATH: ${{ runner.temp }}/reports/word-converter.json
+      run: |
+        cd tools
+        ./run-converter.sh
+      shell: bash
+
+    - name: Upload Word artifact
+      uses: actions/upload-artifact@v7
+      if: > 
+        ${{ steps.renumber-sections.outputs.status }} == 'success' && 
+        ${{ steps.update-grammar.outputs.status }} == 'success' && 
+        ${{ steps.run-converter.outputs.status }} == 'success'
+      with:
+        name: standard.docx
+        path: ./tools/tmp/standard.docx
+        retention-days: 15
+
+    - name: Upload diagnostics
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: spec-update-diagnostics
+        path: ${{ runner.temp }}/reports/
+        if-no-files-found: warn

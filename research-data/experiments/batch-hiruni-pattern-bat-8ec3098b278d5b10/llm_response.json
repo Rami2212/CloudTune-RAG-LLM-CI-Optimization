@@ -1,0 +1,47 @@
+{
+  "id": "gen-1793211547-RJuTjlhjkvc97kkg8nXf",
+  "object": "chat.completion",
+  "created": 1793211547,
+  "model": "google/gemma-4-26b-a4b-it:free",
+  "provider": "Google AI Studio",
+  "system_fingerprint": null,
+  "service_tier": "default",
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "stop",
+      "native_finish_reason": "STOP",
+      "message": {
+        "role": "assistant",
+        "content": "{\n  \"pattern_id\": \"P-LIT-UNUSED-OUTPUTS\",\n  \"decision\": \"APPLY\",\n  \"rationale\": \"In the 'build' job, the 'Upload photon jar artifact' step uploads a jar file only when 'matrix.java == 21'. However, the 'import' and 'backwards-compatibility' jobs both perform their own compilation/assembly steps and do not consume the artifact from the 'build' job. The 'build' job's artifact upload appears to be an unused output within the context of this specific workflow's dependency graph, as no subsequent job uses 'actions/download-artifact' to retrieve it. Removing this step reduces unnecessary upload time and storage usage.\",\n  \"workflow_yaml\": \"name: CI\\n\\non:\\n  workflow_dispatch:\\n  push:\\n  pull_request:\\n\\njobs:\\n  build:\\n\\n    name: Compile project and run tests (Java ${{ matrix.java }})\\n    runs-on: ubuntu-latest\\n    strategy:\\n      matrix:\\n        java:\\n          - 21\\n          - 25\\n\\n    steps:\\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\\n\\n      - name: Setup Java ${{ matrix.java }}\\n        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # 5.2.0\\n        with:\\n          distribution: 'temurin'\\n          java-version: ${{ matrix.java }}\\n          cache: 'gradle'\\n\\n      - name: Compile project, run tests\\n        run: ./gradlew build --no-daemon\\n\\n      - name: Rename jar with version and git SHA\\n        if: matrix.java == 21\\n        run: |\\n          VERSION=$(./gradlew -q properties --property version | grep '^version:' | awk '{print $2}')\\n          SHA=$(git rev-parse --short HEAD)\\n          mv target/photon-*.jar target/photon-$VERSION-$SHA.jar\\n\\n  import:\\n    name: Import OSM data from Nominatim into Photon\\n    runs-on: ubuntu-24.04\\n\\n    steps:\\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\\n\\n      - name: Setup Java 21\\n        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # 5.2.0\\n        with:\\n          distribution: 'temurin'\\n          java-version: 21\\n          cache: 'gradle'\\n\\n      - name: Compile project\\n        run: ./gradlew assemble --no-daemon\\n\\n      - name: Get Photon version\\n        run: echo \\\"PHOTON_VERSION=$(./gradlew -q properties --property version | grep '^version:' | awk '{print $2}')\\\" >> \\\"$GITHUB_ENV\\\"\\n\\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\\n        with:\\n          repository: osm-search/Nominatim\\n          path: Nominatim\\n\\n      - name: Get Date\\n        run: echo \\\"cache_key=$(/bin/date -u \\\"+%Y%W\\\")\\\" >> \\\"$GITHUB_ENV\\\"\\n        shell: bash\\n\\n      - uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # 5.0.3\\n        with:\\n            path: |\\n               Nominatim/data/country_osm_grid.sql.gz\\n               monaco-latest.osm.pbf\\n            key: nominatim-test-data-${{ env.cache_key }}\\n\\n      - name: Install prerequisites\\n        run: |\\n          sudo apt-get update -qq\\n          sudo apt-get install -y -qq osm2pgsql postgresql-postgis virtualenv pkg-config libicu-dev\\n        shell: bash\\n\\n      - name: Setup database\\n        run: |\\n            echo 'fsync = off' | sudo tee /etc/postgresql/16/main/conf.d/local.conf\\n            echo 'synchronous_commit = off' | sudo tee -a /etc/postgresql/16/main/conf.d/local.conf\\n            echo 'full_page_writes = off' | sudo tee -a /etc/postgresql/16/main/conf.d/local.conf\\n            echo 'shared_buffers = 512MB' | sudo tee -a /etc/postgresql/16/main/conf.d/local.conf\\n            sudo systemctl start postgresql\\n            sudo -u postgres createuser -S www-data\\n            sudo -u postgres createuser -s runner\\n            psql -d postgres -c \\\"ALTER USER runner PASSWORD 'foobar'\\\"\\n            psql --version\\n            psql -d postgres -c \\\"SELECT version()\\\"\\n        shell: bash\\n\\n      - name: Download dependencies\\n        run: |\\n            if [ ! -f Nominatim/data/country_osm_grid.sql.gz ]; then\\n                wget --no-verbose -O Nominatim/data/country_osm_grid.sql.gz https://www.nominatim.org/data/country_grid.sql.gz\\n            fi\\n        shell: bash\\n\\n      - name: Build Nominatim\\n        run: |\\n            virtualenv ~/venv\\n            ~/venv/bin/pip install packaging/nominatim-db\\n        shell: bash\\n        working-directory: Nominatim\\n\\n      - name: Prepare import environment\\n        run: |\\n            if [ ! -f monaco-latest.osm.pbf ]; then\\n                wget --no-verbose https://download.geofabrik.de/europe/monaco-latest.osm.pbf\\n            fi\\n            mkdir data-env\\n        shell: bash\\n\\n      - name: Import Nominatim\\n        run: |\\n          ~/venv/bin/nominatim import --osm-file ../monaco-latest.osm.pbf --reverse-only\\n          ~/venv/bin/nominatim admin --check-database\\n        shell: bash\\n        working-directory: data-env\\n\\n      - name: Import Photon\\n        run: |\\n          java -jar \\\"target/photon-$PHOTON_VERSION.jar\\\" import -database nominatim -user runner -password foobar\\n          java -jar \\\"target/photon-$PHOTON_VERSION.jar\\\" update-init -import-user runner -database nominatim -user runner -password foobar\\n\\n      - name: Update Nominatim\\n        run: |\\n          ~/venv/bin/pip install osmium\\n          ~/venv/bin/nominatim replication --init\\n          ~/venv/bin/nominatim replication --once\\n        shell: bash\\n        working-directory: data-env\\n        env:\\n          NOMINATIM_REPLICATION_MAX_DIFF: 10\\n\\n      - name: Update Photon\\n        run: java -jar \\\"target/photon-$PHOTON_VERSION.jar\\\" update -database nominatim -user runner -password foobar\\n\\n\\n  backwards-compatibility:\\n    name: Check backwards compatibility against Photon 1.0.1\\n    runs-on: ubuntu-24.04\\n\\n    steps:\\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\\n\\n      - name: Setup Java 21\\n        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # 5.2.0\\n        with:\\n          distribution: 'temurin'\\n          java-version: 21\\n          cache: 'gradle'\\n\\n      - name: Install prerequisites\\n        run: |\\n          sudo apt-get update -qq\\n          sudo apt-get install -y -qq expect\\n        shell: bash\\n\\n      - name: Compile Photon with older OpenSearch version\\n        run: ./gradlew assemble -PosVersion=3.5.0.0\\n\\n      - uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # 5.0.3\\n        with:\\n            path: |\\n               andorra.jsonl.zst\\n               photon-1.0.1.jar\\n            key: old-photon-download\\n\\n      - name: Download json dump and baseline Photon\\n        run: |\\n            if [ ! -f andorra.jsonl.zst ]; then\\n              wget --no-verbose -O andorra.jsonl.zst https://download1.graphhopper.com/public/europe/andorra/photon-dump-andorra-1.0-latest.jsonl.zst\\n            fi\\n            if [ ! -f photon-1.0.1.jar ]; then\\n              wget --no-verbose -O photon-1.0.1.jar https://github.com/komoot/photon/releases/download/1.0.1/photon-1.0.1.jar\\n            fi\\n        shell: bash\\n\\n      - name: Get Photon version\\n        run: echo \\\"PHOTON_VERSION=$(./gradlew -q properties --property version | grep '^version:' | awk '{print $2}')\\\" >> \\\"$GITHUB_ENV\\\"\\n\\n      - name: Import json dump\\n        run: zstdcat andorra.jsonl.zst | java -jar \\\"target/photon-$PHOTON_VERSION.jar\\\" import -import-file -\\n        shell: bash\\n\\n      - name: Run serve with baseline version\\n        run: expect -c \\\"spawn java -jar photon-1.0.1.jar serve; expect \\\\\\\"You are running Javalin\\\\\\\" { close } eof {exit 2} timeout {exit 2}\\\"\\n        shell: bash\\n\\n      - name: Compile Photon with current OpenSearch version\\n        run: ./gradlew assemble\\n\\n      - name: Run serve with master version\\n        run: expect -c \\\"spawn java -jar target/photon-$PHOTON_VERSION.jar serve; expect \\\\\\\"You are running Javalin\\\\\\\" { close } eof {exit 2} timeout {exit 2}\\\"\\n        shell: bash\\n\"\n}",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 7275,
+    "completion_tokens": 2635,
+    "total_tokens": 9910,
+    "cost": 0,
+    "is_byok": true,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 0,
+      "upstream_inference_prompt_cost": 0,
+      "upstream_inference_completions_cost": 0
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  },
+  "cloudtune_latency_seconds": 58.922
+}
