@@ -1,0 +1,52 @@
+name: Elixir CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  build_and_test:
+
+    name: Build and test
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+
+    - name: Build the Docker image
+      run: docker build . --file Dockerfile --tag waffle
+
+    - name: Compile without optional dependencies
+      run: docker run --env MIX_ENV=prod --env MIX_BUILD_PATH=/tmp/waffle-no-optional waffle mix compile --no-optional-deps --warnings-as-errors
+
+    - name: Run linters
+      run: docker run waffle mix credo --strict
+
+    - name: Select tests based on changes
+      id: test_selection
+      run: |
+        # Determine the base commit to compare against
+        if [ "${{ github.event_name }}" == "pull_request" ]; then
+          BASE_SHA="origin/${{ github.base_ref }}"
+        else
+          BASE_SHA="HEAD~1"
+        fi
+        
+        # Find changed .ex or .exs files
+        CHANGED_FILES=$(git diff --name-only $BASE_SHA HEAD | grep -E '\.(ex|exs)$' | tr '\n' ' ' || true)
+        echo "changed_files=$CHANGED_FILES" >> $GITHUB_OUTPUT
+
+    - name: Run tests
+      run: |
+        if [ -n "${{ steps.test_selection.outputs.changed_files }}" ]; then
+          echo "Running selected tests: ${{ steps.test_selection.outputs.changed_files }}"
+          docker run waffle mix test ${{ steps.test_selection.outputs.changed_files }}
+        else
+          echo "No specific files changed, running full test suite"
+          docker run waffle mix test
+        fi

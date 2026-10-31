@@ -1,0 +1,40 @@
+--- a/.github/workflows/python_unitests.yml
++++ b/.github/workflows/python_unitests.yml
+@@ -1,4 +1,4 @@
+-'on':
++on:
+   push: null
+   pull_request: null
+   workflow_dispatch: null
+@@ -12,13 +12,31 @@
+ 
+     steps:
+     - uses: actions/checkout@v3
++      with:
++        fetch-depth: 0
+     - name: 🐍 - Set up Python ${{ matrix.python-version }}
+       uses: actions/setup-python@v4
+       with:
+         python-version: ${{ matrix.python-version }}
++    - name: Cache dependencies
++      uses: actions/cache@v4
++      with:
++        path: ~/.cache/pip
++        key: ${{ runner.os }}-pip-${{ hashFiles('requirements-test.txt') }}
++        restore-keys: |
++          ${{ runner.os }}-pip-
+     - name: Install Dependencies
+       run: |
+         pip install -U -r requirements-test.txt
++    - name: Selected Tests (Change Dependencies)
++      run: |
++        CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD | grep '\.py$' || true)
++        if [ -n "$CHANGED_FILES" ]; then
++          echo "Running selected tests for: $CHANGED_FILES"
++          PYTHONPATH="$PYTHONPATH:bin" pytest $CHANGED_FILES
++        else
++          echo "No python files changed, skipping selection step."
++        fi
+     - name: Testing
+       run: |
+         PYTHONPATH="$PYTHONPATH:bin" pytest
