@@ -1,0 +1,40 @@
+# Swanky GitHub CI
+
+name: Swanky
+on:
+  push:
+    branches: [dev]
+
+jobs:
+  build-docs:
+    name: "Build Swanky documentation"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build documentation
+        run: cargo doc --no-deps
+
+      - name: Copy default start page
+        run: cp etc/rustdoc-index.html target/doc/index.html
+
+      - name: Upload HTML artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: target/doc/
+
+  deploy-docs:
+    name: "Deploy Swanky documentation"
+    needs: [build-docs]
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish docs to GitHub pages
+        id: deployment
+        uses: actions/deploy-pages@v4

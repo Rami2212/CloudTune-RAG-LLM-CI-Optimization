@@ -1,5 +1,7 @@
 # Run commands
 
+For local BGE-M3 embeddings, Supabase setup, ingestion, and semantic search, see [RUN_RAG_COMMANDS.md](RUN_RAG_COMMANDS.md).
+
 ```powershell
 # One-time setup
 python -m venv .venv

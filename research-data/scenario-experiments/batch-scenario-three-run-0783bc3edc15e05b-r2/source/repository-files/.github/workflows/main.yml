@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# SPDX-FileCopyrightText: Copyright © the xdg-desktop-portal contributors
+
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  build-container:
+    name: Build Container
+    uses: ./.github/workflows/container.yml
+    permissions:
+      packages: write
+    with:
+      image: xdg-desktop-portal:2026-10-24.0
+      containerfile: containerfiles/build.containerfile
+
+  check-container:
+    name: Check Container
+    uses: ./.github/workflows/container.yml
+    permissions:
+      packages: write
+    with:
+      image: xdg-desktop-portal-checks:2026-10-24.1
+      containerfile: containerfiles/check.containerfile
+
+  build-and-test:
+    name: Build and Test
+    uses: ./.github/workflows/build-and-test.yml
+    needs: build-container
+    with:
+      image: ${{ needs.build-container.outputs.image }}
+      image_options: ${{ needs.build-container.outputs.image_options }}
+
+  check:
+    name: Check
+    uses: ./.github/workflows/check.yml
+    needs: check-container
+    with:
+      image: ${{ needs.check-container.outputs.image }}
+      image_options: ${{ needs.check-container.outputs.image_options }}
+
+  pages:
+    name: Documentation & Website
+    uses: ./.github/workflows/pages.yml
+    needs: build-container
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    with:
+      image: ${{ needs.build-container.outputs.image }}
+      image_options: ${{ needs.build-container.outputs.image_options }}

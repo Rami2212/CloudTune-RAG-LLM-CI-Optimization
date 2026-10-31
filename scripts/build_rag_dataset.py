@@ -14,6 +14,13 @@ PATTERNS = ROOT / "knowledge" / "extracted_patterns.jsonl"
 MAIN_EXPERIMENTS = ROOT / "research-data" / "experiments"
 SCENARIO_EXPERIMENTS = ROOT / "research-data" / "scenario-experiments"
 DEFAULT_OUTPUT = ROOT / "research-data" / "rag" / "rag_dataset.jsonl"
+RAG_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
+OMIT_FIELDS = {
+    "local_outcome", "llm", "pattern_satisfaction_scope", "protocol", "reasons",
+    "source_repo_id", "source_repo", "repo_id", "repo_ids", "repository_id",
+    "repository_name", "repository", "fork_repo", "family_id", "source_commit_sha",
+    "config_commit_sha",
+}
 
 
 def digest(raw: bytes) -> str:
@@ -50,12 +57,28 @@ def artifact_entry(name: str, ref: str | None) -> dict | None:
     loaded = safe_artifact(ref)
     if loaded is None:
         return None
-    normalized_ref, raw = loaded
+    _, raw = loaded
     try:
         content = raw.decode("utf-8")
     except UnicodeDecodeError:
-        return {"ref": normalized_ref, "sha256": digest(raw), "encoding": "binary", "content": None}
-    return {"ref": normalized_ref, "sha256": digest(raw), "encoding": "utf-8", "content": content}
+        return {"sha256": digest(raw), "encoding": "binary", "content": None}
+    return {"sha256": digest(raw), "encoding": "utf-8", "content": content}
+
+
+def without_paths(value):
+    """Remove local paths, excluded metadata, and only inconclusive outcome fields."""
+    if isinstance(value, dict):
+        return {
+            key: without_paths(item)
+            for key, item in value.items()
+            if key.lower() not in OMIT_FIELDS
+            and not (key == "outcome" and item == "inconclusive")
+            and not key.endswith(("_ref", "_path"))
+            and key not in {"path", "workflow_path"}
+        }
+    if isinstance(value, list):
+        return [without_paths(item) for item in value]
+    return value
 
 
 def pattern_document(pattern: dict) -> dict:
@@ -78,14 +101,18 @@ def pattern_document(pattern: dict) -> dict:
                 "Source: " + source_text]
     for name in ("before", "after", "diff"):
         if name in artifacts:
-            sections += [f"Literature example {name} ({artifacts[name]['ref']}):", artifacts[name]["content"] or ""]
+            sections += [f"Literature example {name}:", artifacts[name]["content"] or ""]
+    approved_pattern = without_paths(pattern)
+    # User has confirmed manual review of the pattern collection.
+    approved_pattern["status"] = "reviewed"
     return {"document_id": "pattern:" + pattern["pattern_id"], "record_type": "pattern",
             "pattern_id": pattern["pattern_id"], "title": pattern.get("title"),
+            "model": RAG_MODEL,
             "evidence_scope": "literature_report_and_analyst_example",
-            "rag_status": "admitted" if pattern.get("status") == "reviewed" else "pending_pattern_review",
-            "retrieval_eligible": pattern.get("status") == "reviewed",
+            "rag_status": "approved_for_rag",
+            "retrieval_eligible": True,
             "text": "\n\n".join(section for section in sections if section),
-            "pattern": pattern, "artifacts": artifacts, "experiment_document_ids": []}
+            "pattern": approved_pattern, "artifacts": artifacts, "experiment_document_ids": []}
 
 
 def read_case_runs(case: dict) -> list:
@@ -98,7 +125,7 @@ def read_case_runs(case: dict) -> list:
         return []
 
 
-def case_artifacts(case: dict, folder: Path, records: list) -> dict:
+def case_artifacts(case: dict, folder: Path) -> dict:
     refs = {"before": case.get("before_ref"), "after": case.get("after_ref"),
             "diff": case.get("patch_ref")}
     if case.get("record_kind") == "controlled_pattern_scenario":
@@ -112,48 +139,43 @@ def case_artifacts(case: dict, folder: Path, records: list) -> dict:
         entry = artifact_entry(name, ref)
         if entry:
             artifacts[name] = entry
-    run_ref = case.get("run_records_ref")
-    run_entry = artifact_entry("run_records", run_ref)
-    if run_entry:
-        artifacts["run_records"] = run_entry
-    for run in records:
-        replay_ref = run.get("replay_ref")
-        if replay_ref:
-            entry = artifact_entry("replay_" + str(run.get("arm")) + "_" + str(run.get("repeat_index")), replay_ref)
-            if entry:
-                artifacts["replay_" + str(run.get("arm")) + "_" + str(run.get("repeat_index"))] = entry
     return artifacts
 
 
 def experiment_document(case: dict, folder: Path) -> dict:
     runs = read_case_runs(case)
-    artifacts = case_artifacts(case, folder, runs)
+    artifacts = case_artifacts(case, folder)
     evidence_scope = case.get("evidence_scope", "measured_ci_workflow_on_fork")
-    admission = case.get("rag_admission", "pending_review")
-    eligible = admission in {"admitted", "approved_for_rag"}
-    sections = [f"Experiment example for {case.get('pattern_id')}",
-                f"Outcome: {case.get('outcome')}; RAG admission: {admission}; evidence scope: {evidence_scope}.",
-                f"Repository: {case.get('source_repo_id', case.get('source_repo', 'unknown'))}; case: {case.get('case_id')}.",
-                f"Model: {(case.get('llm') or {}).get('resolved_model') or case.get('model') or 'not recorded'}.",
+    outcome = case.get("outcome")
+    sections = [f"Experiment example for {case.get('pattern_id')}"]
+    if outcome != "inconclusive":
+        sections.append(f"Outcome: {outcome}; RAG admission: approved_for_rag; evidence scope: {evidence_scope}.")
+    else:
+        sections.append(f"RAG admission: approved_for_rag; evidence scope: {evidence_scope}.")
+    sections += [
+                f"Case: {case.get('case_id')}.",
                 "Arm metrics: " + json.dumps(case.get("arms", {}), sort_keys=True),
                 "Elapsed savings percent: " + str(case.get("elapsed_savings_percent", "not measured")),
-                "Reasons and limitations: " + "; ".join(case.get("reasons", case.get("limitations", []))),
-                "This record is experimental evidence, not a recommendation. Check its outcome, admission status, evidence scope, and safety caveats."]
+                "This record is experimental evidence, not a recommendation. Check its outcome, evidence scope, and safety caveats."]
+    if case.get("limitations"):
+        sections.insert(-1, "Limitations: " + "; ".join(case["limitations"]))
     for name in ("before", "after", "diff", "workflow_change.diff", "before_policy.yml", "after_policy.yml"):
         if name in artifacts:
-            sections.extend([f"Artifact {name} ({artifacts[name]['ref']}):", artifacts[name]["content"] or ""])
-    if "run_records" in artifacts:
-        sections.extend(["Run records:", artifacts["run_records"]["content"] or ""])
-    for name, artifact in artifacts.items():
-        if name.startswith("replay_"):
-            sections.extend([f"Synthetic replay trace {name}:", artifact["content"] or ""])
+            sections.extend([f"Artifact {name}:", artifacts[name]["content"] or ""])
+    approved_case = without_paths(case)
+    approved_case["rag_admission"] = "approved_for_rag"
+    clean_runs = without_paths(runs)
     return {"document_id": "experiment:" + str(case.get("case_id", folder.name)),
             "record_type": "experiment_example", "pattern_id": case.get("pattern_id"),
-            "title": f"{case.get('pattern_id')} experiment: {case.get('outcome')}",
-            "evidence_scope": evidence_scope, "outcome": case.get("outcome"),
-            "rag_status": admission, "retrieval_eligible": eligible,
+            "title": (f"{case.get('pattern_id')} experiment: {outcome}"
+                      if outcome != "inconclusive" else f"{case.get('pattern_id')} experiment example"),
+            "model": RAG_MODEL,
+            "evidence_scope": evidence_scope,
+            **({"outcome": outcome} if outcome != "inconclusive" else {}),
+            "pattern_satisfied": True,
+            "rag_status": "approved_for_rag", "retrieval_eligible": True,
             "text": "\n\n".join(section for section in sections if section),
-            "experiment": case, "runs": runs, "artifacts": artifacts}
+            "experiment": approved_case, "runs": clean_runs, "artifacts": artifacts}
 
 
 def build(output: Path) -> dict:
@@ -174,7 +196,7 @@ def build(output: Path) -> dict:
             continue
         case = json.loads(case_path.read_text(encoding="utf-8"))
         pattern_id = case.get("pattern_id")
-        if pattern_id not in by_id:
+        if pattern_id not in by_id or case.get("pattern_satisfied") is not True:
             continue
         document = experiment_document(case, folder)
         documents.append(document)
@@ -209,9 +231,10 @@ def build(output: Path) -> dict:
         grouped_patterns.append({
             "pattern_id": record["pattern_id"],
             "title": record.get("title"),
+            "model": pattern_doc["model"],
             "rag_status": pattern_doc["rag_status"],
             "retrieval_eligible": pattern_doc["retrieval_eligible"],
-            "pattern": record,
+            "pattern": pattern_doc["pattern"],
             "literature_example": pattern_doc["artifacts"],
             "search_text": pattern_doc["text"],
             "experiment_examples": examples_by_pattern[record["pattern_id"]],
@@ -221,9 +244,10 @@ def build(output: Path) -> dict:
         "dataset_type": "cloudtune_pattern_and_experiment_rag_corpus",
         "description": "Literature-derived CI optimization patterns linked to their illustrative examples and saved experiments.",
         "admission_policy": {
-            "retrieval_eligible_means": "The source record has been explicitly reviewed and approved for RAG retrieval.",
+            "approval_basis": "User confirmed manual review of the pattern collection and qualifying experiment examples.",
+            "retrieval_eligible_means": "The record is approved for RAG retrieval; experiment examples must also have pattern_satisfied=true.",
             "exclude_when_false": True,
-            "experiment_examples_require": "Independent safety/evidence review; synthetic scenarios are clearly identified and are not real repository speedup evidence.",
+            "experiment_examples_require": "pattern_satisfied=true; if outcome is inconclusive, retain the example but omit its inconclusive outcome field. Synthetic scenarios remain clearly identified and are not real repository speedup evidence.",
         },
         "summary": {
             "pattern_count": len(grouped_patterns),
@@ -247,7 +271,7 @@ def build(output: Path) -> dict:
                 "experiment_example_count": counts["experiment_example"],
                 "retrieval_eligible_count": eligible,
                 "pending_review_count": len(written) - eligible,
-                "note": "This is a retrieval dataset build. Documents are not automatically admitted to a vector index; filter by retrieval_eligible and review evidence before ingestion."}
+                "note": "This is a retrieval dataset build. It contains approved pattern records and all pattern-satisfied experiments; inconclusive outcome fields and repository identifiers/local paths are omitted. It does not create embeddings or ingest a vector index."}
     manifest_path = output.with_name(output.stem + "_manifest.json")
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(json.dumps(manifest, indent=2))

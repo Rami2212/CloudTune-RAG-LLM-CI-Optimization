@@ -1,0 +1,109 @@
+name: Haskell CI - Stack based
+# note: for the most part, shamelessly stolen from xmonad
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    name: Stack CI - ${{ matrix.os }} - ${{ matrix.resolver }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ startsWith( matrix.resolver, 'nightly-' ) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+        resolver:
+          - lts-20               # GHC 9.2
+          - lts-21               # GHC 9.4
+          - lts-22               # GHC 9.6
+          - lts-23               # GHC 9.8
+          - nightly-2025-03-06   # GHC 9.10
+
+    steps:
+      - name: Clone project
+        uses: actions/checkout@v4
+
+      - name: Get ghc version for ${{ matrix.resolver }}
+        shell: bash
+        run: |
+          GHCVER=$(curl -L https://www.stackage.org/${{ matrix.resolver }}/ghc-major-version)
+          echo "Got $GHCVER"
+          echo "ghc=$GHCVER" >> $GITHUB_OUTPUT
+        id: ghc-version
+
+      - uses: haskell-actions/setup@v2
+        name: Setup GHC ${{ steps.ghc-version.outputs.ghc }}
+        id: hs-setup
+        with:
+          ghc-version: ${{ steps.ghc-version.outputs.ghc }}
+          enable-stack: true
+
+      - name: Refresh caches once a month
+        id: cache-date
+        # GHC writes caches on the first miss and then never updates them again;
+        # force updating the cache at least once a month
+        run: |
+          echo "date=$(date +%Y-%m)" >> $GITHUB_OUTPUT
+
+      - name: Ensure STACK_ROOT exists on Windows
+        if: runner.os == 'Windows'
+        run: New-Item -ItemType directory -Path ${{ steps.hs-setup.outputs.stack-root }}
+
+      - name: Cache Haskell package metadata
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.hs-setup.outputs.stack-root }}/pantry
+          key: stack-pantry-${{ runner.os }}-${{ steps.cache-date.outputs.date }}
+          restore-keys: |
+            stack-pantry-${{ runner.os }}-
+
+      - name: Cache Haskell dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ steps.hs-setup.outputs.stack-root }}/*
+            !${{ steps.hs-setup.outputs.stack-root }}/pantry
+          key: stack-${{ runner.os }}-${{ matrix.resolver }}-${{ steps.cache-date.outputs.date }}-${{ hashFiles('stack.yaml') }}-${{ hashFiles('*.cabal') }}
+          restore-keys: |
+            stack-${{ runner.os }}-${{ matrix.resolver }}-${{ steps.cache-date.outputs.date }}-${{ hashFiles('stack.yaml') }}-
+            stack-${{ runner.os }}-${{ matrix.resolver }}-${{ steps.cache-date.outputs.date }}-
+            stack-${{ runner.os }}-${{ matrix.resolver }}-
+
+      - name: Update hackage index
+        # always update index to prevent the shared ~/.stack/pantry cache from being empty
+        run: stack update
+
+      - name: Pull in macOS dependencies
+        if: runner.os == 'macOS'
+        run: git submodule update --init
+
+      - name: Build and test
+        shell: bash
+        if: runner.os != 'macOS'
+        run: |
+          stack test \
+            --fast --no-terminal --skip-msys \
+            --resolver=${{ matrix.resolver }} --system-ghc
+
+      - name: Build and test (macOS, dext)
+        shell: bash
+        if: runner.os == 'macOS'
+        run: |
+          stack test \
+            --fast --no-terminal \
+            --resolver=${{ matrix.resolver }} --system-ghc \
+            --flag kmonad:dext \
+
+      - name: Build and test (macOS, kext)
+        shell: bash
+        if: runner.os == 'macOS'
+        run: |
+          stack test \
+            --fast --no-terminal \
+            --resolver=${{ matrix.resolver }} --system-ghc \
+            --flag kmonad:kext
