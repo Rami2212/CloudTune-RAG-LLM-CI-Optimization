@@ -14,17 +14,95 @@
 
 ---
 
+## Hosted GitHub Actions execution redesign — November 1, 2026
+
+**This section supersedes the older local-controller execution assumptions
+elsewhere in this plan.** No selected repository build or test is timed locally.
+The controller itself may run in CloudTune GitHub Actions, but **all measured
+A/B/C CI jobs execute as real workflow_dispatch runs inside isolated
+research-owned GitHub forks**.
+
+- **Controller:** `.github/workflows/cloudtune-evaluation.yml` runs
+  `evaluation/hosted_pipeline.py`, with automated temporary dependency setup,
+  bounded batches, durable state and scheduled resume.
+- **Preparation:** reuse the existing `evaluation/repository_preparation.py`,
+  pinned source manifests, eligibility and train/evaluation exclusions.
+- **A/B/C:** preserve unchanged Arm A; use the versioned, transparently
+  source-corrected `ci-cost` implementation for B; use existing frozen
+  `research-data/rag/rag_dataset.jsonl`, Supabase pgvector RPC, BGE-M3
+  embeddings and an explicitly configured OpenRouter model for C.
+  **Never retrain, ingest, or update RAG data during the held-out benchmark.**
+  The corpus has a committed 74-record manifest; live index membership and
+  hashes must be verified, not presumed.
+- **Existing research implementation:** reuse the proven mechanisms in
+  `scripts/run_pattern_batch.py` and `scripts/run_ci_experiment.py` for research
+  fork ownership, original/optimized Git commits, GitHub workflow dispatch,
+  run identification, response preservation, timeout and resume handling,
+  and GitHub job timings. Do not interpret local optimizer overhead as CI time.
+- **Fork safety:** original upstream is always read-only; never mutate an
+  untracked existing fork; inspect unrelated workflows; register one common
+  safe dispatch harness before freezing the A/B/C source base; write only
+  the selected YAML on B/C experiment commits. Arm A remains unoptimized.
+- **Static admission:** same actionlint, conservative step/job/trigger/permission
+  and mechanism-specific policy across B/C. The initial automatic allowlist is
+  restricted to additive dependency caching. Broader optimizations need
+  separately reviewed safety predicates, rather than weakening the gate.
+- **Queue correctness:** record GitHub workflow creation, first **actual job**
+  start, final job completion, job start/completion and conclusions. Initial
+  queue = create→first job start. Primary queue-excluded `workflow_elapsed_seconds`
+  equals the **union of intervals containing actual executing jobs**, so neither
+  initial queue nor idle waits between jobs are included. Keep the raw first-job
+  to last-job **makespan** and its idle gaps separately; such gaps can reflect
+  dependencies as well as runner delays. Sum-job runtime is the sum of all
+  executed-job durations, including parallel job time (a resource proxy).
+  Never use `run_started_at` alone for actual job execution and never include
+  GitHub runner queue time in the queue-excluded primary metric.
+- **Durability:** CloudTune's dedicated state branch stores versioned archived
+  snapshots, candidate outputs and raw GitHub run/job API evidence. Persist
+  dispatch intent **before POST**; resolve lost dispatch responses without
+  blindly resending; a queued/running job remains pending and is rechecked
+  by a later scheduled controller. A run completing without ever starting
+  a job is `INCONCLUSIVE_PLATFORM`, not a failed build or duration sample. No
+  forced retries of failed target CI. A scheduled controller checks out the
+  original frozen implementation SHA, even if `main` moved meanwhile. If
+  the scheduled default-branch workflow definition differs from the original,
+  refuse resume until the protocol discrepancy is resolved.
+- **Generation outcomes:** errors from the free OpenRouter generator are
+  recorded as C failures without discarding A/B results. B and C must satisfy
+  the same conservative automatic cache admission rules, including source-bound
+  cache invalidation keys and unchanged job/step/check contracts.
+- **Statistics:** paired B–A, C–A and C–B only on comparable successful runs
+  with the predeclared repetitions. Preserve rejection, NO_CHANGE, failure,
+  attrition and incomplete records in denominators. No invented speedups.
+- **GitHub constraint:** manually triggered controller workflows must first be
+  registered on the CloudTune repository default branch (`main`). Feature
+  branch pushes run verification only; deploying the controller to default
+  branch is a prerequisite to ordinary UI-driven evaluation. Scheduled
+  resumes never start a new experiment by themselves.
+- **Prerequisites and study integrity:** the fork-management credential,
+  Supabase keys and LLM API key stay solely in the controller execution step,
+  never in third-party build/setup steps or target CI. Review GitHub Actions
+  permissions, fork budgets, eligible workflows and required checks before
+  real experiments. One real repository on GitHub must pass an end-to-end
+  smoke test before promotion to a held-out pilot.
+
+**Implementation status is not experimental evidence.** Until a hosted run
+has dispatched A/B/C workflows and collected real GitHub job timings,
+no end-to-end execution success or CI speedup is claimed.
+
+---
+
 ## 1. Goals, boundaries and research questions
 
 Build a safe, reproducible, resumable evaluation pipeline that runs three approaches against the **same pinned GitHub Actions source workflow**. Reuse existing CloudTune experimental and RAG infrastructure rather than duplicating or rewriting the research system.
 
 ### 1.1 Three arms
 
-| Arm | Name | Candidate | Purpose |
-| --- | --- | --- | --- |
-| **A** | Original baseline | Same original pinned workflow, no optimizer-generated modifications | Establish the actual baseline execution time, runner-time, status and required-check results. |
-| **B** | `ci-cost` | Rule-based tool's generated workflow, or `NO_CHANGE` | Measure whether the rule-based approach improves upon A. |
-| **C** | LLM + RAG | Fixed LLM using retrieved, frozen RAG evidence; generated workflow, or `NO_CHANGE` | Evaluate the combined proposed CloudTune optimization method relative to A and B. |
+| Arm   | Name              | Candidate                                                                          | Purpose                                                                                       |
+| ----- | ----------------- | ---------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| **A** | Original baseline | Same original pinned workflow, no optimizer-generated modifications                | Establish the actual baseline execution time, runner-time, status and required-check results. |
+| **B** | `ci-cost`         | Rule-based tool's generated workflow, or `NO_CHANGE`                               | Measure whether the rule-based approach improves upon A.                                      |
+| **C** | LLM + RAG         | Fixed LLM using retrieved, frozen RAG evidence; generated workflow, or `NO_CHANGE` | Evaluate the combined proposed CloudTune optimization method relative to A and B.             |
 
 **Excluded:** D, LLM-only. Because D is absent, the evaluation **cannot isolate the contribution of retrieval from that of the LLM**. Findings must be phrased as performance of the **combined LLM + RAG system**, not proof that RAG itself independently improves performance.
 
@@ -128,32 +206,32 @@ The current repository already contains a significant amount of useful infrastru
 
 ### 3.1 Core scripts and source line references
 
-| Existing file | Relevant lines at reviewed revision | Current implementation | How the evaluation uses it |
-| --- | --- | --- | --- |
-| `scripts/run_ci_experiment.py` | 230–318 | GitHub API and CI timing metrics | Reuse/extract API wrappers and metric calculations. |
-| `scripts/run_ci_experiment.py` | 464–548 | Pinned repository tree/workflow and manifest collection | Reuse design in evaluation-specific read-only preparation. |
-| `scripts/run_ci_experiment.py` | 550–586 | Isolated branches and ref checks | Adapt for three arms while preserving commit/tree identity checks. |
-| `scripts/run_ci_experiment.py` | 677–816 | Workflow dispatch, polling, safe resume and evidence archive | Reuse pending-run/uncertain POST safeguards and per-job metrics. |
-| `scripts/run_pattern_batch.py` | 74–108 | Eligible CI workflow selection | Reuse conservative workflow selection for held-out repositories. |
-| `scripts/run_pattern_batch.py` | 224–391 | Fork setup, dispatch preparation and cleanup | Reuse only after authorization and ownership validation. |
-| `scripts/embed_rag_supabase.py` | 166–188; 232–252 | BGE-M3 and Supabase embedding/search | Provide structured, frozen retrieval results to the evaluation generator. |
-| `scripts/openrouter_optimizer.py` | 90–234 | Existing selected-pattern model calls, retries and parsing | Create a new evaluation adapter that allows pattern selection and `NO_CHANGE`. |
-| `evaluation/build_evaluation_repo_dataset.py` | 25–151 | Held-out dataset building | Reuse the already-generated sample; run fresh screening. |
-| `evaluation/evaluate_rag_vs_ci_cost.py` | 95–278 | Baseline-relative analysis and bootstrap | Extend or wrap for A/B/C and direct paired C-B without losing existing behavior. |
+| Existing file                                 | Relevant lines at reviewed revision | Current implementation                                       | How the evaluation uses it                                                       |
+| --------------------------------------------- | ----------------------------------- | ------------------------------------------------------------ | -------------------------------------------------------------------------------- |
+| `scripts/run_ci_experiment.py`                | 230–318                             | GitHub API and CI timing metrics                             | Reuse/extract API wrappers and metric calculations.                              |
+| `scripts/run_ci_experiment.py`                | 464–548                             | Pinned repository tree/workflow and manifest collection      | Reuse design in evaluation-specific read-only preparation.                       |
+| `scripts/run_ci_experiment.py`                | 550–586                             | Isolated branches and ref checks                             | Adapt for three arms while preserving commit/tree identity checks.               |
+| `scripts/run_ci_experiment.py`                | 677–816                             | Workflow dispatch, polling, safe resume and evidence archive | Reuse pending-run/uncertain POST safeguards and per-job metrics.                 |
+| `scripts/run_pattern_batch.py`                | 74–108                              | Eligible CI workflow selection                               | Reuse conservative workflow selection for held-out repositories.                 |
+| `scripts/run_pattern_batch.py`                | 224–391                             | Fork setup, dispatch preparation and cleanup                 | Reuse only after authorization and ownership validation.                         |
+| `scripts/embed_rag_supabase.py`               | 166–188; 232–252                    | BGE-M3 and Supabase embedding/search                         | Provide structured, frozen retrieval results to the evaluation generator.        |
+| `scripts/openrouter_optimizer.py`             | 90–234                              | Existing selected-pattern model calls, retries and parsing   | Create a new evaluation adapter that allows pattern selection and `NO_CHANGE`.   |
+| `evaluation/build_evaluation_repo_dataset.py` | 25–151                              | Held-out dataset building                                    | Reuse the already-generated sample; run fresh screening.                         |
+| `evaluation/evaluate_rag_vs_ci_cost.py`       | 95–278                              | Baseline-relative analysis and bootstrap                     | Extend or wrap for A/B/C and direct paired C-B without losing existing behavior. |
 
 ### 3.2 Other scripts: reuse boundaries
 
-| Existing scripts | Responsibility | Evaluation decision |
-| --- | --- | --- |
-| `prepare_data.py`, `create_zenodo_repo_dataset.py`, `create_zenodo_pattern_repo_dataset.py` | Candidate data preparation | Reuse prepared datasets; leave scripts untouched. |
-| `select_pattern_repos.py`, `select_unique_pattern_repos.py` | Development pattern sampling | Do not reuse to cherry-pick held-out repositories. |
-| `collect_ci_history.py`, `workflow_history.py` | Historical workflow evidence | Reuse selectively as context; do not substitute historical durations for current A/B/C measured runs. |
-| `build_literature_assets.py`, `validate_knowledge.py` | Literature and knowledge validation | Preserve. |
-| `build_rag_dataset.py` | RAG corpus builder | Reuse and freeze the corpus before main evaluation. |
-| `colab_populate_rag.py` | Alternate RAG ingestion path | Optional ingestion helper, not a second inconsistent retrieval process. |
-| `experiment_environment.py` | `.env` loading and secret redaction | Reuse unchanged. |
-| `run_scenario_batch.py`, `run_new_scenario_batch.py`, `scenario_experiments.py`, `scenario_replay.py` | Synthetic and event/policy scenarios | Keep separate; label evidence correctly. |
-| Existing scripts' test files and `tests/` modules | Regression tests | Run after any extraction/refactor. |
+| Existing scripts                                                                                      | Responsibility                       | Evaluation decision                                                                                   |
+| ----------------------------------------------------------------------------------------------------- | ------------------------------------ | ----------------------------------------------------------------------------------------------------- |
+| `prepare_data.py`, `create_zenodo_repo_dataset.py`, `create_zenodo_pattern_repo_dataset.py`           | Candidate data preparation           | Reuse prepared datasets; leave scripts untouched.                                                     |
+| `select_pattern_repos.py`, `select_unique_pattern_repos.py`                                           | Development pattern sampling         | Do not reuse to cherry-pick held-out repositories.                                                    |
+| `collect_ci_history.py`, `workflow_history.py`                                                        | Historical workflow evidence         | Reuse selectively as context; do not substitute historical durations for current A/B/C measured runs. |
+| `build_literature_assets.py`, `validate_knowledge.py`                                                 | Literature and knowledge validation  | Preserve.                                                                                             |
+| `build_rag_dataset.py`                                                                                | RAG corpus builder                   | Reuse and freeze the corpus before main evaluation.                                                   |
+| `colab_populate_rag.py`                                                                               | Alternate RAG ingestion path         | Optional ingestion helper, not a second inconsistent retrieval process.                               |
+| `experiment_environment.py`                                                                           | `.env` loading and secret redaction  | Reuse unchanged.                                                                                      |
+| `run_scenario_batch.py`, `run_new_scenario_batch.py`, `scenario_experiments.py`, `scenario_replay.py` | Synthetic and event/policy scenarios | Keep separate; label evidence correctly.                                                              |
+| Existing scripts' test files and `tests/` modules                                                     | Regression tests                     | Run after any extraction/refactor.                                                                    |
 
 ### 3.3 Existing assets and limitations
 
@@ -259,7 +337,7 @@ CloudTune-RAG-LLM-CI-Optimization/
 9. Record screening results including `prepared`, `needs_harness`, `ineligible`, `inconclusive`, and `api_error` with transparent reasons.
 10. Reuse frozen snapshots on rerun; changing the configuration or source/protocol requires a new evaluation ID.
 
-**Current Phase 1 limitations:** read-only; no fork creation; no workflow dispatch; no actual baseline durations; B/C optimizers are placeholders in config only. The runnable coordinator explicitly rejects `dry_run: false`.
+**Historical Phase 1 limits (before the hosted controller was added):** the `evaluation.run_pipeline` offline path remains read-only and does not dispatch or time GitHub Actions. The separate `evaluation.hosted_pipeline` controller now implements hosted fork execution, subject to live verification.
 
 **Outputs:** `evaluation/results/<id>/screening.csv`, `preparation_summary.json`, `config.json`, and each repository's snapshot/manifest and `candidates/A/candidate.json`.
 
@@ -394,16 +472,16 @@ This is **illustrative**, not an existing interface. Include tool/model/corpus r
 
 ### 6.2 Run-level schema (minimum fields)
 
-| Area | Fields |
-| --- | --- |
-| Identity | `evaluation_id`, `repo_id`, `workflow_path`, `source_commit_sha`, `arm`, `candidate_sha256` |
-| Run protocol | `repeat_index`, `warmup`, `execution_order`, `cache_regime` |
-| GitHub | `run_id`, `run_attempt`, `run_status`, `conclusion`, `run_branch_sha`, `protocol_valid` |
-| Timings | `started_at_utc`, `completed_at_utc`, `workflow_elapsed_seconds`, `sum_job_runtime_seconds`, `initial_queue_seconds` |
-| Correctness | `required_checks_pass`, `safety_verdict`, `failure_reason`, `review_evidence_ref` |
-| Generation | `optimizer_seconds`, optional `retrieval_seconds`, `tokens_in`, `tokens_out`, pinned tool/model refs |
-| Monetary estimates | Optional CI rate/date/source and `ci_cost_usd` only if justified |
-| Evidence | `raw_ref`, original/patch hashes, C retrieval IDs/scores |
+| Area               | Fields                                                                                                               |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------- |
+| Identity           | `evaluation_id`, `repo_id`, `workflow_path`, `source_commit_sha`, `arm`, `candidate_sha256`                          |
+| Run protocol       | `repeat_index`, `warmup`, `execution_order`, `cache_regime`                                                          |
+| GitHub             | `run_id`, `run_attempt`, `run_status`, `conclusion`, `run_branch_sha`, `protocol_valid`                              |
+| Timings            | `started_at_utc`, `completed_at_utc`, `workflow_elapsed_seconds`, `sum_job_runtime_seconds`, `initial_queue_seconds` |
+| Correctness        | `required_checks_pass`, `safety_verdict`, `failure_reason`, `review_evidence_ref`                                    |
+| Generation         | `optimizer_seconds`, optional `retrieval_seconds`, `tokens_in`, `tokens_out`, pinned tool/model refs                 |
+| Monetary estimates | Optional CI rate/date/source and `ci_cost_usd` only if justified                                                     |
+| Evidence           | `raw_ref`, original/patch hashes, C retrieval IDs/scores                                                             |
 
 ### 6.3 Persisted run state
 
@@ -474,11 +552,11 @@ Positive value: left-mentioned optimizer is faster under its comparison. Negativ
 
 ### 7.5 Hypothetical illustration only
 
-| Arm | Example median time | Example savings vs A |
-| --- | ---: | ---: |
-| A — Original | 200 s | 0% |
-| B — `ci-cost` | 175 s | 12.5% |
-| C — LLM + RAG | 140 s | 30% |
+| Arm           | Example median time | Example savings vs A |
+| ------------- | ------------------: | -------------------: |
+| A — Original  |               200 s |                   0% |
+| B — `ci-cost` |               175 s |                12.5% |
+| C — LLM + RAG |               140 s |                  30% |
 
 On these **illustrative data**, C's direct advantage over B is `100 × (175 − 140) / 175 = 20%`. These are **not actual CloudTune results**; safety and run-protocol acceptance are prerequisites for a measured claim.
 
@@ -515,7 +593,7 @@ The **existing Phase 1 implementation** provides `evaluation/configs/pilot.json`
 }
 ```
 
-**Important:** `run_pipeline.py` currently supports only `--stage prepare` and rejects any `execution.dry_run` other than `true`. The B, C, `actionlint`, cache and repetition settings are **reserved for later stages**. Setting them does not activate an optimizer or remote CI execution.
+**Important:** `evaluation.run_pipeline` supports offline `prepare` and `ci-cost` candidate generation and requires `execution.dry_run: true`. Actual hosted A/B/C execution is implemented separately in `evaluation.hosted_pipeline` with `evaluation/configs/hosted_pilot.json`, `dry_run: false`, GitHub credentials and safety admission; no local target CI timing occurs.
 
 The completed pipeline configuration should additionally pin the `ci-cost` commit/executable checksum, exact generator model, RAG corpus/index and embedding revision, prompt hash, fork policy, dispatch timeouts, GitHub Actions permissions, required-check contract, run budget and acceptance thresholds. Configuration changes after execution require a distinct immutable evaluation ID.
 
@@ -616,25 +694,25 @@ Use unit and mocked-integration tests before spending GitHub Actions minutes.
 
 ### 11.1 Incremental implementation/commit order
 
-| Commit stage | Main work | Exit criterion |
-| --- | --- | --- |
-| **1 — Preparation + A candidate** | New read-only repository screener, original candidate, coordinator, configs, tests, permanent guide | Reproducible immutable snapshots, offline tests, zero CI dispatches. |
-| **2 — B (`ci-cost`)** | Tool adapter, normalized candidate, error/`NO_CHANGE` handling | Actual pinned `ci-cost` output can be safely archived from A snapshot. |
-| **3 — C (LLM + RAG)** | Structured retrieval, generator adapter, model prompt and provenance | Candidate/`NO_CHANGE` with frozen retrieval evidence. |
-| **4 — Shared validation** | YAML, `actionlint`, required checks, security and behavior constraints | B/C candidates receive the same documented safety verdict. |
-| **5 — GitHub Actions execution** | Isolated refs, measured A/B/C runs, pending-state resume | One repository completes proper A/B/C repeated run protocol. |
-| **6 — Reporting** | Export, paired A/B/C statistics, failure accounting | Reproducible per-repository and aggregate summary. |
-| **7 — Final tests/guide** | Extended test suite, protocol documentation, stable CLI | Full end-to-end smoke tests, stable single guide, PR ready. |
+| Commit stage                      | Main work                                                                                           | Exit criterion                                                         |
+| --------------------------------- | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| **1 — Preparation + A candidate** | New read-only repository screener, original candidate, coordinator, configs, tests, permanent guide | Reproducible immutable snapshots, offline tests, zero CI dispatches.   |
+| **2 — B (`ci-cost`)**             | Tool adapter, normalized candidate, error/`NO_CHANGE` handling                                      | Actual pinned `ci-cost` output can be safely archived from A snapshot. |
+| **3 — C (LLM + RAG)**             | Structured retrieval, generator adapter, model prompt and provenance                                | Candidate/`NO_CHANGE` with frozen retrieval evidence.                  |
+| **4 — Shared validation**         | YAML, `actionlint`, required checks, security and behavior constraints                              | B/C candidates receive the same documented safety verdict.             |
+| **5 — GitHub Actions execution**  | Isolated refs, measured A/B/C runs, pending-state resume                                            | One repository completes proper A/B/C repeated run protocol.           |
+| **6 — Reporting**                 | Export, paired A/B/C statistics, failure accounting                                                 | Reproducible per-repository and aggregate summary.                     |
+| **7 — Final tests/guide**         | Extended test suite, protocol documentation, stable CLI                                             | Full end-to-end smoke tests, stable single guide, PR ready.            |
 
 **All commits go to `feature/evaluation-pipeline`**; push each tested commit to the same remote branch. Do **not** create a new branch or README per phase. Open one PR from `feature/evaluation-pipeline` to `develop` after the pipeline is complete.
 
 ### 11.2 Practical research run stages
 
-| Stage | Repositories | Measured repetitions per arm | Purpose |
-| --- | ---: | ---: | --- |
-| Development smoke test | 1–3 **development** repositories | 1–3 | Test the code and policies without contaminating the held-out evaluation. |
-| Frozen evaluation pilot | 10–20 held-out eligible repositories | 3 | Measure practicality, variability, rate limits, safety and budget. |
-| Main evaluation | Initially 50–100 eligible repositories | 5 | Full comparison, with sample size justified by pilot variation and statistical/power needs. |
+| Stage                   |                           Repositories | Measured repetitions per arm | Purpose                                                                                     |
+| ----------------------- | -------------------------------------: | ---------------------------: | ------------------------------------------------------------------------------------------- |
+| Development smoke test  |       1–3 **development** repositories |                          1–3 | Test the code and policies without contaminating the held-out evaluation.                   |
+| Frozen evaluation pilot |   10–20 held-out eligible repositories |                            3 | Measure practicality, variability, rate limits, safety and budget.                          |
+| Main evaluation         | Initially 50–100 eligible repositories |                            5 | Full comparison, with sample size justified by pilot variation and statistical/power needs. |
 
 A `repository_limit: 5` preparation check is **not** five eligible repositories and is **not** statistical evidence of effectiveness. For example, 50 repositories × 3 arms × 5 repetitions means 750 measured CI executions before failures/retries/warmups; the actual number depends on eligibility and policy.
 

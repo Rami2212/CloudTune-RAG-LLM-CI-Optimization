@@ -8,12 +8,12 @@ The current RAG corpus contains 25 literature patterns and 49 pattern-satisfied 
 
 ## Comparison arms
 
-| Arm | Method | Purpose |
-| --- | --- | --- |
-| **A — Original** | Run the original pinned workflow without optimization. | Measures baseline time and runner use. |
-| **B — `ci-cost`** | Run a pinned version of `ci-cost` and evaluate its generated candidate. | Rule-based optimizer comparison. |
-| **C — LLM + RAG** | Give the same repository context and original workflow to a fixed LLM, with relevant retrieved RAG patterns/examples. | Proposed method. |
-| **Optional D — LLM-only** | Same as C, using the same model and prompt, but without retrieved material. | Separates the effect of RAG from the effect of using an LLM. Recommended if the claim is that RAG itself helps. |
+| Arm                       | Method                                                                                                                | Purpose                                                                                                         |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| **A — Original**          | Run the original pinned workflow without optimization.                                                                | Measures baseline time and runner use.                                                                          |
+| **B — `ci-cost`**         | Run a pinned version of `ci-cost` and evaluate its generated candidate.                                               | Rule-based optimizer comparison.                                                                                |
+| **C — LLM + RAG**         | Give the same repository context and original workflow to a fixed LLM, with relevant retrieved RAG patterns/examples. | Proposed method.                                                                                                |
+| **Optional D — LLM-only** | Same as C, using the same model and prompt, but without retrieved material.                                           | Separates the effect of RAG from the effect of using an LLM. Recommended if the claim is that RAG itself helps. |
 
 Keep the generator model, base prompt, repository files, output format, safety limits, retry count, and token budget the same for C and D. The embedding model is `BAAI/bge-m3`; it retrieves evidence and does not generate the workflow patch.
 
@@ -89,12 +89,12 @@ It computes paired elapsed-time, runner-time, and optional billed-cost reduction
 
 ## Result table template
 
-| Arm | Repositories | Safe candidates | Required checks passed | Median elapsed saving vs A | Median runner-time saving vs A | `NO_CHANGE` / rejected | Median optimizer latency |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| A — Original |  | N/A |  | 0% | 0% | N/A | N/A |
-| B — `ci-cost` |  |  |  |  |  |  |  |
-| C — LLM + RAG |  |  |  |  |  |  |  |
-| D — LLM-only (optional) |  |  |  |  |  |  |  |
+| Arm                     | Repositories | Safe candidates | Required checks passed | Median elapsed saving vs A | Median runner-time saving vs A | `NO_CHANGE` / rejected | Median optimizer latency |
+| ----------------------- | -----------: | --------------: | ---------------------: | -------------------------: | -----------------------------: | ---------------------: | -----------------------: |
+| A — Original            |              |             N/A |                        |                         0% |                             0% |                    N/A |                      N/A |
+| B — `ci-cost`           |              |                 |                        |                            |                                |                        |                          |
+| C — LLM + RAG           |              |                 |                        |                            |                                |                        |                          |
+| D — LLM-only (optional) |              |                 |                        |                            |                                |                        |                          |
 
 ## Current status and interpretation
 

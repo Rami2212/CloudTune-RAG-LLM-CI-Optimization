@@ -14,22 +14,59 @@ The planned pipeline evaluates three arms on the **same pinned repository/workfl
 
 **LLM-only (D) is out of scope.** Do not interpret C-versus-B results as an isolation of RAG's contribution from the LLM's contribution.
 
+## Hosted-first operating model (start here)
+
+**Research measurements are made only by GitHub Actions jobs in research-owned
+forks of the evaluated repositories.** The CloudTune GitHub Actions workflow
+`.github/workflows/cloudtune-evaluation.yml` coordinates selection, frozen A/B/C
+candidate generation, safety admission, dispatch, durable resume and reporting.
+There is no requirement to clone `ci-cost` into the developer's `.venv` or run
+target repository builds locally. The optional local setup described in Sections
+3–9 is retained for debugging old preparation/optimizer commands, **not** for
+measuring CI time. For actual hosted execution, use Section 10.
+
+**One-time GitHub setup:** register the controller workflow on CloudTune's
+`main` default branch; configure the fork-management, Supabase and OpenRouter
+repository secrets; review a _development-only_ pilot configuration and job
+permissions; then manually start it in GitHub Actions. Keep the initial held-out
+cohort unexposed until the development smoke experiment has passed.
+
+### Clock definitions for the study
+
+- `initial_queue_seconds`: GitHub run creation to first executed job start.
+- `workflow_elapsed_seconds`: **union of intervals when at least one actual
+  GitHub Actions job is running**. Overlapping parallel jobs count once and
+  idle gaps waiting for the next runner are excluded. This is the primary
+  queue-excluded _active workflow time_ measure.
+- `workflow_makespan_seconds`: first job start to last job finish, including
+  possible _internal_ runner scheduling gaps. Report separately; it is not
+  the queue-excluded metric.
+- `inter_job_idle_seconds`: makespan minus active workflow time. This captures
+  idle intervals but is not independently proof that every gap was caused by
+  GitHub runner scheduling, because job dependencies may also contribute.
+- `sum_job_runtime_seconds`: sum of actual executed-job durations. This is a
+  runner-occupation proxy; overlapping jobs contribute separately.
+
+The distinctions between these outcomes must be retained in exported data and
+statistical analysis. No optimizer, local npm, model download, network API
+request or queue wait is included in the measured target CI execution.
+
 ## 2. Current implementation status
 
-| Capability                                               | Status      | Entry point / file                                                                            |
-| -------------------------------------------------------- | ----------- | --------------------------------------------------------------------------------------------- |
-| Held-out dataset reading and development-data exclusions | Implemented | `evaluation/repository_preparation.py`                                                        |
-| Conservative public GitHub repository/workflow screening | Implemented | `evaluation/repository_preparation.py`                                                        |
-| Pinned snapshot and bounded manifest/lockfile archiving  | Implemented | `evaluation/repository_preparation.py`                                                        |
-| Unchanged Arm A **candidate record**, not a CI execution | Implemented | `evaluation/optimizers/original.py`                                                           |
-| Read-only coordinator, repeatable local output           | Implemented | `evaluation/run_pipeline.py`                                                                  |
-| B — `ci-cost` candidate generation                       | Planned     | `evaluation/optimizers/ci_cost.py`                                                            |
-| C — retrieval and LLM candidate generation               | Planned     | `evaluation/rag_retriever.py`, `evaluation/optimizers/rag_llm.py`                             |
-| Common `actionlint` / semantic / security validation     | Planned     | `evaluation/candidate_validator.py`                                                           |
-| A/B/C isolated CI execution and resumption               | Planned     | `evaluation/ci_executor.py`                                                                   |
-| Full run export and paired comparative statistics        | Planned     | `evaluation/results_exporter.py`; update existing analysis script only if explicitly approved |
+| Capability                                               | Status                                | Entry point / file                                                                            |
+| -------------------------------------------------------- | ------------------------------------- | --------------------------------------------------------------------------------------------- |
+| Held-out dataset reading and development-data exclusions | Implemented                           | `evaluation/repository_preparation.py`                                                        |
+| Conservative public GitHub repository/workflow screening | Implemented                           | `evaluation/repository_preparation.py`                                                        |
+| Pinned snapshot and bounded manifest/lockfile archiving  | Implemented                           | `evaluation/repository_preparation.py`                                                        |
+| Unchanged Arm A **candidate record**, not a CI execution | Implemented                           | `evaluation/optimizers/original.py`                                                           |
+| Read-only coordinator, repeatable local output           | Implemented                           | `evaluation/run_pipeline.py` (`prepare`, `ci-cost`)                                           |
+| B — `ci-cost` source-fixed candidate generation          | Implemented                           | `evaluation/optimizers/ci_cost.py`                                                            |
+| C — frozen Supabase/BGE-M3 + LLM candidate generation    | Code added; live verification pending | `evaluation/rag_retriever.py`, `evaluation/optimizers/rag_llm.py`                             |
+| Common `actionlint` / conservative security gate         | Code added; live verification pending | `evaluation/candidate_validator.py`                                                           |
+| A/B/C fork-hosted execution and durable resumption       | Code added; live verification pending | `evaluation/ci_executor.py`                                                                   |
+| Paired local summaries / repository bootstrap reporting  | Code added; live verification pending | `evaluation/results_exporter.py`; update existing analysis script only if explicitly approved |
 
-**Current entrypoint only implements `--stage prepare`.** It neither creates forks nor enables GitHub Actions, edits workflow YAML, makes optimizer calls, dispatches CI runs, or measures CI time. It must not be used to claim measured evaluation results.
+**Available stages:** `--stage prepare` and `--stage ci-cost` (offline Arm B generation). Neither stage creates forks, dispatches CI runs, or measures CI time. The new stage invokes an external rule-based CLI on isolated snapshot copies; generated changes are not yet validated or deployed.
 
 ## 3. Prerequisites
 
@@ -37,7 +74,7 @@ The planned pipeline evaluates three arms on the **same pinned repository/workfl
 - Python 3.11+ with the repository's `requirements.txt` installed (`PyYAML`).
 - Repository files: `evaluation/evaluation_repositories_4000.csv` and `research-data/zenodo_20340547/pattern_repo_candidates_20.csv`.
 - GitHub public API read access. For higher rate limits, set `GITHUB_TOKEN` in the shell or in the root `.env`; never commit credentials.
-- The current implementation needs **read access only**. Do not grant repository write or Actions permissions just to run preparation.
+- The **preparation stage** needs read access only. The separate hosted fork-execution controller in Section 10 requires explicitly scoped write/Actions credentials; do not grant those just to prepare repository snapshots.
 
 ### Install dependencies
 
@@ -137,3 +174,300 @@ A repeated run with the same evaluation ID reuses already frozen repository snap
 Update **this guide** when new stages and CLI commands are implemented. Do not create `PHASE2_README.md`, `PHASE3_README.md`, etc. Keep status tables, examples and commands in sync with actual code. The existing `evaluation/README.md` research protocol is deliberately untouched unless a separate, explicit change is requested.
 
 The complete design and implementation work plan is maintained as a **separate, downloadable Markdown document**, not included in the implementation patch.
+
+## 9. Install and run Arm B — corrected pinned `ci-cost` source
+
+**Research identity:** Arm B now uses **ci-cost 1.0.0, pinned at upstream
+`e3722ea83da600bebac9ad21ec52490df824eb5c`, with the reviewed
+`cloudtune-ci-cost-source-fix-v1` TypeScript correctness fixes**. It is **not**
+the unchanged off-the-shelf release. Cite this distinction in the methods and
+limitations; do not call it an unmodified `ci-cost` baseline. All fixes are
+applied to the _upstream source_ and compiled before any evaluation; the Python
+adapter never rewrites generated workflow output.
+
+The upstream README documents `npx ci-cost`, but `ci-cost@1.0.0` is not available
+from the public npm registry. Use the pinned GitHub source instead. The source
+fixes address incorrect checkout `fetch-depth` handling (checkout v4 defaults
+to depth 1), invalid indentation in generated cache steps, and a matrix
+`fail-fast` change that formerly inserted only a comment. Generation also
+validates YAML before writing output. No heuristic post-generation repair is
+allowed.
+
+Prerequisites: Node.js 20+, npm, Git, Python with PyYAML, and access to GitHub
+and the public npm registry. The local tool is kept under `.venv/ci-cost` and
+has its own npm dependencies; the CloudTune root remains a Python project.
+
+### Setup and verification
+
+In **Windows PowerShell**, from the existing CloudTune repository root:
+
+```powershell
+.\.venv\Scripts\python.exe -m evaluation.third_party.ci_cost.setup
+.\.venv\Scripts\python.exe -m evaluation.third_party.ci_cost.setup --verify
+```
+
+In **Linux Bash**:
+
+```bash
+./.venv/bin/python -m evaluation.third_party.ci_cost.setup
+./.venv/bin/python -m evaluation.third_party.ci_cost.setup --verify
+```
+
+Setup checks out the exact upstream SHA, verifies an initially clean checkout,
+patches only reviewed TypeScript source, installs dependencies using `npm ci
+--ignore-scripts`, recompiles with the pinned TypeScript dependency, then
+executes the **real compiled CLI** on two YAML smoke cases including the
+previously failing `fabrikt` checkout shape. It refuses to record a successful
+installation if any generated YAML is invalid or source changes differ from
+the allowed compiled source files. The generated installation manifest hashes
+the fix specification, modified source/compiled files, and upstream lockfile.
+
+**Do not run `npm ci --omit=dev` for setup:** the TypeScript compiler is a
+development dependency and is needed to rebuild the fixed source. Do not run
+`npx ci-cost@1.0.0`; that package is unavailable from npm.
+
+### Candidate generation
+
+**Windows PowerShell**:
+
+```powershell
+.\.venv\Scripts\python.exe -m evaluation.run_pipeline --config evaluation\configs\pilot.json --stage ci-cost
+Get-Content evaluation\results\cloudtune-abc-preparation-pilot-001\ci_cost_summary.json
+```
+
+**Linux Bash**:
+
+```bash
+./.venv/bin/python -m evaluation.run_pipeline --config evaluation/configs/pilot.json --stage ci-cost
+cat evaluation/results/cloudtune-abc-preparation-pilot-001/ci_cost_summary.json
+```
+
+The corrected build writes immutable candidates under
+`repositories/<repo>/candidates/B/cloudtune-ci-cost-source-fix-v1/`. Earlier
+`candidates/B/candidate.json` artifacts (including the previous `fabrikt`
+error) are **preserved**. The coordinator reports the corrected build's result
+without overwriting historical evidence.
+
+`APPLY` means a substantive YAML change was generated, `NO_CHANGE` means none
+was generated, and `ERROR` means the tool, source verification or generated
+output failed. `SKIPPED` means the repository was screened out. An APPLY result
+is not proof of behavior-preserving optimization or time savings. Common
+candidate validation, required checks and real GitHub Actions runs remain
+separate subsequent implementation stages. `github_actions_runs` is 0 here.
+
+A source-fixed comparator is methodologically different from the original
+upstream tool. Preserve upstream failures as separate evidence; do not combine
+or replace those measurements without declaring which ci-cost build was used.
+
+### Tests
+
+**Windows PowerShell**:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+**Linux Bash**:
+
+```bash
+./.venv/bin/python -m unittest discover -s tests -v
+```
+
+The offline tests verify snapshot integrity, candidate archiving, source-fix
+identity, and compiled transformation functions where TypeScript is available.
+They do not substitute for the real CLI smoke tests in setup or future hosted
+GitHub Actions evaluation runs.
+
+---
+
+## 10. GitHub-hosted A/B/C evaluation controller (new architecture)
+
+**Measured target CI execution happens only on GitHub Actions runners in
+research-owned forks of the target repositories.** The CloudTune controller
+performs repository screening, candidate generation, static safety checks,
+remote GitHub Actions dispatch and REST evidence collection. **It never runs
+selected repositories' build/test workloads locally.** Python, npm, TypeScript,
+BGE-M3 and OpenRouter are used for candidate preparation; those durations are
+not counted as target CI execution time.
+
+**Repository audit / existing code reuse:** The previous experiment subsystem
+`scripts/run_pattern_batch.py` and `scripts/run_ci_experiment.py` already uses
+forks, pinned Git trees, experiment commits, `workflow_dispatch`, pending-run
+recovery and GitHub Actions job timing. The new evaluation implementation
+preserves these proven mechanisms while adding three-arm comparisons and a
+hosted controller. Its RAG retrieval reads the existing `cloudtune_rag_documents`
+/ `cloudtune_rag_chunks` Supabase schema defined by
+`supabase/migrations/202610310001_cloudtune_rag.sql`. It does **not** train,
+rebuild, upload, or update the corpus during an evaluation. The committed corpus
+manifest declares 74 records (25 literature patterns + 49 examples); this is
+**not proof that 74 records are currently installed in Supabase**. The controller
+verifies live document hashes, memberships and one BGE-M3 embedding revision
+against `research-data/rag/rag_dataset.jsonl` before creating Arm C.
+
+### 10.1 Two GitHub Actions execution locations
+
+```text
+CloudTune repository: .github/workflows/cloudtune-evaluation.yml
+  |
+  +-- prepare a frozen source commit and documented eligibility
+  +-- create A (unchanged), B (source-fixed ci-cost), C (BGE-M3/Supabase + LLM)
+  +-- actionlint and conservative common safety admission
+  +-- create/prepare research-owned fork, register common dispatch harness
+  +-- commit A/B/C to isolated refs derived from the SAME pinned source
+  |
+  v
+Target research fork: selected .github/workflows/<workflow>.yml
+  +-- workflow_dispatch on A => actual GitHub Actions build/tests
+  +-- workflow_dispatch on B => actual GitHub Actions build/tests, if admitted
+  +-- workflow_dispatch on C => actual GitHub Actions build/tests, if admitted
+  |
+  v
+GitHub REST workflow-run + jobs endpoints
+  +-- preserve raw run/job JSON, SHA and conclusion
+  +-- initial GitHub runner queue delay: creation -> FIRST job start
+  +-- active job time: union of started_at -> completed_at job intervals
+  +-- raw makespan: FIRST job start -> LAST executed job finish
+  +-- inter-job idle: raw makespan - active job time
+  +-- job runtime: sum of each executed job's start -> completion
+  +-- CI required-check outcome and protocol identity
+  |
+  v
+CloudTune state branch + archived report/evidence
+```
+
+**Queue measurement policy:** `run_started_at` is not accepted as a substitute
+for the first job's `started_at`. Even multi-hour initial GitHub queue delays
+must not inflate execution time. The queue-excluded primary `workflow_elapsed_seconds` merges overlapping job
+intervals and excludes _all_ intervals where no target job is running. The
+unmodified start-to-finish makespan remains available separately to explain
+practical workflow completion latency, and `inter_job_idle_seconds` shows its
+gaps. Those gaps may reflect dependencies as well as runner scheduling; their
+cause must not be asserted without additional GitHub evidence. The **sum of
+executed job runtimes** is reported as a separate runner-resource proxy. Neither measure
+is described as GitHub billed minutes without official billing evidence.
+
+A queued/running GitHub workflow is **not** a failed target CI run. The
+controller saves dispatch intent and run identity before further actions,
+returns `WAITING_FOR_GITHUB_RUN`, and rechecks in later scheduled invocations.
+It must never send a second POST simply because an earlier dispatch timed out
+or a runner remained queued. Ambiguous dispatches are retained for investigation
+and never converted to measured failures or fake speedups.
+
+### 10.2 Setup once on GitHub; no local npm setup
+
+The hosted controller is `.github/workflows/cloudtune-evaluation.yml`.
+It installs Node.js, Python, actionlint and the pinned source-corrected ci-cost
+**inside GitHub's temporary controller runner environment**. No ci-cost clone
+inside the developer's `.venv` is required for a hosted evaluation. The
+source-corrected B comparator **must be reported as such**; it is not the
+unmodified upstream `ci-cost` release.
+
+**GitHub Actions default-branch constraint:** CloudTune's remote default branch
+is `main`. GitHub's regular Actions UI manual `workflow_dispatch` requires this
+controller workflow to be registered on the default branch. Pushing the new
+workflow only to `feature/evaluation-pipeline` triggers the **non-dispatching
+verification** job; it does not enable a reliable manual UI start. Review and
+merge the controller workflow to `main` (or register an appropriately reviewed
+workflow on `main`) before manually starting hosted experiments. All evaluation
+commits remain versioned and separate from the original upstream source.
+
+Configure the following **CloudTune Actions repository secrets** using the
+GitHub repository settings (do not commit them or pass them to target builds):
+
+- `CLOUDTUNE_FORK_TOKEN`: GitHub credential that can create and administer
+  research-account forks, enable Actions, write branches and dispatch target
+  workflows. A repository-scoped `GITHUB_TOKEN` cannot write into another
+  account's forks. Grant only the permissions required for your research-owned
+  forks, and test them with a disposable development repository first.
+- `SUPABASE_URL`, `SUPABASE_SECRET_KEY`: the existing Supabase RAG index.
+- `OPENROUTER_API_KEY`: the chosen pinned free generation model.
+
+CloudTune's own temporary `GITHUB_TOKEN` needs `contents: write` **only** for
+its versioned `cloudtune-evaluation-state` branch. These secrets are exposed
+only to the controller execution step, **not** to the third-party npm install
+or source compilation steps, and never to the target fork's CI jobs.
+
+GitHub UI: **Actions -> CloudTune GitHub-hosted A/B/C evaluation -> Run workflow**.
+Choose `main` after the controller has been registered there, and select
+`evaluation/configs/hosted_pilot.json`. The committed hosted pilot attempts
+three **dataset rows**, not necessarily three eligible forks, with three
+repetitions per valid arm. Do not run against the full 4,000-row candidate pool
+without a separately pre-registered research sampling and spending protocol.
+
+Every 30 minutes GitHub's scheduled controller attempts to resume an
+**already-started** pilot. A schedule alone does not start a new study. Each
+invocation caps fresh dispatches at three; pending runs are resolved before any
+new dispatch. GitHub scheduled events can be delayed or dropped under load:
+manual re-dispatch with the **same** frozen controller revision and config is
+also possible without reissuing a pending target run.
+
+### 10.3 Evidence and safety boundaries
+
+Scheduled resumes check out the **exact original controller commit**
+archived in the experiment ledger, even if CloudTune's default branch has moved
+since the initial launch. If the newer default-branch _workflow definition_ has
+changed, the controller refuses automatic resume instead of silently changing
+the experiment protocol. The GitHub-hosted controller and measured fork runs
+remain separately versioned.
+
+The hosted controller checkpoints frozen source files, LLM retrieval/results,
+candidates and real GitHub API run/job responses to the dedicated
+`cloudtune-evaluation-state` branch. Commits are non-force, hashes are checked,
+and resumes restore archived snapshots rather than re-screening moving upstream
+heads. The controller uploads an additional per-invocation GitHub Actions
+artifact from `evaluation/results/`; that artifact is **not** the durable
+source of truth across separate hosted runner instances.
+
+The conservative initial shared validator automatically admits only narrow
+**additive dependency-cache** proposals preserving the original job IDs,
+steps, commands, matrices, triggers and permissions. Cache keys must be
+bound to the runner OS and dependency input hashes. Required dispatch inputs
+without defaults are rejected before experiment branch creation. Other valid optimization
+mechanisms are `REVIEW_REQUIRED` and **not** automatically executed. Neither
+YAML parsing, actionlint nor a successful CI conclusion alone proves general
+behavioral equivalence; a broader study needs a predeclared mechanism-specific
+safety protocol and independent review.
+
+Initial baseline required-job names are inferred from the successful first
+GitHub Actions run only when an explicit list is absent. This is a **heuristic
+experiment contract**, not proof of an upstream branch-protection requirement.
+For research-grade main evaluation, freeze a reviewed required-check contract
+before generating comparisons.
+
+**Important:** source-corrected ci-cost changes are attributed only to the
+`ci-cost v1.0.0 + CloudTune source-fix v1` comparator. For C, the BGE-M3
+embedding revision, retrieval results and model response are retained; model
+provider aliases and free-tier availability may change and can make an
+experiment inconclusive. Failed or unavailable models are not silently replaced
+with a paid model.
+
+### 10.4 Report interpretation
+
+`evaluation/results/<evaluation_id>/hosted_report.json` and
+`hosted_runs.csv` and `hosted_aggregate.json` contain observed runs,
+paired repository-level statistics and queue-separated timings, including
+active job time, full makespan, inter-job idle gaps, initial queue and summed
+job runtime. A free-model error is recorded as an Arm C generation failure;
+it does not erase successful A/B evidence. Each
+repository's raw GitHub run and jobs responses are archived under its frozen
+snapshot `runs/<run_id>/attempt-<attempt>/`. Summaries include C-vs-B,
+B-vs-A and C-vs-A **only where required comparable GitHub executions exist**.
+Incomplete repetitions, rejected candidates, failed builds, and skipped
+repositories remain visible with explicit missing values; no imputed or
+invented elapsed-time savings are reported. A failed actual CI run is terminal
+(`FAILED_TARGET_CI`) under this protocol. A completed GitHub run where **no
+job acquired a runner** is `INCONCLUSIVE_PLATFORM`, not an execution-time
+measurement or a failed target build; it is not silently retried. Later
+scheduled controllers must not run replacement repetitions merely to obtain
+a favorable result. Preserving failures in the study
+denominator is mandatory.
+
+### 10.5 Verification limits
+
+The local automated tests validate the controller state machine, source checks,
+queue-time arithmetic, archive creation, candidate validation and mocked GitHub
+run collection. They **cannot** establish that a real GitHub token has fork
+administration rights, that a particular upstream workflow is runnable on a
+research fork, that the live Supabase corpus is populated, or that the hosted
+A/B/C study has finished. A real one-repository development smoke experiment
+on GitHub Actions is required before a held-out pilot or main research run.

@@ -1,8 +1,7 @@
-"""CloudTune A/B/C evaluation coordinator — Phase 1 read-only preparation.
+"""CloudTune A/B/C evaluation coordinator — read-only preparation and Arm B generation.
 
-Until later implementation phases, this entrypoint supports only the
-``prepare`` stage. It deliberately cannot dispatch workflows, create forks or
-claim execution measurements. B and C optimizers remain planned work.
+``prepare`` snapshots original workflows and ``ci-cost`` generates offline B
+candidates. Neither stage creates forks, dispatches CI or measures savings.
 """
 from __future__ import annotations
 
@@ -15,6 +14,7 @@ from pathlib import Path
 
 from scripts.experiment_environment import load_env
 
+from evaluation.optimizers.ci_cost import generate_ci_cost_candidate
 from evaluation.optimizers.original import original_candidate
 from evaluation.repository_preparation import (
     GitHubReader,
@@ -30,21 +30,21 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "evaluation" / "configs" / "pilot.json"
 
 
-def load_config(path: Path) -> dict:
+def load_config(path: Path, *, allow_hosted: bool = False) -> dict:
     config = json.loads(path.read_text(encoding="utf-8"))
     evaluation_id = config.get("evaluation_id", "")
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", evaluation_id):
         raise ValueError("evaluation_id must contain only letters, digits, underscores and hyphens")
     if config.get("arms") != ["original", "ci_cost", "rag"]:
-        raise ValueError("Phase 1 config must reserve the three arms: original, ci_cost, rag")
+        raise ValueError("Evaluation config must reserve three arms: original, ci_cost, rag")
     if not isinstance(config.get("repository_limit"), int) or not 1 <= config["repository_limit"] <= 100:
         raise ValueError("repository_limit must be between 1 and 100")
     if not isinstance(config.get("repository_start_at", 1), int) or config.get("repository_start_at", 1) < 1:
         raise ValueError("repository_start_at must be a positive integer")
-    if config.get("execution", {}).get("dry_run") is not True:
-        raise ValueError("Phase 1 is strictly read-only; execution.dry_run must be true")
+    if config.get("execution", {}).get("dry_run") is not True and not allow_hosted:
+        raise ValueError("Preparation and local candidate generation require execution.dry_run=true")
     if config.get("dataset_split", "evaluation") != "evaluation":
-        raise ValueError("Phase 1 expects the held-out evaluation dataset")
+        raise ValueError("Evaluation requires the held-out evaluation dataset")
     return config
 
 
@@ -101,18 +101,78 @@ def prepare(config: dict, *, reader: GitHubReader | None = None, project_root: P
     return summary
 
 
+
+def generate_b(config: dict, *, project_root: Path = ROOT,
+               optimizer=generate_ci_cost_candidate) -> dict:
+    """Generate B from pinned preparation output without further GitHub reads.
+
+    ``screening.csv`` includes ineligible rows for transparent attrition counts;
+    only prepared/needs_harness repositories have valid original snapshots.
+    """
+    output = project_root / "evaluation/results" / config["evaluation_id"]
+    frozen_config = output / "config.json"
+    screening = output / "screening.csv"
+    if not frozen_config.exists() or not screening.exists():
+        raise ValueError("Run --stage prepare first; frozen configuration/screening is missing")
+    if json.loads(frozen_config.read_text(encoding="utf-8")) != config:
+        raise ValueError("Evaluation configuration differs from pinned preparation")
+    dataset_hash = file_sha256(project_root / config["dataset"])
+    previous = json.loads((output / "preparation_summary.json").read_text(encoding="utf-8"))
+    if previous.get("dataset_sha256") != dataset_hash:
+        raise ValueError("Held-out dataset has changed since preparation")
+    version = config.get("ci_cost", {}).get("version", "")
+    if version != "1.0.0":
+        raise ValueError("Arm B requires reviewed ci-cost version 1.0.0")
+
+    with screening.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    selected = read_evaluation_rows(project_root / config["dataset"])
+    start = config.get("repository_start_at", 1) - 1
+    expected_ids = [row["repo_id"] for row in selected[start:start + config["repository_limit"]]]
+    if [row["repo_id"] for row in rows] != expected_ids:
+        raise ValueError("Screening rows do not match selected evaluation dataset rows")
+
+    summaries: list[dict] = []
+    for row in rows:
+        if row["status"] not in ("prepared", "needs_harness"):
+            summaries.append({"repo_id": row["repo_id"], "decision": "SKIPPED",
+                              "reason": "Not eligible for candidate generation: " + row["status"]})
+            continue
+        manifest_path = Path(row["manifest_path"]).resolve()
+        if not manifest_path.is_relative_to((output / "repositories").resolve()):
+            raise ValueError("Screening references a manifest outside this evaluation")
+        if not manifest_path.is_file():
+            raise ValueError("Prepared repository manifest is missing")
+        snapshot_dir = manifest_path.parent
+        candidate = optimizer(snapshot_dir, version=version)
+        summaries.append({"repo_id": row["repo_id"], "decision": candidate["decision"],
+                          "status": candidate["status"], "reason": candidate.get("error")})
+        print(f"{row['repo_id']}: Arm B {candidate['decision']} — {candidate['status']}", flush=True)
+    counts = {name: sum(row["decision"] == name for row in summaries)
+              for name in sorted({row["decision"] for row in summaries})}
+    summary = {"evaluation_id": config["evaluation_id"],
+               "stage": "ci_cost_offline_generation_only", "repositories": summaries,
+               "counts": counts, "github_actions_runs": 0,
+               "note": "Generated candidates are NOT safety-validated or CI-executed."}
+    (output / "ci_cost_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    return summary
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    parser.add_argument("--stage", choices=("prepare",), default="prepare")
+    parser.add_argument("--stage", choices=("prepare", "ci-cost"), default="prepare")
     args = parser.parse_args()
     try:
         config = load_config(args.config)
         # Reuse the repository's existing .env loader; exported shell values win.
         load_env(ROOT / ".env")
-        print(json.dumps(prepare(config), indent=2))
+        summary = prepare(config) if args.stage == "prepare" else generate_b(config)
+        print(json.dumps(summary, indent=2))
+        if args.stage == "ci-cost" and summary["counts"].get("ERROR", 0):
+            return 1
     except (OSError, ValueError, KeyError, csv.Error, json.JSONDecodeError) as error:
-        print(f"Preparation failed: {error}", file=sys.stderr)
+        print(f"Evaluation stage failed: {error}", file=sys.stderr)
         return 1
     return 0
 
