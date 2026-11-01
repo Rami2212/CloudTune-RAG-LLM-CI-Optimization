@@ -27,6 +27,8 @@ MANIFEST_NAMES = frozenset({
     "package.json", "package-lock.json", "npm-shrinkwrap.json", "pyproject.toml",
     "requirements.txt", "pom.xml", "build.gradle", "go.mod", "go.sum",
     "Cargo.toml", "Cargo.lock", "Makefile", "WORKSPACE", "MODULE.bazel",
+    "yarn.lock", "pnpm-lock.yaml", "poetry.lock", "uv.lock", "Pipfile.lock",
+    "gradle.lockfile",
 })
 MAX_FILE_BYTES = 2_000_000
 MAX_CONTEXT_FILES = 100
@@ -196,6 +198,30 @@ class GitHubReader:
             raise PreparationError(f"GitHub API HTTP {error.code}: {api_path}", "api_error") from error
         except (urllib.error.URLError, TimeoutError) as error:
             raise PreparationError(f"GitHub API connection failed for {api_path}", "api_error") from error
+
+    def workflow_history(self, repo_id: str, workflow_path: str, branch: str) -> dict:
+        """Read bounded, pre-evaluation CI history; never claim it is a measured baseline.
+
+        No write permissions or fork access are required. If GitHub denies run
+        history, preserve an explicit unavailable status rather than guessing.
+        """
+        query = urllib.parse.urlencode({"per_page": 5, "branch": branch, "status": "completed"})
+        workflow_name = urllib.parse.quote(Path(workflow_path).name, safe="")
+        try:
+            history = self.get_json(
+                f"/repos/{validate_repo_id(repo_id)}/actions/workflows/{workflow_name}/runs?{query}")
+        except PreparationError as error:
+            return {"status": "unavailable", "reason": error.status, "runs": []}
+        rows = history.get("workflow_runs")
+        if not isinstance(rows, list):
+            return {"status": "unavailable", "reason": "invalid_history_response", "runs": []}
+        return {"status": "historical_context_only" if rows else "no_completed_runs",
+                "measurement": "not_a_measured_baseline",
+                "runs": [{"run_id": item.get("id"), "head_sha": item.get("head_sha"),
+                          "conclusion": item.get("conclusion"), "event": item.get("event"),
+                          "created_at_utc": item.get("created_at"),
+                          "updated_at_utc": item.get("updated_at")}
+                         for item in rows[:5] if isinstance(item, dict)]}
 
     def blob(self, repo_id: str, blob_sha: str) -> bytes:
         if not re.fullmatch(r"[0-9a-fA-F]{40}", blob_sha):
@@ -386,6 +412,9 @@ def prepare_repository(
                  "language": row.get("language"), "split": row.get("split")}
     write_json_immutable(folder / "selection.json", selection)
     write_json_immutable(folder / "source" / "files_manifest.json", {"archived": archived, "omitted": omitted})
+    history_reader = getattr(reader, "workflow_history", None)
+    ci_history = (history_reader(repo_id, workflow_path, default_branch)
+                  if callable(history_reader) else {"status": "not_collected", "runs": []})
     manifest = {
         "schema_version": 1,
         "repo_id": repo_id,
@@ -402,6 +431,7 @@ def prepare_repository(
         "dispatch_problems": problems,
         "context_files_archived": len(archived),
         "context_files_omitted": len(omitted),
+        "ci_history": ci_history,
         "required_checks": {"status": "not_verified", "reason": "Requires branch-protection and/or baseline evidence"},
         "notes": ["Read-only snapshot. No fork, workflow mutation, CI dispatch, or baseline execution performed.",
                   "Safety screening is conservative, not a semantic equivalence proof."],

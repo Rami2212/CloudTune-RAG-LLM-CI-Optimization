@@ -384,7 +384,8 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False) -> dict:
                         save()
                     c = generate_rag_candidate(snapshot, retriever=retriever,
                              model=config["rag"]["generator_model"], top_k=config["rag"]["top_k"],
-                             max_tokens=config["rag"]["max_tokens"])
+                             max_tokens=config["rag"]["max_tokens"],
+                             required_job_names=config["execution"].get("required_job_names", []))
                 except (ValueError, RuntimeError, OSError, KeyError, json.JSONDecodeError) as exc:
                     # A provider/network/generation failure is a valid research
                     # outcome, not a reason to drop the repository or fabricate

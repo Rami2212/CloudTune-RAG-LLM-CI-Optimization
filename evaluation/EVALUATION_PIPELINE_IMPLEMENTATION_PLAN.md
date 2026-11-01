@@ -1,8 +1,9 @@
 # CloudTune — A/B/C Evaluation Pipeline Implementation Plan
 
-> **Current implementation (November 1, 2026):** The evaluation coordinator runs
-> locally and dispatches CI exclusively to research-owned candidate forks. Earlier
-> hosted-controller proposals are superseded by Section 14 below.
+> **Planning record:** Sections 1–13 preserve the implementation plan and decisions
+> established before and during Phases 1 and 2. Dated corrections are retained,
+> not substituted for the original roadmap. For the final local-controller decision,
+> see Section 14; the hosted-controller proposal below is historical.
 
 **Document type:** Technical implementation plan (not a handoff document)  
 **Project:** CloudTune — RAG and LLM-Based CI Optimization  
@@ -12,19 +13,19 @@
 **Repository source reviewed:** `develop`, commit `305463509678c1cbf0ba3a45b94d789701710234`, October 31, 2026  
 **Document updated:** November 1, 2026  
 **Scope:** Evaluation arms **A (Original)**, **B (`ci-cost`)**, **C (LLM + RAG)**; **exclude D (LLM-only)**.  
-**Repository documentation policy:** **Do not change any existing README**, including the existing `evaluation/README.md`, as part of the current implementation. The pipeline has its own new, permanent `evaluation/PIPELINE_GUIDE.md`. Do not create a README for each implementation phase. The implementation plan is distributed separately and **must not be included in the implementation patch**.
+**Repository documentation policy:** **Do not change any existing README**, including `evaluation/README.md`, as part of this implementation. Maintain one `evaluation/PIPELINE_GUIDE.md` for operations and preserve this plan as the historical implementation roadmap, updating it in place only when decisions change. Do not create a README for each phase.
 
 > This is a **forward-looking implementation plan**, not a claim that the entire evaluation pipeline or research study has already been executed. The reviewed source revision is pinned above. Line numbers in existing scripts refer to that revision and may differ as new code is introduced.
 
 ---
 
-## Hosted GitHub Actions execution redesign — November 1, 2026
+## Historical hosted-controller proposal — superseded November 1, 2026
 
-**This section supersedes the older local-controller execution assumptions
-elsewhere in this plan.** No selected repository build or test is timed locally.
-The controller itself may run in CloudTune GitHub Actions, but **all measured
-A/B/C CI jobs execute as real workflow_dispatch runs inside isolated
-research-owned GitHub forks**.
+**Historical decision record, not the deployed operator architecture.** The
+following proposal to host the coordinator in CloudTune GitHub Actions was
+superseded during Phases 1–2. Preserve it as a record of the design change;
+ignore its hosted workflow, state branch, setup and scheduled-resume directions.
+The adopted local controller and candidate-fork execution are in Section 14.
 
 - **Controller:** `.github/workflows/cloudtune-evaluation.yml` runs
   `evaluation/hosted_pipeline.py`, with automated temporary dependency setup,
@@ -90,9 +91,9 @@ research-owned GitHub forks**.
   real experiments. One real repository on GitHub must pass an end-to-end
   smoke test before promotion to a held-out pilot.
 
-**Implementation status is not experimental evidence.** Until a hosted run
-has dispatched A/B/C workflows and collected real GitHub job timings,
-no end-to-end execution success or CI speedup is claimed.
+**Implementation status is not experimental evidence.** Until a real
+candidate-fork run dispatches A/B/C workflows and records actual GitHub job
+timings, no end-to-end execution success or CI speedup is claimed.
 
 ---
 
@@ -341,7 +342,7 @@ CloudTune-RAG-LLM-CI-Optimization/
 9. Record screening results including `prepared`, `needs_harness`, `ineligible`, `inconclusive`, and `api_error` with transparent reasons.
 10. Reuse frozen snapshots on rerun; changing the configuration or source/protocol requires a new evaluation ID.
 
-**Historical Phase 1 limits (before the hosted controller was added):** the `evaluation.run_pipeline` offline path remains read-only and does not dispatch or time GitHub Actions. The separate `evaluation.hosted_pipeline` controller now implements hosted fork execution, subject to live verification.
+**Phase 1 implementation boundary:** `evaluation.run_pipeline` remains read-only for preparation and offline candidate generation. The subsequent `evaluation.fork_pipeline` local coordinator handles candidate-fork execution; its live GitHub run and cleanup lifecycle still require a development-only smoke test.
 
 **Outputs:** `evaluation/results/<id>/screening.csv`, `preparation_summary.json`, `config.json`, and each repository's snapshot/manifest and `candidates/A/candidate.json`.
 
@@ -368,7 +369,7 @@ CloudTune-RAG-LLM-CI-Optimization/
 
 **New files:** `evaluation/rag_retriever.py`, `evaluation/optimizers/rag_llm.py`.
 
-1. Verify/create the RAG schema and ingest the frozen `build_rag_dataset.py` corpus through the existing BGE-M3/Supabase implementation.
+1. Reuse the existing frozen `build_rag_dataset.py` corpus and BGE-M3/Supabase index. Verify live schema, corpus membership, document hashes and embedding revision read-only; do not recreate or re-ingest the corpus during evaluation.
 2. Pin corpus hash, embedding-model revision, chunking, index details and retrieval configuration. Never blend evaluation results into the corpus during benchmark runs.
 3. Build a repository-specific retrieval query from selected CI YAML, build/test steps, dependencies/lockfiles, job structure, runner configuration and relevant CI history.
 4. Retrieve `top_k` chunks with document IDs, scores, pattern IDs, sources and limitations. Similarity alone is not proof of applicability.
@@ -597,7 +598,7 @@ The **existing Phase 1 implementation** provides `evaluation/configs/pilot.json`
 }
 ```
 
-**Important:** `evaluation.run_pipeline` supports offline `prepare` and `ci-cost` candidate generation and requires `execution.dry_run: true`. Actual hosted A/B/C execution is implemented separately in `evaluation.hosted_pipeline` with `evaluation/configs/hosted_pilot.json`, `dry_run: false`, GitHub credentials and safety admission; no local target CI timing occurs.
+**Important:** `evaluation.run_pipeline` supports offline `prepare` and `ci-cost` candidate generation with `execution.dry_run: true`. The local `evaluation.fork_pipeline` coordinator uses `evaluation/configs/fork_pilot.json` for real candidate-fork execution after explicit safety and credential review. The research repository does not run measured target CI.
 
 The completed pipeline configuration should additionally pin the `ci-cost` commit/executable checksum, exact generator model, RAG corpus/index and embedding revision, prompt hash, fork policy, dispatch timeouts, GitHub Actions permissions, required-check contract, run budget and acceptance thresholds. Configuration changes after execution require a distinct immutable evaluation ID.
 
@@ -756,11 +757,13 @@ The **evaluation pipeline implementation** is complete only when it can:
 - Existing RAG embeddings/retrieval: <https://github.com/Rami2212/CloudTune-RAG-LLM-CI-Optimization/blob/main/scripts/embed_rag_supabase.py>
 - Rule-based comparison tool: <https://github.com/mariotavarez/ci-cost>
 
-**End of implementation plan.**
+**End of the original phase-by-phase plan; the dated architecture amendment follows.**
 
 ---
 
 ## 14. Corrected implementation and research-fork cleanup protocol (November 1, 2026)
+
+**Progress on `feature/evaluation-pipeline`:** Phases 1 (repository preparation and unchanged A candidate) and 2 (source-corrected `ci-cost` B candidate) were implemented in the branch's first three commits, ahead of `develop`. Phase 3 extends that existing work; it is not a fresh implementation. Later validation, fork execution and reporting code exists but is not yet accepted as live-verified research evidence.
 
 This section supersedes prior proposals to run a controller workflow in the CloudTune research repository. The correct research process uses a **local Python coordinator**, `evaluation/fork_pipeline.py`, following the fork and dispatch mechanics already established by `scripts/run_pattern_batch.py` and `scripts/run_ci_experiment.py`. The original scripts and all teammates' research artifacts are unchanged.
 

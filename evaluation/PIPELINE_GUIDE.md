@@ -18,22 +18,21 @@ The planned pipeline evaluates three arms on the **same pinned repository/workfl
 
 **LLM-only (D) is out of scope.** Do not interpret C-versus-B results as an isolation of RAG's contribution from the LLM's contribution.
 
-## Hosted-first operating model (start here)
+## Current operating model — local coordinator and candidate-fork CI
 
-**Research measurements are made only by GitHub Actions jobs in research-owned
-forks of the evaluated repositories.** The CloudTune GitHub Actions workflow
-`.github/workflows/cloudtune-evaluation.yml` coordinates selection, frozen A/B/C
-candidate generation, safety admission, dispatch, durable resume and reporting.
-There is no requirement to clone `ci-cost` into the developer's `.venv` or run
-target repository builds locally. The optional local setup described in Sections
-3–9 is retained for debugging old preparation/optimizer commands, **not** for
-measuring CI time. For actual hosted execution, use Section 10.
+**Only research-owned candidate forks execute measured GitHub Actions jobs.**
+The CloudTune controller runs locally via `python -m evaluation.fork_pipeline`.
+It screens repositories, creates the same-source A/B/C candidates, validates
+optimized changes, dispatches fork workflows, and records raw GitHub evidence.
+The CloudTune research repository does **not** host an evaluation Actions
+controller or execute target builds/tests. See **Section 11** for the current
+commands and safe fork cleanup policy.
 
-**One-time GitHub setup:** register the controller workflow on CloudTune's
-`main` default branch; configure the fork-management, Supabase and OpenRouter
-repository secrets; review a _development-only_ pilot configuration and job
-permissions; then manually start it in GitHub Actions. Keep the initial held-out
-cohort unexposed until the development smoke experiment has passed.
+The earlier offline preparation and `ci-cost` instructions in Sections 3–9
+remain relevant. Section 10 documents a superseded hosted-controller design;
+do **not** perform its GitHub `main` registration, state-branch, schedule, or
+secrets setup. Use a development-only repository for the first live smoke
+experiment, never the held-out evaluation cohort.
 
 ### Clock definitions for the study
 
@@ -78,7 +77,7 @@ request or queue wait is included in the measured target CI execution.
 - Python 3.11+ with the repository's `requirements.txt` installed (`PyYAML`).
 - Repository files: `evaluation/evaluation_repositories_4000.csv` and `research-data/zenodo_20340547/pattern_repo_candidates_20.csv`.
 - GitHub public API read access. For higher rate limits, set `GITHUB_TOKEN` in the shell or in the root `.env`; never commit credentials.
-- The **preparation stage** needs read access only. The separate hosted fork-execution controller in Section 10 requires explicitly scoped write/Actions credentials; do not grant those just to prepare repository snapshots.
+- The **preparation stage** needs read access only. The local fork coordinator in Section 11 requires appropriately scoped fork-management, Contents and Actions permissions for real execution; do not grant those merely to prepare repository snapshots.
 
 ### Install dependencies
 
@@ -279,12 +278,18 @@ or replace those measurements without declaring which ci-cost build was used.
 
 The offline tests verify snapshot integrity, candidate archiving, source-fix
 identity, and compiled transformation functions where TypeScript is available.
-They do not substitute for the real CLI smoke tests in setup or future hosted
+They do not substitute for the real CLI smoke tests or future candidate-fork
 GitHub Actions evaluation runs.
 
 ---
 
-## 10. GitHub-hosted A/B/C evaluation controller (new architecture)
+## 10. Historical design record — superseded GitHub-hosted controller
+
+> **Do not use any commands or setup steps in this section.** It records an
+> intermediate hosted-controller proposal, which was abandoned during the
+> earlier implementation work. No `.github/workflows/cloudtune-evaluation.yml`
+> controller, CloudTune state branch, or scheduled resume exists in the adopted
+> architecture. Follow **Section 11** for the actual local coordinator.
 
 **Measured target CI execution happens only on GitHub Actions runners in
 research-owned forks of the target repositories.** The CloudTune controller
@@ -357,7 +362,7 @@ It must never send a second POST simply because an earlier dispatch timed out
 or a runner remained queued. Ambiguous dispatches are retained for investigation
 and never converted to measured failures or fake speedups.
 
-### 10.2 Setup once on GitHub; no local npm setup
+### 10.2 Archived hosted setup — do not follow
 
 The hosted controller is `.github/workflows/cloudtune-evaluation.yml`.
 It installs Node.js, Python, actionlint and the pinned source-corrected ci-cost
@@ -478,7 +483,7 @@ on GitHub Actions is required before a held-out pilot or main research run.
 
 ---
 
-## 11. Corrected operator model — candidate-fork execution
+## 11. Current operator model — candidate-fork execution
 
 **This section supersedes Section 10 wherever it describes a GitHub Actions controller in the CloudTune repository.** The research repository must not run selected repositories' CI workflows. The coordinator runs locally using `python -m evaluation.fork_pipeline`; only candidate repository forks run measured CI jobs through GitHub Actions.
 
@@ -507,3 +512,33 @@ Once a candidate repository's runs are finalized and raw GitHub run/job evidence
 ```
 
 `--check-config` performs no GitHub writes. The `--watch` option is for actual experiments after repository selection, credentials, dependencies and study eligibility are reviewed. **Do not use held-out evaluation rows as a development smoke test.** The implementation has mock-based verification, not a confirmed live fork-execution-and-deletion test. Keep existing `scripts/`, RAG data and README files unchanged.
+
+### Phase 3 read-only RAG verification
+
+The new `evaluation.phase3_check` command verifies the pinned 74-record corpus
+hash locally, then optionally verifies the existing Supabase index and retrieves
+BGE-M3 chunks. It never uploads embeddings, calls the generator, creates forks,
+or dispatches workflows. `remote` and `retrieve` require your configured `.env`
+and installed `requirements-rag.txt` dependencies.
+
+**Windows PowerShell**
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p test_phase3_rag.py -v
+.\.venv\Scripts\python.exe -m evaluation.phase3_check --mode local
+.\.venv\Scripts\python.exe -m evaluation.phase3_check --mode remote
+.\.venv\Scripts\python.exe -m evaluation.phase3_check --mode retrieve
+```
+
+**Linux Bash**
+
+```bash
+./.venv/bin/python -m unittest discover -s tests -p 'test_phase3_rag.py' -v
+./.venv/bin/python -m evaluation.phase3_check --mode local
+./.venv/bin/python -m evaluation.phase3_check --mode remote
+./.venv/bin/python -m evaluation.phase3_check --mode retrieve
+```
+
+A successful local preflight is **not** proof that the live Supabase index,
+OpenRouter generation, or Phase 5 GitHub Actions execution works. Preserve all
+Phase 1/2 changes and experimental evidence.
