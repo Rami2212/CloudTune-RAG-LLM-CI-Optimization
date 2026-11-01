@@ -22,6 +22,32 @@ class CandidateValidationError(ValueError):
 
 FORBIDDEN_STEP_KEYS = {"continue-on-error"}
 
+# The cache key must invalidate when the dependencies represented by its path
+# change. Matching hashFiles( alone is insufficient: README.md is not a lockfile.
+CACHE_DEPENDENCY_GLOBS = {
+    "node_modules": ("package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml"),
+    "~/.npm": ("package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml"),
+    "~/.cache/pip": ("requirements.txt", "requirements*.txt", "poetry.lock", "pdm.lock", "uv.lock", "Pipfile.lock"),
+    "~/.cargo/registry": ("Cargo.lock",),
+    "~/.cargo/git": ("Cargo.lock",),
+    "~/.gradle/caches": ("gradle.lockfile", "libs.versions.toml"),
+    "~/.m2/repository": ("pom.xml",),
+}
+
+
+def _cache_key_tracks_dependencies(path: str, key: str) -> bool:
+    """Approve explicit runner+dependency hashes, never arbitrary file hashes."""
+    if "${{ runner.os }}" not in key:
+        return False
+    # Conservative, intentionally allow only plain quoted paths. Advanced
+    # expressions can be considered in a separately reviewed safety policy.
+    hashes = re.findall(r"hashFiles\(\s*['\"]([^'\"]+)['\"]\s*\)", key)
+    if not hashes:
+        return False
+    allowed = CACHE_DEPENDENCY_GLOBS[path]
+    return any(glob == known or (glob.startswith("**/") and glob[3:] == known)
+               for glob in hashes for known in allowed)
+
 
 def _actionlint(data: bytes, executable: str | None = None) -> dict:
     executable = executable or shutil.which("actionlint")
@@ -72,7 +98,7 @@ def validate_candidate(original: bytes, candidate: bytes, *, actionlint: str | N
         reasons.append("UNSAFE_WORKFLOW:" + ",".join(safety_findings(after)))
     if set(before) != set(after):
         reasons.append("TOP_LEVEL_KEYS_CHANGED")
-    # In the initial hosted evaluation protocol, require exactly the same
+    # In the initial fork evaluation protocol, require exactly the same
     # trigger, permissions, jobs, matrix, runner, dependencies and commands.
     for key in set(before) | set(after):
         if key not in {"jobs"} and before.get(key) != after.get(key):
@@ -103,14 +129,10 @@ def validate_candidate(original: bytes, candidate: bytes, *, actionlint: str | N
                   # No broad restore keys or unpinned cache keys: dependency
                   # changes must invalidate the cache to preserve CI behavior.
                   set(step["with"]) == {"path", "key"} and
-                  "${{ runner.os }}" in step["with"]["key"] and
-                  "hashFiles(" in step["with"]["key"] and
                   "**" not in step["with"]["path"] and
                   not re.search(r"(^|/)\.{2}(/|$)", step["with"]["path"]) and
-                  step["with"]["path"].strip() in {
-                      "node_modules", "~/.npm", "~/.cache/pip", "~/.cargo/registry",
-                      "~/.cargo/git", "~/.gradle/caches", "~/.m2/repository"
-                  }):
+                  step["with"]["path"].strip() in CACHE_DEPENDENCY_GLOBS and
+                  _cache_key_tracks_dependencies(step["with"]["path"].strip(), step["with"]["key"])):
                 continue
             else:
                 reasons.append("UNAPPROVED_STEP_EDIT:" + jid)

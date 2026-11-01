@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -29,8 +30,23 @@ COMPILED_FILES = ("dist/optimizer.js", "dist/checks/misc.js")
 MANIFEST_FILE = ".cloudtune-source-fix.json"
 
 
+def _safe_tool_environment() -> dict[str, str]:
+    """Do not pass research-account secrets to third-party Git/npm/build scripts.
+
+    The ci-cost checkout is public. Installation and compilation must not have
+    access to GitHub, Supabase, OpenRouter or local npm registry credentials.
+    """
+    env = {key: value for key, value in os.environ.items()
+           if not re.search(r"TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY|CREDENTIAL|AUTH", key, re.I)}
+    env["NPM_CONFIG_USERCONFIG"] = os.devnull
+    env["NPM_CONFIG_GLOBALCONFIG"] = os.devnull
+    env["CI"] = "true"
+    return env
+
+
 def _run(command: list[str], *, cwd: Path | None = None) -> str:
-    result = subprocess.run(command, cwd=cwd, capture_output=True, text=True, check=False)
+    result = subprocess.run(command, cwd=cwd, capture_output=True, text=True,
+                            check=False, env=_safe_tool_environment())
     if result.returncode:
         raise RuntimeError(f"Command failed ({result.returncode}): {' '.join(command)}\n{result.stderr[-1000:]}")
     return result.stdout.strip()
@@ -117,6 +133,7 @@ jobs:
                 ["node", str(root / "dist/index.js"), "--fix", "--dir=" + str(folder)],
                 capture_output=True, text=True, timeout=60, check=False,
                 cwd=tmp,
+                env=_safe_tool_environment(),
             )
             if result.returncode not in (0, 1) or "Error generating optimized files:" in result.stderr:
                 raise RuntimeError(f"ci-cost smoke case {name} failed: {result.stderr[-500:]}")

@@ -1,0 +1,424 @@
+"""Offline protocol checks; no workflow dispatch, fork writes, or network requests."""
+from __future__ import annotations
+
+import csv
+import hashlib
+import json
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import evaluation.fork_pipeline as pipeline
+
+from evaluation.candidate_validator import validate_candidate
+from evaluation.ci_executor import (
+    ForkExperiment, GitHubError, RunPending, ensure_dispatch, job_timing_metrics,
+    summarize_records, verify_fork,
+)
+from evaluation.fork_pipeline import StateStore, _config, exclusive_controller
+from evaluation.results_exporter import summarize_cohort
+from evaluation.third_party.ci_cost.setup import _safe_tool_environment
+
+
+ORIGINAL = b"""name: CI
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"""
+
+
+class FakeRunnerGitHub:
+    """Deterministic Actions evidence fixture with a long GitHub runner queue."""
+    def __init__(self, status="completed"):
+        self.status = status
+
+    def request(self, method, path, body=None):
+        assert method == "GET", (method, path)
+        if path.endswith("/actions/runs/901"):
+            return {"status": self.status, "conclusion": "success", "run_attempt": 1,
+                    "workflow_id": 42, "head_sha": "b" * 40,
+                    "head_branch": "cloudtune/demo-a", "event": "workflow_dispatch",
+                    "created_at": "2026-11-01T09:00:00Z",
+                    "run_started_at": "2026-11-01T09:20:00Z"}
+        raise AssertionError(path)
+
+    def all(self, path, key):
+        assert key == "jobs", path
+        return [{"id": 10, "name": "test", "status": "completed",
+                 "conclusion": "success", "started_at": "2026-11-01T11:00:00Z",
+                 "completed_at": "2026-11-01T11:01:00Z", "runner_name": "runner-1",
+                 "labels": ["ubuntu-24.04"]}]
+
+
+
+
+class HostedProtocolTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.state = {"fork_repo": "research/test", "workflow_id": 42,
+                      "pending": {"arm": "A", "repeat": 1, "run_id": 901},
+                      "records": [], "arms": {"A": {"sha": "b" * 40,
+                                  "branch": "cloudtune/demo-a", "workflow_sha256": "hash"}}}
+
+    def experiment(self, status="completed", max_wait_seconds=10):
+        return ForkExperiment(FakeRunnerGitHub(status), repo_id="source/test",
+                  workflow_path=".github/workflows/ci.yml", source_sha="a" * 40,
+                  original=ORIGINAL, evaluation_id="sample", max_wait_seconds=max_wait_seconds,
+                  poll_seconds=1)
+
+    def test_two_hour_queue_excluded_from_execution_seconds(self):
+        callbacks = []
+        record = self.experiment().execute(self.state, lambda: callbacks.append(1),
+                                           arm="A", repeat=1, required=["test"], max_total=3)
+        self.assertEqual(record["initial_queue_seconds"], 7200)
+        self.assertEqual(record["workflow_elapsed_seconds"], 60)
+        self.assertEqual(record["sum_job_runtime_seconds"], 60)
+        self.assertEqual(record["first_job_started_at"], "2026-11-01T11:00:00Z")
+        self.assertTrue(record["comparable"])
+        self.assertIsNone(self.state["pending"])
+        self.assertEqual(len(callbacks), 1)
+
+    def test_internal_runner_queue_is_excluded_from_active_elapsed(self):
+        # Job 1: 10:00-10:02, job 2 queued for 30 minutes, then 10:32-10:35.
+        # The raw wall makespan is 35 minutes, but jobs only executed 5 minutes.
+        jobs = [
+            {"started_at": "2026-11-01T10:00:00Z", "completed_at": "2026-11-01T10:02:00Z"},
+            {"started_at": "2026-11-01T10:32:00Z", "completed_at": "2026-11-01T10:35:00Z"},
+        ]
+        metrics = job_timing_metrics(jobs)
+        self.assertEqual(metrics["active_seconds"], 300)
+        self.assertEqual(metrics["makespan_seconds"], 2100)
+        self.assertEqual(metrics["idle_gap_seconds"], 1800)
+
+    def test_parallel_jobs_do_not_double_count_active_time(self):
+        jobs = [
+            {"started_at": "2026-11-01T10:00:00Z", "completed_at": "2026-11-01T10:03:00Z"},
+            {"started_at": "2026-11-01T10:01:00Z", "completed_at": "2026-11-01T10:04:00Z"},
+            {"started_at": "2026-11-01T10:04:00Z", "completed_at": "2026-11-01T10:05:00Z"},
+        ]
+        metrics = job_timing_metrics(jobs)
+        self.assertEqual(metrics["active_seconds"], 300)
+        self.assertEqual(metrics["makespan_seconds"], 300)
+        self.assertEqual(metrics["idle_gap_seconds"], 0)
+
+    def test_dispatch_required_inputs_without_default_fail_before_fork_write(self):
+        workflow = ORIGINAL.replace(b"  workflow_dispatch:",
+           b"  workflow_dispatch:\n    inputs:\n      environment:\n        required: true")
+        with self.assertRaisesRegex(ValueError, "DISPATCH_INPUT_MISSING_DEFAULT"):
+            ensure_dispatch(workflow)
+
+    def test_github_no_job_start_is_platform_inconclusive(self):
+        github = FakeRunnerGitHub()
+        github.all = lambda path, key: []
+        runner = ForkExperiment(github, repo_id="source/test",
+                 workflow_path=".github/workflows/ci.yml", source_sha="a" * 40,
+                 original=ORIGINAL, evaluation_id="sample", max_wait_seconds=10,
+                 poll_seconds=1)
+        record = runner.execute(self.state, lambda: None, arm="A", repeat=1,
+                                required=["test"], max_total=3)
+        self.assertEqual(record["failure_class"], "PLATFORM_NO_JOB_START")
+        self.assertIsNone(record["workflow_elapsed_seconds"])
+        self.assertFalse(record["comparable"])
+        self.assertEqual(len(self.state["records"]), 1)
+
+    def test_queued_run_stays_pending_and_is_not_redispatched(self):
+        with self.assertRaises(RunPending):
+            self.experiment(status="queued", max_wait_seconds=0).execute(
+                self.state, lambda: None, arm="A", repeat=1, required=["test"], max_total=3)
+        self.assertEqual(self.state["pending"]["run_id"], 901)
+        self.assertEqual(self.state["records"], [])
+
+    def _cleanup_experiment(self, github):
+        return ForkExperiment(github, repo_id="source/test",
+                              workflow_path=".github/workflows/ci.yml",
+                              source_sha="a" * 40, original=ORIGINAL,
+                              evaluation_id="sample", max_wait_seconds=0,
+                              poll_seconds=1)
+
+    def _cleanup_state(self):
+        return {"fork_repo": "research/test", "fork_owner": "research",
+                "fork_creation_intent": "research/test",
+                "fork_created_by_evaluation": True,
+                "measurements_finalized": True, "pending": None,
+                "records": [{"arm": "A", "run_id": 901}]}
+
+    def test_uncertain_fork_create_does_not_authorize_deletion(self):
+        class ExistingFork:
+            def request(self, method, path, body=None):
+                if method == "GET" and path == "/user":
+                    return {"login": "research"}
+                if method == "GET" and path == "/repos/research/test":
+                    return {"full_name": "research/test"}
+                raise AssertionError((method, path, body))
+        state = {"fork_creation_intent": "research/test"}
+        with self.assertRaisesRegex(ValueError, "not proven to be created"):
+            self._cleanup_experiment(ExistingFork()).provision(state, lambda: None)
+        self.assertFalse(state.get("fork_created_by_evaluation", False))
+
+    def test_cleanup_deletes_only_created_fork_after_jobs_finish(self):
+        events = []
+        class Fake:
+            def request(self, method, path, body=None):
+                events.append((method, path))
+                if method == "GET":
+                    return {"owner": {"login": "research"}, "fork": True,
+                            "permissions": {"push": True},
+                            "source": {"full_name": "source/test"}}
+                if method == "DELETE":
+                    return None
+                raise AssertionError((method, path))
+            def all(self, path, key):
+                self_check = key == "workflow_runs"
+                if not self_check: raise AssertionError((path, key))
+                return [{"id": 901, "status": "completed"}]
+        state = self._cleanup_state()
+        saved = []
+        result = self._cleanup_experiment(Fake()).cleanup_fork(
+            state, lambda: saved.append(dict(state)))
+        self.assertEqual(result, "DELETED")
+        self.assertEqual(events[-1], ("DELETE", "/repos/research/test"))
+        self.assertEqual(saved[-2]["cleanup_status"], "DELETE_REQUESTED")
+        self.assertEqual(saved[-1]["cleanup_status"], "DELETED")
+        self.assertEqual(len([e for e in events if e[0] == "DELETE"]), 1)
+        self._cleanup_experiment(Fake()).cleanup_fork(state, lambda: None)
+        self.assertEqual(len([e for e in events if e[0] == "DELETE"]), 1)
+
+    def test_cleanup_never_deletes_preexisting_fork(self):
+        class Forbidden:
+            def request(self, *args): raise AssertionError("Should never call GitHub")
+            def all(self, *args): raise AssertionError("Should never list jobs")
+        state = self._cleanup_state()
+        state["fork_created_by_evaluation"] = False
+        result = self._cleanup_experiment(Forbidden()).cleanup_fork(state, lambda: None)
+        self.assertEqual(result, "PRESERVED_NOT_OWNED")
+
+    def test_cleanup_refuses_pending_target_run(self):
+        class Forbidden:
+            def request(self, *args): raise AssertionError("Should never call GitHub")
+        state = self._cleanup_state()
+        state["pending"] = {"arm": "A", "repeat": 1, "run_id": 901}
+        with self.assertRaises(RunPending):
+            self._cleanup_experiment(Forbidden()).cleanup_fork(state, lambda: None)
+
+    def test_cleanup_refuses_other_queued_fork_runs(self):
+        class Fake:
+            def request(self, method, path, body=None):
+                assert method == "GET"
+                return {"owner": {"login": "research"}, "fork": True,
+                        "permissions": {"push": True},
+                        "source": {"full_name": "source/test"}}
+            def all(self, path, key):
+                return [{"id": 901, "status": "completed"},
+                        {"id": 902, "status": "queued"}]
+        state = self._cleanup_state()
+        result = self._cleanup_experiment(Fake()).cleanup_fork(state, lambda: None)
+        self.assertEqual(result, "WAITING_FOR_OTHER_RUNS")
+        self.assertEqual(state["cleanup_active_run_ids"], [902])
+        self.assertNotIn("cleanup_intent", state)
+
+    def test_cleanup_lost_delete_response_does_not_resend(self):
+        methods = []
+        class Fake:
+            def request(self, method, path, body=None):
+                methods.append(method)
+                if method == "DELETE":
+                    raise RuntimeError("GitHub DELETE response uncertain")
+                return {"owner": {"login": "research"}, "fork": True,
+                        "permissions": {"push": True},
+                        "source": {"full_name": "source/test"}}
+            def all(self, path, key): return []
+        state = self._cleanup_state()
+        runner = self._cleanup_experiment(Fake())
+        self.assertEqual(runner.cleanup_fork(state, lambda: None), "DELETE_OUTCOME_UNKNOWN")
+        self.assertEqual(runner.cleanup_fork(state, lambda: None), "DELETE_OUTCOME_UNKNOWN")
+        self.assertEqual(methods.count("DELETE"), 1)
+        class Missing:
+            def request(self, *args): raise GitHubError(404, "missing")
+        self.assertEqual(self._cleanup_experiment(Missing()).cleanup_fork(state, lambda: None), "DELETED")
+
+    def test_ci_cost_setup_does_not_inherit_research_secrets(self):
+        with patch.dict(os.environ, {
+            "OPENROUTER_API_KEY": "fixture-model-secret",
+            "GITHUB_TOKEN": "fixture-github-secret",
+            "SUPABASE_SECRET_KEY": "fixture-db-secret",
+            "PATH": "fixture-path",
+        }):
+            env = _safe_tool_environment()
+        self.assertNotIn("OPENROUTER_API_KEY", env)
+        self.assertNotIn("GITHUB_TOKEN", env)
+        self.assertNotIn("SUPABASE_SECRET_KEY", env)
+        self.assertEqual(env["PATH"], "fixture-path")
+
+    def test_cleanup_denied_permission_does_not_discard_evidence(self):
+        class Fake:
+            def request(self, method, path, body=None):
+                if method == "DELETE": raise GitHubError(403, path)
+                return {"owner": {"login": "research"}, "fork": True,
+                        "permissions": {"push": True},
+                        "source": {"full_name": "source/test"}}
+            def all(self, path, key): return []
+        state = self._cleanup_state()
+        self.assertEqual(self._cleanup_experiment(Fake()).cleanup_fork(state, lambda: None), "BLOCKED_PERMISSION")
+        self.assertEqual(len(state["records"]), 1)
+
+    def test_no_savings_claimed_without_both_arms(self):
+        data = [{"arm":"A", "comparable":True, "workflow_elapsed_seconds":100,
+                 "sum_job_runtime_seconds":110}]
+        stats = summarize_records(data)
+        self.assertIsNone(stats["B"]["elapsed_saving_percent_vs_A"])
+        self.assertIsNone(stats["C"]["elapsed_saving_percent_vs_A"])
+
+    def test_invalid_yaml_is_classified_not_raised(self):
+        result = validate_candidate(ORIGINAL, b"name: test\njobs:\n  x: [bad\n")
+        self.assertEqual(result["verdict"], "FAIL")
+
+    def test_unapproved_cache_path_is_rejected_even_if_syntax_valid(self):
+        bad = ORIGINAL.replace(b"      - run: echo ok", b"      - name: Cache SSH\n        uses: actions/cache@v4\n        with:\n          path: ~/.ssh\n          key: test\n      - run: echo ok")
+        with patch("evaluation.candidate_validator._actionlint", return_value={"status": "PASS", "reason":""}):
+            verdict = validate_candidate(ORIGINAL, bad)
+        self.assertNotEqual(verdict["verdict"], "PASS")
+
+    def test_cache_key_must_depend_on_runner_and_dependency_lockfile(self):
+        bad = ORIGINAL.replace(b"      - run: echo ok", b"      - name: Cache dependencies\n        uses: actions/cache@v4\n        with:\n          path: ~/.npm\n          key: constant\n      - run: echo ok")
+        with patch("evaluation.candidate_validator._actionlint", return_value={"status": "PASS", "reason": ""}):
+            outcome = validate_candidate(ORIGINAL, bad)
+        self.assertNotEqual(outcome["verdict"], "PASS")
+
+    def test_allowlist_accepts_source_bound_dependency_cache(self):
+        good = ORIGINAL.replace(b"      - run: echo ok", b"      - name: Cache dependencies\n        uses: actions/cache@v4\n        with:\n          path: ~/.npm\n          key: ${{ runner.os }}-${{ hashFiles('package-lock.json') }}\n      - run: echo ok")
+        with patch("evaluation.candidate_validator._actionlint", return_value={"status": "PASS", "reason": ""}):
+            outcome = validate_candidate(ORIGINAL, good)
+        self.assertEqual(outcome["verdict"], "PASS")
+
+    def test_hashing_unrelated_readme_does_not_make_cache_safe(self):
+        bad = ORIGINAL.replace(b"      - run: echo ok", b"      - name: Cache deps\n        uses: actions/cache@v4\n        with:\n          path: ~/.npm\n          key: ${{ runner.os }}-${{ hashFiles('README.md') }}\n      - run: echo ok")
+        with patch("evaluation.candidate_validator._actionlint", return_value={"status": "PASS", "reason": ""}):
+            self.assertNotEqual(validate_candidate(ORIGINAL, bad)["verdict"], "PASS")
+
+    def test_ineligible_first_row_does_not_require_a_snapshot(self):
+
+        root = self.root
+        out = root / "evaluation/results/skipped"
+        out.mkdir(parents=True)
+        with (out / "screening.csv").open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, fieldnames=["repo_id", "status", "manifest_path"])
+            writer.writeheader()
+            writer.writerow({"repo_id": "source/repo", "status": "ineligible", "manifest_path": ""})
+        config = {"evaluation_id": "skipped", "repetitions": 3, "ci_cost": {"version": "1.0.0"},
+                  "rag": {"embedding_revision": "AUTO_PIN_SINGLE", "dataset_sha256": "a"*64}}
+        with patch.object(pipeline, "ROOT", root), \
+             patch.object(pipeline, "_ensure_preparation", return_value=out), \
+             patch.object(pipeline, "GitHub", return_value=MagicMock()), \
+             patch.object(pipeline, "implementation_digest", return_value="f" * 64), \
+             patch.dict("os.environ", {"GITHUB_TOKEN": "fake"}):
+            report = pipeline.run_fork_evaluation(config)
+        self.assertEqual(report["repositories"]["source/repo"]["status"], "SKIPPED")
+        self.assertTrue((out / "state.json").is_file())
+
+    def test_local_state_survives_restart_without_replaying_a_dispatch(self):
+        output = self.root / "evaluation/results/study"
+        snapshot = output / "repositories" / "demo-repo"
+        (snapshot / "source").mkdir(parents=True)
+        (snapshot / "source/original.yml").write_bytes(ORIGINAL)
+        (snapshot / "manifest.json").write_text(json.dumps({
+            "repo_id": "demo/repo", "workflow_sha256": hashlib.sha256(ORIGINAL).hexdigest()}))
+        dataset = self.root / "dataset.csv"
+        dataset.write_text("repo_id,split\ndemo/repo,evaluation\n")
+        record = {"evaluation_id": "study", "dataset": "dataset.csv",
+                  "dataset_sha256": hashlib.sha256(dataset.read_bytes()).hexdigest(),
+                  "repositories": {"demo/repo": {"status": "WAITING_FOR_GITHUB_RUN",
+                                                 "pending": {"arm": "A", "repeat": 1,
+                                                             "run_id": 901}}},
+                  "screening": [{"repo_id": "demo/repo", "status": "prepared"}]}
+        with patch.object(pipeline, "ROOT", self.root):
+            first = StateStore("study", output_root=self.root)
+            first.save(record, snapshots={"demo/repo": snapshot})
+            recovered = StateStore("study", output_root=self.root).load()
+            self.assertEqual(recovered["repositories"]["demo/repo"]["pending"]["run_id"], 901)
+            restored = StateStore("study", output_root=self.root).restore(output, recovered)
+        self.assertEqual(Path(restored[0]["manifest_path"]), snapshot / "manifest.json")
+        self.assertEqual((snapshot / "source/original.yml").read_bytes(), ORIGINAL)
+
+    def test_local_checkpoint_fails_closed_on_mutated_snapshot(self):
+        output = self.root / "evaluation/results/study"
+        snapshot = output / "repositories/repo"
+        (snapshot / "source").mkdir(parents=True)
+        (snapshot / "source/original.yml").write_bytes(ORIGINAL)
+        (snapshot / "manifest.json").write_text(json.dumps({
+            "repo_id": "demo/repo", "workflow_sha256": "f" * 64}))
+        with self.assertRaisesRegex(ValueError, "Pinned repository snapshot changed"):
+            StateStore("study", output_root=self.root).save(
+                {"repositories": {"demo/repo": {}}}, snapshots={"demo/repo": snapshot})
+
+    def test_local_controller_lock_blocks_parallel_evaluations(self):
+        with patch.object(pipeline, "ROOT", self.root):
+            with exclusive_controller("study"):
+                with self.assertRaisesRegex(RuntimeError, "Controller already active"):
+                    with exclusive_controller("study"):
+                        pass
+            with exclusive_controller("study"):
+                pass
+
+    def test_no_cloudtune_actions_workflow_or_remote_state_branch(self):
+        root = Path(__file__).resolve().parents[1]
+        self.assertFalse((root / ".github/workflows/cloudtune-evaluation.yml").exists())
+        source = (root / "evaluation/fork_pipeline.py").read_text()
+        self.assertNotIn("/git/refs/heads/cloudtune-evaluation-state", source)
+        self.assertNotIn("cloudtune-evaluation-state", source)
+
+    def test_fork_must_be_owned_by_research_account(self):
+        fork = {"owner": {"login": "wrong"}, "fork": True, "permissions": {"push": True},
+                "source": {"full_name": "source/test"}}
+        with self.assertRaisesRegex(ValueError, "authorized"):
+            verify_fork(fork, "source/test", "research")
+
+    def test_head_to_head_c_vs_b_requires_actual_paired_runs(self):
+        record = []
+        for arm, elapsed in (("A", 100), ("B", 90), ("C", 80)):
+            for rep in range(3):
+                record.append({"arm":arm, "comparable":True,
+                               "workflow_elapsed_seconds":elapsed,
+                               "sum_job_runtime_seconds":elapsed,
+                               "initial_queue_seconds":7200})
+        complete = summarize_records(record, repetitions=3)
+        self.assertAlmostEqual(complete["C"]["elapsed_saving_percent_vs_B"], 100 * 10 / 90)
+        partial = summarize_records(record[:-1], repetitions=3)
+        self.assertIsNone(partial["C"]["elapsed_saving_percent_vs_B"])
+
+    def test_aggregate_requires_complete_repos_and_preserves_denominators(self):
+        dataset = {"repo1": {"status": "COMPLETE", "run_statistics": {
+                        "C": {"elapsed_saving_percent_vs_B": 15.0}}},
+                   "repo2": {"status": "INCOMPLETE", "run_statistics": {
+                        "C": {"elapsed_saving_percent_vs_B": 99.0}}},
+                   "repo3": {"status": "SKIPPED", "run_statistics": {}}}
+        summary = summarize_cohort(dataset, bootstrap_samples=100)
+        self.assertEqual(summary["total_selected"], 3)
+        self.assertEqual(summary["incomplete_repositories"], 1)
+        comparison = summary["comparisons"]["C_vs_B_elapsed"]
+        self.assertEqual(comparison["paired_repositories"], 1)
+        self.assertEqual(comparison["median_saving_percent"], 15.0)
+        self.assertIsNone(comparison["bootstrap_95pct_ci_percent"])
+
+    def test_fork_config_validates_without_tokens_or_git_api(self):
+        config = {
+            "evaluation_id": "test", "dataset":"dataset.csv", "dataset_split":"evaluation",
+            "repository_start_at":1, "repository_limit":1,
+            "arms":["original","ci_cost","rag"],"repetitions":3,"warmup_runs":0,
+            "rag":{"embedding_model":"BAAI/bge-m3", "embedding_revision":"AUTO_PIN_SINGLE",
+                   "dataset_sha256":"a"*64,"generator_model":"specific/model:free"},
+            "execution":{"dry_run":False,"cache_regime":"uncontrolled"}}
+        path = self.root / "hosted.json"
+        path.write_text(json.dumps(config))
+        self.assertEqual(_config(path)["evaluation_id"], "test")
+
+
+if __name__ == "__main__":
+    unittest.main()

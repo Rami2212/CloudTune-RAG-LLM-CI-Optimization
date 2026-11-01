@@ -1,5 +1,9 @@
 # CloudTune Evaluation Pipeline — Usage Guide
 
+> **Current implementation (November 1, 2026):** CloudTune runs a local fork coordinator;
+> only evaluated candidate forks run measured GitHub Actions CI. The previous hosted
+> controller instructions in Section 10 are superseded by the corrected Section 11.
+
 This guide is the long-term **user and operator guide** for the CloudTune evaluation pipeline. It is maintained as the pipeline grows. The repository's existing [`evaluation/README.md`](README.md) remains unchanged; that document describes the research evaluation protocol. This guide describes how to operate the implementation.
 
 ## 1. Evaluation scope
@@ -471,3 +475,35 @@ administration rights, that a particular upstream workflow is runnable on a
 research fork, that the live Supabase corpus is populated, or that the hosted
 A/B/C study has finished. A real one-repository development smoke experiment
 on GitHub Actions is required before a held-out pilot or main research run.
+
+---
+
+## 11. Corrected operator model — candidate-fork execution
+
+**This section supersedes Section 10 wherever it describes a GitHub Actions controller in the CloudTune repository.** The research repository must not run selected repositories' CI workflows. The coordinator runs locally using `python -m evaluation.fork_pipeline`; only candidate repository forks run measured CI jobs through GitHub Actions.
+
+The earlier `.github/workflows/cloudtune-evaluation.yml`, `evaluation/hosted_pipeline.py` and `evaluation/configs/hosted_pilot.json` are replaced by the local fork coordinator and `evaluation/configs/fork_pilot.json`. No CloudTune Actions workflow, default-branch registration or remote state branch is necessary.
+
+The process screens and freezes each repository, prepares original A, source-corrected `ci-cost` B and frozen RAG+LLM C candidates, applies the common conservative validator, creates isolated refs on a **research-owned candidate fork**, dispatches workflows using GitHub APIs, collects real GitHub job timestamps and stores all results in `evaluation/results/<evaluation_id>/`. Local setup and model latency are never measured as target CI duration. Long queues and gaps between jobs are excluded from active execution-time metrics.
+
+### Safe automatic fork cleanup
+
+Once a candidate repository's runs are finalized and raw GitHub run/job evidence is persisted locally, the controller attempts to delete its temporary fork. Deletion requires explicit proof that the fork was created by this evaluation, a matching fork identity, no pending dispatch and no non-completed GitHub Actions runs on that fork. A pre-existing fork is **never deleted**. The deletion intent is checkpointed before the GitHub DELETE. Missing delete permissions are recorded as `BLOCKED_PERMISSION`; uncertain responses are reconciled without blindly sending another DELETE. Active runs postpone cleanup and remain visible in `cleanup_status`.
+
+### Commands from repository root
+
+**Windows PowerShell**
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe -m evaluation.fork_pipeline --config evaluation/configs/fork_pilot.json --check-config
+```
+
+**Linux Bash**
+
+```bash
+./.venv/bin/python -m unittest discover -s tests -v
+./.venv/bin/python -m evaluation.fork_pipeline --config evaluation/configs/fork_pilot.json --check-config
+```
+
+`--check-config` performs no GitHub writes. The `--watch` option is for actual experiments after repository selection, credentials, dependencies and study eligibility are reviewed. **Do not use held-out evaluation rows as a development smoke test.** The implementation has mock-based verification, not a confirmed live fork-execution-and-deletion test. Keep existing `scripts/`, RAG data and README files unchanged.

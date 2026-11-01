@@ -204,13 +204,16 @@ class ForkExperiment:
             if exc.code != 404:
                 raise
         else:
-            # Recover only an earlier explicitly recorded fork-creation intent.
-            # Never adopt an unrelated, pre-existing personal fork.
-            if state.get("fork_creation_intent") != expected:
-                raise ValueError(f"Existing fork {existing['full_name']} was not created for this evaluation")
+            # A persisted fork-creation intent does not prove who created an
+            # existing repository after an uncertain POST response. Never
+            # adopt and later delete it without positive creation evidence.
+            if (state.get("fork_creation_intent") != expected or
+                    not state.get("fork_created_by_evaluation")):
+                raise ValueError(
+                    f"Existing fork {existing['full_name']} is not proven to be "
+                    "created by this evaluation; preserve it for manual review")
             verify_fork(existing, self.upstream, owner)
-            state.update(fork_repo=existing["full_name"], fork_owner=owner,
-                         fork_created_by_evaluation=True)
+            state.update(fork_repo=existing["full_name"], fork_owner=owner)
             save()
             return
         state["fork_creation_intent"] = expected
@@ -546,6 +549,75 @@ class ForkExperiment:
         state["pending"] = None
         save()
         return outcome
+
+
+    def cleanup_fork(self, state: dict, save) -> str:
+        """Delete only a fork created for THIS experiment, after all runs settle.
+
+        Persist intent before DELETE. On interrupted DELETE, a subsequent call
+        confirms 404 without reusing the fork name or resending an unsafe write.
+        Never delete a pre-existing fork or one with active/unknown Actions runs.
+        """
+        if not state.get("measurements_finalized"):
+            raise ValueError("Fork cleanup requires finalized measurement records")
+        if state.get("pending"):
+            raise RunPending("Fork still has a pending CI dispatch; cleanup postponed")
+        if not state.get("fork_repo"):
+            return "NOT_CREATED"
+        if state.get("cleanup_status") == "DELETED":
+            return "DELETED"
+        fork_name = state["fork_repo"]
+        expected = state.get("fork_creation_intent")
+        owner = state.get("fork_owner", "")
+        if (not state.get("fork_created_by_evaluation") or not owner or
+                expected != fork_name or not fork_name.startswith(owner + "/")):
+            state["cleanup_status"] = "PRESERVED_NOT_OWNED"
+            save()
+            return "PRESERVED_NOT_OWNED"
+
+        try:
+            fork = self.gh.request("GET", "/repos/" + fork_name)
+        except GitHubError as exc:
+            if exc.code == 404 and state.get("cleanup_intent") == fork_name:
+                state["cleanup_status"] = "DELETED"
+                save()
+                return "DELETED"
+            raise
+        verify_fork(fork, self.upstream, owner)
+        if not state.get("cleanup_intent"):
+            # Fail closed if ANY workflow is still queued, waiting, requested,
+            # pending, or running, including workflows unrelated to the target.
+            runs = self.gh.all(f"/repos/{fork_name}/actions/runs", "workflow_runs")
+            active = [r for r in runs if r.get("status") not in {"completed"}]
+            if active:
+                state["cleanup_status"] = "WAITING_FOR_OTHER_RUNS"
+                state["cleanup_active_run_ids"] = [r.get("id") for r in active]
+                save()
+                return "WAITING_FOR_OTHER_RUNS"
+            state["cleanup_intent"] = fork_name
+            state["cleanup_status"] = "DELETE_REQUESTED"
+            save()  # Critical: crash-safe DELETE intent, before the API call.
+        else:
+            if state["cleanup_intent"] != fork_name:
+                raise ValueError("Fork cleanup intent changed")
+            # An earlier DELETE may have been accepted despite a lost response.
+            # Never blindly send the destructive request twice.
+            state["cleanup_status"] = "DELETE_OUTCOME_UNKNOWN"
+            save()
+            return "DELETE_OUTCOME_UNKNOWN"
+        try:
+            self.gh.request("DELETE", "/repos/" + fork_name)
+        except GitHubError as exc:
+            state["cleanup_status"] = "BLOCKED_PERMISSION" if exc.code in {401, 403} else "DELETE_OUTCOME_UNKNOWN"
+            save()
+            return state["cleanup_status"]
+        except RuntimeError:
+            state["cleanup_status"] = "DELETE_OUTCOME_UNKNOWN"
+            save()
+            return "DELETE_OUTCOME_UNKNOWN"
+        state["cleanup_status"] = "DELETED"
+        save()
+        return "DELETED"
 
 
 def summarize_records(records: list[dict], *, repetitions: int | None = None) -> dict:

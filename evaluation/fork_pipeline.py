@@ -1,181 +1,159 @@
-"""Automated CloudTune hosted A/B/C evaluation coordinator.
+"""CloudTune A/B/C controller following the existing fork-based research flow.
 
-The controller may run on a GitHub-hosted runner, but ALL MEASURED target
-build/test jobs run on GitHub Actions inside isolated research-owned forks.
-Remote state is checkpointed in CloudTune's dedicated state branch so it can
-resume across runner restarts without replaying ambiguous workflow dispatches.
+The coordinator runs locally and invokes GitHub's API; target repositories'
+build and test commands execute ONLY on GitHub Actions inside research-owned
+forks. Local durable state survives long runner queues and interrupted sessions.
+No GitHub Actions workflow or state branch is needed in the CloudTune repo.
 """
 from __future__ import annotations
 
 import argparse
-import base64
-import io
-import zipfile
 import csv
 import hashlib
 import json
 import os
 import re
-from datetime import datetime, timezone
 import sys
+import time
+import tempfile
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
+from scripts.experiment_environment import load_env
+from evaluation.third_party.ci_cost.setup import install as install_ci_cost
+
 from evaluation.candidate_validator import validate_candidate
-from evaluation.ci_executor import ForkExperiment, GitHub, GitHubError, RunPending, summarize_records
+from evaluation.ci_executor import ForkExperiment, GitHub, RunPending, summarize_records
 from evaluation.optimizers.ci_cost import generate_ci_cost_candidate
 from evaluation.optimizers.rag_llm import generate_rag_candidate
 from evaluation.rag_retriever import Retriever
 from evaluation.results_exporter import summarize_cohort
-from evaluation.repository_preparation import file_sha256, read_evaluation_rows, workflow_doc
+from evaluation.repository_preparation import GitHubReader, file_sha256, workflow_doc
 from evaluation.run_pipeline import ROOT, load_config, prepare
 
 
-STATE_BRANCH = "cloudtune-evaluation-state"
-PROTOCOL = "cloudtune-hosted-abc-v1"
+PROTOCOL = "cloudtune-local-fork-abc-v2"
 
 
 class StateStore:
-    """Durable Git state for ephemeral, hosted evaluation controllers.
+    """Crash-safe local experiment ledger; never writes to CloudTune GitHub.
 
-    A single non-force Git commit atomically checkpoints state JSON and any
-    frozen snapshot ZIPs. All writes occur on a dedicated state branch, not
-    on the development or original upstream branches. GitHub Actions controller
-    concurrency must prevent simultaneous writers for this state branch.
+    Frozen snapshots remain in evaluation/results/<evaluation_id>/repositories.
+    Restart the same command after interruption: a pending GitHub dispatch is
+    discovered from its recorded intent instead of sent again.
     """
-    MAX_SNAPSHOT_BYTES = 25_000_000
-    MAX_COMPRESSED_BYTES = 15_000_000
 
-    def __init__(self, github: GitHub, repository: str, evaluation_id: str):
-        self.gh, self.repo, self.id = github, repository, evaluation_id
-        self.path = "runs/" + evaluation_id + ".json"
-        self.head: str | None = None
-        self._ensure_branch()
-
-    def _head(self) -> str:
-        return self.gh.request("GET", f"/repos/{self.repo}/git/ref/heads/{STATE_BRANCH}")["object"]["sha"]
-
-    def _ensure_branch(self):
-        try:
-            self.head = self._head()
-            return
-        except GitHubError as exc:
-            if exc.code != 404:
-                raise
-        metadata = self.gh.request("GET", f"/repos/{self.repo}")
-        head = self.gh.request("GET", f"/repos/{self.repo}/commits/{metadata['default_branch']}")
-        try:
-            self.gh.request("POST", f"/repos/{self.repo}/git/refs", {
-                "ref": "refs/heads/" + STATE_BRANCH, "sha": head["sha"]})
-        except GitHubError as exc:
-            if exc.code != 422:
-                raise
-        self.head = self._head()
+    def __init__(self, evaluation_id: str, output_root: Path | None = None):
+        output_root = output_root if output_root is not None else ROOT
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", evaluation_id):
+            raise ValueError("Unsafe evaluation_id for local state path")
+        self.root = output_root / "evaluation" / "results" / evaluation_id
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.path = self.root / "state.json"
 
     def load(self) -> dict | None:
-        try:
-            record = self.gh.request("GET", f"/repos/{self.repo}/contents/{self.path}?ref={STATE_BRANCH}")
-        except GitHubError as exc:
-            if exc.code == 404:
-                return None
-            raise
-        return json.loads(base64.b64decode(record["content"]).decode("utf-8"))
-
-    @classmethod
-    def _pack(cls, snapshot: Path) -> bytes:
-        """Create a deterministic bounded archive with no unsafe symlinks."""
-        buf = io.BytesIO()
-        total = 0
-        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
-            for path in sorted(p for p in snapshot.rglob("*") if p.is_file()):
-                if path.is_symlink():
-                    raise ValueError("Symlink in frozen evaluation snapshot")
-                relative = path.relative_to(snapshot)
-                total += path.stat().st_size
-                if total > cls.MAX_SNAPSHOT_BYTES:
-                    raise ValueError("Frozen snapshot exceeds hosted archive cap; mark repository unsupported")
-                info = zipfile.ZipInfo(relative.as_posix(), date_time=(2020, 1, 1, 0, 0, 0))
-                info.compress_type = zipfile.ZIP_DEFLATED
-                archive.writestr(info, path.read_bytes())
-        data = buf.getvalue()
-        if len(data) > cls.MAX_COMPRESSED_BYTES:
-            raise ValueError("Frozen snapshot exceeds hosted compressed archive cap")
-        return data
+        if not self.path.exists():
+            return None
+        return json.loads(self.path.read_text(encoding="utf-8"))
 
     def save(self, document: dict, *, snapshots: dict[str, Path] | None = None) -> None:
-        """Atomically checkpoint metadata and requested snapshot file contents.
-
-        No target-fork dispatch or mutation is permitted before this succeeds.
-        """
-        updates = []
+        """Write ledger atomically AFTER verifying local immutable snapshots."""
         for repo_id, snapshot in (snapshots or {}).items():
-            contents = self._pack(snapshot)
-            sha = hashlib.sha256(contents).hexdigest()
-            path = f"archives/{self.id}/{hashlib.sha256(repo_id.encode()).hexdigest()[:20]}.zip"
-            blob = self.gh.request("POST", f"/repos/{self.repo}/git/blobs", {
-                "content": base64.b64encode(contents).decode("ascii"), "encoding": "base64"})
-            updates.append({"path": path, "mode": "100644", "type": "blob", "sha": blob["sha"]})
-            document["repositories"][repo_id]["archive"] = {
-                "blob_sha": blob["sha"], "sha256": sha, "path": path,
-                "snapshot_name": snapshot.name}
-        raw = json.dumps(document, sort_keys=True, ensure_ascii=False, indent=2).encode("utf-8")
-        if len(raw) > 900_000:
-            raise RuntimeError("Durable run ledger exceeds configured limit")
-        blob = self.gh.request("POST", f"/repos/{self.repo}/git/blobs", {
-            "content": base64.b64encode(raw).decode("ascii"), "encoding": "base64"})
-        updates.append({"path": self.path, "mode": "100644", "type": "blob", "sha": blob["sha"]})
-        current = self._head()
-        if current != self.head:
-            raise RuntimeError("State branch was modified by another writer; do not overwrite it")
-        head = self.gh.request("GET", f"/repos/{self.repo}/git/commits/{current}")
-        tree = self.gh.request("POST", f"/repos/{self.repo}/git/trees", {
-            "base_tree": head["tree"]["sha"], "tree": updates})
-        commit = self.gh.request("POST", f"/repos/{self.repo}/git/commits", {
-            "message": "[skip ci] CloudTune evaluation checkpoint " + self.id,
-            "tree": tree["sha"], "parents": [current]})
-        self.gh.request("PATCH", f"/repos/{self.repo}/git/refs/heads/{STATE_BRANCH}", {
-            "sha": commit["sha"], "force": False})
-        self.head = commit["sha"]
+            snapshot = snapshot.resolve()
+            base = (self.root / "repositories").resolve()
+            if not snapshot.is_relative_to(base):
+                raise ValueError("Snapshot escaped evaluation results")
+            manifest = snapshot / "manifest.json"
+            original = snapshot / "source" / "original.yml"
+            if not manifest.is_file() or not original.is_file():
+                raise ValueError("Evaluation snapshot is incomplete")
+            details = json.loads(manifest.read_text(encoding="utf-8"))
+            if (details.get("repo_id") != repo_id or
+                    file_sha256(original) != details.get("workflow_sha256")):
+                raise ValueError("Pinned repository snapshot changed")
+            document["repositories"][repo_id]["snapshot_name"] = snapshot.name
+        raw = (json.dumps(document, sort_keys=True, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        if len(raw) > 2_000_000:
+            raise ValueError("Experiment ledger too large; do not discard recorded runs")
+        # The write is atomic on the same volume; a killed process cannot leave
+        # a half-written state.json that could trigger a duplicate dispatch.
+        fd, name = tempfile.mkstemp(prefix=".state-", suffix=".tmp", dir=self.root)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(name, self.path)
+        finally:
+            if os.path.exists(name):
+                os.unlink(name)
 
     def restore(self, output: Path, document: dict) -> list[dict]:
-        """Restore the exact archived context, never the upstream moving HEAD."""
+        """Recover only locally frozen snapshots, never moving upstream HEAD."""
         if document.get("dataset_sha256") != file_sha256(ROOT / document["dataset"]):
             raise ValueError("Held-out dataset changed since frozen evaluation")
-        output.mkdir(parents=True, exist_ok=True)
         rows = []
+        base = (output / "repositories").resolve()
         for entry in document["screening"]:
             row = dict(entry)
             if row["status"] in {"prepared", "needs_harness"}:
-                archive_info = document["repositories"][row["repo_id"]].get("archive")
-                if not archive_info:
-                    raise ValueError("Frozen evaluation snapshot is missing from durable ledger")
-                packed = self.gh.blob(self.repo, archive_info["blob_sha"])
-                if hashlib.sha256(packed).hexdigest() != archive_info["sha256"]:
-                    raise ValueError("Frozen evaluation archive checksum mismatch")
-                name = archive_info["snapshot_name"]
+                name = document["repositories"][row["repo_id"]].get("snapshot_name", "")
                 if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
-                    raise ValueError("Unsafe frozen evaluation snapshot name")
-                target = output / "repositories" / name
-                target.mkdir(parents=True, exist_ok=True)
-                with zipfile.ZipFile(io.BytesIO(packed)) as zipped:
-                    total = 0
-                    for member in zipped.infolist():
-                        rel = Path(member.filename)
-                        if rel.is_absolute() or ".." in rel.parts or not member.filename or member.is_dir():
-                            raise ValueError("Unsafe archived snapshot member")
-                        total += member.file_size
-                        if total > self.MAX_SNAPSHOT_BYTES:
-                            raise ValueError("Archived snapshot exceeds size cap")
-                        dest = target / rel
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        dest.write_bytes(zipped.read(member))
+                    raise ValueError("Unsafe or missing frozen snapshot name")
+                target = (base / name).resolve()
+                if not target.is_relative_to(base):
+                    raise ValueError("Frozen snapshot escaped evaluation directory")
                 manifest = target / "manifest.json"
-                if not manifest.is_file():
-                    raise ValueError("Archived snapshot has no manifest")
+                original = target / "source" / "original.yml"
+                if not manifest.is_file() or not original.is_file():
+                    raise ValueError("Frozen snapshot missing; cannot silently re-fetch")
+                meta = json.loads(manifest.read_text(encoding="utf-8"))
+                if (meta.get("repo_id") != row["repo_id"] or
+                        file_sha256(original) != meta.get("workflow_sha256")):
+                    raise ValueError("Frozen snapshot was altered")
                 row["manifest_path"] = str(manifest)
             else:
                 row["manifest_path"] = ""
             rows.append(row)
         return rows
+
+
+
+
+@contextmanager
+def exclusive_controller(evaluation_id: str):
+    """Prevent two local controllers dispatching the same trial concurrently.
+
+    An interrupted process may leave the lock. Verify no evaluation process is
+    running before deleting the stale .controller.lock file to resume.
+    """
+    folder = ROOT / "evaluation/results" / evaluation_id
+    folder.mkdir(parents=True, exist_ok=True)
+    lock = folder / ".controller.lock"
+    try:
+        fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        raise RuntimeError(f"Controller already active or stale lock: {lock}") from None
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(str(os.getpid()) + "\n")
+        yield
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+def implementation_digest() -> str:
+    """Freeze evaluator code identity across every resumed GitHub dispatch."""
+    names = ("fork_pipeline.py", "ci_executor.py", "candidate_validator.py",
+             "rag_retriever.py", "results_exporter.py", "repository_preparation.py",
+             "run_pipeline.py", "optimizers/ci_cost.py", "optimizers/rag_llm.py",
+             "third_party/ci_cost/setup.py", "third_party/ci_cost/source_fixes.py")
+    sha = hashlib.sha256()
+    for name in names:
+        sha.update(name.encode("utf-8") + b"\0")
+        sha.update((ROOT / "evaluation" / name).read_bytes())
+    return sha.hexdigest()
 
 
 def _repo_snapshot(output: Path, row: dict) -> Path:
@@ -190,17 +168,17 @@ def _repo_snapshot(output: Path, row: dict) -> Path:
 def _config(path: Path) -> dict:
     config = load_config(path, allow_hosted=True)
     if config.get("execution", {}).get("dry_run") is not False:
-        raise ValueError("Hosted config must explicitly specify execution.dry_run=false")
+        raise ValueError("Fork evaluation config must explicitly specify execution.dry_run=false")
     if config.get("arms") != ["original", "ci_cost", "rag"]:
-        raise ValueError("Hosted evaluation requires the three A/B/C arms")
-    if not 1 <= config.get("repository_limit", 0) <= 3:
-        raise ValueError("Hosted job allows at most 3 candidate rows per run; use batches")
+        raise ValueError("Fork evaluation requires the three A/B/C arms")
+    if not 1 <= config.get("repository_limit", 0) <= 100:
+        raise ValueError("Evaluation repository_limit must be 1..100; partition larger cohorts")
     if not 1 <= config.get("repetitions", 0) <= 5:
-        raise ValueError("Hosted repetitions must be 1..5")
+        raise ValueError("Fork repetitions must be 1..5")
     if config.get("execution", {}).get("cache_regime") != "uncontrolled":
         raise ValueError("This protocol only supports explicitly reported uncontrolled caches")
     if config.get("warmup_runs") != 0:
-        raise ValueError("Hosted v1 does not implement separate warmup runs")
+        raise ValueError("Fork protocol v2 does not implement separate warmup runs")
     if config.get("rag", {}).get("embedding_model") != "BAAI/bge-m3":
         raise ValueError("The existing RAG system uses BAAI/bge-m3")
     revision = config.get("rag", {}).get("embedding_revision", "")
@@ -229,11 +207,12 @@ def _candidate_yaml(snapshot: Path, arm: str, outcome: dict, original: bytes) ->
     return data
 
 
-def _ensure_preparation(config: dict, state: dict, store: StateStore) -> Path:
+def _ensure_preparation(config: dict, state: dict, store: StateStore, token: str | None = None) -> Path:
     """Freeze once; later runner invocations restore identical archived blobs."""
     output = ROOT / "evaluation/results" / config["evaluation_id"]
     if "screening" not in state:
-        prepare(config)
+        # Reuse the same research-account token for read-only screening.
+        prepare(config, reader=GitHubReader(token=token))
         with (output / "screening.csv").open(newline="", encoding="utf-8") as stream:
             rows = list(csv.DictReader(stream))
         state["screening"] = [{k: v for k, v in row.items() if k != "manifest_path"} for row in rows]
@@ -275,18 +254,20 @@ def _save_report(output: Path, state: dict) -> dict:
                               "validation": record.get("validation", {}),
                               "run_statistics": results,
                               "run_records": record.get("records", []),
-                              "failure_reason": record.get("failure_reason")}
+                              "failure_reason": record.get("failure_reason"),
+                              "cleanup_status": record.get("cleanup_status", "NOT_STARTED"),
+                              "fork_repo": record.get("fork_repo")}
     report = {"evaluation_id": state["evaluation_id"], "protocol": PROTOCOL,
               "timing_source": "GitHub Actions REST jobs API exclusively; active job interval union excludes runner queue gaps",
               "reported_utc": datetime.now(timezone.utc).isoformat(),
               "repositories": summaries,
               "aggregate": summarize_cohort(summaries)}
-    path = output / "hosted_report.json"
+    path = output / "fork_report.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    (output / "hosted_aggregate.json").write_text(
+    (output / "fork_aggregate.json").write_text(
         json.dumps(report["aggregate"], indent=2) + "\n", encoding="utf-8")
-    with (output / "hosted_runs.csv").open("w", encoding="utf-8", newline="") as handle:
+    with (output / "fork_runs.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=["repo_id", "arm", "repeat", "run_id", "run_attempt",
                          "config_commit_sha", "conclusion", "protocol_valid", "required_checks_pass",
                          "comparable", "workflow_elapsed_seconds", "sum_job_runtime_seconds",
@@ -299,51 +280,35 @@ def _save_report(output: Path, state: dict) -> dict:
     return report
 
 
-def run_hosted(config: dict, *, resume_only: bool = False) -> dict:
-    # Target fork writes require a separate credential; repository-scoped
-    # GITHUB_TOKEN cannot write to independently owned research forks.
-    controller_token = os.environ.get("GITHUB_TOKEN", "")
-    fork_token = os.environ.get("CLOUDTUNE_FORK_TOKEN", "")
-    controller_repo = os.environ.get("GITHUB_REPOSITORY", "")
-    # Scheduled invocations use the original controller source commit selected
-    # by preflight. Never silently run a different implementation after main
-    # moves while a multi-day experiment is in progress.
-    controller_sha = os.environ.get("CLOUDTUNE_CONTROLLER_SHA") or os.environ.get("GITHUB_SHA", "")
-    if not controller_token or not fork_token or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", controller_repo):
-        raise ValueError("Run in GitHub Actions with GITHUB_TOKEN and CLOUDTUNE_FORK_TOKEN")
-    if not re.fullmatch(r"[a-f0-9]{40}", controller_sha):
-        raise ValueError("GITHUB_SHA must be a pinned controller commit")
+def run_fork_evaluation(config: dict, *, resume_only: bool = False) -> dict:
+    # GitHub credentials authorize research-owned forks only. This process does
+    # not modify CloudTune's GitHub repository or execute target build scripts.
+    token = os.environ.get("CLOUDTUNE_FORK_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if not token:
+        raise ValueError("Set GITHUB_TOKEN or CLOUDTUNE_FORK_TOKEN in the existing .env")
     config_sha = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
-    store = StateStore(GitHub(controller_token), controller_repo, config["evaluation_id"])
+    code_sha = implementation_digest()
+    store = StateStore(config["evaluation_id"])
     state = store.load()
     if state is None:
         if resume_only:
             return {"evaluation_id": config["evaluation_id"], "protocol": PROTOCOL,
                     "repositories": {}, "status": "NO_ACTIVE_RUN"}
         state = {"evaluation_id": config["evaluation_id"], "config_sha256": config_sha,
-                 "controller_sha": controller_sha, "protocol": PROTOCOL,
+                 "implementation_sha256": code_sha, "protocol": PROTOCOL,
                  "repetitions": config["repetitions"], "repositories": {}}
-    elif (state.get("config_sha256"), state.get("controller_sha"), state.get("protocol")) != (config_sha, controller_sha, PROTOCOL):
-        raise ValueError("Frozen hosted config, controller commit or protocol changed; use a new evaluation_id")
-    output = _ensure_preparation(config, state, store)
+    elif (state.get("config_sha256"), state.get("implementation_sha256"), state.get("protocol")) != (config_sha, code_sha, PROTOCOL):
+        raise ValueError("Frozen config or evaluator implementation changed; use a new evaluation_id")
+    output = _ensure_preparation(config, state, store, token=token)
     version = config.get("ci_cost", {}).get("version")
     if version != "1.0.0":
         raise ValueError("Unexpected ci-cost version")
-    # Reuse the existing pinned dataset + stored BGE-M3 embeddings, never
-    # rebuild or upload a training corpus during held-out evaluation.
-    retriever = Retriever(
-        revision=state.get("rag_revision") or (None if config["rag"]["embedding_revision"] == "AUTO_PIN_SINGLE" else config["rag"]["embedding_revision"]),
-        dataset_path=ROOT / "research-data/rag/rag_dataset.jsonl",
-        dataset_sha256=config["rag"]["dataset_sha256"])
-    if state.get("rag_revision") and state["rag_revision"] != retriever.revision:
-        raise ValueError("Frozen Supabase embedding revision changed")
-    state["rag_revision"] = retriever.revision
-    store.save(state)
+    # RAG access is intentionally lazy. An unavailable Supabase index must not
+    # prevent baseline A or rule-based B GitHub measurements.
+    retriever = None
     with (output / "screening.csv").open(newline="", encoding="utf-8") as stream:
         decisions = list(csv.DictReader(stream))
-    fork_api = GitHub(fork_token)
-    new_dispatches = 0
-    max_new_dispatches = 3  # bounded work per hosted runner; scheduled runs resume
+    fork_api = GitHub(token)
     for row in decisions:
         repo_id = row["repo_id"]
         state["repositories"].setdefault(repo_id, {"status": "SELECTED", "candidates": {},
@@ -358,14 +323,26 @@ def run_hosted(config: dict, *, resume_only: bool = False) -> dict:
                 r.get("failure_class") == "PLATFORM_NO_JOB_START" for r in noncomparable)
                 else "FAILED_TARGET_CI")
             store.save(state)
+            if row["status"] in {"prepared", "needs_harness"} and repo.get("fork_repo"):
+                snapshot = _repo_snapshot(output, row)
+                meta = json.loads((snapshot / "manifest.json").read_text())
+                experiment = ForkExperiment(fork_api, repo_id=repo_id,
+                     workflow_path=meta["workflow_path"], source_sha=meta["source_commit_sha"],
+                     original=(snapshot / "source/original.yml").read_bytes(),
+                     evaluation_id=config["evaluation_id"], max_wait_seconds=180,
+                     poll_seconds=15, evidence_root=snapshot)
+                repo["measurements_finalized"] = True
+                experiment.cleanup_fork(repo, lambda: store.save(state, snapshots={repo_id: snapshot}))
             continue
-        def save():
-            store.save(state, snapshots={repo_id: snapshot})
         if row["status"] not in {"prepared", "needs_harness"}:
             repo.update(status="SKIPPED", failure_reason=row["status"])
-            save()
+            store.save(state)
             continue
         snapshot = _repo_snapshot(output, row)
+
+        def save():
+            # Always checkpoint THIS repository's frozen files and run ledger.
+            store.save(state, snapshots={repo_id: snapshot})
         manifest = json.loads((snapshot / "manifest.json").read_text())
         original = (snapshot / "source/original.yml").read_bytes()
         if file_sha256(snapshot / "source/original.yml") != manifest["workflow_sha256"]:
@@ -376,13 +353,35 @@ def run_hosted(config: dict, *, resume_only: bool = False) -> dict:
              evaluation_id=config["evaluation_id"], max_wait_seconds=180,
              poll_seconds=15, evidence_root=snapshot)
         try:
+            if repo.get("measurements_finalized"):
+                # All target repetitions already ended in a prior process.
+                # Retry only non-destructive fork cleanup/reconciliation.
+                experiment.cleanup_fork(repo, save)
+                continue
             if "B" not in repo["candidates"]:
-                b = generate_ci_cost_candidate(snapshot, version=version)
+                try:
+                    # Local candidate generation only; the target's CI still
+                    # runs exclusively on GitHub Actions in its research fork.
+                    tool_dir = ROOT / "evaluation/results/.tools/ci-cost"
+                    install_ci_cost(tool_dir)
+                    b = generate_ci_cost_candidate(snapshot, version=version, tool_dir=tool_dir)
+                except (OSError, ValueError, RuntimeError) as exc:
+                    b = {"decision": "ERROR", "status": "GENERATION_ERROR",
+                         "error": type(exc).__name__ + ": " + str(exc)[:400]}
                 repo["candidates"]["B"] = {k: b.get(k) for k in ("decision", "status", "after_sha256",
                                                           "candidate_relative_dir", "generated_artifact", "error")}
                 store.save(state, snapshots={repo_id: snapshot})
             if "C" not in repo["candidates"]:
                 try:
+                    if retriever is None:
+                        retriever = Retriever(
+                            revision=state.get("rag_revision") or (
+                                None if config["rag"]["embedding_revision"] == "AUTO_PIN_SINGLE"
+                                else config["rag"]["embedding_revision"]),
+                            dataset_path=ROOT / "research-data/rag/rag_dataset.jsonl",
+                            dataset_sha256=config["rag"]["dataset_sha256"])
+                        state["rag_revision"] = retriever.revision
+                        save()
                     c = generate_rag_candidate(snapshot, retriever=retriever,
                              model=config["rag"]["generator_model"], top_k=config["rag"]["top_k"],
                              max_tokens=config["rag"]["max_tokens"])
@@ -420,6 +419,7 @@ def run_hosted(config: dict, *, resume_only: bool = False) -> dict:
             # Always execute baseline first, then rotate C/B order. Every
             # target job is a real GitHub Actions run, not local simulation.
             reps = config["repetitions"]
+            failed_trial = None
             for repeat in range(1, reps + 1):
                 order = (["A", "B", "C"] if repeat % 3 == 1 else
                          ["B", "C", "A"] if repeat % 3 == 2 else ["C", "A", "B"])
@@ -430,28 +430,30 @@ def run_hosted(config: dict, *, resume_only: bool = False) -> dict:
                         continue
                     if any(r["arm"] == arm and r["repeat"] == repeat for r in repo["records"]):
                         continue
-                    if not repo.get("pending"):
-                        if new_dispatches >= max_new_dispatches:
-                            repo["status"] = "READY_FOR_NEXT_CONTROLLER_RUN"
-                            save()
-                            return _save_report(output, state)
-                        new_dispatches += 1
                     required = repo.get("required_names") or config["execution"].get("required_job_names", [])
                     outcome = experiment.execute(repo, save, arm=arm, repeat=repeat,
                              required=required, max_total=reps*3)
                     if not outcome["comparable"]:
-                        if outcome.get("failure_class") == "PLATFORM_NO_JOB_START":
-                            repo["status"] = "INCONCLUSIVE_PLATFORM"
-                            repo["failure_reason"] = (f"GitHub run {outcome['run_id']} completed "
-                                                      "without any runner executing a job")
-                            save()
-                            return _save_report(output, state)
-                        raise RuntimeError(f"Actual GitHub Actions {arm} run {outcome['run_id']} failed correctness or protocol checks")
-            repo["status"] = ("COMPLETE"
-                              if len(repo["records"]) == reps * len(candidates)
-                              and all(row.get("comparable") for row in repo["records"])
-                              else "INCOMPLETE")
-            save()
+                        failed_trial = outcome
+                        break
+                if failed_trial:
+                    break
+            if failed_trial:
+                platform = failed_trial.get("failure_class") == "PLATFORM_NO_JOB_START"
+                repo["status"] = "INCONCLUSIVE_PLATFORM" if platform else "FAILED_TARGET_CI"
+                repo["failure_reason"] = (
+                    f"GitHub run {failed_trial['run_id']} completed without a started job"
+                    if platform else
+                    f"GitHub run {failed_trial['run_id']} failed correctness or protocol checks")
+            else:
+                repo["status"] = ("COMPLETE"
+                                  if len(candidates) == 3
+                                  and len(repo["records"]) == reps * 3
+                                  and all(record.get("comparable") for record in repo["records"])
+                                  else "INCOMPLETE")
+            repo["measurements_finalized"] = True
+            save()  # Persist ALL measurements before deleting the research fork.
+            experiment.cleanup_fork(repo, save)
         except RunPending as pending:
             repo["status"] = "WAITING_FOR_GITHUB_RUN"
             repo["pending_reason"] = str(pending)
@@ -474,7 +476,11 @@ def main() -> int:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--check-config", action="store_true")
     parser.add_argument("--resume-only", action="store_true",
-                        help="Only continue a previously started evaluation; schedule-safe")
+                        help="Continue only a previously started evaluation")
+    parser.add_argument("--watch", action="store_true",
+                        help="Continue checking queued GitHub runs until all rows settle")
+    parser.add_argument("--poll-interval", type=int, default=120,
+                        help="Seconds between long-queue resume cycles (default 120)")
     args = parser.parse_args()
     try:
         config = _config(args.config)
@@ -482,12 +488,33 @@ def main() -> int:
             print(json.dumps({"valid": True, "protocol": PROTOCOL,
                               "evaluation_id": config["evaluation_id"]}, indent=2))
             return 0
-        report = run_hosted(config, resume_only=args.resume_only)
-        print(json.dumps({"evaluation_id": report["evaluation_id"],
-                          "repositories": {k: v["status"] for k, v in report["repositories"].items()}}, indent=2))
-        return 0
+        if args.poll_interval < 10:
+            raise ValueError("--poll-interval must be at least 10 seconds")
+        load_env(ROOT / ".env")
+        with exclusive_controller(config["evaluation_id"]):
+            while True:
+                report = run_fork_evaluation(config, resume_only=args.resume_only)
+                status = {k: v["status"] for k, v in report["repositories"].items()}
+                cleanup = {k: v.get("cleanup_status") for k, v in report["repositories"].items()}
+                print(json.dumps({"evaluation_id": report["evaluation_id"],
+                                  "repositories": status, "fork_cleanup": cleanup}, indent=2), flush=True)
+                active = {"SELECTED", "WAITING_FOR_GITHUB_RUN", "READY_FOR_NEXT_CONTROLLER_RUN"}
+                needs_cleanup = any(row.get("cleanup_status") in {
+                                    "WAITING_FOR_OTHER_RUNS", "DELETE_OUTCOME_UNKNOWN"}
+                                    for row in report["repositories"].values())
+                if not args.watch or not (any(value in active for value in status.values()) or needs_cleanup):
+                    unresolved = {k: v for k, v in cleanup.items()
+                                  if v in {"BLOCKED_PERMISSION", "DELETE_OUTCOME_UNKNOWN",
+                                           "WAITING_FOR_OTHER_RUNS", "PRESERVED_NOT_OWNED"}}
+                    if unresolved:
+                        print("Fork cleanup is not complete: " + json.dumps(unresolved),
+                              file=sys.stderr, flush=True)
+                        return 2
+                    return 0
+                print("GitHub CI or fork cleanup pending; retrying safely without duplicate dispatch.", flush=True)
+                time.sleep(args.poll_interval)
     except (OSError, ValueError, RuntimeError, KeyError, TypeError, json.JSONDecodeError) as exc:
-        print(f"Hosted evaluation failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        print(f"Fork evaluation failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
 

@@ -1,5 +1,9 @@
 # CloudTune — A/B/C Evaluation Pipeline Implementation Plan
 
+> **Current implementation (November 1, 2026):** The evaluation coordinator runs
+> locally and dispatches CI exclusively to research-owned candidate forks. Earlier
+> hosted-controller proposals are superseded by Section 14 below.
+
 **Document type:** Technical implementation plan (not a handoff document)  
 **Project:** CloudTune — RAG and LLM-Based CI Optimization  
 **Repository:** <https://github.com/Rami2212/CloudTune-RAG-LLM-CI-Optimization>  
@@ -753,3 +757,17 @@ The **evaluation pipeline implementation** is complete only when it can:
 - Rule-based comparison tool: <https://github.com/mariotavarez/ci-cost>
 
 **End of implementation plan.**
+
+---
+
+## 14. Corrected implementation and research-fork cleanup protocol (November 1, 2026)
+
+This section supersedes prior proposals to run a controller workflow in the CloudTune research repository. The correct research process uses a **local Python coordinator**, `evaluation/fork_pipeline.py`, following the fork and dispatch mechanics already established by `scripts/run_pattern_batch.py` and `scripts/run_ci_experiment.py`. The original scripts and all teammates' research artifacts are unchanged.
+
+Each candidate repository is prepared once from a pinned source commit; arms A, B and C are generated separately, checked with a common conservative validator, and committed to isolated refs on a research-owned fork. The controller dispatches _actual target CI_ exclusively to GitHub Actions on those fork refs. GitHub's runner queue duration is not treated as CI execution; actual started/completed job intervals, active time, makespan and summed runtime are reported separately. Interrupted experiments preserve their frozen snapshots, dispatch IDs and evidence in ignored local `evaluation/results/<evaluation_id>/state.json` and resume without blindly sending duplicate dispatches.
+
+When a repository is finished (including explicitly finalized failed or partial attempts), save all run/job evidence locally **before** deleting the evaluation-created fork. Delete only a fork positively identified as created by this evaluation. Do not delete if any workflow on the fork remains queued, requested, waiting, running or otherwise non-completed; do not delete a pre-existing fork. Write a durable cleanup intent before DELETE, and reconcile missing/uncertain responses without retrying destructive requests blindly. Missing deletion permission must be recorded; results must remain available even if cleanup is postponed.
+
+This correction replaces `.github/workflows/cloudtune-evaluation.yml`, `evaluation/hosted_pipeline.py`, `evaluation/configs/hosted_pilot.json` and `tests/test_hosted_evaluation.py` with the local evaluation controller, `evaluation/configs/fork_pilot.json` and `tests/test_fork_evaluation.py`. The permanent guide is `evaluation/PIPELINE_GUIDE.md`. The existing `evaluation/README.md`, `scripts/`, `knowledge/`, `research-data/`, `supabase/` and `research-paper/` remain unchanged.
+
+**Verification scope:** the patched controller has offline unit tests for state preservation, queue handling and safe fork cleanup. Live GitHub token permissions, an actual A/B/C candidate-fork run and real deletion still require a separately selected development-only smoke study before held-out evaluation.
