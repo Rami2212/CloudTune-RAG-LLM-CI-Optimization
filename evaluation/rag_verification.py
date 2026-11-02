@@ -14,6 +14,7 @@ import tempfile
 from pathlib import Path
 
 from scripts.experiment_environment import load_env
+from evaluation.openrouter_settings import resolve_openrouter_env
 from evaluation.rag_retriever import Retriever
 from evaluation.optimizers.rag_llm import generate_rag_candidate
 from evaluation.candidate_validator import validate_candidate
@@ -61,10 +62,10 @@ def main() -> int:
     options = parser.parse_args()
     try:
         config_path = options.config if options.config.is_absolute() else ROOT / options.config
-        config = json.loads(config_path.read_text(encoding="utf-8"))
+        load_env(ROOT / ".env")
+        config = resolve_openrouter_env(json.loads(config_path.read_text(encoding="utf-8")))
         summary = check_local(config, corpus=CORPUS)
         if options.mode != "local":
-            load_env(ROOT / ".env")
             revision = config["rag"]["embedding_revision"]
             retriever = Retriever(revision=None if revision == "AUTO_PIN_SINGLE" else revision,
                                   dataset_path=CORPUS, dataset_sha256=config["rag"]["dataset_sha256"])

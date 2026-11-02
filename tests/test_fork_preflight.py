@@ -62,6 +62,8 @@ class PreflightGateTests(unittest.TestCase):
                   "repositories": {"owner/repo": {"status": status,
                      "cleanup_status": "NOT_STARTED"}}}
         with (patch.object(sys, "argv", ["controller", "--config", "unused", *args]),
+              patch.dict(os.environ, {"OPENROUTER_MODEL": "offline/test:free",
+                                      "OPENROUTER_MAX_TOKENS": "24000"}),
               patch.object(pipeline, "_config", return_value=config),
               patch.object(pipeline, "selected_repository_rows", return_value=[(1, "owner/repo")]),
               patch.object(pipeline, "load_env"),
@@ -129,20 +131,24 @@ class PreflightGateTests(unittest.TestCase):
             experiment.make_arm.side_effect = AssertionError("preflight must not push an arm")
             experiment.execute.side_effect = AssertionError("preflight must not dispatch CI")
             with (patch.dict(os.environ, {"GITHUB_TOKEN": "offline-test-token",
+                                       "CI_COST_DIR": str(root / "reviewed-ci-cost-v2"),
                                        "CLOUDTUNE_AUTO_DELETE_FORKS": "true"}),
                   patch.object(pipeline, "ROOT", root),
                   patch.object(pipeline, "implementation_digest", return_value="code-sha"),
                   patch.object(pipeline, "_ensure_preparation", side_effect=prepared),
                   patch.object(pipeline, "GitHub", return_value=MagicMock()),
                   patch.object(pipeline, "ForkExperiment", return_value=experiment),
-                  patch.object(pipeline, "install_ci_cost"),
-                  patch.object(pipeline, "generate_ci_cost_candidate", return_value=b),
+                  patch.object(pipeline, "install_ci_cost") as install,
+                  patch.object(pipeline, "generate_ci_cost_candidate", return_value=b) as generate,
                   patch.object(pipeline, "Retriever") as retriever,
                   patch.object(pipeline, "generate_rag_candidate", return_value=c),
                   patch.object(pipeline, "_candidate_yaml", return_value=b"safe-cache-workflow"),
                   patch.object(pipeline, "validate_and_archive", return_value={"verdict": "PASS"})):
                 retriever.return_value.revision = "a" * 40
                 report = pipeline.run_fork_evaluation(config, preflight_only=True)
+                install.assert_called_once_with((root / "reviewed-ci-cost-v2").resolve())
+                self.assertEqual(generate.call_args.kwargs["tool_dir"],
+                                 (root / "reviewed-ci-cost-v2").resolve())
             result = report["repositories"]["owner/repo"]
             self.assertEqual(result["status"], "PREFLIGHT_READY")
             self.assertEqual(result["admitted_arms"], ["A", "B", "C"])

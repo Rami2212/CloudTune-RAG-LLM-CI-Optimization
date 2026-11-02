@@ -12,8 +12,8 @@ import threading
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
-
-OPENROUTER_REQUEST_SECONDS = 60
+# Maximum time allowed for one complete OpenRouter API response.
+OPENROUTER_REQUEST_SECONDS = 120
 
 
 class OpenRouterPaused(RuntimeError):
@@ -34,7 +34,9 @@ def request_openrouter_json(request, *, opener=None, deadline_seconds: float = O
     pauses immediately rather than dispatching another request in parallel.
     """
     if not 0 < deadline_seconds <= OPENROUTER_REQUEST_SECONDS:
-        raise ValueError("OpenRouter deadline must be between 0 and 60 seconds")
+        raise ValueError(
+            f"OpenRouter deadline must be between 0 and {OPENROUTER_REQUEST_SECONDS} seconds"
+        )
     opener = opener or urlopen
     finished = threading.Event()
     response = {}

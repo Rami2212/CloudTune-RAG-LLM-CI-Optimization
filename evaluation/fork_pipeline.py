@@ -30,6 +30,7 @@ from evaluation.ci_executor import (
 )
 from evaluation.optimizers.ci_cost import generate_ci_cost_candidate
 from evaluation.openrouter_http import OpenRouterPaused
+from evaluation.openrouter_settings import resolve_openrouter_env
 from evaluation.optimizers.rag_llm import generate_rag_candidate
 from evaluation.rag_retriever import Retriever
 from evaluation.results_exporter import summarize_cohort
@@ -151,8 +152,10 @@ def exclusive_controller(evaluation_id: str):
 def implementation_digest() -> str:
     """Freeze evaluator code identity across every resumed GitHub dispatch."""
     names = ("fork_pipeline.py", "ci_executor.py", "candidate_validator.py",
+             "setup_node_compatibility.py", "setup_node_releases.json",
              "rag_retriever.py", "results_exporter.py", "repository_preparation.py",
-             "run_pipeline.py", "openrouter_http.py", "optimizers/ci_cost.py", "optimizers/rag_llm.py",
+             "run_pipeline.py", "openrouter_http.py", "openrouter_settings.py",
+             "optimizers/ci_cost.py", "optimizers/rag_llm.py",
              "third_party/ci_cost/setup.py", "third_party/ci_cost/source_fixes.py")
     sha = hashlib.sha256()
     for name in names:
@@ -194,8 +197,8 @@ def _config(path: Path) -> dict:
         raise ValueError("Select AUTO_PIN_SINGLE or a 40-character BGE-M3 revision")
     if not re.fullmatch(r"[a-f0-9]{64}", config.get("rag", {}).get("dataset_sha256", "")):
         raise ValueError("Pin the RAG dataset SHA256")
-    if not config.get("rag", {}).get("generator_model", "").endswith(":free"):
-        raise ValueError("Pin a free OpenRouter generator model")
+    # Model and output ceiling are validated separately from the environment,
+    # before any evaluation state is created or a model request is sent.
     return config
 
 
@@ -534,7 +537,8 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False,
                 try:
                     # Local candidate generation only; the target's CI still
                     # runs exclusively on GitHub Actions in its research fork.
-                    tool_dir = ROOT / "evaluation/results/.tools/ci-cost"
+                    tool_dir = Path(os.environ.get("CI_COST_DIR", str(
+                        ROOT / "evaluation/results/.tools/ci-cost-npm-download-v4"))).resolve()
                     log_progress("OPTIMIZER", f"{repo_id}: preparing CI-Cost optimizer")
                     install_ci_cost(tool_dir)
                     b = generate_ci_cost_candidate(snapshot, version=version, tool_dir=tool_dir)
@@ -738,9 +742,13 @@ def main() -> int:
     try:
         if args.preflight and (args.watch or args.resume_only or args.rerun):
             raise ValueError("--preflight cannot be combined with --watch, --resume-only or --rerun")
+        # Load .env BEFORE resolving the config. The selected generator model
+        # and output limit are env-only, then frozen into the evaluation hash.
+        load_env(ROOT / ".env")
         config = configure_batch(_config(args.config), start_at=args.start_at,
                                  stop_at=args.stop_at, limit=args.limit,
                                  batch_id=args.batch_id)
+        config = resolve_openrouter_env(config)
         if args.rerun:
             if not args.batch_id:
                 raise ValueError("--rerun requires --batch-id")
@@ -753,7 +761,9 @@ def main() -> int:
             print(json.dumps({"valid": True, "protocol": PROTOCOL,
                               "evaluation_id": config["evaluation_id"],
                               "repository_start_at": config["repository_start_at"],
-                              "repository_limit": config["repository_limit"]}, indent=2))
+                              "repository_limit": config["repository_limit"],
+                              "openrouter_model": config["rag"]["generator_model"],
+                              "openrouter_max_tokens": config["rag"]["max_tokens"]}, indent=2))
             return 0
         # Validate selection before loading any credentials or starting work.
         # --list prints dataset positions only; no GitHub or model calls.
@@ -765,7 +775,6 @@ def main() -> int:
             return 0
         if args.poll_interval < 10:
             raise ValueError("--poll-interval must be at least 10 seconds")
-        load_env(ROOT / ".env")
         with exclusive_controller(config["evaluation_id"]):
             while True:
                 report = run_fork_evaluation(config, resume_only=args.resume_only,

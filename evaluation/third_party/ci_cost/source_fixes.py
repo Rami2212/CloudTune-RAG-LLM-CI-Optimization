@@ -8,9 +8,12 @@ from __future__ import annotations
 
 from hashlib import sha256
 from pathlib import Path
+import json
+
+from evaluation.setup_node_compatibility import compatible_setup_node_refs
 
 UPSTREAM_COMMIT = "e3722ea83da600bebac9ad21ec52490df824eb5c"
-FIX_REVISION = "cloudtune-ci-cost-source-fix-v1"
+FIX_REVISION = "cloudtune-ci-cost-npm-download-v4-compatibility"
 
 _OLD_CACHE = r"""function injectCacheStep(
   content: string,
@@ -52,11 +55,13 @@ _NEW_CACHE = r"""function injectCacheStep(
   const yamlLines = cacheYaml.split(/\r?\n/);
   const firstIndent = Math.min(...yamlLines.filter((line) => line.trim()).map(
     (line) => /^ */.exec(line)?.[0].length ?? 0));
-  for (let i = 0; i + 1 < lines.length; i++) {
-    const header = /^( *)(- name:.*)$/.exec(lines[i] ?? '');
+  for (let i = 0; i < lines.length; i++) {
+    const header = /^( *)- (name:.*|run:.*)$/.exec(lines[i] ?? '');
     if (!header) continue;
     const depth = header[1]?.length ?? 0;
-    const run = new RegExp(`^ {${depth + 2}}run:\\s*(.*)$`).exec(lines[i + 1] ?? '');
+    const run = header[2]?.startsWith('run:')
+      ? /^run:\s*(.*)$/.exec(header[2])
+      : new RegExp(`^ {${depth + 2}}run:\\s*(.*)$`).exec(lines[i + 1] ?? '');
     if (!run || !command.test(run[1] ?? '')) continue;
     const formatted = yamlLines.map((line) => line.trim()
       ? ' '.repeat(depth) + line.slice(firstIndent) : line);
@@ -124,11 +129,50 @@ _NEW_OUTPUT_GUARD = """    // Fail before writing if a transformation produces i
 _OLD_SHALLOW_CHECK = "if (fetchDepth === undefined && !needsFullHistory) {"
 _NEW_SHALLOW_CHECK = "if ((fetchDepth === 0 || fetchDepth === '0') && !needsFullHistory) {"
 
+_OLD_NPM_PROPOSAL = r"""        optimizedContent = injectCacheStep(
+          optimizedContent,
+          'npm',
+          `      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: \${{ runner.os }}-node-\${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            \${{ runner.os }}-node-`
+        );"""
+_NEW_NPM_PROPOSAL = r"""        // Adapted baseline: cache npm downloads through the existing
+        // setup-node action, in the recommended job only. Never cache installed
+        // artifacts or change action refs, commands, or other action inputs.
+        const doc = yaml.load(optimizedContent) as {
+          jobs: Record<string, {steps?: Array<{
+            uses?: string; with?: Record<string, unknown>;
+          }>}>;
+        };
+        const steps = rec.affectedJob ? doc.jobs[rec.affectedJob]?.steps : undefined;
+        const refs = new Set(__SETUP_NODE_RELEASE_REFS__);
+        const setup = steps?.find((step) => step.uses && refs.has(step.uses));
+        if (setup?.with?.['node-version'] &&
+            !('cache' in setup.with) && !('cache-dependency-path' in setup.with)) {
+          setup.with['cache'] = 'npm';
+          optimizedContent = yaml.dump(doc, {lineWidth: -1, noRefs: true});
+        }"""
+_NEW_NPM_PROPOSAL = _NEW_NPM_PROPOSAL.replace(
+    "__SETUP_NODE_RELEASE_REFS__", json.dumps(sorted(compatible_setup_node_refs())))
+
+_OLD_CONCURRENCY_APPLY = "        optimizedContent = addConcurrencyGroup(optimizedContent, workflow.name ?? '');"
+_NEW_CONCURRENCY_APPLY = """        // npm cache serialization must not make an unrelated transformation
+        // newly applicable to source syntax the upstream helper did not handle.
+        if (addConcurrencyGroup(workflow.raw, workflow.name ?? '') !== workflow.raw) {
+          optimizedContent = addConcurrencyGroup(optimizedContent, workflow.name ?? '');
+        }"""
+
 REPLACEMENTS = {
     "src/optimizer.ts": ((_OLD_CACHE, _NEW_CACHE),
                          (_OLD_SHALLOW, _NEW_SHALLOW),
                          (_OLD_FAILFAST, _NEW_FAILFAST),
-                         (_OLD_OUTPUT_GUARD, _NEW_OUTPUT_GUARD)),
+                         (_OLD_OUTPUT_GUARD, _NEW_OUTPUT_GUARD),
+                         (_OLD_NPM_PROPOSAL, _NEW_NPM_PROPOSAL),
+                         (_OLD_CONCURRENCY_APPLY, _NEW_CONCURRENCY_APPLY)),
     "src/checks/misc.ts": ((_OLD_SHALLOW_CHECK, _NEW_SHALLOW_CHECK),),
 }
 

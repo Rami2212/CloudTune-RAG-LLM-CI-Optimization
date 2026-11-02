@@ -118,6 +118,23 @@ class HostedProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "DISPATCH_INPUT_MISSING_DEFAULT"):
             ensure_dispatch(workflow)
 
+    def test_dispatch_harness_accepts_quoted_mapping_keys_without_reformatting(self):
+        for key in ("on", "'on'", '"on"'):
+            for newline in ("\n", "\r\n"):
+                with self.subTest(key=key, newline=repr(newline)):
+                    source = (f"name: CI\n{key}: # events\n    push:\n"
+                              "jobs:\n  test:\n    runs-on: ubuntu-latest\n"
+                              "    steps:\n      - run: echo ok\n").replace("\n", newline).encode()
+                    expected = source.replace(b"    push:", b"    workflow_dispatch:" +
+                                              newline.encode() + b"    push:")
+                    self.assertEqual(ensure_dispatch(source), expected)
+                    self.assertEqual(ensure_dispatch(expected), expected)
+
+    def test_dispatch_harness_rejects_quoted_sequence_events(self):
+        source = b"'on':\n  - push\njobs:\n  test:\n    steps:\n      - run: echo ok\n"
+        with self.assertRaises(ValueError):
+            ensure_dispatch(source)
+
     def test_github_no_job_start_is_platform_inconclusive(self):
         github = FakeRunnerGitHub()
         github.all = lambda path, key: []

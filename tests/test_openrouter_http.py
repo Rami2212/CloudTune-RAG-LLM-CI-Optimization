@@ -90,9 +90,9 @@ class OpenRouterHttpTests(unittest.TestCase):
         with self.assertRaisesRegex(OpenRouterPaused, "invalid JSON"):
             request_openrouter_json(object(), opener=lambda *_args, **_kw: Bad(), deadline_seconds=0.2)
 
-    def test_deadlines_above_60_are_rejected(self):
-        with self.assertRaisesRegex(ValueError, "60 seconds"):
-            request_openrouter_json(object(), deadline_seconds=61)
+    def test_deadlines_above_120_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "120 seconds"):
+            request_openrouter_json(object(), deadline_seconds=121)
 
 
 if __name__ == "__main__":

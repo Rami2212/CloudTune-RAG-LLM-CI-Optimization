@@ -286,7 +286,7 @@ The complete design and implementation work plan is maintained as a **separate, 
 
 **Research identity:** Arm B now uses **ci-cost 1.0.0, pinned at upstream
 `e3722ea83da600bebac9ad21ec52490df824eb5c`, with the reviewed
-`cloudtune-ci-cost-source-fix-v1` TypeScript correctness fixes**. It is **not**
+`cloudtune-ci-cost-npm-download-v4-compatibility` source adaptation**. It is **not**
 the unchanged off-the-shelf release. Cite this distinction in the methods and
 limitations; do not call it an unmodified `ci-cost` baseline. All fixes are
 applied to the _upstream source_ and compiled before any evaluation; the Python
@@ -350,7 +350,7 @@ cat evaluation/results/cloudtune-abc-preparation-pilot-001/ci_cost_summary.json
 ```
 
 The corrected build writes immutable candidates under
-`repositories/<repo>/candidates/B/cloudtune-ci-cost-source-fix-v1/`. Earlier
+`repositories/<repo>/candidates/B/cloudtune-ci-cost-npm-download-v4-compatibility/`. Earlier
 `candidates/B/candidate.json` artifacts (including the previous `fabrikt`
 error) are **preserved**. The coordinator reports the corrected build's result
 without overwriting historical evidence.
@@ -760,10 +760,34 @@ remain authoritative. An existing experiment ID freezes the evaluator code;
 live work, rather than changing the frozen implementation of a completed or
 pending trial. Preserve any retained forks for review until manually cleared.
 
-### Reviewed `setup-node` npm download-cache admission (policy v2)
+### Reviewed `setup-node` npm download-cache admission (policy v5)
 
 The common B/C admission gate can now approve one exact additive edit:
-adding `with.cache: npm` to an existing `actions/setup-node@v4` step.
+adding `with.cache: npm` to an existing official setup-node release reference
+recognized by `evaluation/setup_node_compatibility.py`. It uses the frozen
+official tag-to-commit snapshot in `evaluation/setup_node_releases.json`.
+Release families v4, v5, v6 and v7 are supported, including recorded full
+version tags (such as v6.4.0) and SHAs matching recorded official releases.
+Arbitrary SHAs, branch names, nonexistent versions, future majors, forked
+actions and YAML version comments do not grant compatibility approval.
+The action reference must remain identical in the source and candidate.
+Unknown setup-node cache edits receive `UNREVIEWED_SETUP_NODE_REF:<job>:<ref>`.
+The Python validator and compiled CI-Cost generator use the same registry;
+generation never upgrades or replaces the original action reference.
+The registry records release identity, not a per-commit runtime equivalence
+proof. Major/version tags remain mutable GitHub refs; use a recorded SHA for
+an immutable action reference. Runtime admission performs no network lookups.
+To collect an updated official snapshot for review, run:
+`python -m evaluation.refresh_setup_node_releases --output evaluation/results/setup_node_releases.proposed.json`.
+Review it before replacing the checked-in registry, rebuild CI-Cost in a new
+tool directory, and use a new evaluation ID. A new release family requires
+separate compatibility review. Registry changes alter the evaluator digest;
+the exact registry SHA256 is also included in archived validation identities.
+The v5 and v7 action definitions and cache implementations were reviewed at
+https://github.com/actions/setup-node/blob/v5/src/cache-restore.ts and
+https://github.com/actions/setup-node/blob/v7/src/cache-restore.ts.
+`REQUIRED_STEP_REMOVED_OR_MODIFIED` means an original step was not preserved;
+it does not necessarily mean a test command was deleted.
 All other step fields and inputs, triggers, jobs, test commands, matrix,
 permissions, and checkout behavior must remain unchanged. Approval also
 requires a checkout before setup-node, an untampered frozen root
@@ -777,6 +801,23 @@ A missing root lockfile or a non-root npm installation requires review.
 Candidate validity is not proof of a runtime speedup; measure it on GitHub.
 Prior validation evidence is immutable: use a **new** `dev-` evaluation ID after
 this policy change, and never reuse a prior trial's saved rejection as PASS.
+
+CI-Cost source-fix v2 additionally recognizes unnamed `- run: npm ci` install
+steps when inserting its existing cache proposal. It preserves the upstream
+cache mechanism; `node_modules` caches and broad restore keys still require
+review. Install v2 in a fresh tool directory with
+`python -m evaluation.third_party.ci_cost.setup --tool-dir evaluation/results/.tools/ci-cost-v2`
+and set `CI_COST_DIR` to that absolute directory before running a new trial.
+Existing v1 installations and archived trial outputs must remain intact.
+
+The current `cloudtune-ci-cost-npm-download-v4-compatibility` baseline replaces the npm
+installed-artifact proposal with `cache: npm` on an existing reviewed setup-node
+step in the affected job. It preserves commands and action references and
+leaves unsupported setup-node refs unchanged. Admission still requires frozen
+root lockfile evidence. This is an explicitly adapted baseline, not unmodified
+upstream CI-Cost. Install it into `evaluation/results/.tools/ci-cost-npm-download-v4` and set
+`CI_COST_DIR` to that absolute path. The fork controller defaults to this v4
+directory. Use a fresh trial ID and the updated source_fix_revision.
 
 ### Offline A/B/C admission preflight (no research fork)
 

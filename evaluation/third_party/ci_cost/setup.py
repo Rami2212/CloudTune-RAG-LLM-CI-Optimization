@@ -132,11 +132,17 @@ jobs:
 on:
   push:
   pull_request:
+concurrency:
+  group: existing
+  cancel-in-progress: false
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - name: Install
         run: npm ci
       - name: Test
@@ -165,8 +171,11 @@ jobs:
             parsed = workflow_doc(generated.read_bytes())
             if not isinstance(parsed.get("jobs"), dict):
                 raise RuntimeError(f"ci-cost smoke case {name} lost the jobs mapping")
-            if name == "npm" and "Cache node_modules" not in generated.read_text(encoding="utf-8"):
-                raise RuntimeError("ci-cost smoke candidate failed to insert its intended cache step")
+            if name == "npm":
+                expected = workflow_doc(original.encode())
+                expected["jobs"]["build"]["steps"][1]["with"]["cache"] = "npm"
+                if parsed != expected:
+                    raise RuntimeError("ci-cost npm download cache changed unexpected workflow fields")
             # The upstream broken shallow-clone transformation inserted a new
             # `with: fetch-depth: 1` under checkout despite checkout v4 default.
             if "fetch-depth: 1" in generated.read_text(encoding="utf-8"):

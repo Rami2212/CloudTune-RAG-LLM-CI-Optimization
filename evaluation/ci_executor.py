@@ -126,7 +126,7 @@ def digest(value: bytes) -> str:
 def ensure_dispatch(raw: bytes) -> bytes:
     """Common experimental harness, applied identically to A/B/C.
 
-    Only a plain YAML mapping `on:` may be extended. Other trigger syntax
+    Only a block YAML mapping with a plain or quoted `on` key may be extended. Other trigger syntax
     requires review; this function does not perform broad YAML reformatting.
     """
     before = workflow_doc(raw)
@@ -139,14 +139,17 @@ def ensure_dispatch(raw: bytes) -> bytes:
             raise ValueError("Workflow cannot be safely dispatched: " + ", ".join(problems))
         return raw
     text = raw.decode("utf-8-sig")
-    matches = list(re.finditer(r"^on:\s*$", text, re.MULTILINE))
+    matches = list(re.finditer(r'''^(?:on|'on'|"on"):[ \t]*(?:#[^\r\n]*)?(?=\r?$)''',
+                               text, re.MULTILINE))
     if len(matches) != 1:
         raise ValueError("Workflow has no safe plain on: mapping for dispatch harness")
     match = matches[0]
     first = text[match.end():]
-    if not re.match(r"\n[ \t]+[A-Za-z_]", first):
+    child = re.match(r"(\r?\n)( +)[A-Za-z_]", first)
+    if not child:
         raise ValueError("Workflow on: block is not an ordinary mapping")
-    amended = (text[:match.end()] + "\n  workflow_dispatch:" + text[match.end():]).encode("utf-8")
+    amended = (text[:match.end()] + child[1] + child[2] + "workflow_dispatch:" +
+               text[match.end():]).encode("utf-8")
     after = workflow_doc(amended)
     old_on, new_on = before.get("on"), after.get("on")
     if not isinstance(old_on, dict) or not isinstance(new_on, dict) or new_on.get("workflow_dispatch") is not None:

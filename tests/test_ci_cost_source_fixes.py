@@ -15,6 +15,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from evaluation.repository_preparation import workflow_doc
+from evaluation.candidate_validator import validate_candidate, _cache_evidence
+from evaluation.optimizers.ci_cost import generate_ci_cost_candidate
+from hashlib import sha256
 from evaluation.third_party.ci_cost import setup
 from evaluation.third_party.ci_cost.source_fixes import (
     FIX_REVISION, REPLACEMENTS, corrected_sources, fix_identity,
@@ -60,10 +63,10 @@ class SourceFixTests(unittest.TestCase):
                 self.assertIn(new.encode("utf-8"), fixed[name])
                 # The output-validation insertion intentionally retains the
                 # original header as a suffix; only the added guard is new.
-                if "Fail before writing" not in new:
+                if old not in new:
                     self.assertNotIn(old.encode("utf-8"), fixed[name])
         self.assertEqual(len(fix_identity()), 64)
-        self.assertEqual(FIX_REVISION, "cloudtune-ci-cost-source-fix-v1")
+        self.assertEqual(FIX_REVISION, "cloudtune-ci-cost-npm-download-v4-compatibility")
 
     def test_unknown_upstream_source_fails_closed(self):
         (self.root / "src/optimizer.ts").write_text("different version", encoding="utf-8")
@@ -80,6 +83,53 @@ class SourceFixTests(unittest.TestCase):
     def test_verifier_rejects_uninstalled_tool(self):
         with self.assertRaisesRegex(ValueError, "manifest is missing"):
             setup.verify_installation(self.root)
+
+    def test_real_cli_download_cache_preserves_other_jobs_and_commands(self):
+        if not (setup.DEFAULT_DIR / setup.MANIFEST_FILE).is_file():
+            self.skipTest("Requires current ci-cost installation")
+        original = b"""name: CI
+on: [push, pull_request]
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v6.4.0
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run lint
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm test
+"""
+        snapshot = self.root / "snapshot"
+        (snapshot / "source").mkdir(parents=True)
+        (snapshot / "source/original.yml").write_bytes(original)
+        (snapshot / "manifest.json").write_text(json.dumps({
+            "workflow_path": ".github/workflows/ci.yml", "status": "prepared",
+            "source_commit_sha": "a" * 40,
+            "workflow_sha256": sha256(original).hexdigest(),
+        }))
+        result = generate_ci_cost_candidate(snapshot, tool_dir=setup.DEFAULT_DIR)
+        self.assertEqual(result["decision"], "APPLY", result.get("error"))
+        candidate = (snapshot / result["candidate_relative_dir"] / "optimized.yml").read_bytes()
+        expected = workflow_doc(original)
+        expected["jobs"]["lint"]["steps"][1]["with"]["cache"] = "npm"
+        self.assertEqual(workflow_doc(candidate), expected)
+        with patch("evaluation.candidate_validator._actionlint", return_value={"status": "PASS"}):
+            self.assertEqual(validate_candidate(original, candidate)["verdict"], "PASS")
+        self.assertEqual(_cache_evidence(original, candidate, {"package-lock.json"}),
+                         (["package-lock.json"], []))
+        self.assertIn("SETUP_NODE_NPM_ROOT_LOCKFILE_NOT_FROZEN:lint",
+                      _cache_evidence(original, candidate, set())[1])
 
     def test_compiled_source_functions_generate_valid_yaml(self):
         """Compile the same TS functions the real ci-cost build receives."""
@@ -142,6 +192,8 @@ const shallow = `jobs:
 console.log(JSON.stringify({
   gradle: addShallowClone(gradle),
   cache: injectCacheStep(original, 'npm', cache),
+  unnamed: injectCacheStep(original.replace('- name: Install\n      run: npm ci', '- run: npm ci'), 'npm', cache),
+  crlf: injectCacheStep(original.replace('- name: Install\n      run: npm ci', '- run: npm ci').replace(/\n/g, '\r\n'), 'npm', cache),
   shallow: addShallowClone(shallow),
   failfast: enableFailFast('fail-fast: false')
 }));
@@ -153,6 +205,11 @@ console.log(JSON.stringify({
         self.assertEqual(data["gradle"],
                          "name: CI\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n    - uses: actions/checkout@v4\n    - uses: actions/setup-java@v4\n      with:\n        java-version: '17'\n        distribution: 'temurin'\n    - name: Build Project\n      run: ./gradlew clean build\n")
         self.assertIn("Cache node_modules", data["cache"])
+        for key in ("unnamed", "crlf"):
+            steps = workflow_doc(data[key].encode())["jobs"]["build"]["steps"]
+            self.assertEqual(steps[-1], {"run": "npm ci"})
+            self.assertEqual(steps[-2]["uses"], "actions/cache@v4")
+        self.assertNotIn("\n", data["crlf"].replace("\r\n", ""))
         self.assertEqual(len(workflow_doc(data["cache"].encode())["jobs"]), 1)
         self.assertIn("fetch-depth: 1", data["shallow"])
         self.assertNotIn("fetch-depth: 0", data["shallow"])

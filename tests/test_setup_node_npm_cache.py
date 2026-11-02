@@ -107,6 +107,42 @@ class SetupNodeNpmCacheTests(unittest.TestCase):
                                              self.candidate, decision="APPLY",
                                              generation={}), verdict)
 
+    def test_reviewed_sha_passes_full_admission_with_frozen_lockfile(self):
+        ref = "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1"
+        self.original = ORIGINAL.replace("actions/setup-node@v4", ref).encode()
+        self.candidate = CANDIDATE.replace("actions/setup-node@v4", ref).encode()
+        self.make_snapshot()
+        verdict = validate_and_archive(self.snapshot, "C", self.original,
+                                       self.candidate, decision="APPLY", generation={})
+        self.assertEqual(verdict["verdict"], "PASS")
+        self.assertEqual(verdict["reasons"], [])
+
+    def test_reviewed_major_versions_keep_evidence_and_edit_guards(self):
+        for version in ("v5", "v6", "v7", "v4.0.0"):
+            for lock in ("package-lock.json", None):
+                with self.subTest(version=version, lock=lock), tempfile.TemporaryDirectory() as scratch:
+                    self.snapshot = Path(scratch)
+                    self.original = ORIGINAL.replace("setup-node@v4", "setup-node@" + version).encode()
+                    self.candidate = CANDIDATE.replace("setup-node@v4", "setup-node@" + version).encode()
+                    self.make_snapshot(lockfile=lock)
+                    result = validate_and_archive(self.snapshot, "C", self.original,
+                                                  self.candidate, decision="APPLY", generation={})
+                    self.assertEqual(result["verdict"], "PASS" if lock else "REVIEW_REQUIRED")
+                    changed = self.candidate.replace(b"npm test", b"echo skipped")
+                    self.assertEqual(validate_candidate(self.original, changed)["verdict"], "REVIEW_REQUIRED")
+
+    def test_unreviewed_refs_and_action_ref_changes_require_review(self):
+        reviewed = "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1"
+        for ref in ("actions/setup-node@" + "a" * 40, "actions/setup-node@v99.0.0"):
+            with self.subTest(ref=ref):
+                source = ORIGINAL.replace("actions/setup-node@v4", ref).encode()
+                candidate = CANDIDATE.replace("actions/setup-node@v4", ref).encode()
+                result = validate_candidate(source, candidate)
+                self.assertEqual(result["verdict"], "REVIEW_REQUIRED")
+                self.assertIn("REQUIRED_STEP_REMOVED_OR_MODIFIED:build", result["reasons"])
+        result = self.verdict(CANDIDATE.replace("actions/setup-node@v4", reviewed))
+        self.assertEqual(result["verdict"], "REVIEW_REQUIRED")
+
     def test_missing_root_lockfile_requires_review(self):
         for name in (None, "packages/workspace/package-lock.json", "yarn.lock"):
             with self.subTest(file=name):

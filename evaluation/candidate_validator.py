@@ -16,6 +16,7 @@ import yaml
 from pathlib import Path
 
 from evaluation.repository_preparation import workflow_doc, safety_findings, write_json_immutable
+from evaluation.setup_node_compatibility import setup_node_cache_compatibility, compatibility_digest
 
 
 class CandidateValidationError(ValueError):
@@ -24,9 +25,8 @@ class CandidateValidationError(ValueError):
 
 FORBIDDEN_STEP_KEYS = {"continue-on-error"}
 
-
 def _setup_node_npm_cache_added(original_step: dict, candidate_step: dict) -> bool:
-    """Recognize ONLY the pinned setup-node v4 npm-download-cache addition.
+    """Recognize ONLY reviewed setup-node npm-download-cache additions.
 
     This is not permission to change an action version, test commands, step
     identity, Node version or arbitrary action inputs. The separate evidence
@@ -34,7 +34,7 @@ def _setup_node_npm_cache_added(original_step: dict, candidate_step: dict) -> bo
     """
     if not isinstance(original_step, dict) or not isinstance(candidate_step, dict):
         return False
-    if original_step.get("uses") != "actions/setup-node@v4":
+    if not setup_node_cache_compatibility(original_step.get("uses"))["supported"]:
         return False
     old_with = original_step.get("with")
     if (not isinstance(old_with, dict) or not old_with.get("node-version")
@@ -52,7 +52,7 @@ def _original_steps_preserved(original_steps: list, candidate_steps: list) -> bo
 
     An inserted step can be unapproved without deleting any original step.
     An edited/replaced original step, however, is not considered preserved.
-    The narrow approved setup-node v4 cache addition counts as preserved.
+    The narrow approved setup-node cache addition counts as preserved.
     """
     position = 0
     for step in candidate_steps:
@@ -182,13 +182,17 @@ def validate_candidate(original: bytes, candidate: bytes, *, actionlint: str | N
                   _cache_key_tracks_dependencies(step["with"]["path"].strip(), step["with"]["key"])):
                 continue
             else:
+                ref = step.get("uses")
+                if (isinstance(ref, str) and ref.startswith("actions/setup-node@")
+                        and not setup_node_cache_compatibility(ref)["supported"]):
+                    reasons.append("UNREVIEWED_SETUP_NODE_REF:" + jid + ":" + ref)
                 reasons.append("UNAPPROVED_STEP_EDIT:" + jid)
                 break
         # The fast first-pass match may stop at an *inserted* unapproved
         # step. Rescan the full sequence before claiming an original step was
         # deleted. Keep UNAPPROVED_STEP_EDIT regardless of that diagnosis.
         if pos != len(old_steps) and not _original_steps_preserved(old_steps, new_steps):
-            reasons.append("REQUIRED_STEP_REMOVED:" + jid)
+            reasons.append("REQUIRED_STEP_REMOVED_OR_MODIFIED:" + jid)
     lint = _actionlint(candidate, actionlint)
     if lint["status"] != "PASS":
         reasons.append("ACTIONLINT_" + lint["status"])
@@ -200,7 +204,7 @@ def validate_candidate(original: bytes, candidate: bytes, *, actionlint: str | N
 
 
 # Frozen repository evidence and immutable candidate admission records.
-POLICY_REVISION = "cloudtune-frozen-cache-v2-setup-node-npm"
+POLICY_REVISION = "cloudtune-frozen-cache-v5-setup-node-npm-compatibility"
 _HASH_EXPRESSION = re.compile(r"hashFiles\(\s*(['\"])([^'\"]+)\1\s*\)")
 _EXPRESSION = re.compile(r"\$\{\{\s*(.*?)\s*\}\}")
 
@@ -364,6 +368,7 @@ def validate_and_archive(snapshot: Path, arm: str, original: bytes, candidate: b
         raise ValueError("Validation source differs from pinned original workflow")
     after_sha = _digest(candidate) if candidate is not None else None
     identity = {"arm": arm, "decision": decision, "policy_revision": POLICY_REVISION,
+                "setup_node_registry_sha256": compatibility_digest(),
                 "source_commit_sha": manifest["source_commit_sha"],
                 "workflow_path": manifest["workflow_path"],
                 "before_sha256": before_sha, "after_sha256": after_sha}

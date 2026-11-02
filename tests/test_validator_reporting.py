@@ -64,15 +64,15 @@ class ValidatorReportingTests(unittest.TestCase):
         result = self._validate(with_cache())
         self.assertEqual(result["verdict"], "REVIEW_REQUIRED")
         self.assertIn("UNAPPROVED_STEP_EDIT:build", result["reasons"])
-        self.assertNotIn("REQUIRED_STEP_REMOVED:build", result["reasons"])
+        self.assertNotIn("REQUIRED_STEP_REMOVED_OR_MODIFIED:build", result["reasons"])
 
     def test_actual_original_step_removal_is_still_reported(self):
         result = self._validate(BASE.replace(b"      - name: Test\n        run: npm test\n", b""))
-        self.assertIn("REQUIRED_STEP_REMOVED:build", result["reasons"])
+        self.assertIn("REQUIRED_STEP_REMOVED_OR_MODIFIED:build", result["reasons"])
 
     def test_modifying_original_step_still_counts_as_unpreserved(self):
         result = self._validate(BASE.replace(b"run: npm test", b"run: echo skipped"))
-        self.assertIn("REQUIRED_STEP_REMOVED:build", result["reasons"])
+        self.assertIn("REQUIRED_STEP_REMOVED_OR_MODIFIED:build", result["reasons"])
         self.assertIn("UNAPPROVED_STEP_EDIT:build", result["reasons"])
 
     def test_header_claims_are_not_mistaken_for_applied_changes(self):

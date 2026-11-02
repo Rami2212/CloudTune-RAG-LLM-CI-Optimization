@@ -163,8 +163,8 @@ def generate_rag_candidate(snapshot_dir: Path, *, retriever: Retriever,
         latency = None  # An interrupted request's latency cannot be recovered.
     else:
         try:
-            # A full HTTP response must arrive within 60 seconds. urllib's
-            # ordinary socket timeout does not cover a slow chunked body.
+            # A full HTTP response must arrive within the configured deadline.
+            # urllib's ordinary socket timeout does not cover a slow chunked body.
             # The request is sent only once; transient failures pause this arm.
             reply = request_openrouter_json(req, opener=urlopen)
         except OpenRouterPaused as exc:
