@@ -39,10 +39,15 @@ def summarize_cohort(repositories: dict, *, bootstrap_samples: int = 1000,
             key = f"{measure}_saving_percent_{suffix}"
             values = []
             for repo_id, row in sorted(repositories.items()):
-                num = row.get("run_statistics", {}).get(arm, {}).get(key)
-                # Values from rejected or incomplete candidates cannot be
-                # reported as measured optimization effects.
-                if row.get("status") != "COMPLETE" or not isinstance(num, (int, float)):
+                stats = row.get("run_statistics", {})
+                baseline = "A" if suffix == "vs_A" else "B"
+                num = stats.get(arm, {}).get(key)
+                # Evaluate comparison eligibility per pair. A valid A/B result
+                # stays usable when C abstains or has no comparable GitHub run.
+                # Each required arm must have its complete valid repetition set.
+                if not (stats.get(baseline, {}).get("complete") and
+                        stats.get(arm, {}).get("complete") and
+                        isinstance(num, (int, float))):
                     continue
                 values.append(float(num))
             values.sort()

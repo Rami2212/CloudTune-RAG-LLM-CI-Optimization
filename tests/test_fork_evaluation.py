@@ -166,13 +166,19 @@ class HostedProtocolTests(unittest.TestCase):
     def test_cleanup_deletes_only_created_fork_after_jobs_finish(self):
         events = []
         class Fake:
+            def __init__(self):
+                self.deleted = False
+
             def request(self, method, path, body=None):
                 events.append((method, path))
                 if method == "GET":
+                    if self.deleted:
+                        raise GitHubError(404, path)
                     return {"id": 4242, "owner": {"login": "research"}, "fork": True,
                             "permissions": {"push": True},
                             "source": {"full_name": "source/test"}}
                 if method == "DELETE":
+                    self.deleted = True
                     return None
                 raise AssertionError((method, path))
             def all(self, path, key):
@@ -184,12 +190,39 @@ class HostedProtocolTests(unittest.TestCase):
         result = self._cleanup_experiment(Fake()).cleanup_fork(
             state, lambda: saved.append(dict(state)))
         self.assertEqual(result, "DELETED")
-        self.assertEqual(events[-1], ("DELETE", "/repos/research/test"))
+        self.assertEqual(events[-2:], [("DELETE", "/repos/research/test"),
+                                       ("GET", "/repos/research/test")])
         self.assertEqual(saved[-2]["cleanup_status"], "DELETE_REQUESTED")
         self.assertEqual(saved[-1]["cleanup_status"], "DELETED")
         self.assertEqual(len([e for e in events if e[0] == "DELETE"]), 1)
         self._cleanup_experiment(Fake()).cleanup_fork(state, lambda: None)
         self.assertEqual(len([e for e in events if e[0] == "DELETE"]), 1)
+
+    def test_cleanup_does_not_claim_deletion_while_fork_still_exists(self):
+        methods = []
+
+        class Fake:
+            def request(self, method, path, body=None):
+                methods.append(method)
+                if method == "DELETE":
+                    return None
+                return {"id": 4242, "owner": {"login": "research"}, "fork": True,
+                        "permissions": {"push": True},
+                        "source": {"full_name": "source/test"}}
+
+            def all(self, path, key):
+                return [{"id": 901, "status": "completed"}]
+
+        state = self._cleanup_state()
+        runner = self._cleanup_experiment(Fake())
+        with patch("evaluation.ci_executor.time.sleep", return_value=None):
+            self.assertEqual(runner.cleanup_fork(state, lambda: None),
+                             "DELETE_OUTCOME_UNKNOWN")
+        self.assertEqual(state["cleanup_intent"], "research/test")
+        # A second check cannot send another destructive request.
+        self.assertEqual(runner.cleanup_fork(state, lambda: None),
+                         "DELETE_OUTCOME_UNKNOWN")
+        self.assertEqual(methods.count("DELETE"), 1)
 
     def test_cleanup_never_deletes_preexisting_fork(self):
         class Forbidden:
@@ -395,9 +428,11 @@ class HostedProtocolTests(unittest.TestCase):
 
     def test_aggregate_requires_complete_repos_and_preserves_denominators(self):
         dataset = {"repo1": {"status": "COMPLETE", "run_statistics": {
-                        "C": {"elapsed_saving_percent_vs_B": 15.0}}},
+                        "B": {"complete": True},
+                        "C": {"complete": True, "elapsed_saving_percent_vs_B": 15.0}}},
                    "repo2": {"status": "INCOMPLETE", "run_statistics": {
-                        "C": {"elapsed_saving_percent_vs_B": 99.0}}},
+                        "B": {"complete": True},
+                        "C": {"complete": False, "elapsed_saving_percent_vs_B": 99.0}}},
                    "repo3": {"status": "SKIPPED", "run_statistics": {}}}
         summary = summarize_cohort(dataset, bootstrap_samples=100)
         self.assertEqual(summary["total_selected"], 3)
@@ -406,6 +441,22 @@ class HostedProtocolTests(unittest.TestCase):
         self.assertEqual(comparison["paired_repositories"], 1)
         self.assertEqual(comparison["median_saving_percent"], 15.0)
         self.assertIsNone(comparison["bootstrap_95pct_ci_percent"])
+
+    def test_aggregate_retains_valid_b_vs_a_when_c_abstains(self):
+        records = [
+            {"arm": "A", "comparable": True, "workflow_elapsed_seconds": 100,
+             "sum_job_runtime_seconds": 110},
+            {"arm": "B", "comparable": True, "workflow_elapsed_seconds": 90,
+             "sum_job_runtime_seconds": 99},
+        ]
+        stats = summarize_records(records, repetitions=1)
+        summary = summarize_cohort({
+            "repo1": {"status": "INCOMPLETE", "run_statistics": stats}
+        }, bootstrap_samples=100)
+        self.assertEqual(summary["comparisons"]["B_vs_A_elapsed"]["paired_repositories"], 1)
+        self.assertAlmostEqual(summary["comparisons"]["B_vs_A_elapsed"]["median_saving_percent"], 10)
+        self.assertEqual(summary["comparisons"]["C_vs_A_elapsed"]["paired_repositories"], 0)
+        self.assertEqual(summary["comparisons"]["C_vs_B_elapsed"]["paired_repositories"], 0)
 
     def test_fork_config_validates_without_tokens_or_git_api(self):
         config = {

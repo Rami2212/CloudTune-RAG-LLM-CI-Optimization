@@ -640,9 +640,31 @@ class ForkExperiment:
             state["cleanup_status"] = "DELETE_OUTCOME_UNKNOWN"
             save()
             return "DELETE_OUTCOME_UNKNOWN"
-        state["cleanup_status"] = "DELETED"
+        # GitHub accepting DELETE does not prove the fork is already gone.
+        # Confirm 404; never mistake a delayed or uncertain response for deletion.
+        for attempt in range(3):
+            try:
+                self.gh.request("GET", "/repos/" + fork_name)
+            except GitHubError as exc:
+                if exc.code == 404:
+                    state["cleanup_status"] = "DELETED"
+                    save()
+                    return "DELETED"
+                state["cleanup_status"] = (
+                    "BLOCKED_PERMISSION" if exc.code in {401, 403} else "DELETE_OUTCOME_UNKNOWN")
+                save()
+                return state["cleanup_status"]
+            except RuntimeError:
+                state["cleanup_status"] = "DELETE_OUTCOME_UNKNOWN"
+                save()
+                return "DELETE_OUTCOME_UNKNOWN"
+            if attempt < 2:
+                time.sleep(2)
+        # Keep the immutable cleanup intent; a later resume may confirm 404
+        # but cannot issue a second DELETE against a different repository.
+        state["cleanup_status"] = "DELETE_OUTCOME_UNKNOWN"
         save()
-        return "DELETED"
+        return "DELETE_OUTCOME_UNKNOWN"
 
 
 def summarize_records(records: list[dict], *, repetitions: int | None = None) -> dict:
