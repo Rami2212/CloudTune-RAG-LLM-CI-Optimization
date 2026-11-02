@@ -24,6 +24,29 @@ class CandidateValidationError(ValueError):
 
 FORBIDDEN_STEP_KEYS = {"continue-on-error"}
 
+
+def _setup_node_npm_cache_added(original_step: dict, candidate_step: dict) -> bool:
+    """Recognize ONLY the pinned setup-node v4 npm-download-cache addition.
+
+    This is not permission to change an action version, test commands, step
+    identity, Node version or arbitrary action inputs. The separate evidence
+    gate must still verify a frozen root lockfile and checkout ordering.
+    """
+    if not isinstance(original_step, dict) or not isinstance(candidate_step, dict):
+        return False
+    if original_step.get("uses") != "actions/setup-node@v4":
+        return False
+    old_with = original_step.get("with")
+    if (not isinstance(old_with, dict) or not old_with.get("node-version")
+            or "cache" in old_with or "cache-dependency-path" in old_with):
+        return False
+    if set(original_step) != set(candidate_step) or not isinstance(candidate_step.get("with"), dict):
+        return False
+    return (all(candidate_step[key] == value for key, value in original_step.items()
+                if key != "with")
+            and candidate_step["with"] == {**old_with, "cache": "npm"})
+
+
 # The cache key must invalidate when the dependencies represented by its path
 # change. Matching hashFiles( alone is insufficient: README.md is not a lockfile.
 CACHE_DEPENDENCY_GLOBS = {
@@ -123,6 +146,11 @@ def validate_candidate(original: bytes, candidate: bytes, *, actionlint: str | N
         for step in new_steps:
             if pos < len(old_steps) and step == old_steps[pos]:
                 pos += 1
+            elif (pos < len(old_steps) and
+                  _setup_node_npm_cache_added(old_steps[pos], step)):
+                # The original step is still present, with exactly one safe
+                # additional input; do not mistake it for a removed step.
+                pos += 1
             elif (set(step) == {"name", "uses", "with"} and
                   step.get("uses") == "actions/cache@v4" and
                   isinstance(step.get("with"), dict) and
@@ -152,7 +180,7 @@ def validate_candidate(original: bytes, candidate: bytes, *, actionlint: str | N
 
 
 # Frozen repository evidence and immutable candidate admission records.
-POLICY_REVISION = "cloudtune-frozen-cache-v1"
+POLICY_REVISION = "cloudtune-frozen-cache-v2-setup-node-npm"
 _HASH_EXPRESSION = re.compile(r"hashFiles\(\s*(['\"])([^'\"]+)\1\s*\)")
 _EXPRESSION = re.compile(r"\$\{\{\s*(.*?)\s*\}\}")
 
@@ -223,7 +251,13 @@ def _dependency_key_evidence(cache_path: str, cache_key: str, frozen: set[str]) 
 
 
 def _cache_evidence(original: bytes, candidate: bytes, frozen: set[str]) -> tuple[list[str], list[str]]:
-    """Check every newly inserted cache step using the same rules for B and C."""
+    """Verify source-bound dependencies for BOTH safe cache mechanisms.
+
+    The strict setup-node case uses the action's built-in npm download cache,
+    not node_modules caching. Its default lookup requires a frozen *root*
+    package-lock.json or npm-shrinkwrap.json, with unchanged setup-node inputs.
+    All other candidate edits retain their existing conservative verdicts.
+    """
     before, after = workflow_doc(original), workflow_doc(candidate)
     reasons: list[str] = []
     evidence: list[str] = []
@@ -241,6 +275,38 @@ def _cache_evidence(original: bytes, candidate: bytes, frozen: set[str]) -> tupl
                 cursor += 1
                 if str(step.get("uses", "")).startswith("actions/checkout@"):
                     checkout_seen = True
+                continue
+            if (cursor < len(original_steps) and
+                    _setup_node_npm_cache_added(original_steps[cursor], step)):
+                # setup-node reads the lockfile only after checkout. Reject a
+                # seemingly valid edit that cannot initialize its npm cache.
+                cursor += 1
+                if not checkout_seen:
+                    reasons.append("SETUP_NODE_CACHE_BEFORE_CHECKOUT:" + str(job_id))
+                # A custom working directory can move the install away from
+                # setup-node's default root lockfile. This narrow policy does
+                # not approve monorepo/nested install layouts automatically.
+                defaults = job.get("defaults", {})
+                if (isinstance(defaults, dict) and
+                        isinstance(defaults.get("run"), dict) and
+                        defaults["run"].get("working-directory")):
+                    reasons.append("SETUP_NODE_CACHE_NONROOT_WORKDIR:" + str(job_id))
+                locks = sorted(frozen & {"package-lock.json", "npm-shrinkwrap.json"})
+                if not locks:
+                    reasons.append("SETUP_NODE_NPM_ROOT_LOCKFILE_NOT_FROZEN:" + str(job_id))
+                else:
+                    evidence.extend(locks)
+                # Root npm installation is necessary for this exact cache to
+                # be relevant. A nested install with an implicit different
+                # dependency graph needs separate, reviewed lockfile mapping.
+                following = original_steps[cursor:]
+                installs = [item for item in following if isinstance(item, dict)
+                            and isinstance(item.get("run"), str)
+                            and re.search(r"\bnpm\s+(?:ci|install)\b", item["run"])]
+                if not installs:
+                    reasons.append("SETUP_NODE_CACHE_NO_NPM_INSTALL:" + str(job_id))
+                elif any(item.get("working-directory") for item in installs):
+                    reasons.append("SETUP_NODE_CACHE_NONROOT_INSTALL:" + str(job_id))
                 continue
             if step.get("uses") != "actions/cache@v4":
                 # The common validator has already rejected unknown edits.

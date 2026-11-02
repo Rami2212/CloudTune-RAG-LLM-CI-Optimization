@@ -760,6 +760,24 @@ remain authoritative. An existing experiment ID freezes the evaluator code;
 live work, rather than changing the frozen implementation of a completed or
 pending trial. Preserve any retained forks for review until manually cleared.
 
+### Reviewed `setup-node` npm download-cache admission (policy v2)
+
+The common B/C admission gate can now approve one exact additive edit:
+adding `with.cache: npm` to an existing `actions/setup-node@v4` step.
+All other step fields and inputs, triggers, jobs, test commands, matrix,
+permissions, and checkout behavior must remain unchanged. Approval also
+requires a checkout before setup-node, an untampered frozen root
+`package-lock.json` or `npm-shrinkwrap.json`, and a subsequent root npm install.
+This caches npm package downloads, **not** `node_modules` artifacts.
+
+Adding concurrency cancellation, changing checkout depth or job commands,
+adding a cache-dependency-path override, and injecting broader cache steps
+remain under the pre-existing safety policy; they are **not** auto-approved.
+A missing root lockfile or a non-root npm installation requires review.
+Candidate validity is not proof of a runtime speedup; measure it on GitHub.
+Prior validation evidence is immutable: use a **new** `dev-` evaluation ID after
+this policy change, and never reuse a prior trial's saved rejection as PASS.
+
 ### Development-only fork execution smoke (no held-out repository)
 
 The A/B/C fork controller now supports a separately labeled, bounded development
