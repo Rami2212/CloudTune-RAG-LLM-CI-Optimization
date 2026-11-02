@@ -20,7 +20,7 @@ from typing import Callable
 import yaml
 
 from evaluation.repository_preparation import WORKFLOW_PATH, workflow_doc, write_immutable, write_json_immutable
-from evaluation.third_party.ci_cost.setup import verify_installation
+from evaluation.third_party.ci_cost.setup import isolate_npm_config, verify_installation
 from evaluation.third_party.ci_cost.source_fixes import FIX_REVISION, fix_identity
 
 PINNED_VERSION = "1.0.0"
@@ -44,12 +44,11 @@ def _environment() -> dict[str, str]:
     """
     result = {
         key: val for key, val in os.environ.items()
-        if not re.search(r"(TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY|CREDENTIAL)", key, re.I)
-        and key not in {"CI_COST_DIR", "NODE_OPTIONS", "NPM_CONFIG_USERCONFIG", "NPM_CONFIG_GLOBALCONFIG"}
+        if not re.search(r"(TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY|CREDENTIAL|AUTH)", key, re.I)
+        and key.upper() not in {"CI_COST_DIR", "NODE_OPTIONS", "NPM_CONFIG_USERCONFIG", "NPM_CONFIG_GLOBALCONFIG"}
     }
-    # Prevent implicit authentication through a user's per-user npmrc.
-    result["NPM_CONFIG_USERCONFIG"] = os.devnull
-    result["NPM_CONFIG_GLOBALCONFIG"] = os.devnull
+    # Individual subprocesses supply distinct, empty npmrc files in their
+    # temporary workspace. Never reuse the caller's npm authentication files.
     result["CI"] = "true"
     return result
 
@@ -143,7 +142,8 @@ def generate_ci_cost_candidate(
             workflow_dir.mkdir(parents=True)
             target_file = workflow_dir / Path(workflow_path).name
             target_file.write_bytes(original)
-            opts = {"cwd": str(root), "env": _environment(), "capture_output": True,
+            opts = {"cwd": str(root), "env": isolate_npm_config(_environment(), root),
+                    "capture_output": True,
                     "text": True, "timeout": timeout_seconds, "check": False}
             version_run = command_runner([*command, "--version"], **opts)
             version_output = (version_run.stdout or "").strip()

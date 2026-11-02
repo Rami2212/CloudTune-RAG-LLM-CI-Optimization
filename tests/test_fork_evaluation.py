@@ -132,6 +132,55 @@ class HostedProtocolTests(unittest.TestCase):
         self.assertFalse(record["comparable"])
         self.assertEqual(len(self.state["records"]), 1)
 
+    def test_disabled_fork_workflow_is_enabled_then_verified_active(self):
+        methods = []
+        class Fake:
+            def __init__(self):
+                self.enabled = False
+            def request(self, method, path, body=None):
+                methods.append((method, path))
+                if method == "GET":
+                    return {"id": 42, "state": "active" if self.enabled else "disabled_fork"}
+                if method == "PUT" and path.endswith("/actions/workflows/42/enable"):
+                    self.enabled = True
+                    return None  # GitHub 204 No Content.
+                raise AssertionError((method, path))
+        runner = ForkExperiment(Fake(), repo_id="source/test",
+             workflow_path=".github/workflows/ci.yml", source_sha="a"*40,
+             original=ORIGINAL, evaluation_id="sample", max_wait_seconds=10,
+             poll_seconds=1)
+        state = {"fork_repo": "research/test"}
+        saved = []
+        with patch("evaluation.ci_executor.time.sleep", return_value=None):
+            runner._wait_for_workflow(state, lambda: saved.append(dict(state)))
+        self.assertEqual(state["workflow_id"], 42)
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(sum(method == "PUT" for method, _ in methods), 1)
+        self.assertEqual(methods[-1][0], "GET")
+
+    def test_already_active_workflow_never_sends_enable(self):
+        class Fake:
+            def request(self, method, path, body=None):
+                assert method == "GET"
+                return {"id": 42, "state": "active"}
+        runner = ForkExperiment(Fake(), repo_id="source/test",
+             workflow_path=".github/workflows/ci.yml", source_sha="a"*40,
+             original=ORIGINAL, evaluation_id="sample", max_wait_seconds=10,
+             poll_seconds=1)
+        state = {"fork_repo": "research/test", "workflow_id": 42}
+        runner._wait_for_workflow(state, lambda: None)
+
+    def test_changed_workflow_identity_is_rejected(self):
+        class Fake:
+            def request(self, method, path, body=None):
+                return {"id": 99, "state": "active"}
+        runner = ForkExperiment(Fake(), repo_id="source/test",
+             workflow_path=".github/workflows/ci.yml", source_sha="a"*40,
+             original=ORIGINAL, evaluation_id="sample", max_wait_seconds=10,
+             poll_seconds=1)
+        with self.assertRaisesRegex(ValueError, "workflow ID changed"):
+            runner._wait_for_workflow({"fork_repo": "research/test", "workflow_id": 42}, lambda: None)
+
     def test_queued_run_stays_pending_and_is_not_redispatched(self):
         with self.assertRaises(RunPending):
             self.experiment(status="queued", max_wait_seconds=0).execute(

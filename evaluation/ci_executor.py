@@ -26,6 +26,16 @@ from evaluation.repository_preparation import (
 )
 
 
+def log_progress(stage: str, message: str) -> None:
+    """Print safe, time-stamped operational progress; never log API credentials.
+
+    Keep this intentionally independent from GitHub state and checkpoint data.
+    Terminal output is diagnostic and must not become experimental evidence.
+    """
+    now = dt.datetime.now(dt.timezone.utc).strftime("%H:%M:%S UTC")
+    print(f"[{now}] [{stage}] {message}", flush=True)
+
+
 class RunPending(RuntimeError):
     """A dispatched GitHub run is still queued/running; retry collection later.
 
@@ -214,11 +224,13 @@ class ForkExperiment:
     def provision(self, state: dict, save) -> None:
         """Create only research-owned forks; refuse pre-existing untracked ones."""
         if state.get("fork_repo"):
+            log_progress("FORK", f"Verifying saved fork identity: {state['fork_repo']}")
             if type(state.get("fork_id")) is not int or state["fork_id"] <= 0:
                 raise ValueError("Pinned fork repository ID missing; do not reuse fork")
             fork = self.gh.request("GET", "/repos/" + state["fork_repo"])
             verify_fork(fork, self.upstream, state["fork_owner"],
                         expected_id=state["fork_id"])
+            log_progress("FORK", f"Saved fork identity verified (id={state['fork_id']})")
             return
         owner = self.gh.request("GET", "/user")["login"]
         expected = owner + "/" + self.upstream.split("/", 1)[1]
@@ -244,6 +256,7 @@ class ForkExperiment:
             return
         state["fork_creation_intent"] = expected
         save()
+        log_progress("FORK", f"Creating new research-owned fork {expected} from {self.upstream}")
         # A lost response is deliberately NOT automatically retried. A rerun
         # checks existing fork identity and requires explicit recovery approval.
         created = self.gh.request("POST", "/repos/" + self.upstream + "/forks", {})
@@ -258,10 +271,12 @@ class ForkExperiment:
         state.update(fork_repo=fork_name, fork_owner=owner, fork_id=numeric_id,
                      fork_created_by_evaluation=True)
         save()
+        log_progress("FORK", f"Fork created, numeric identity={numeric_id}; waiting for GitHub readiness")
         for _ in range(40):
             try:
                 fork = self.gh.request("GET", "/repos/" + fork_name)
                 verify_fork(fork, self.upstream, owner, expected_id=numeric_id)
+                log_progress("FORK", f"Fork ready: https://github.com/{fork_name}")
                 return
             except GitHubError as exc:
                 if exc.code != 404:
@@ -299,6 +314,7 @@ class ForkExperiment:
             raise
 
     def prepare(self, state: dict, save) -> None:
+        log_progress("WORKFLOW", f"Preparing common A/B/C dispatch harness for {state['fork_repo']}")
         if state.get("prepared_commit"):
             fork = state["fork_repo"]
             if self._ref(fork, state["default_branch"]) != state["default_branch_commit"]:
@@ -310,6 +326,10 @@ class ForkExperiment:
                 state["actions_disabled_for_setup"] = False
                 save()
             if state.get("workflow_id"):
+                # A saved workflow ID is not proof that the workflow is active.
+                # Newly forked repositories can disable a workflow separately
+                # from the repository-wide Actions setting.
+                self._wait_for_workflow(state, save)
                 return
             # Resume the registration poll even if the commit was prepared.
             # Never produce a second harness commit after a runner timeout.
@@ -331,6 +351,7 @@ class ForkExperiment:
         source = self.gh.request("GET", f"/repos/{fork}/git/commits/{self.source_sha}")
         source_tree = source["tree"]["sha"]
         common = ensure_dispatch(self.original)
+        log_progress("WORKFLOW", f"Common dispatch harness validated for {self.workflow_path}")
         static_check = validate_baseline(common)
         if static_check["verdict"] != "PASS":
             raise ValueError("Prepared baseline workflow did not pass actionlint and static safety checks: " +
@@ -349,6 +370,7 @@ class ForkExperiment:
             # Disable Actions before the registration push to avoid executing
             # unrelated push-triggered workflows during harness setup.
             if not state.get("actions_disabled_for_setup"):
+                log_progress("WORKFLOW", "Temporarily disabling fork Actions before harness-registration push")
                 self.gh.request("PUT", f"/repos/{fork}/actions/permissions", {"enabled": False})
                 state["actions_disabled_for_setup"] = True
                 save()
@@ -370,26 +392,58 @@ class ForkExperiment:
                      harness_sha256=digest(common), original_sha256=digest(self.original),
                      common_workflow=base64.b64encode(common).decode("ascii"), arms={})
         save()
+        log_progress("WORKFLOW", "Enabling GitHub Actions for the research fork")
         self.gh.request("PUT", f"/repos/{fork}/actions/permissions", {"enabled": True})
         state["actions_disabled_for_setup"] = False
         save()
         self._wait_for_workflow(state, save)
 
     def _wait_for_workflow(self, state: dict, save) -> None:
-        """GitHub can index registered workflows asynchronously."""
+        """Wait for workflow indexing; enable disabled fork workflows safely.
+
+        Repository-wide Actions permissions and the individual workflow's
+        active/disabled state are independent GitHub settings. Enabling a
+        workflow with PUT is idempotent and does NOT dispatch a CI run.
+        """
         fork = state["fork_repo"]
-        for _ in range(24):
+        name = Path(self.workflow_path).name
+        enabled_this_cycle = False
+        last_state = None
+        log_progress("WORKFLOW", f"Checking registration and state of {fork}/{name}")
+        for attempt in range(1, 25):
             try:
-                workflow = self.gh.request("GET", f"/repos/{fork}/actions/workflows/{Path(self.workflow_path).name}")
-                if workflow.get("state") == "active":
-                    state["workflow_id"] = workflow["id"]
-                    save()
+                workflow = self.gh.request("GET", f"/repos/{fork}/actions/workflows/{name}")
+                workflow_id = workflow.get("id")
+                current = workflow.get("state")
+                if type(workflow_id) is not int or workflow_id <= 0:
+                    raise ValueError("GitHub workflow registration has no numeric workflow ID")
+                if state.get("workflow_id") is not None and state["workflow_id"] != workflow_id:
+                    raise ValueError("Registered workflow ID changed; refusing unsafe reuse")
+                if current != last_state or attempt % 5 == 0:
+                    log_progress("WORKFLOW", f"{name}: state={current}, id={workflow_id}, poll={attempt}/24")
+                last_state = current
+                if current == "active":
+                    if state.get("workflow_id") != workflow_id:
+                        state["workflow_id"] = workflow_id
+                        save()
+                    log_progress("WORKFLOW", f"Workflow active: {name} (id={workflow_id})")
                     return
+                if current in {"disabled_manually", "disabled_inactivity", "disabled_fork"}:
+                    if not enabled_this_cycle:
+                        log_progress("WORKFLOW", f"Enabling disabled fork workflow {name} (state={current})")
+                        self.gh.request("PUT", f"/repos/{fork}/actions/workflows/{workflow_id}/enable")
+                        enabled_this_cycle = True
+                        log_progress("WORKFLOW", "Enable request accepted; waiting for active state")
+                elif current not in {"queued", "requested"}:
+                    # Do not automatically enable a deleted or unknown workflow.
+                    raise ValueError(f"Unexpected GitHub workflow state: {current!r}")
             except GitHubError as exc:
                 if exc.code != 404:
                     raise
+                if attempt == 1 or attempt % 5 == 0:
+                    log_progress("WORKFLOW", f"Registration not visible yet (HTTP 404, poll={attempt}/24)")
             time.sleep(5)
-        raise RunPending("GitHub workflow registration is pending; retry on next controller run")
+        raise RunPending(f"GitHub workflow {name} not active after registration polls; retry observation")
 
     def make_arm(self, state: dict, arm: str, proposed: bytes, save) -> dict:
         fork = state["fork_repo"]
@@ -407,6 +461,7 @@ class ForkExperiment:
             raise ValueError("Arm A differs from common prepared baseline")
         result = state["arms"].get(arm)
         if result:
+            log_progress("ARM", f"Verifying existing arm {arm} branch {result['branch']}")
             if result["workflow_sha256"] != digest(rendered):
                 raise ValueError("Experimental candidate bytes changed")
             remote = self._ref(fork, result["branch"])
@@ -418,6 +473,7 @@ class ForkExperiment:
                 raise ValueError("Experimental arm reference changed")
             self._verify_arm_tree(fork, state["prepared_tree"], result)
             return result
+        log_progress("ARM", f"Creating arm {arm} on isolated pinned-source branch")
         tree = state["prepared_tree"] if arm == "A" else self._new_tree(fork, state["prepared_tree"], rendered)
         commit = state["prepared_commit"] if arm == "A" else self._commit(fork, tree, state["prepared_commit"], arm)
         branch = f"{self.prefix}-{arm.lower()}"
@@ -432,6 +488,7 @@ class ForkExperiment:
         elif remote != commit:
             raise ValueError("Experiment arm branch was modified unexpectedly")
         self._verify_arm_tree(fork, state["prepared_tree"], result)
+        log_progress("ARM", f"Arm {arm} prepared and verified: {branch}")
         return result
 
     def _verify_arm_tree(self, fork: str, common_tree: str, arm: dict) -> None:
@@ -456,9 +513,12 @@ class ForkExperiment:
         pending = state["pending"]
         fork = state["fork_repo"]
         if pending.get("run_id"):
+            log_progress("CI", f"Resuming existing run {pending['run_id']} without redispatch")
             return pending["run_id"]
         arm = state["arms"][pending["arm"]]
-        for _ in range(max(1, self.max_wait_seconds // self.poll_seconds)):
+        for attempt in range(1, max(1, self.max_wait_seconds // self.poll_seconds) + 1):
+            if attempt == 1 or attempt % 4 == 0:
+                log_progress("CI", f"Reconciling dispatch for arm {pending['arm']} repeat {pending['repeat']} (poll={attempt})")
             matches = [row for row in self._run_ids(fork, state["workflow_id"], arm["branch"])
                        if (row["id"] not in pending["old_ids"] and row.get("head_sha") == arm["sha"]
                            and row.get("event") == "workflow_dispatch")]
@@ -467,6 +527,7 @@ class ForkExperiment:
             if matches:
                 pending["run_id"] = matches[0]["id"]
                 save()
+                log_progress("CI", f"Found run {pending['run_id']}: https://github.com/{fork}/actions/runs/{pending['run_id']}")
                 return pending["run_id"]
             time.sleep(self.poll_seconds)
         raise RunPending("Dispatch identity not resolved yet; retry observation without sending another POST")
@@ -477,6 +538,7 @@ class ForkExperiment:
         # POST outcomes, queue timeout and controller reruns.
         if state.get("pending"):
             p = state["pending"]
+            log_progress("CI", f"Pending dispatch: arm {p['arm']}, repeat {p['repeat']}, run_id={p.get('run_id')}")
             if (p["arm"], p["repeat"]) != (arm, repeat):
                 raise RuntimeError("Earlier dispatch is pending; resume it before new runs")
         else:
@@ -493,22 +555,33 @@ class ForkExperiment:
                                 "sent_at": dt.datetime.now(dt.timezone.utc).isoformat(), "run_id": None}
             state["dispatch_count"] = state.get("dispatch_count", 0) + 1
             save()
+            log_progress("CI", f"Dispatching arm {arm}, repeat {repeat}, branch={run_arm['branch']}")
             response = self.gh.request("POST", f"/repos/{fork}/actions/workflows/{state['workflow_id']}/dispatches", {
                 "ref": run_arm["branch"], "inputs": {}, "return_run_details": True})
             if response and response.get("workflow_run_id"):
                 state["pending"]["run_id"] = response["workflow_run_id"]
                 save()
+                log_progress("CI", f"Dispatch accepted: https://github.com/{fork}/actions/runs/{response['workflow_run_id']}")
         run_id = self._pending_run(state, save)
         fork = state["fork_repo"]
         started = time.monotonic()
+        last_run_status = None
         while True:
             run = self.gh.request("GET", f"/repos/{fork}/actions/runs/{run_id}")
-            if run.get("status") == "completed":
+            status = run.get("status", "unknown")
+            if status != last_run_status or last_run_status is None:
+                log_progress("CI", f"Run {run_id} state={status} (arm {arm}, repeat {repeat})")
+                last_run_status = status
+            else:
+                log_progress("CI", f"Run {run_id} still {status}; checking again in {self.poll_seconds}s")
+            if status == "completed":
+                log_progress("CI", f"Run {run_id} completed with conclusion={run.get('conclusion')}")
                 break
             if time.monotonic() - started > self.max_wait_seconds:
                 raise RunPending(f"GitHub run {run_id} is queued/in progress; resume observation later")
             time.sleep(self.poll_seconds)
         attempt = run.get("run_attempt", 1)
+        log_progress("EVIDENCE", f"Fetching run {run_id} attempt {attempt} jobs and measurements")
         jobs = self.gh.all(f"/repos/{fork}/actions/runs/{run_id}/attempts/{attempt}/jobs", "jobs")
         arm_ref = state["arms"][arm]
         valid = (run.get("head_sha") == arm_ref["sha"] and
@@ -582,6 +655,7 @@ class ForkExperiment:
         state.setdefault("records", []).append(outcome)
         state["pending"] = None
         save()
+        log_progress("EVIDENCE", f"Arm {arm}, repeat {repeat}: comparable={outcome['comparable']}, active={elapsed}s, runner={total}s, initial_queue={initial_queue}s; archived")
         return outcome
 
 
@@ -597,6 +671,7 @@ class ForkExperiment:
         if state.get("pending"):
             raise RunPending("Fork still has a pending CI dispatch; cleanup postponed")
         if not state.get("fork_repo"):
+            log_progress("CLEANUP", "No fork created; cleanup not required")
             return "NOT_CREATED"
         if state.get("cleanup_status") == "DELETED":
             return "DELETED"
@@ -623,6 +698,7 @@ class ForkExperiment:
             # before any cleanup API request or destructive DELETE intent.
             state["cleanup_status"] = "RETAINED_BY_CONFIGURATION"
             save()
+            log_progress("CLEANUP", f"Fork retained by configuration: https://github.com/{fork_name}")
             return "RETAINED_BY_CONFIGURATION"
 
         try:
@@ -647,6 +723,7 @@ class ForkExperiment:
             state["cleanup_intent"] = fork_name
             state["cleanup_status"] = "DELETE_REQUESTED"
             save()  # Critical: crash-safe DELETE intent, before the API call.
+            log_progress("CLEANUP", f"Deleting verified evaluation-owned fork: {fork_name}")
         else:
             if state["cleanup_intent"] != fork_name:
                 raise ValueError("Fork cleanup intent changed")

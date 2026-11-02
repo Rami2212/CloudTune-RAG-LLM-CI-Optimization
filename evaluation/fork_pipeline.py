@@ -26,13 +26,14 @@ from evaluation.third_party.ci_cost.setup import install as install_ci_cost
 from evaluation.candidate_validator import validate_and_archive
 from evaluation.ci_executor import (
     ForkExperiment, GitHub, RunPending, automatic_fork_deletion_enabled,
-    summarize_records,
+    log_progress, summarize_records,
 )
 from evaluation.optimizers.ci_cost import generate_ci_cost_candidate
 from evaluation.optimizers.rag_llm import generate_rag_candidate
 from evaluation.rag_retriever import Retriever
 from evaluation.results_exporter import summarize_cohort
-from evaluation.repository_preparation import GitHubReader, file_sha256, workflow_doc
+from evaluation.repository_preparation import (GitHubReader, file_sha256, read_evaluation_rows,
+                                               workflow_doc)
 from evaluation.run_pipeline import ROOT, load_config, prepare
 
 
@@ -197,6 +198,124 @@ def _config(path: Path) -> dict:
     return config
 
 
+
+def configure_batch(config: dict, *, start_at: int | None = None,
+                    stop_at: int | None = None, limit: int | None = None,
+                    batch_id: str | None = None) -> dict:
+    """Resolve CLI range overrides into the frozen experiment configuration.
+
+    Positions are 1-based in the original dataset; --stop-at is inclusive.
+    Never mutate the loaded template: the resolved values are hashed with the
+    evaluator implementation and checked on every resume.
+    """
+    if stop_at is not None and limit is not None:
+        raise ValueError("--stop-at and --limit cannot be used together")
+    start = config.get("repository_start_at", 1) if start_at is None else start_at
+    if type(start) is not int or start < 1:
+        raise ValueError("--start-at must be a positive integer")
+    if stop_at is not None:
+        if type(stop_at) is not int or stop_at < start:
+            raise ValueError("--stop-at must be at least --start-at")
+        count = stop_at - start + 1
+    elif limit is not None:
+        count = limit
+    else:
+        count = config["repository_limit"]
+    if type(count) is not int or not 1 <= count <= 100:
+        raise ValueError("Select between 1 and 100 repositories per batch")
+    resolved = dict(config)
+    resolved["repository_start_at"] = start
+    resolved["repository_limit"] = count
+    if batch_id is not None:
+        # A batch has its own local state, snapshots, and report directory.
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", batch_id):
+            raise ValueError("--batch-id must be 1-64 letters, digits, underscores or hyphens")
+        resolved["evaluation_id"] = batch_id
+    if config.get("execution", {}).get("development_smoke") is True:
+        if count != 1 or not resolved["evaluation_id"].startswith("dev-"):
+            raise ValueError("Development smoke requires one row and a dev- batch ID")
+    return resolved
+
+
+def selected_repository_rows(config: dict, *, explicit_stop: int | None = None
+                             ) -> list[tuple[int, str]]:
+    """Validate a cohort slice before any fork/API writes or local checkpoint.
+
+    A preview is only a dataset-position check; safety/eligibility screening
+    happens later in the read-only preparation stage.
+    """
+    rows = read_evaluation_rows(ROOT / config["dataset"],
+                                expected_split=config.get("dataset_split", "evaluation"))
+    start = config["repository_start_at"]
+    end = min(len(rows), start + config["repository_limit"] - 1)
+    if start > len(rows):
+        raise ValueError(f"--start-at {start} exceeds dataset size {len(rows)}")
+    if explicit_stop is not None and explicit_stop > len(rows):
+        raise ValueError(f"--stop-at {explicit_stop} exceeds dataset size {len(rows)}")
+    return [(position, rows[position - 1]["repo_id"])
+            for position in range(start, end + 1)]
+
+
+def _batch_generation_finalized(state: dict, config: dict,
+                                selection: list[tuple[int, str]]) -> bool:
+    """A rerun can only follow a settled generation with immutable evidence.
+
+    Existing pending GitHub dispatches are resumed, NEVER replayed. Retained
+    supervisor evidence is preserved; the next provisioning gate rejects any
+    still-existing fork until it has been manually removed.
+    """
+    expected_hash = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
+    if state.get("protocol") != PROTOCOL or state.get("config_sha256") != expected_hash:
+        raise ValueError("Existing batch has a different frozen protocol/configuration")
+    if state.get("dataset_sha256") != file_sha256(ROOT / config["dataset"]):
+        raise ValueError("Existing batch has a different frozen dataset")
+    entries = state.get("repositories")
+    if not isinstance(entries, dict) or set(entries) != {repo for _, repo in selection}:
+        return False
+    for row in entries.values():
+        if not isinstance(row, dict) or row.get("pending") is not None:
+            return False
+        if row.get("status") == "SKIPPED" and not row.get("fork_repo"):
+            continue
+        if (row.get("status") not in {"COMPLETE", "INCOMPLETE", "FAILED_TARGET_CI",
+                                      "INCONCLUSIVE_PLATFORM"}
+                or row.get("measurements_finalized") is not True):
+            return False
+        if row.get("fork_repo") and row.get("cleanup_status") not in {
+                "DELETED", "RETAINED_BY_CONFIGURATION"}:
+            return False
+    return True
+
+
+def resolve_rerun_batch(config: dict, selection: list[tuple[int, str]]) -> dict:
+    """Create independent -r2/-r3 generations without overwriting prior runs.
+
+    Repeated --rerun resumes an unfinished numbered generation. Once the
+    generation finishes, the NEXT --rerun allocates the next unused number.
+    """
+    base_id = config["evaluation_id"]
+    for generation in range(1, 10000):
+        trial_id = base_id if generation == 1 else f"{base_id}-r{generation}"
+        if len(trial_id) > 80:
+            raise ValueError("Batch ID is too long for numbered rerun generations")
+        trial = dict(config)
+        trial["evaluation_id"] = trial_id
+        folder = ROOT / "evaluation/results" / trial_id
+        state_file = folder / "state.json"
+        if not state_file.exists():
+            if generation == 1:
+                raise ValueError("--rerun requires an existing batch; start normally first")
+            if folder.exists():
+                raise ValueError(f"Generation {trial_id} has no state; inspect before retrying")
+            return trial
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        if not _batch_generation_finalized(state, trial, selection):
+            if generation == 1:
+                raise ValueError("Original batch is not finalized; resume without --rerun")
+            return trial  # Continue the same pending numbered generation safely.
+    raise ValueError("Too many rerun generations")
+
+
 def _candidate_yaml(snapshot: Path, arm: str, outcome: dict, original: bytes) -> bytes | None:
     if outcome.get("decision") == "NO_CHANGE":
         return None
@@ -218,6 +337,7 @@ def _ensure_preparation(config: dict, state: dict, store: StateStore, token: str
     output = ROOT / "evaluation/results" / config["evaluation_id"]
     if "screening" not in state:
         # Reuse the same research-account token for read-only screening.
+        log_progress("PREP", f"Screening selected repository range for {config['evaluation_id']}")
         prepare(config, reader=GitHubReader(token=token))
         with (output / "screening.csv").open(newline="", encoding="utf-8") as stream:
             rows = list(csv.DictReader(stream))
@@ -234,6 +354,7 @@ def _ensure_preparation(config: dict, state: dict, store: StateStore, token: str
                 snapshot_paths[row["repo_id"]] = _repo_snapshot(output, row)
         store.save(state, snapshots=snapshot_paths)
     else:
+        log_progress("PREP", "Restoring pinned repository snapshots from existing checkpoint")
         restored = store.restore(output, state)
         (output / "config.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
         (output / "preparation_summary.json").write_text(
@@ -294,6 +415,13 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False) -> dict:
     token = os.environ.get("CLOUDTUNE_FORK_TOKEN") or os.environ.get("GITHUB_TOKEN")
     if not token:
         raise ValueError("Set GITHUB_TOKEN or CLOUDTUNE_FORK_TOKEN in the existing .env")
+    # Diagnostic logging must not require fields omitted by valid minimal test fixtures.
+    log_progress(
+        "BATCH",
+        f"Evaluation {config['evaluation_id']} started; "
+        f"{config.get('repository_limit', 'unspecified')} selected rows, "
+        f"{config['repetitions']} repeats/arm",
+    )
     config_sha = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
     code_sha = implementation_digest()
     store = StateStore(config["evaluation_id"])
@@ -317,8 +445,9 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False) -> dict:
     with (output / "screening.csv").open(newline="", encoding="utf-8") as stream:
         decisions = list(csv.DictReader(stream))
     fork_api = GitHub(token)
-    for row in decisions:
+    for position, row in enumerate(decisions, 1):
         repo_id = row["repo_id"]
+        log_progress("REPO", f"[{position}/{len(decisions)}] {repo_id}: screening={row['status']}")
         state["repositories"].setdefault(repo_id, {"status": "SELECTED", "candidates": {},
                                                    "validation": {}, "records": [], "pending": None})
         repo = state["repositories"][repo_id]
@@ -344,6 +473,7 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False) -> dict:
             continue
         if row["status"] not in {"prepared", "needs_harness"}:
             repo.update(status="SKIPPED", failure_reason=row["status"])
+            log_progress("REPO", f"{repo_id}: skipped by eligibility screening: {row['status']}")
             store.save(state)
             continue
         snapshot = _repo_snapshot(output, row)
@@ -362,6 +492,7 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False) -> dict:
              poll_seconds=15, evidence_root=snapshot)
         try:
             if repo.get("measurements_finalized"):
+                log_progress("REPO", f"{repo_id}: measurements already finalized; reconciling cleanup only")
                 # All target repetitions already ended in a prior process.
                 # Retry only non-destructive fork cleanup/reconciliation.
                 experiment.cleanup_fork(repo, save)
@@ -371,6 +502,7 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False) -> dict:
                     # Local candidate generation only; the target's CI still
                     # runs exclusively on GitHub Actions in its research fork.
                     tool_dir = ROOT / "evaluation/results/.tools/ci-cost"
+                    log_progress("OPTIMIZER", f"{repo_id}: preparing ci-cost tool for B")
                     install_ci_cost(tool_dir)
                     b = generate_ci_cost_candidate(snapshot, version=version, tool_dir=tool_dir)
                 except (OSError, ValueError, RuntimeError) as exc:
@@ -378,10 +510,12 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False) -> dict:
                          "error": type(exc).__name__ + ": " + str(exc)[:400]}
                 repo["candidates"]["B"] = {k: b.get(k) for k in ("decision", "status", "after_sha256",
                                                           "candidate_relative_dir", "generated_artifact", "error")}
+                log_progress("OPTIMIZER", f"{repo_id}: B decision={b.get('decision')}, status={b.get('status')}")
                 store.save(state, snapshots={repo_id: snapshot})
             if "C" not in repo["candidates"]:
                 try:
                     if retriever is None:
+                        log_progress("OPTIMIZER", f"{repo_id}: initializing BGE-M3 retriever for C")
                         retriever = Retriever(
                             revision=state.get("rag_revision") or (
                                 None if config["rag"]["embedding_revision"] == "AUTO_PIN_SINGLE"
@@ -390,6 +524,7 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False) -> dict:
                             dataset_sha256=config["rag"]["dataset_sha256"])
                         state["rag_revision"] = retriever.revision
                         save()
+                    log_progress("OPTIMIZER", f"{repo_id}: requesting free LLM+RAG candidate for C")
                     c = generate_rag_candidate(snapshot, retriever=retriever,
                              model=config["rag"]["generator_model"], top_k=config["rag"]["top_k"],
                              max_tokens=config["rag"]["max_tokens"],
@@ -402,6 +537,7 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False) -> dict:
                          "generated_artifact": None, "model": config["rag"]["generator_model"],
                          "error": type(exc).__name__ + ": " + str(exc)[:400]}
                 repo["candidates"]["C"] = {k: c.get(k) for k in ("decision", "after_sha256", "generated_artifact", "error", "model")}
+                log_progress("OPTIMIZER", f"{repo_id}: C decision={c.get('decision')}")
                 store.save(state, snapshots={repo_id: snapshot})
             candidates = {"A": original}
             for arm in "BC":
@@ -416,8 +552,10 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False) -> dict:
                                                generation=result)
                 repo["validation"][arm] = verdict
                 save()
+                log_progress("VALIDATION", f"{repo_id}: arm {arm} verdict={verdict['verdict']}")
                 if verdict["verdict"] == "PASS" and data is not None:
                     candidates[arm] = data
+            log_progress("REPO", f"{repo_id}: admitted arms={','.join(candidates)}; preparing research fork")
             experiment.provision(repo, save)
             experiment.prepare(repo, save)
             if repo.get("workflow_id") is None:
@@ -439,6 +577,7 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False) -> dict:
                     if any(r["arm"] == arm and r["repeat"] == repeat for r in repo["records"]):
                         continue
                     required = repo.get("required_names") or config["execution"].get("required_job_names", [])
+                    log_progress("CI", f"{repo_id}: measuring arm {arm}, repeat {repeat}/{reps}")
                     outcome = experiment.execute(repo, save, arm=arm, repeat=repeat,
                              required=required, max_total=reps*3)
                     if not outcome["comparable"]:
@@ -459,12 +598,21 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False) -> dict:
                                   and len(repo["records"]) == reps * 3
                                   and all(record.get("comparable") for record in repo["records"])
                                   else "INCOMPLETE")
+            if repo["status"] == "INCOMPLETE":
+                # A baseline-only smoke is useful, but not a paired A/B/C result.
+                missing = [f"{arm}: {repo['candidates'][arm].get('decision', 'UNKNOWN')} / "
+                           f"{repo.get('validation', {}).get(arm, {}).get('verdict', 'UNKNOWN')}"
+                           for arm in "BC" if arm not in candidates]
+                repo["failure_reason"] = "No complete A/B/C pair; " + ", ".join(missing)
             repo["measurements_finalized"] = True
+            repo.pop("pending_reason", None)
             save()  # Persist ALL measurements before deleting the research fork.
+            log_progress("REPO", f"{repo_id}: finalized status={repo['status']}; runs={len(repo.get('records', []))}; reason={repo.get('failure_reason', 'none')}")
             experiment.cleanup_fork(repo, save)
         except RunPending as pending:
             repo["status"] = "WAITING_FOR_GITHUB_RUN"
             repo["pending_reason"] = str(pending)
+            log_progress("PENDING", f"{repo_id}: {pending}; pending run={repo.get('pending', {}).get('run_id') if repo.get('pending') else None}")
             save()
             return _save_report(output, state)
         except Exception as exc:
@@ -472,6 +620,7 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False) -> dict:
             # an ambiguous failure, and we never label a failed run a speedup.
             repo["status"] = "INCOMPLETE"
             repo["failure_reason"] = type(exc).__name__ + ": " + str(exc)[:400]
+            log_progress("ERROR", f"{repo_id}: interrupted by {type(exc).__name__}; inspect checkpoint")
             save()
             _save_report(output, state)
             raise
@@ -482,6 +631,18 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--start-at", type=int,
+                        help="First 1-based row in the shared evaluation CSV")
+    parser.add_argument("--stop-at", type=int,
+                        help="Last 1-based row, inclusive (exclusive with --limit)")
+    parser.add_argument("--limit", type=int,
+                        help="Maximum rows from --start-at, capped at 100")
+    parser.add_argument("--batch-id",
+                        help="Unique team/member experiment ID and checkpoint directory")
+    parser.add_argument("--list", action="store_true",
+                        help="Preview selected repository rows without network calls")
+    parser.add_argument("--rerun", action="store_true",
+                        help="Run completed cases in a preserved generation (-r2/-r3/...)")
     parser.add_argument("--check-config", action="store_true")
     parser.add_argument("--resume-only", action="store_true",
                         help="Continue only a previously started evaluation")
@@ -491,10 +652,30 @@ def main() -> int:
                         help="Seconds between long-queue resume cycles (default 120)")
     args = parser.parse_args()
     try:
-        config = _config(args.config)
+        config = configure_batch(_config(args.config), start_at=args.start_at,
+                                 stop_at=args.stop_at, limit=args.limit,
+                                 batch_id=args.batch_id)
+        if args.rerun:
+            if not args.batch_id:
+                raise ValueError("--rerun requires --batch-id")
+            if args.resume_only:
+                raise ValueError("Use --rerun alone to resume a pending rerun generation")
+            # Resolve only from frozen local state; never issue network requests.
+            selection = selected_repository_rows(config, explicit_stop=args.stop_at)
+            config = resolve_rerun_batch(config, selection)
         if args.check_config:
             print(json.dumps({"valid": True, "protocol": PROTOCOL,
-                              "evaluation_id": config["evaluation_id"]}, indent=2))
+                              "evaluation_id": config["evaluation_id"],
+                              "repository_start_at": config["repository_start_at"],
+                              "repository_limit": config["repository_limit"]}, indent=2))
+            return 0
+        # Validate selection before loading any credentials or starting work.
+        # --list prints dataset positions only; no GitHub or model calls.
+        selection = selected_repository_rows(config, explicit_stop=args.stop_at)
+        if args.list:
+            print(f"evaluation_id: {config['evaluation_id']}")
+            for position, repo_id in selection:
+                print(f"{position}\t{repo_id}\thttps://github.com/{repo_id}")
             return 0
         if args.poll_interval < 10:
             raise ValueError("--poll-interval must be at least 10 seconds")
@@ -520,7 +701,7 @@ def main() -> int:
                               file=sys.stderr, flush=True)
                         return 2
                     return 0
-                print("GitHub CI or fork cleanup pending; retrying safely without duplicate dispatch.", flush=True)
+                log_progress("BATCH", f"Pending hosted CI or cleanup; checking again in {args.poll_interval}s (no duplicate dispatch)")
                 time.sleep(args.poll_interval)
     except (OSError, ValueError, RuntimeError, KeyError, TypeError, json.JSONDecodeError) as exc:
         print(f"Fork evaluation failed: {type(exc).__name__}: {exc}", file=sys.stderr)

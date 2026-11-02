@@ -8,10 +8,14 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+import hashlib
 from unittest.mock import patch
 
 from evaluation.ci_executor import ForkExperiment, GitHubError, verify_fork
-from evaluation.fork_pipeline import _config
+from evaluation.fork_pipeline import (
+    PROTOCOL, _config, configure_batch, resolve_rerun_batch,
+    selected_repository_rows,
+)
 from evaluation.run_pipeline import load_config, prepare
 
 
@@ -151,6 +155,131 @@ class ForkSafetyTests(unittest.TestCase):
             outcome = prepare(config, reader=ForbiddenReader(), project_root=root)
         self.assertEqual(outcome["counts"], {"ineligible": 1})
         self.assertEqual(outcome["github_actions_runs"], 0)
+
+    def test_batch_flags_resolve_inclusive_ranges_without_mutating_config(self):
+        baseline = self.config(dev=False)
+        baseline["repository_limit"] = 3
+        first = configure_batch(baseline, start_at=1, stop_at=100, batch_id="team-01")
+        second = configure_batch(baseline, start_at=101, limit=100, batch_id="team-02")
+        self.assertEqual((first["repository_start_at"], first["repository_limit"],
+                          first["evaluation_id"]), (1, 100, "team-01"))
+        self.assertEqual((second["repository_start_at"], second["repository_limit"],
+                          second["evaluation_id"]), (101, 100, "team-02"))
+        self.assertEqual(baseline["repository_limit"], 3)
+        self.assertEqual(baseline["repository_start_at"], 1)
+        self.assertEqual(configure_batch(baseline)["evaluation_id"], "regular")
+        self.assertEqual(configure_batch(baseline, start_at=16)["repository_limit"], 3)
+
+    def test_batch_flags_reject_invalid_or_unsafe_ranges(self):
+        baseline = self.config(dev=False)
+        cases = (
+            {"start_at": 0}, {"stop_at": 0}, {"start_at": 10, "stop_at": 9},
+            {"start_at": 1, "stop_at": 101}, {"limit": 0}, {"limit": 101},
+            {"limit": 10, "stop_at": 10}, {"batch_id": "../bad"},
+            {"batch_id": ""}, {"batch_id": "name with spaces"},
+        )
+        for kwargs in cases:
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                configure_batch(baseline, **kwargs)
+        with self.assertRaisesRegex(ValueError, "Development smoke"):
+            configure_batch(self.config(dev=True), limit=2)
+        with self.assertRaisesRegex(ValueError, "Development smoke"):
+            configure_batch(self.config(dev=True), batch_id="team-01")
+
+    def test_team_ranges_partition_500_rows_with_no_overlap(self):
+        # The preview uses the exact CSV order, never a filtered/reindexed list.
+        dataset = self.root / "team.csv"
+        dataset.write_text("repo_id,split\n" + "".join(
+            f"example/repo-{index},evaluation\n" for index in range(1, 501)))
+        baseline = self.config(dev=False)
+        baseline["dataset"] = "team.csv"
+        positions = []
+        with patch("evaluation.fork_pipeline.ROOT", self.root):
+            for member in range(5):
+                first = member * 100 + 1
+                last = first + 99
+                batch = configure_batch(baseline, start_at=first, stop_at=last,
+                                        batch_id=f"team-{member + 1:02d}")
+                selection = selected_repository_rows(batch, explicit_stop=last)
+                self.assertEqual(len(selection), 100)
+                self.assertEqual(selection[0], (first, f"example/repo-{first}"))
+                self.assertEqual(selection[-1], (last, f"example/repo-{last}"))
+                positions.extend(position for position, _ in selection)
+            self.assertEqual(positions, list(range(1, 501)))
+            with self.assertRaisesRegex(ValueError, "exceeds dataset size"):
+                selected_repository_rows(
+                    configure_batch(baseline, start_at=501, limit=1))
+            with self.assertRaisesRegex(ValueError, "exceeds dataset size"):
+                selected_repository_rows(
+                    configure_batch(baseline, start_at=451, stop_at=520),
+                    explicit_stop=520)
+
+    def test_rerun_generation_requires_settled_original_and_preserves_evidence(self):
+        dataset = self.root / "team.csv"
+        dataset.write_text("repo_id,split\nexample/one,evaluation\nexample/two,evaluation\n")
+        original = self.config(dev=False)
+        original["dataset"] = "team.csv"
+        batch = configure_batch(original, start_at=1, limit=2, batch_id="team-02")
+
+        def save(trial, *, finished, cleanup="DELETED"):
+            path = self.root / "evaluation/results" / trial["evaluation_id"] / "state.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            record = {"status": "COMPLETE" if finished else "WAITING_FOR_GITHUB_RUN",
+                      "measurements_finalized": finished,
+                      "pending": None if finished else {"arm": "A", "repeat": 1},
+                      "fork_repo": "research/one", "cleanup_status": cleanup}
+            payload = {"protocol": PROTOCOL,
+                       "config_sha256": hashlib.sha256(json.dumps(trial, sort_keys=True).encode()).hexdigest(),
+                       "dataset_sha256": hashlib.sha256(dataset.read_bytes()).hexdigest(),
+                       "repositories": {"example/one": dict(record), "example/two": dict(record)}}
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            return path
+
+        with patch("evaluation.fork_pipeline.ROOT", self.root):
+            selection = selected_repository_rows(batch)
+            with self.assertRaisesRegex(ValueError, "existing batch"):
+                resolve_rerun_batch(batch, selection)
+            save(batch, finished=False)
+            with self.assertRaisesRegex(ValueError, "not finalized"):
+                resolve_rerun_batch(batch, selection)
+            source = save(batch, finished=True)
+            saved_bytes = source.read_bytes()
+            second = resolve_rerun_batch(batch, selection)
+            self.assertEqual(second["evaluation_id"], "team-02-r2")
+            save(second, finished=False)
+            self.assertEqual(resolve_rerun_batch(batch, selection)["evaluation_id"], "team-02-r2")
+            save(second, finished=True)
+            self.assertEqual(resolve_rerun_batch(batch, selection)["evaluation_id"], "team-02-r3")
+            self.assertEqual(source.read_bytes(), saved_bytes)
+
+    def test_rerun_rejects_unsettled_cleanup_or_changed_config(self):
+        dataset = self.root / "team.csv"
+        dataset.write_text("repo_id,split\nexample/one,evaluation\n")
+        original = self.config(dev=False)
+        original["dataset"] = "team.csv"
+        batch = configure_batch(original, limit=1, batch_id="team-01")
+        path = self.root / "evaluation/results/team-01/state.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        state = {"protocol": PROTOCOL,
+                 "config_sha256": hashlib.sha256(json.dumps(batch, sort_keys=True).encode()).hexdigest(),
+                 "dataset_sha256": hashlib.sha256(dataset.read_bytes()).hexdigest(),
+                 "repositories": {"example/one": {
+                     "status": "COMPLETE", "measurements_finalized": True,
+                     "pending": None, "fork_repo": "research/one",
+                     "cleanup_status": "DELETE_OUTCOME_UNKNOWN"}}}
+        path.write_text(json.dumps(state), encoding="utf-8")
+        with patch("evaluation.fork_pipeline.ROOT", self.root):
+            selection = selected_repository_rows(batch)
+            with self.assertRaisesRegex(ValueError, "not finalized"):
+                resolve_rerun_batch(batch, selection)
+            state["repositories"]["example/one"]["cleanup_status"] = "RETAINED_BY_CONFIGURATION"
+            path.write_text(json.dumps(state), encoding="utf-8")
+            # Rerun preserves a retained fork; provisioning checks its identity.
+            self.assertEqual(resolve_rerun_batch(batch, selection)["evaluation_id"], "team-01-r2")
+            altered = dict(batch)
+            altered["repetitions"] = 2
+            with self.assertRaisesRegex(ValueError, "frozen protocol/configuration"):
+                resolve_rerun_batch(altered, selection)
 
     def test_dev_smoke_is_limited_to_one_repo_and_repeat(self):
         path = self.root / "config.json"

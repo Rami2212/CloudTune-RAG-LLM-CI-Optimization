@@ -675,6 +675,91 @@ To preserve the evaluation-created fork and its GitHub Actions history for super
 
 `--check-config` performs no GitHub writes. The `--watch` option is for actual experiments after repository selection, credentials, dependencies and study eligibility are reviewed. **Do not use held-out evaluation rows as a development smoke test.** The implementation has mock-based verification, not a confirmed live fork-execution-and-deletion test. Keep existing `scripts/`, RAG data and README files unchanged.
 
+### Team-controlled evaluation batches (up to 500 sample rows)
+
+The fork controller accepts the same dataset-position controls as the pattern
+runner: `--start-at` (1-based), inclusive `--stop-at`, and `--limit`.
+Use **either** `--stop-at` or `--limit`, never both. The upper bound is
+100 repository rows per controller invocation, not 100 completed A/B/C trials.
+Ineligible/abstaining rows keep their original dataset positions. Every team
+member must use a unique `--batch-id`; this becomes the frozen
+`evaluation_id` and `evaluation/results/<batch-id>/` directory. Reuse the
+**same batch ID, range, configuration and code version** when resuming.
+Changed identities are rejected rather than replaying GitHub dispatches.
+
+`--rerun` repeats a **finished batch** under the same base `--batch-id`, but
+stores every generation separately (`team-02-r2`, `team-02-r3`, ...). Previous
+snapshots, runs, and reports stay unchanged. When a numbered generation has
+pending CI, repeat the exact `--rerun` command to resume it, not to dispatch
+again. An unfinished original batch must be resumed **without** `--rerun`.
+Unresolved cleanup blocks a new generation. Retained supervisor-review forks
+are never deleted by rerun; remove them manually before new provisioning, or
+the controller will safely reject the existing fork. `--resume-only` and
+`--rerun` cannot be combined.
+
+Run `--list` first to preview repository IDs and positions without GitHub
+requests, credential loading, fork creation or CI dispatch. A preview is not
+an eligibility or safety verdict. `--check-config` validates flags and the
+effective range but does not require the CSV file to exist.
+
+Example for a 500-row shared evaluation dataset, divided into five non-overlapping
+100-row batches:
+
+| Member | Batch ID | Start | Stop |
+| ------ | -------- | ----: | ---: |
+| 1      | team-01  |     1 |  100 |
+| 2      | team-02  |   101 |  200 |
+| 3      | team-03  |   201 |  300 |
+| 4      | team-04  |   301 |  400 |
+| 5      | team-05  |   401 |  500 |
+
+**Windows PowerShell**
+
+```powershell
+.\.venv\Scripts\python.exe -m evaluation.fork_pipeline --config evaluation/configs/fork_pilot.json --batch-id team-02 --start-at 101 --stop-at 200 --list
+# After the study and live-safety preflight, execute and resume with identical flags:
+.\.venv\Scripts\python.exe -m evaluation.fork_pipeline --config evaluation/configs/fork_pilot.json --batch-id team-02 --start-at 101 --stop-at 200 --watch
+# Rerun this finished batch with a new, evidence-preserving generation:
+.\.venv\Scripts\python.exe -m evaluation.fork_pipeline --config evaluation/configs/fork_pilot.json --batch-id team-02 --start-at 101 --stop-at 200 --rerun --watch
+```
+
+**Linux Bash**
+
+```bash
+./.venv/bin/python -m evaluation.fork_pipeline --config evaluation/configs/fork_pilot.json --batch-id team-02 --start-at 101 --stop-at 200 --list
+# After the study and live-safety preflight, execute and resume with identical flags:
+./.venv/bin/python -m evaluation.fork_pipeline --config evaluation/configs/fork_pilot.json --batch-id team-02 --start-at 101 --stop-at 200 --watch
+# Rerun this finished batch with a new, evidence-preserving generation:
+./.venv/bin/python -m evaluation.fork_pipeline --config evaluation/configs/fork_pilot.json --batch-id team-02 --start-at 101 --stop-at 200 --rerun --watch
+```
+
+These examples describe the future team evaluation, **not permission to launch
+the 500-repository sample before the development smoke and evidence export
+have been completed**. Do not start overlapping controllers for the same
+batch or target repositories.
+
+### Live evaluation progress and fork workflow activation
+
+The local controller now prints timestamped stages for preparation, optimizer
+B/C decisions, validation admission, fork creation, harness setup, workflow
+registration, arm branches, CI dispatch and run status, measurements, and fork
+retention/deletion. Workflow runs still execute on GitHub Actions in the
+research-owned candidate fork, never on the CloudTune repository.
+
+GitHub can disable individual workflows on new public forks even when
+repository-level Actions is enabled. After registering the common dispatch
+harness, the controller checks the workflow ID and state, uses GitHub's
+idempotent `PUT /repos/{owner}/{repo}/actions/workflows/{workflow_id}/enable`
+only when needed, and re-checks for `active` before making arm branches or
+dispatches. The research token needs **Actions: write** permission.
+
+The controller logs are intentionally operational diagnostics, not immutable
+research results. State files, original workflow snapshots and raw job timing
+remain authoritative. An existing experiment ID freezes the evaluator code;
+**after applying this patch, start a NEW `dev-` evaluation ID** for further
+live work, rather than changing the frozen implementation of a completed or
+pending trial. Preserve any retained forks for review until manually cleared.
+
 ### Development-only fork execution smoke (no held-out repository)
 
 The A/B/C fork controller now supports a separately labeled, bounded development

@@ -37,16 +37,36 @@ def _safe_tool_environment() -> dict[str, str]:
     access to GitHub, Supabase, OpenRouter or local npm registry credentials.
     """
     env = {key: value for key, value in os.environ.items()
-           if not re.search(r"TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY|CREDENTIAL|AUTH", key, re.I)}
-    env["NPM_CONFIG_USERCONFIG"] = os.devnull
-    env["NPM_CONFIG_GLOBALCONFIG"] = os.devnull
+           if not re.search(r"TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY|CREDENTIAL|AUTH", key, re.I)
+           and key.upper() not in {"NPM_CONFIG_USERCONFIG", "NPM_CONFIG_GLOBALCONFIG"}}
     env["CI"] = "true"
     return env
 
 
+def isolate_npm_config(environment: dict[str, str], scratch: Path) -> dict[str, str]:
+    """Provide two distinct *empty* absolute npmrc files for an isolated process.
+
+    On Windows, os.devnull == 'nul'. Passing it for BOTH npm config roles
+    makes current npm reject the subprocess as double-loading one path.
+    The caller owns the temporary directory for the whole subprocess lifetime.
+    """
+    user = scratch / "cloudtune-user.npmrc"
+    global_file = scratch / "cloudtune-global.npmrc"
+    for path in (user, global_file):
+        # Exclusive creation prevents a previous config file being adopted.
+        with path.open("x", encoding="utf-8"):
+            pass
+    result = dict(environment)
+    result["NPM_CONFIG_USERCONFIG"] = str(user.resolve())
+    result["NPM_CONFIG_GLOBALCONFIG"] = str(global_file.resolve())
+    return result
+
+
 def _run(command: list[str], *, cwd: Path | None = None) -> str:
-    result = subprocess.run(command, cwd=cwd, capture_output=True, text=True,
-                            check=False, env=_safe_tool_environment())
+    with tempfile.TemporaryDirectory(prefix="cloudtune-ci-cost-npm-") as scratch:
+        environment = isolate_npm_config(_safe_tool_environment(), Path(scratch))
+        result = subprocess.run(command, cwd=cwd, capture_output=True, text=True,
+                                check=False, env=environment)
     if result.returncode:
         raise RuntimeError(f"Command failed ({result.returncode}): {' '.join(command)}\n{result.stderr[-1000:]}")
     return result.stdout.strip()
@@ -133,7 +153,7 @@ jobs:
                 ["node", str(root / "dist/index.js"), "--fix", "--dir=" + str(folder)],
                 capture_output=True, text=True, timeout=60, check=False,
                 cwd=tmp,
-                env=_safe_tool_environment(),
+                env=isolate_npm_config(_safe_tool_environment(), Path(tmp)),
             )
             if result.returncode not in (0, 1) or "Error generating optimized files:" in result.stderr:
                 raise RuntimeError(f"ci-cost smoke case {name} failed: {result.stderr[-500:]}")
