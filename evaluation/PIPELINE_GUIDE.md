@@ -651,9 +651,11 @@ Run the offline candidate admission tests before starting a pilot:
 These tests use temporary snapshots and mocked validation tools. They do not
 create forks, run GitHub Actions, or prove Phase 5 live execution and cleanup.
 
-### Safe automatic fork cleanup
+### Safe automatic fork cleanup and optional retention
 
-Once a candidate repository's runs are finalized and raw GitHub run/job evidence is persisted locally, the controller attempts to delete its temporary fork. Deletion requires explicit proof that the fork was created by this evaluation, a matching fork identity, no pending dispatch and no non-completed GitHub Actions runs on that fork. A pre-existing fork is **never deleted**. The deletion intent is checkpointed before the GitHub DELETE. Missing delete permissions are recorded as `BLOCKED_PERMISSION`; uncertain responses are reconciled without blindly sending another DELETE. Active runs postpone cleanup and remain visible in `cleanup_status`.
+The default is `CLOUDTUNE_AUTO_DELETE_FORKS=true` (also used when the key is absent). Once a candidate repository's runs are finalized and raw GitHub run/job evidence is persisted locally, the controller attempts to delete its temporary fork. Deletion requires explicit proof that the fork was created by this evaluation, a matching fork identity, no pending dispatch and no non-completed GitHub Actions runs on that fork. A pre-existing fork is **never deleted**. The deletion intent is checkpointed before the GitHub DELETE. Missing delete permissions are recorded as `BLOCKED_PERMISSION`; uncertain responses are reconciled without blindly sending another DELETE. Active runs postpone cleanup and remain visible in `cleanup_status`.
+
+To preserve the evaluation-created fork and its GitHub Actions history for supervisor review, set `CLOUDTUNE_AUTO_DELETE_FORKS=false` in the ignored root `.env` **before starting the trial**. This does not skip CI, validation, evidence archival or reporting. After completion the ledger records `cleanup_status=RETAINED_BY_CONFIGURATION`, and `fork_report.json` retains the `fork_repo` GitHub name. A retained fork is not automatically deleted on subsequent resumes, even after the flag is changed back to true; delete it manually after supervisor review. A false setting cannot reverse a previously requested DELETE, and any uncertain DELETE outcome remains explicitly unresolved. Invalid boolean values cause an early error before GitHub writes.
 
 ### Commands from repository root
 

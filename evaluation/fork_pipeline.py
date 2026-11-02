@@ -24,7 +24,10 @@ from scripts.experiment_environment import load_env
 from evaluation.third_party.ci_cost.setup import install as install_ci_cost
 
 from evaluation.candidate_validator import validate_and_archive
-from evaluation.ci_executor import ForkExperiment, GitHub, RunPending, summarize_records
+from evaluation.ci_executor import (
+    ForkExperiment, GitHub, RunPending, automatic_fork_deletion_enabled,
+    summarize_records,
+)
 from evaluation.optimizers.ci_cost import generate_ci_cost_candidate
 from evaluation.optimizers.rag_llm import generate_rag_candidate
 from evaluation.rag_retriever import Retriever
@@ -286,6 +289,8 @@ def _save_report(output: Path, state: dict) -> dict:
 def run_fork_evaluation(config: dict, *, resume_only: bool = False) -> dict:
     # GitHub credentials authorize research-owned forks only. This process does
     # not modify CloudTune's GitHub repository or execute target build scripts.
+    # Validate before any GitHub writes; reject ambiguous deletion preferences.
+    automatic_fork_deletion_enabled()
     token = os.environ.get("CLOUDTUNE_FORK_TOKEN") or os.environ.get("GITHUB_TOKEN")
     if not token:
         raise ValueError("Set GITHUB_TOKEN or CLOUDTUNE_FORK_TOKEN in the existing .env")

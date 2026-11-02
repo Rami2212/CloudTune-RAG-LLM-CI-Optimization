@@ -10,6 +10,7 @@ import base64
 import datetime as dt
 import hashlib
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -36,6 +37,19 @@ class GitHubError(RuntimeError):
     def __init__(self, code: int, path: str):
         super().__init__(f"GitHub HTTP {code} for {path}")
         self.code = code
+
+
+def automatic_fork_deletion_enabled() -> bool:
+    """Read the fork-cleanup setting; reject ambiguous values.
+
+    Automatic deletion is enabled unless explicitly disabled by the operator.
+    """
+    value = os.environ.get("CLOUDTUNE_AUTO_DELETE_FORKS", "true").strip().lower()
+    if value in {"true", "1", "yes", "on"}:
+        return True
+    if value in {"false", "0", "no", "off"}:
+        return False
+    raise ValueError("CLOUDTUNE_AUTO_DELETE_FORKS must be true or false")
 
 
 class GitHub:
@@ -586,6 +600,10 @@ class ForkExperiment:
             return "NOT_CREATED"
         if state.get("cleanup_status") == "DELETED":
             return "DELETED"
+        if state.get("cleanup_status") == "RETAINED_BY_CONFIGURATION":
+            # Resuming with a different environment must never silently
+            # destroy the fork evidence retained for supervisor review.
+            return "RETAINED_BY_CONFIGURATION"
         fork_name = state["fork_repo"]
         expected = state.get("fork_creation_intent")
         owner = state.get("fork_owner", "")
@@ -599,6 +617,13 @@ class ForkExperiment:
             state["cleanup_status"] = "PRESERVED_UNVERIFIED_ID"
             save()
             return "PRESERVED_UNVERIFIED_ID"
+
+        if not automatic_fork_deletion_enabled() and not state.get("cleanup_intent"):
+            # Owned and identity-pinned fork: persist the retention decision
+            # before any cleanup API request or destructive DELETE intent.
+            state["cleanup_status"] = "RETAINED_BY_CONFIGURATION"
+            save()
+            return "RETAINED_BY_CONFIGURATION"
 
         try:
             fork = self.gh.request("GET", "/repos/" + fork_name)

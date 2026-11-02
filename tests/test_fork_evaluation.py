@@ -14,8 +14,8 @@ import evaluation.fork_pipeline as pipeline
 
 from evaluation.candidate_validator import validate_candidate
 from evaluation.ci_executor import (
-    ForkExperiment, GitHubError, RunPending, ensure_dispatch, job_timing_metrics,
-    summarize_records, verify_fork,
+    ForkExperiment, GitHubError, RunPending, automatic_fork_deletion_enabled,
+    ensure_dispatch, job_timing_metrics, summarize_records, verify_fork,
 )
 from evaluation.fork_pipeline import StateStore, _config, exclusive_controller
 from evaluation.results_exporter import summarize_cohort
@@ -62,6 +62,9 @@ class HostedProtocolTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        env_patch = patch.dict(os.environ, {"CLOUDTUNE_AUTO_DELETE_FORKS": "true"})
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
         self.root = Path(self.temp.name)
         self.state = {"fork_repo": "research/test", "workflow_id": 42,
                       "pending": {"arm": "A", "repeat": 1, "run_id": 901},
@@ -197,6 +200,61 @@ class HostedProtocolTests(unittest.TestCase):
         self.assertEqual(len([e for e in events if e[0] == "DELETE"]), 1)
         self._cleanup_experiment(Fake()).cleanup_fork(state, lambda: None)
         self.assertEqual(len([e for e in events if e[0] == "DELETE"]), 1)
+
+    def test_auto_delete_env_defaults_true_and_rejects_invalid_values(self):
+        # Opt-out is deliberate; malformed values cannot silently change safety.
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(automatic_fork_deletion_enabled())
+        for value in ("false", "0", "no", "off", " FALSE "):
+            with self.subTest(value=value), patch.dict(
+                os.environ, {"CLOUDTUNE_AUTO_DELETE_FORKS": value}
+            ):
+                self.assertFalse(automatic_fork_deletion_enabled())
+        with patch.dict(os.environ, {"CLOUDTUNE_AUTO_DELETE_FORKS": "true"}):
+            self.assertTrue(automatic_fork_deletion_enabled())
+        with patch.dict(os.environ, {"CLOUDTUNE_AUTO_DELETE_FORKS": "sometimes"}):
+            with self.assertRaisesRegex(ValueError, "CLOUDTUNE_AUTO_DELETE_FORKS"):
+                automatic_fork_deletion_enabled()
+
+    def test_retained_fork_requires_no_github_calls_and_survives_resume(self):
+        class Forbidden:
+            def request(self, *args):
+                raise AssertionError("Retained fork must not be queried or deleted")
+            def all(self, *args):
+                raise AssertionError("Retained fork must not list Actions runs")
+
+        runner = self._cleanup_experiment(Forbidden())
+        state = self._cleanup_state()
+        checkpoints = []
+        with patch.dict(os.environ, {"CLOUDTUNE_AUTO_DELETE_FORKS": "false"}):
+            result = runner.cleanup_fork(state, lambda: checkpoints.append(dict(state)))
+        self.assertEqual(result, "RETAINED_BY_CONFIGURATION")
+        self.assertEqual(state["cleanup_status"], "RETAINED_BY_CONFIGURATION")
+        self.assertEqual(state["fork_repo"], "research/test")
+        self.assertNotIn("cleanup_intent", state)
+        self.assertEqual(len(checkpoints), 1)
+
+        # Later re-enabling must not delete a deliberately preserved fork.
+        with patch.dict(os.environ, {"CLOUDTUNE_AUTO_DELETE_FORKS": "true"}):
+            result = runner.cleanup_fork(state, lambda: checkpoints.append(dict(state)))
+        self.assertEqual(result, "RETAINED_BY_CONFIGURATION")
+        self.assertEqual(len(checkpoints), 1)
+
+    def test_retention_cannot_reverse_an_already_requested_delete(self):
+        class Fake:
+            def request(self, method, path, body=None):
+                if method != "GET":
+                    raise AssertionError("Never repeat a DELETE")
+                return {"id": 4242, "owner": {"login": "research"}, "fork": True,
+                        "permissions": {"push": True},
+                        "source": {"full_name": "source/test"}}
+
+        state = self._cleanup_state()
+        state["cleanup_intent"] = "research/test"
+        with patch.dict(os.environ, {"CLOUDTUNE_AUTO_DELETE_FORKS": "false"}):
+            result = self._cleanup_experiment(Fake()).cleanup_fork(state, lambda: None)
+        self.assertEqual(result, "DELETE_OUTCOME_UNKNOWN")
+        self.assertNotEqual(state["cleanup_status"], "RETAINED_BY_CONFIGURATION")
 
     def test_cleanup_does_not_claim_deletion_while_fork_still_exists(self):
         methods = []
