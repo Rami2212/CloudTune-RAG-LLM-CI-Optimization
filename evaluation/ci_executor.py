@@ -26,6 +26,20 @@ from evaluation.repository_preparation import (
 )
 
 
+# Human-readable names are for diagnostics only. Persisted A/B/C identifiers,
+# GitHub experiment branches, and exported arm keys are intentionally unchanged.
+ARM_NAMES = {
+    "A": "Original Workflow",
+    "B": "CI-Cost",
+    "C": "LLM + RAG",
+}
+
+
+def arm_name(arm: str) -> str:
+    """Return the stable display name of a controlled evaluation arm."""
+    return ARM_NAMES[arm]
+
+
 def log_progress(stage: str, message: str) -> None:
     """Print safe, time-stamped operational progress; never log API credentials.
 
@@ -314,7 +328,7 @@ class ForkExperiment:
             raise
 
     def prepare(self, state: dict, save) -> None:
-        log_progress("WORKFLOW", f"Preparing common A/B/C dispatch harness for {state['fork_repo']}")
+        log_progress("WORKFLOW", f"Preparing common Original Workflow / CI-Cost / LLM + RAG dispatch harness for {state['fork_repo']}")
         if state.get("prepared_commit"):
             fork = state["fork_repo"]
             if self._ref(fork, state["default_branch"]) != state["default_branch_commit"]:
@@ -461,7 +475,7 @@ class ForkExperiment:
             raise ValueError("Arm A differs from common prepared baseline")
         result = state["arms"].get(arm)
         if result:
-            log_progress("ARM", f"Verifying existing arm {arm} branch {result['branch']}")
+            log_progress("ARM", f"Verifying existing {arm_name(arm)} branch {result['branch']}")
             if result["workflow_sha256"] != digest(rendered):
                 raise ValueError("Experimental candidate bytes changed")
             remote = self._ref(fork, result["branch"])
@@ -473,7 +487,7 @@ class ForkExperiment:
                 raise ValueError("Experimental arm reference changed")
             self._verify_arm_tree(fork, state["prepared_tree"], result)
             return result
-        log_progress("ARM", f"Creating arm {arm} on isolated pinned-source branch")
+        log_progress("ARM", f"Creating {arm_name(arm)} on isolated pinned-source branch")
         tree = state["prepared_tree"] if arm == "A" else self._new_tree(fork, state["prepared_tree"], rendered)
         commit = state["prepared_commit"] if arm == "A" else self._commit(fork, tree, state["prepared_commit"], arm)
         branch = f"{self.prefix}-{arm.lower()}"
@@ -488,7 +502,7 @@ class ForkExperiment:
         elif remote != commit:
             raise ValueError("Experiment arm branch was modified unexpectedly")
         self._verify_arm_tree(fork, state["prepared_tree"], result)
-        log_progress("ARM", f"Arm {arm} prepared and verified: {branch}")
+        log_progress("ARM", f"{arm_name(arm)} prepared and verified: {branch}")
         return result
 
     def _verify_arm_tree(self, fork: str, common_tree: str, arm: dict) -> None:
@@ -520,7 +534,7 @@ class ForkExperiment:
         while True:
             attempt += 1
             if attempt == 1 or attempt % 4 == 0:
-                log_progress("CI", f"Reconciling dispatch for arm {pending['arm']} repeat {pending['repeat']} (poll={attempt})")
+                log_progress("CI", f"Reconciling dispatch for {arm_name(pending['arm'])}, repeat {pending['repeat']} (poll={attempt})")
             matches = [row for row in self._run_ids(fork, state["workflow_id"], arm["branch"])
                        if (row["id"] not in pending["old_ids"] and row.get("head_sha") == arm["sha"]
                            and row.get("event") == "workflow_dispatch")]
@@ -559,7 +573,7 @@ class ForkExperiment:
         # POST outcomes, queue timeout and controller reruns.
         if state.get("pending"):
             p = state["pending"]
-            log_progress("CI", f"Pending dispatch: arm {p['arm']}, repeat {p['repeat']}, run_id={p.get('run_id')}")
+            log_progress("CI", f"Pending dispatch: {arm_name(p['arm'])}, repeat {p['repeat']}, run_id={p.get('run_id')}")
             if (p["arm"], p["repeat"]) != (arm, repeat):
                 raise RuntimeError("Earlier dispatch is pending; resume it before new runs")
         else:
@@ -576,7 +590,7 @@ class ForkExperiment:
                                 "sent_at": dt.datetime.now(dt.timezone.utc).isoformat(), "run_id": None}
             state["dispatch_count"] = state.get("dispatch_count", 0) + 1
             save()
-            log_progress("CI", f"Dispatching arm {arm}, repeat {repeat}, branch={run_arm['branch']}")
+            log_progress("CI", f"Dispatching {arm_name(arm)}, repeat {repeat}, branch={run_arm['branch']}")
             response = self.gh.request("POST", f"/repos/{fork}/actions/workflows/{state['workflow_id']}/dispatches", {
                 "ref": run_arm["branch"], "inputs": {}, "return_run_details": True})
             if response and response.get("workflow_run_id"):
@@ -609,19 +623,19 @@ class ForkExperiment:
                 )
 
             if status != last_run_status or last_run_status is None:
-                log_progress("CI", f"Run {run_id} state={status} (arm {arm}, repeat {repeat})")
+                log_progress("CI", f"Run {run_id} state={status} ({arm_name(arm)}, repeat {repeat})")
                 last_run_status = status
             else:
-                log_progress("CI", f"Run {run_id} still {status}; checking again in {self.poll_seconds}s")
+                log_progress("CI", f"Run {run_id} ({arm_name(arm)}) still {status}; checking again in {self.poll_seconds}s")
             if status == "completed":
-                log_progress("CI", f"Run {run_id} completed with conclusion={run.get('conclusion')}")
+                log_progress("CI", f"Run {run_id} ({arm_name(arm)}) completed with conclusion={run.get('conclusion')}")
                 break
             if (self.max_wait_seconds is not None and
                     time.monotonic() - started > self.max_wait_seconds):
                 raise RunPending(f"GitHub run {run_id} is queued/in progress; resume observation later")
             time.sleep(self.poll_seconds)
         attempt = run.get("run_attempt", 1)
-        log_progress("EVIDENCE", f"Fetching run {run_id} attempt {attempt} jobs and measurements")
+        log_progress("EVIDENCE", f"Fetching {arm_name(arm)} run {run_id}, attempt {attempt}, jobs and measurements")
         jobs = self.gh.all(f"/repos/{fork}/actions/runs/{run_id}/attempts/{attempt}/jobs", "jobs")
         arm_ref = state["arms"][arm]
         valid = (run.get("head_sha") == arm_ref["sha"] and
@@ -695,7 +709,7 @@ class ForkExperiment:
         state.setdefault("records", []).append(outcome)
         state["pending"] = None
         save()
-        log_progress("EVIDENCE", f"Arm {arm}, repeat {repeat}: comparable={outcome['comparable']}, active={elapsed}s, runner={total}s, initial_queue={initial_queue}s; archived")
+        log_progress("EVIDENCE", f"{arm_name(arm)}, repeat {repeat}: comparable={outcome['comparable']}, active={elapsed}s, runner={total}s, initial_queue={initial_queue}s; archived")
         return outcome
 
 

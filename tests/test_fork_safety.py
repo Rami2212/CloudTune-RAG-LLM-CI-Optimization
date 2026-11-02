@@ -21,6 +21,16 @@ from evaluation.run_pipeline import load_config, prepare
 
 class ForkSafetyTests(unittest.TestCase):
     def setUp(self):
+        # Force deletion-mode tests to exercise fork identity verification,
+        # regardless of the developer's fork-retention environment setting.
+        # These tests use fake GitHub clients and never delete real forks.
+        deletion_mode = patch.dict(
+            "os.environ",
+            {"CLOUDTUNE_AUTO_DELETE_FORKS": "true"},
+        )
+        deletion_mode.start()
+        self.addCleanup(deletion_mode.stop)
+
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name)

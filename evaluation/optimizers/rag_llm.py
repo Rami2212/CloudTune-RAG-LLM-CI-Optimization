@@ -13,9 +13,9 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from evaluation.openrouter_http import OpenRouterPaused, request_openrouter_json
 from evaluation.repository_preparation import MANIFEST_NAMES, workflow_doc, write_immutable, write_json_immutable
 from evaluation.rag_retriever import Retriever
 
@@ -163,12 +163,22 @@ def generate_rag_candidate(snapshot_dir: Path, *, retriever: Retriever,
         latency = None  # An interrupted request's latency cannot be recovered.
     else:
         try:
-            with urlopen(req, timeout=180) as response:
-                reply = json.load(response)
-        except HTTPError as exc:
-            raise RuntimeError(f"Arm C OpenRouter HTTP {exc.code}; request archived") from None
-        except (URLError, TimeoutError):
-            raise RuntimeError("Arm C OpenRouter connection failed; request archived") from None
+            # A full HTTP response must arrive within 60 seconds. urllib's
+            # ordinary socket timeout does not cover a slow chunked body.
+            # The request is sent only once; transient failures pause this arm.
+            reply = request_openrouter_json(req, opener=urlopen)
+        except OpenRouterPaused as exc:
+            # Store a sanitized status, never the Authorization header or
+            # provider error body. The frozen request/retrieval can be reused
+            # by an explicit resume, without fabricating a candidate.
+            (target / "llm_error.json").write_text(json.dumps({
+                "failure_class": "OPENROUTER_PAUSED",
+                "http_status": exc.http_status,
+                "reason": str(exc),
+                "request_sha256": _hash((target / "llm_request.json").read_bytes()),
+                "recorded_utc": datetime.now(timezone.utc).isoformat(),
+            }, indent=2) + "\n", encoding="utf-8")
+            raise
         # Save the original provider response before validating generated JSON.
         # Provider responses are untrusted; never archive request headers/tokens.
         write_json_immutable(response_path, reply)

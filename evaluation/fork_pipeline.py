@@ -26,9 +26,10 @@ from evaluation.third_party.ci_cost.setup import install as install_ci_cost
 from evaluation.candidate_validator import validate_and_archive
 from evaluation.ci_executor import (
     ForkExperiment, GitHub, RunPending, automatic_fork_deletion_enabled,
-    log_progress, summarize_records,
+    arm_name, log_progress, summarize_records,
 )
 from evaluation.optimizers.ci_cost import generate_ci_cost_candidate
+from evaluation.openrouter_http import OpenRouterPaused
 from evaluation.optimizers.rag_llm import generate_rag_candidate
 from evaluation.rag_retriever import Retriever
 from evaluation.results_exporter import summarize_cohort
@@ -151,7 +152,7 @@ def implementation_digest() -> str:
     """Freeze evaluator code identity across every resumed GitHub dispatch."""
     names = ("fork_pipeline.py", "ci_executor.py", "candidate_validator.py",
              "rag_retriever.py", "results_exporter.py", "repository_preparation.py",
-             "run_pipeline.py", "optimizers/ci_cost.py", "optimizers/rag_llm.py",
+             "run_pipeline.py", "openrouter_http.py", "optimizers/ci_cost.py", "optimizers/rag_llm.py",
              "third_party/ci_cost/setup.py", "third_party/ci_cost/source_fixes.py")
     sha = hashlib.sha256()
     for name in names:
@@ -478,14 +479,18 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False,
         if preflight_only and (repo.get("fork_repo") or repo.get("pending") or
                                repo.get("records") or repo.get("measurements_finalized")):
             raise ValueError("Cannot preflight a trial with hosted execution state; use a new dev- ID")
-        noncomparable = [record for record in repo.get("records", [])
-                         if record.get("comparable") is False]
-        if noncomparable:
-            # A workflow that never acquired a runner is a platform-inconclusive
-            # attempt, not evidence of slow or failed CI. Do not blindly retry.
-            repo["status"] = ("INCONCLUSIVE_PLATFORM" if any(
-                r.get("failure_class") == "PLATFORM_NO_JOB_START" for r in noncomparable)
-                else "FAILED_TARGET_CI")
+        failed_baseline = next((record for record in repo.get("records", [])
+                                if record["arm"] == "A" and not record.get("comparable")), None)
+        if failed_baseline:
+            # Only a failed ORIGINAL baseline invalidates the whole repository.
+            # A failed B or C is isolated and its other admitted peer continues
+            # after process restarts; evidence is never silently replayed.
+            platform = failed_baseline.get("failure_class") == "PLATFORM_NO_JOB_START"
+            repo["status"] = "INCONCLUSIVE_PLATFORM" if platform else "FAILED_TARGET_CI"
+            repo["failure_reason"] = (
+                f"Original Workflow run {failed_baseline['run_id']} completed without a started job"
+                if platform else
+                f"Original Workflow run {failed_baseline['run_id']} failed correctness or protocol checks")
             store.save(state)
             if row["status"] in {"prepared", "needs_harness"} and repo.get("fork_repo"):
                 snapshot = _repo_snapshot(output, row)
@@ -530,7 +535,7 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False,
                     # Local candidate generation only; the target's CI still
                     # runs exclusively on GitHub Actions in its research fork.
                     tool_dir = ROOT / "evaluation/results/.tools/ci-cost"
-                    log_progress("OPTIMIZER", f"{repo_id}: preparing ci-cost tool for B")
+                    log_progress("OPTIMIZER", f"{repo_id}: preparing CI-Cost optimizer")
                     install_ci_cost(tool_dir)
                     b = generate_ci_cost_candidate(snapshot, version=version, tool_dir=tool_dir)
                 except (OSError, ValueError, RuntimeError) as exc:
@@ -538,12 +543,12 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False,
                          "error": type(exc).__name__ + ": " + str(exc)[:400]}
                 repo["candidates"]["B"] = {k: b.get(k) for k in ("decision", "status", "after_sha256",
                                                           "candidate_relative_dir", "generated_artifact", "error")}
-                log_progress("OPTIMIZER", f"{repo_id}: B decision={b.get('decision')}, status={b.get('status')}")
+                log_progress("OPTIMIZER", f"{repo_id}: CI-Cost decision={b.get('decision')}, status={b.get('status')}")
                 store.save(state, snapshots={repo_id: snapshot})
             if "C" not in repo["candidates"]:
                 try:
                     if retriever is None:
-                        log_progress("OPTIMIZER", f"{repo_id}: initializing BGE-M3 retriever for C")
+                        log_progress("OPTIMIZER", f"{repo_id}: initializing BGE-M3 retriever for LLM + RAG")
                         retriever = Retriever(
                             revision=state.get("rag_revision") or (
                                 None if config["rag"]["embedding_revision"] == "AUTO_PIN_SINGLE"
@@ -552,11 +557,21 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False,
                             dataset_sha256=config["rag"]["dataset_sha256"])
                         state["rag_revision"] = retriever.revision
                         save()
-                    log_progress("OPTIMIZER", f"{repo_id}: requesting free LLM+RAG candidate for C")
+                    log_progress("OPTIMIZER", f"{repo_id}: requesting free LLM + RAG candidate")
                     c = generate_rag_candidate(snapshot, retriever=retriever,
                              model=config["rag"]["generator_model"], top_k=config["rag"]["top_k"],
                              max_tokens=config["rag"]["max_tokens"],
                              required_job_names=config["execution"].get("required_job_names", []))
+                except OpenRouterPaused as exc:
+                    # Unlike an invalid candidate, an unavailable free provider
+                    # must not become a permanent C=ERROR on this checkpoint.
+                    # Stop before creating any fork; resume the frozen request
+                    # only after a human explicitly restarts the controller.
+                    repo["status"] = "LLM_PAUSED"
+                    repo["failure_reason"] = str(exc)
+                    save()
+                    log_progress("OPTIMIZER", f"{repo_id}: LLM + RAG paused: {exc}")
+                    return _save_report(output, state)
                 except (ValueError, RuntimeError, OSError, KeyError, json.JSONDecodeError) as exc:
                     # A provider/network/generation failure is a valid research
                     # outcome, not a reason to drop the repository or fabricate
@@ -565,7 +580,7 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False,
                          "generated_artifact": None, "model": config["rag"]["generator_model"],
                          "error": type(exc).__name__ + ": " + str(exc)[:400]}
                 repo["candidates"]["C"] = {k: c.get(k) for k in ("decision", "after_sha256", "generated_artifact", "error", "model")}
-                log_progress("OPTIMIZER", f"{repo_id}: C decision={c.get('decision')}")
+                log_progress("OPTIMIZER", f"{repo_id}: LLM + RAG decision={c.get('decision')}")
                 store.save(state, snapshots={repo_id: snapshot})
             candidates = {"A": original}
             for arm in "BC":
@@ -580,24 +595,30 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False,
                                                generation=result)
                 repo["validation"][arm] = verdict
                 save()
-                log_progress("VALIDATION", f"{repo_id}: arm {arm} verdict={verdict['verdict']}")
+                log_progress("VALIDATION", f"{repo_id}: {arm_name(arm)} verdict={verdict['verdict']}")
                 if verdict["verdict"] == "PASS" and data is not None:
                     candidates[arm] = data
+            repo["admitted_arms"] = list(candidates)
             if _hold_for_preflight(repo, candidates, preflight_only=preflight_only,
                                    require_all_arms=require_all_arms):
                 save()  # Archive every verdict without creating any fork/arm.
-                log_progress("PREFLIGHT", f"{repo_id}: {repo['status']}; admitted={','.join(candidates)}")
+                log_progress("PREFLIGHT", f"{repo_id}: {repo['status']}; admitted={', '.join(arm_name(arm) for arm in candidates)}")
                 continue
-            log_progress("REPO", f"{repo_id}: admitted arms={','.join(candidates)}; preparing research fork")
+            log_progress("REPO", f"{repo_id}: admitted arms={', '.join(arm_name(arm) for arm in candidates)}; preparing research fork")
             experiment.provision(repo, save)
             experiment.prepare(repo, save)
             if repo.get("workflow_id") is None:
                 raise RuntimeError("Fork workflow is not registered/active")
             for arm, data in candidates.items():
                 experiment.make_arm(repo, arm, data, save)
-            # Always execute baseline first, then rotate C/B order. Every
-            # target job is a real GitHub Actions run, not local simulation.
+            # Measure only admitted arms. A failure in Original Workflow
+            # invalidates the baseline and stops the entire repository. A failed
+            # optimized arm is quarantined for this repository, but its peer
+            # continues; this policy also applies when resuming checkpoints.
             reps = config["repetitions"]
+            failed_optimized_arms = {record["arm"] for record in repo["records"]
+                                     if record["arm"] in {"B", "C"}
+                                     and not record.get("comparable")}
             failed_trial = None
             for repeat in range(1, reps + 1):
                 order = (["A", "B", "C"] if repeat % 3 == 1 else
@@ -605,38 +626,64 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False,
                 # The first actual experiment run must be A to establish
                 # required jobs; subsequent repetitions use rotating orders.
                 for arm in order:
-                    if arm not in candidates:
+                    if arm not in candidates or arm in failed_optimized_arms:
                         continue
                     if any(r["arm"] == arm and r["repeat"] == repeat for r in repo["records"]):
                         continue
                     required = repo.get("required_names") or config["execution"].get("required_job_names", [])
-                    log_progress("CI", f"{repo_id}: measuring arm {arm}, repeat {repeat}/{reps}")
+                    log_progress("CI", f"{repo_id}: measuring {arm_name(arm)}, repeat {repeat}/{reps}")
                     outcome = experiment.execute(repo, save, arm=arm, repeat=repeat,
                              required=required, max_total=reps*3)
                     if not outcome["comparable"]:
-                        failed_trial = outcome
-                        break
+                        if arm == "A":
+                            # A is the reference for every speedup comparison.
+                            failed_trial = outcome
+                            log_progress("CI", f"{repo_id}: Original Workflow failed; stopping this repository")
+                            break
+                        failed_optimized_arms.add(arm)
+                        log_progress("CI", f"{repo_id}: {arm_name(arm)} failed; "
+                                            "stopping only this arm's remaining trials")
                 if failed_trial:
                     break
             if failed_trial:
                 platform = failed_trial.get("failure_class") == "PLATFORM_NO_JOB_START"
                 repo["status"] = "INCONCLUSIVE_PLATFORM" if platform else "FAILED_TARGET_CI"
                 repo["failure_reason"] = (
-                    f"GitHub run {failed_trial['run_id']} completed without a started job"
+                    f"Original Workflow run {failed_trial['run_id']} completed without a started job"
                     if platform else
-                    f"GitHub run {failed_trial['run_id']} failed correctness or protocol checks")
+                    f"Original Workflow run {failed_trial['run_id']} failed correctness or protocol checks")
             else:
-                repo["status"] = ("COMPLETE"
-                                  if len(candidates) == 3
-                                  and len(repo["records"]) == reps * 3
-                                  and all(record.get("comparable") for record in repo["records"])
-                                  else "INCOMPLETE")
-            if repo["status"] == "INCOMPLETE":
-                # A baseline-only smoke is useful, but not a paired A/B/C result.
-                missing = [f"{arm}: {repo['candidates'][arm].get('decision', 'UNKNOWN')} / "
-                           f"{repo.get('validation', {}).get(arm, {}).get('verdict', 'UNKNOWN')}"
-                           for arm in "BC" if arm not in candidates]
-                repo["failure_reason"] = "No complete A/B/C pair; " + ", ".join(missing)
+                complete = (len(candidates) == 3 and
+                            len(repo["records"]) == reps * 3 and
+                            all(record.get("comparable") for record in repo["records"]))
+                if complete:
+                    repo["status"] = "COMPLETE"
+                    repo["failure_reason"] = None
+                elif failed_optimized_arms:
+                    # Platform failures remain distinct from actual target-CI
+                    # failures; both are excluded from invalid pair metrics.
+                    failures = [record for record in repo["records"]
+                                if record["arm"] in failed_optimized_arms
+                                and not record.get("comparable")]
+                    repo["status"] = ("INCONCLUSIVE_PLATFORM" if failures and all(
+                        record.get("failure_class") == "PLATFORM_NO_JOB_START" for record in failures)
+                        else "FAILED_TARGET_CI")
+                else:
+                    repo["status"] = "INCOMPLETE"
+                if not complete:
+                    # Record failure and abstention separately; the valid A/B or
+                    # A/C comparison remains eligible in the cohort exporter.
+                    issues = [f"{arm_name(arm)}: "
+                              f"{repo['candidates'][arm].get('decision', 'UNKNOWN')} / "
+                              f"{repo.get('validation', {}).get(arm, {}).get('verdict', 'UNKNOWN')}"
+                              for arm in "BC" if arm not in candidates]
+                    issues.extend(
+                        f"{arm_name(record['arm'])}: GitHub run {record['run_id']} "
+                        f"{record.get('failure_class') or 'not comparable'}"
+                        for record in repo["records"]
+                        if record["arm"] in failed_optimized_arms
+                        and not record.get("comparable"))
+                    repo["failure_reason"] = "No complete A/B/C comparison; " + "; ".join(issues)
             repo["measurements_finalized"] = True
             repo.pop("pending_reason", None)
             save()  # Persist ALL measurements before deleting the research fork.
@@ -730,6 +777,12 @@ def main() -> int:
                 if (args.preflight or args.require_all_arms) and any(
                         value == "PREFLIGHT_BLOCKED" for value in status.values()):
                     print("A/B/C admission blocked; no fork created for blocked repositories.",
+                          file=sys.stderr, flush=True)
+                    return 2
+                if any(value == "LLM_PAUSED" for value in status.values()):
+                    print("OpenRouter request paused; inspect archived llm_error.json "
+                          "and resume explicitly with the same frozen evaluation ID. "
+                          "No automatic LLM retry or CI dispatch occurred.",
                           file=sys.stderr, flush=True)
                     return 2
                 active = {"SELECTED", "WAITING_FOR_GITHUB_RUN", "READY_FOR_NEXT_CONTROLLER_RUN"}
