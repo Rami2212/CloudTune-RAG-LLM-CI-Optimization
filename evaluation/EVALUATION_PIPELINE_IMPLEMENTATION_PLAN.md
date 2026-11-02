@@ -624,6 +624,40 @@ python3 -m venv .venv
 
 A working existing `.venv` can be reused. Place your GitHub token in the existing `.env` or shell environment; **read permissions suffice** for this initial stage.
 
+#### Phase 3 and later: RAG dependencies and CPU/CUDA setup
+
+The Phase 1 `requirements.txt` alone is insufficient for frozen BGE-M3 retrieval
+or the RAG+OpenRouter smoke test. Install `requirements-rag.txt` in the **same**
+`.venv`. `sentence-transformers` loads pretrained BGE-M3 weights on first
+retrieval; a local GPU is optional and no training occurs. The complete
+version-aware installation, pinned CUDA 12.8 PyTorch replacement instructions,
+CUDA diagnostics, cache details and PowerShell/Linux verification commands are
+maintained in [PIPELINE_GUIDE.md](PIPELINE_GUIDE.md#install-the-rag-dependencies-phase-3--arm-c).
+
+**Windows PowerShell**
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-rag.txt
+.\.venv\Scripts\python.exe -m pip check
+```
+
+**Linux Bash**
+
+```bash
+./.venv/bin/python -m pip install -r requirements-rag.txt
+./.venv/bin/python -m pip check
+```
+
+The Phase 3 local and remote checks do not require GPU inference, but `retrieve`
+and `smoke` load BGE-M3 on the selected device. A CUDA-enabled PyTorch build
+is required for NVIDIA GPU execution (`torch.cuda.is_available()` must be
+`True`); otherwise use `cpu`. Set `CLOUDTUNE_RAG_DEVICE=cuda` only after the
+`evaluation/rag_retriever.py` device-selection change is present. Pin and
+record the chosen inference hardware for comparable, reproducible studies.
+Supabase and OpenRouter credentials are needed for their respective live
+modes, not for offline preparation or unit tests. No benchmark runs or forks
+are started by the Phase 3 verification CLI.
+
 ### 9.2 Run preparation
 
 **Windows PowerShell**

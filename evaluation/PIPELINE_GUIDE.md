@@ -97,6 +97,112 @@ python3 -m venv .venv
 
 If you already have a working `.venv`, use it rather than creating another one.
 
+### Install the RAG dependencies (Phase 3 / Arm C)
+
+The lightweight `requirements.txt` installs PyYAML for preparation, validation,
+and Arm B. **Real BGE-M3 retrieval and the Arm C smoke test additionally require
+`requirements-rag.txt`** (`sentence-transformers` and `psycopg`). Install both
+into the **same** `.venv`; never install the large model into the repository.
+
+**Windows PowerShell**
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements-rag.txt
+.\.venv\Scripts\python.exe -m pip check
+```
+
+**Linux Bash**
+
+```bash
+./.venv/bin/python -m pip install -r requirements.txt
+./.venv/bin/python -m pip install -r requirements-rag.txt
+./.venv/bin/python -m pip check
+```
+
+`--mode local` and `--mode remote` do **not** load the embedding weights;
+`--mode retrieve` and `--mode smoke` do. On first retrieval, Hugging Face
+may download BGE-M3 weights (roughly 2 GB) into its model cache, normally
+`~/.cache/huggingface/hub/models--BAAI--bge-m3/` on Linux or
+`%USERPROFILE%\.cache\huggingface\hub\models--BAAI--bge-m3\` on Windows.
+`HF_HOME` or `HF_HUB_CACHE` can change that cache location. Repeated runs
+should reuse the downloaded revision. BGE-M3 **embeds** queries locally;
+OpenRouter generates workflow candidates remotely. No local LLM training is
+needed.
+
+Windows may warn that the Hugging Face cache cannot use symlinks. Retrieval
+still works but large files may consume extra disk space; enabling Windows
+Developer Mode can improve cache efficiency. Unauthenticated downloads of
+public BGE-M3 weights are supported but may face lower rate limits; optional
+`HF_TOKEN` credentials can improve rate limits. The Windows
+`torch.distributed.elastic` redirect warning is informational, too.
+Allow several GB of disk space, especially if both `pytorch_model.bin`
+and `model.safetensors` are cached. Never commit cached weights.
+
+### Optional NVIDIA GPU: install a CUDA-enabled PyTorch build
+
+**CPU is supported** and is the default. For an NVIDIA GPU, verify the driver
+with `nvidia-smi` and check whether the existing PyTorch build can access it.
+If `torch.cuda.is_available()` is already `True`, **do not reinstall PyTorch**.
+Do not install a second copy of the entire `requirements-rag.txt` stack just
+to change the PyTorch compute backend.
+
+**Windows PowerShell**
+
+```powershell
+nvidia-smi
+.\.venv\Scripts\python.exe -c "import torch; print('torch:', torch.__version__, 'CUDA:', torch.version.cuda, 'available:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'not detected')"
+```
+
+**Linux Bash**
+
+```bash
+nvidia-smi
+./.venv/bin/python -c "import torch; print('torch:', torch.__version__, 'CUDA:', torch.version.cuda, 'available:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'not detected')"
+```
+
+If CUDA is unavailable despite a supported NVIDIA GPU and driver, **replace**
+the CPU-only PyTorch wheel with a matching official CUDA wheel. The pinned
+CUDA 12.8 example below matches the tested RTX 4050 environment. Other
+hardware or CUDA releases should follow the official [PyTorch installation
+selector](https://pytorch.org/get-started/locally/) instead.
+
+**Windows PowerShell (only if CUDA is currently unavailable)**
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install --force-reinstall "torch==2.11.0" --index-url https://download.pytorch.org/whl/cu128
+.\.venv\Scripts\python.exe -m pip check
+```
+
+**Linux Bash (only if CUDA is currently unavailable)**
+
+```bash
+./.venv/bin/python -m pip install --force-reinstall 'torch==2.11.0' --index-url https://download.pytorch.org/whl/cu128
+./.venv/bin/python -m pip check
+```
+
+PyTorch `2.11.0` / CUDA `12.8` is an **example pinned environment**, not
+an instruction to replace a working or otherwise pinned installation.
+`--force-reinstall` is intentionally only in the repair path. Use an
+appropriately compatible `torchvision` version if your environment has it
+installed; do not mix mismatched PyTorch/torchvision wheels.
+
+After verifying `torch.cuda.is_available() == True`, set
+`CLOUDTUNE_RAG_DEVICE=cuda` in the ignored root `.env`. To keep CPU inference,
+use `CLOUDTUNE_RAG_DEVICE=cpu` (or omit the setting). **Device selection works
+only when `evaluation/rag_retriever.py` includes the `CLOUDTUNE_RAG_DEVICE`
+reader**; the original Phase 3 remote commit hardcodes `device="cpu"` until
+the local device-selection edit is committed. Do not claim a GPU run without
+verifying which device the retriever actually used. On a 6-GB laptop GPU,
+CUDA out-of-memory is possible; switch to CPU if necessary. The current
+candidate metadata does not automatically record the selected inference
+device: keep it fixed and record it in experiment environment notes.
+
+For the later fork-based execution phase, also install Node.js/npm for the
+pinned `ci-cost` adapter and install `actionlint` on PATH; candidate admission
+fails closed if `actionlint` is absent. Check with `node --version`,
+`npm --version`, and `actionlint -version`. **No Docker is required.**
+
 ## 4. Run the implemented preparation stage
 
 The committed pilot configuration is [`configs/pilot.json`](configs/pilot.json). It reserves the three arms but deliberately uses `execution.dry_run: true`.
@@ -513,13 +619,23 @@ Once a candidate repository's runs are finalized and raw GitHub run/job evidence
 
 `--check-config` performs no GitHub writes. The `--watch` option is for actual experiments after repository selection, credentials, dependencies and study eligibility are reviewed. **Do not use held-out evaluation rows as a development smoke test.** The implementation has mock-based verification, not a confirmed live fork-execution-and-deletion test. Keep existing `scripts/`, RAG data and README files unchanged.
 
-### Phase 3 read-only RAG verification
+### Phase 3 local, remote, retrieval, and synthetic smoke verification
 
-The new `evaluation.phase3_check` command verifies the pinned 74-record corpus
-hash locally, then optionally verifies the existing Supabase index and retrieves
-BGE-M3 chunks. It never uploads embeddings, calls the generator, creates forks,
-or dispatches workflows. `remote` and `retrieve` require your configured `.env`
-and installed `requirements-rag.txt` dependencies.
+Run these modes **in order**. `local` verifies the frozen on-disk hash with no
+network access. `remote` reads and audits the existing Supabase index without
+loading BGE-M3. `retrieve` additionally loads BGE-M3 on the selected local
+CPU/GPU and searches the index. `smoke` additionally calls the **pinned free
+OpenRouter generator** with a synthetic, non-held-out workflow. `smoke` can
+use free-model quota and is **not** a measured CI experiment. None of these
+modes uploads embeddings, modifies Supabase, creates forks or dispatches CI.
+
+For `remote`, `retrieve`, and `smoke`, provide `SUPABASE_URL` and either
+`SUPABASE_SECRET_KEY` or `SUPABASE_SERVICE_ROLE_KEY` through the root `.env`
+or exported environment. `smoke` additionally requires `OPENROUTER_API_KEY`.
+The generator model and token limit come from `evaluation/configs/fork_pilot.json`,
+**not** `OPENROUTER_MODEL` / `OPENROUTER_MAX_TOKENS` in `.env`. Keep credentials
+out of Git and logs. Install `requirements-rag.txt` before retrieval/smoke;
+follow the CPU/CUDA setup instructions in Section 3.
 
 **Windows PowerShell**
 
@@ -528,6 +644,7 @@ and installed `requirements-rag.txt` dependencies.
 .\.venv\Scripts\python.exe -m evaluation.phase3_check --mode local
 .\.venv\Scripts\python.exe -m evaluation.phase3_check --mode remote
 .\.venv\Scripts\python.exe -m evaluation.phase3_check --mode retrieve
+.\.venv\Scripts\python.exe -m evaluation.phase3_check --mode smoke
 ```
 
 **Linux Bash**
@@ -537,8 +654,13 @@ and installed `requirements-rag.txt` dependencies.
 ./.venv/bin/python -m evaluation.phase3_check --mode local
 ./.venv/bin/python -m evaluation.phase3_check --mode remote
 ./.venv/bin/python -m evaluation.phase3_check --mode retrieve
+./.venv/bin/python -m evaluation.phase3_check --mode smoke
 ```
 
 A successful local preflight is **not** proof that the live Supabase index,
 OpenRouter generation, or Phase 5 GitHub Actions execution works. Preserve all
-Phase 1/2 changes and experimental evidence.
+Phase 1/2 changes and experimental evidence. On Windows, Git CRLF checkout
+conversion can change the raw SHA256 of the frozen JSONL corpus; preserve its
+committed LF bytes rather than changing the pinned dataset SHA256 or re-ingesting
+it. Confirm `remote`, `retrieve`, and optional `smoke` independently before
+marking Phase 3 live-verified.

@@ -162,7 +162,17 @@ class Retriever:
         if self.model is None:
             if SentenceTransformer is None:
                 raise RuntimeError("Install requirements-rag.txt in the local controller environment")
-            self.model = SentenceTransformer(MODEL, revision=self.revision, device="cpu")
+            
+            # Allow GPU acceleration without changing the default execution behavior.
+            # Keep the selected device consistent and record it for research reproducibility.
+            self.device = os.environ.get("CLOUDTUNE_RAG_DEVICE", "cpu")
+
+            self.model = SentenceTransformer(
+                MODEL,
+                revision=self.revision,
+                device=self.device,
+            )
+            
         if len(self.model.tokenizer(query, add_special_tokens=True)["input_ids"]) > self.model.max_seq_length:
             raise ValueError("RAG retrieval query exceeds model token limit")
         vector = self.model.encode([query], normalize_embeddings=True, show_progress_bar=False,
