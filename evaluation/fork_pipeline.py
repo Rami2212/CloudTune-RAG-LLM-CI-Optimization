@@ -177,11 +177,11 @@ def _config(path: Path) -> dict:
         raise ValueError("Fork evaluation requires the three A/B/C arms")
     if not 1 <= config.get("repository_limit", 0) <= 100:
         raise ValueError("Evaluation repository_limit must be 1..100; partition larger cohorts")
-    if not 1 <= config.get("repetitions", 0) <= 5:
-        raise ValueError("Fork repetitions must be 1..5")
+    if type(config.get("repetitions")) is not int or config["repetitions"] != 3:
+        raise ValueError("Fork evaluation requires exactly 3 measured repetitions per admitted arm")
     if config.get("execution", {}).get("development_smoke") is True:
-        if config["repository_limit"] != 1 or config["repetitions"] != 1:
-            raise ValueError("Development smoke is limited to one repository and one repetition per arm")
+        if config["repository_limit"] != 1:
+            raise ValueError("Development smoke is limited to one repository; 3 repetitions per arm")
     if config.get("execution", {}).get("cache_regime") != "uncontrolled":
         raise ValueError("This protocol only supports explicitly reported uncontrolled caches")
     if config.get("warmup_runs") != 0:
@@ -493,7 +493,7 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False,
                 experiment = ForkExperiment(fork_api, repo_id=repo_id,
                      workflow_path=meta["workflow_path"], source_sha=meta["source_commit_sha"],
                      original=(snapshot / "source/original.yml").read_bytes(),
-                     evaluation_id=config["evaluation_id"], max_wait_seconds=180,
+                     evaluation_id=config["evaluation_id"], max_wait_seconds=None,
                      poll_seconds=15, evidence_root=snapshot)
                 repo["measurements_finalized"] = True
                 experiment.cleanup_fork(repo, lambda: store.save(state, snapshots={repo_id: snapshot}))
@@ -516,7 +516,7 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False,
         workflow_doc(original)
         experiment = ForkExperiment(fork_api, repo_id=repo_id, workflow_path=manifest["workflow_path"],
              source_sha=manifest["source_commit_sha"], original=original,
-             evaluation_id=config["evaluation_id"], max_wait_seconds=180,
+             evaluation_id=config["evaluation_id"], max_wait_seconds=None,
              poll_seconds=15, evidence_root=snapshot)
         try:
             if repo.get("measurements_finalized"):

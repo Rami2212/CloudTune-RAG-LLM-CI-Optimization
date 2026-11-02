@@ -839,11 +839,21 @@ blindly.
 3. Copy `evaluation/configs/development_smoke.example.json` to
    `evaluation/results/development_smoke.json` (ignored by Git). Use a **new** `dev-` prefixed
    `evaluation_id` for each independent trial. Keep `repository_limit: 1` and
-   `repetitions: 1`; never change an existing evaluation's frozen config.
+   `repetitions: 3`; never change an existing evaluation's frozen config.
+   Exactly three measured repetitions are required for each admitted arm.
+   If B/C are not admitted, their non-execution remains explicit; do not
+   invent timing measurements or force unsafe workflows to run.
 4. Run offline tests and `--check-config` first. For a real dispatch, use a
    dedicated authorized GitHub token and reviewed Supabase/OpenRouter credentials
    in the ignored `.env`. **Only the explicit non-check command below writes to
    GitHub.** It creates and deletes a research-owned candidate fork.
+
+**Resuming long GitHub queues:** The hosted controller keeps polling a pending
+run without a local time limit. Restart with the **same evaluation ID without
+`--rerun`** after interruption; the saved dispatch is observed rather than
+sent again. `--rerun` intentionally starts a NEW numbered generation after the
+previous generation has finalized. Hosted GitHub Actions still applies its
+own platform limits. Queue time stays excluded from measured execution time.
 
 **Windows PowerShell**
 

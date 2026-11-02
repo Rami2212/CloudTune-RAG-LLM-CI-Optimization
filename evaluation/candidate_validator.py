@@ -47,6 +47,23 @@ def _setup_node_npm_cache_added(original_step: dict, candidate_step: dict) -> bo
             and candidate_step["with"] == {**old_with, "cache": "npm"})
 
 
+def _original_steps_preserved(original_steps: list, candidate_steps: list) -> bool:
+    """Check original-step subsequence independently of unapproved additions.
+
+    An inserted step can be unapproved without deleting any original step.
+    An edited/replaced original step, however, is not considered preserved.
+    The narrow approved setup-node v4 cache addition counts as preserved.
+    """
+    position = 0
+    for step in candidate_steps:
+        if position >= len(original_steps):
+            break
+        if (step == original_steps[position] or
+                _setup_node_npm_cache_added(original_steps[position], step)):
+            position += 1
+    return position == len(original_steps)
+
+
 # The cache key must invalidate when the dependencies represented by its path
 # change. Matching hashFiles( alone is insufficient: README.md is not a lockfile.
 CACHE_DEPENDENCY_GLOBS = {
@@ -167,7 +184,10 @@ def validate_candidate(original: bytes, candidate: bytes, *, actionlint: str | N
             else:
                 reasons.append("UNAPPROVED_STEP_EDIT:" + jid)
                 break
-        if pos != len(old_steps):
+        # The fast first-pass match may stop at an *inserted* unapproved
+        # step. Rescan the full sequence before claiming an original step was
+        # deleted. Keep UNAPPROVED_STEP_EDIT regardless of that diagnosis.
+        if pos != len(old_steps) and not _original_steps_preserved(old_steps, new_steps):
             reasons.append("REQUIRED_STEP_REMOVED:" + jid)
     lint = _actionlint(candidate, actionlint)
     if lint["status"] != "PASS":

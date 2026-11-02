@@ -14,7 +14,7 @@ import os
 import re
 import time
 from pathlib import Path
-from statistics import median
+from statistics import mean, median
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -208,7 +208,7 @@ class ForkExperiment:
     """One repository, one selected workflow, three isolated arm branches."""
     def __init__(self, github: GitHub, *, repo_id: str, workflow_path: str,
                  source_sha: str, original: bytes, evaluation_id: str,
-                 max_wait_seconds: int, poll_seconds: int,
+                 max_wait_seconds: int | None, poll_seconds: int,
                  evidence_root: Path | None = None):
         self.gh = github
         self.upstream = repo_id
@@ -516,7 +516,9 @@ class ForkExperiment:
             log_progress("CI", f"Resuming existing run {pending['run_id']} without redispatch")
             return pending["run_id"]
         arm = state["arms"][pending["arm"]]
-        for attempt in range(1, max(1, self.max_wait_seconds // self.poll_seconds) + 1):
+        attempt = 0
+        while True:
+            attempt += 1
             if attempt == 1 or attempt % 4 == 0:
                 log_progress("CI", f"Reconciling dispatch for arm {pending['arm']} repeat {pending['repeat']} (poll={attempt})")
             matches = [row for row in self._run_ids(fork, state["workflow_id"], arm["branch"])
@@ -529,8 +531,27 @@ class ForkExperiment:
                 save()
                 log_progress("CI", f"Found run {pending['run_id']}: https://github.com/{fork}/actions/runs/{pending['run_id']}")
                 return pending["run_id"]
+
+            # Preserve bounded polling for test callers that explicitly
+            # configure a maximum wait.
+            if (self.max_wait_seconds is not None and
+                    attempt >= max(1, self.max_wait_seconds // self.poll_seconds)):
+                raise RunPending(
+                    "Dispatch identity not resolved yet; "
+                    "retry observation without sending another POST"
+                )
+
+            # An undiscoverable dispatch is different from a confirmed
+            # queued GitHub run. Stop after roughly 10 minutes if GitHub
+            # never reveals its run ID. Preserve the pending checkpoint.
+            if (self.max_wait_seconds is None and
+                    attempt * self.poll_seconds >= 600):
+                raise RuntimeError(
+                    "GitHub dispatch not discoverable after 10 minutes; "
+                    "pending dispatch retained for investigation"
+                )
+
             time.sleep(self.poll_seconds)
-        raise RunPending("Dispatch identity not resolved yet; retry observation without sending another POST")
 
     def execute(self, state: dict, save, *, arm: str, repeat: int,
                 required: list[str], max_total: int) -> dict:
@@ -569,6 +590,24 @@ class ForkExperiment:
         while True:
             run = self.gh.request("GET", f"/repos/{fork}/actions/runs/{run_id}")
             status = run.get("status", "unknown")
+
+            # Only recognized GitHub Actions states may be polled.
+            # Unknown states must not cause indefinite waiting.
+            valid_statuses = {
+                "queued",
+                "in_progress",
+                "waiting",
+                "pending",
+                "requested",
+                "completed",
+            }
+
+            if status not in valid_statuses:
+                raise ValueError(
+                    f"Unexpected GitHub Actions run status {status!r} "
+                    f"for run {run_id}; pending dispatch preserved"
+                )
+
             if status != last_run_status or last_run_status is None:
                 log_progress("CI", f"Run {run_id} state={status} (arm {arm}, repeat {repeat})")
                 last_run_status = status
@@ -577,7 +616,8 @@ class ForkExperiment:
             if status == "completed":
                 log_progress("CI", f"Run {run_id} completed with conclusion={run.get('conclusion')}")
                 break
-            if time.monotonic() - started > self.max_wait_seconds:
+            if (self.max_wait_seconds is not None and
+                    time.monotonic() - started > self.max_wait_seconds):
                 raise RunPending(f"GitHub run {run_id} is queued/in progress; resume observation later")
             time.sleep(self.poll_seconds)
         attempt = run.get("run_attempt", 1)
@@ -779,11 +819,18 @@ def summarize_records(records: list[dict], *, repetitions: int | None = None) ->
     results = {}
     for arm, runs in by_arm.items():
         valid = [r for r in runs if r["comparable"]]
-        complete = bool(valid) and (repetitions is None or len(valid) == repetitions)
+        complete = bool(valid) and (repetitions is None or
+                                    (len(runs) == repetitions and len(valid) == repetitions))
         results[arm] = {"attempted": len(runs), "comparable": len(valid),
                         "failed": len(runs) - len(valid), "complete": complete,
                         "median_elapsed_seconds": median(r["workflow_elapsed_seconds"] for r in valid) if complete else None,
+                        "mean_elapsed_seconds": mean(r["workflow_elapsed_seconds"] for r in valid) if complete else None,
                         "median_runner_seconds": median(r["sum_job_runtime_seconds"] for r in valid) if complete else None,
+                        "mean_runner_seconds": mean(r["sum_job_runtime_seconds"] for r in valid) if complete else None,
+                        "mean_initial_queue_seconds": (mean(r["initial_queue_seconds"] for r in valid
+                                                        if r.get("initial_queue_seconds") is not None)
+                                  if complete and all(r.get("initial_queue_seconds") is not None for r in valid)
+                                  else None),
                         "median_initial_queue_seconds": (median(r["initial_queue_seconds"] for r in valid
                                                          if r.get("initial_queue_seconds") is not None)
                                   if complete and all(r.get("initial_queue_seconds") is not None for r in valid)
@@ -794,6 +841,16 @@ def summarize_records(records: list[dict], *, repetitions: int | None = None) ->
             baseline = results[baseline_arm][f"median_{kind}_seconds"]
             optimized = results[target][f"median_{kind}_seconds"]
             results[target][f"{kind}_saving_percent_{suffix}"] = (
+                100 * (baseline - optimized) / baseline
+                if baseline is not None and optimized is not None and baseline > 0 else None)
+    # Descriptive arithmetic-mean comparisons supplement, but never replace,
+    # the existing median-based primary outcome. Incomplete arms remain null.
+    for target, baseline_arm in (("B", "A"), ("C", "A"), ("C", "B")):
+        suffix = "vs_A" if baseline_arm == "A" else "vs_B"
+        for kind in ("elapsed", "runner"):
+            baseline = results[baseline_arm][f"mean_{kind}_seconds"]
+            optimized = results[target][f"mean_{kind}_seconds"]
+            results[target][f"mean_{kind}_saving_percent_{suffix}"] = (
                 100 * (baseline - optimized) / baseline
                 if baseline is not None and optimized is not None and baseline > 0 else None)
     return results

@@ -116,7 +116,7 @@ class ForkSafetyTests(unittest.TestCase):
                 "dataset": "evaluation/results/development_repositories.csv",
                 "dataset_split": "development" if dev else "evaluation",
                 "repository_start_at": 1, "repository_limit": 1,
-                "arms": ["original", "ci_cost", "rag"], "repetitions": 1,
+                "arms": ["original", "ci_cost", "rag"], "repetitions": 3,
                 "warmup_runs": 0,
                 "rag": {"embedding_model": "BAAI/bge-m3", "embedding_revision": "AUTO_PIN_SINGLE",
                         "dataset_sha256": "a" * 64, "generator_model": "free/model:free"},
@@ -281,13 +281,18 @@ class ForkSafetyTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "frozen protocol/configuration"):
                 resolve_rerun_batch(altered, selection)
 
-    def test_dev_smoke_is_limited_to_one_repo_and_repeat(self):
+    def test_dev_smoke_is_limited_to_one_repo_and_requires_three_runs(self):
         path = self.root / "config.json"
-        for key in ("repository_limit", "repetitions"):
-            config = self.config()
-            config[key] = 2
+        config = self.config()
+        config["repository_limit"] = 2
+        path.write_text(json.dumps(config))
+        with self.assertRaisesRegex(ValueError, "Development smoke is limited"):
+            _config(path)
+        config["repository_limit"] = 1
+        for repetitions in (1, 2, 4, 5):
+            config["repetitions"] = repetitions
             path.write_text(json.dumps(config))
-            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "Development smoke is limited"):
+            with self.subTest(repetitions=repetitions), self.assertRaisesRegex(ValueError, "exactly 3"):
                 _config(path)
 
 

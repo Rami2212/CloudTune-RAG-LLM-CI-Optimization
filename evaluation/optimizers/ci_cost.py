@@ -60,6 +60,95 @@ def _diff(original: bytes, optimized: bytes, workflow_path: str) -> bytes:
         fromfile="a/" + workflow_path, tofile="b/" + workflow_path)).encode("utf-8")
 
 
+def _recommendation_audit(original: bytes, generated: bytes) -> dict:
+    """Compare *claims* in ci-cost's header against observed YAML edits.
+
+    Upstream prints recommendations as if they were applied, even when its
+    transformer leaves the corresponding field unchanged. This metadata is
+    diagnostic only: it does not modify YAML, grant admission, or establish
+    any measured savings. Unknown recommendation types remain UNVERIFIED.
+    """
+    before, after = workflow_doc(original), workflow_doc(generated)
+    text = generated.decode("utf-8-sig")
+    claims = re.findall(r"(?m)^# - \[[^]\n]+\] ([^\r\n]+)$", text)
+    estimate = re.search(r"(?m)^# Estimated savings: ([^\r\n]+)$", text)
+
+    before_jobs, after_jobs = before.get("jobs", {}), after.get("jobs", {})
+
+    def steps(job: dict) -> list[dict]:
+        return [step for step in job.get("steps", []) if isinstance(step, dict)]
+
+    def cached_steps(job: dict) -> list[dict]:
+        return [step for step in steps(job) if
+                str(step.get("uses", "")).startswith("actions/cache@") or
+                (isinstance(step.get("with"), dict) and "cache" in step["with"])]
+
+    def commands(job: dict) -> list[str]:
+        return [step["run"] for step in steps(job) if isinstance(step.get("run"), str)]
+
+    added_cache = False
+    npm_install_replaced = False
+    fail_fast_changed = False
+    shallow_clone_changed = False
+    for job_id in before_jobs.keys() & after_jobs.keys():
+        old, new = before_jobs[job_id], after_jobs[job_id]
+        # A modification of an existing cache is not a newly added cache.
+        added_cache |= len(cached_steps(new)) > len(cached_steps(old))
+        # Align run steps independently of added action steps, preserving order.
+        old_commands, new_commands = commands(old), commands(new)
+        npm_install_replaced |= (len(old_commands) == len(new_commands) and any(
+            re.search(r"\bnpm install\b", previous) and
+            re.search(r"\bnpm ci\b", current) and previous != current
+            for previous, current in zip(old_commands, new_commands)))
+        old_strategy, new_strategy = old.get("strategy", {}), new.get("strategy", {})
+        if isinstance(old_strategy, dict) and isinstance(new_strategy, dict):
+            fail_fast_changed |= (old_strategy.get("fail-fast") != new_strategy.get("fail-fast")
+                                  and new_strategy.get("fail-fast") is True)
+        old_checkouts = [step.get("with", {}).get("fetch-depth") for step in steps(old)
+                         if str(step.get("uses", "")).startswith("actions/checkout@")
+                         and isinstance(step.get("with", {}), dict)]
+        new_checkouts = [step.get("with", {}).get("fetch-depth") for step in steps(new)
+                         if str(step.get("uses", "")).startswith("actions/checkout@")
+                         and isinstance(step.get("with", {}), dict)]
+        shallow_clone_changed |= old_checkouts != new_checkouts
+
+    observed = {
+        "concurrency_changed": ("concurrency" not in before and "concurrency" in after),
+        "dependency_cache_added": added_cache,
+        "npm_install_replaced_with_npm_ci": npm_install_replaced,
+        "fail_fast_changed": fail_fast_changed,
+        "checkout_fetch_depth_changed": shallow_clone_changed,
+    }
+    checks = []
+    for claim in claims:
+        lower = claim.lower()
+        if "concurrency" in lower:
+            key = "concurrency_changed"
+        elif "npm ci" in lower and "npm install" in lower:
+            key = "npm_install_replaced_with_npm_ci"
+        elif "fail-fast" in lower:
+            key = "fail_fast_changed"
+        elif "shallow" in lower or "fetch-depth" in lower:
+            key = "checkout_fetch_depth_changed"
+        elif "cache" in lower:
+            key = "dependency_cache_added"
+        else:
+            key = None
+        checks.append({"recommendation": claim, "matched_observation": key,
+                       "status": ("OBSERVED" if observed[key] else "NOT_OBSERVED")
+                       if key else "UNVERIFIED"})
+    return {
+        "reported_recommendations": claims,
+        "reported_estimated_savings": estimate.group(1).strip() if estimate else None,
+        "reported_estimate_is_measured": False,
+        "observed_transformations": observed,
+        "recommendation_checks": checks,
+        "unobserved_reported_recommendations": [item["recommendation"] for item in checks
+                                                  if item["status"] == "NOT_OBSERVED"],
+        "audit_scope": "Known ci-cost recommendation categories; not admission or runtime evidence",
+    }
+
+
 def generate_ci_cost_candidate(
     snapshot_dir: Path,
     *,
@@ -124,7 +213,7 @@ def generate_ci_cost_candidate(
         "generated_sha256": None, "semantic_changed": False,
         "required_checks_status": "not_verified", "safety_verdict": "NOT_CHECKED",
         "execution_status": "NOT_EXECUTED", "optimizer_seconds": 0.0,
-        "exit_code": None, "error": None,
+        "exit_code": None, "error": None, "recommendation_audit": None,
     }
     stdout = ""
     stderr = ""
@@ -182,6 +271,9 @@ def generate_ci_cost_candidate(
                 # Header comments alone are not an applied optimization.
                 changed = workflow_doc(original) != workflow_doc(generated)
                 outcome["semantic_changed"] = changed
+                # Keep upstream's exact output, but archive an independent
+                # observation of which advertised changes really occurred.
+                outcome["recommendation_audit"] = _recommendation_audit(original, generated)
                 outcome["decision"] = "APPLY" if changed else "NO_CHANGE"
             else:
                 outcome["decision"] = "NO_CHANGE"
