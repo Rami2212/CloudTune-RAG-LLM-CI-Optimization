@@ -1,4 +1,4 @@
-"""Phase 3 verification: read-only index checks and opt-in free-model smoke.
+"""RAG integration verification: read-only index checks and opt-in free-model smoke.
 
 Local, remote and retrieve modes only read frozen data. Explicit smoke mode
 sends a synthetic CI fixture to the pinned free generator. No mode creates
@@ -30,11 +30,11 @@ def check_local(config: dict, *, corpus: Path = CORPUS) -> dict:
     expected = rag.get("dataset_sha256")
     if (not isinstance(model, str) or not model.endswith(":free") or
             not isinstance(max_tokens, int) or max_tokens < 1):
-        raise ValueError("Phase 3 requires an explicitly pinned free model and positive max_tokens")
+        raise ValueError("RAG integration requires an explicitly pinned free model and positive max_tokens")
     if rag.get("embedding_model") != "BAAI/bge-m3":
-        raise ValueError("Phase 3 requires frozen BAAI/bge-m3 embeddings")
+        raise ValueError("RAG integration requires frozen BAAI/bge-m3 embeddings")
     if not isinstance(expected, str) or len(expected) != 64:
-        raise ValueError("Phase 3 requires the frozen dataset SHA256")
+        raise ValueError("RAG integration requires the frozen dataset SHA256")
     observed = hashlib.sha256(corpus.read_bytes()).hexdigest()
     if observed != expected:
         raise ValueError("Local RAG corpus differs from the frozen evaluation SHA256")
@@ -43,9 +43,9 @@ def check_local(config: dict, *, corpus: Path = CORPUS) -> dict:
         not isinstance(revision, str) or len(revision) != 40 or
         any(ch not in "0123456789abcdef" for ch in revision)
     ):
-        raise ValueError("Phase 3 embedding revision must be frozen or AUTO_PIN_SINGLE")
+        raise ValueError("RAG embedding revision must be frozen or AUTO_PIN_SINGLE")
     if not isinstance(rag.get("top_k"), int) or not 1 <= rag["top_k"] <= 20:
-        raise ValueError("Phase 3 top_k must be between 1 and 20")
+        raise ValueError("RAG top_k must be between 1 and 20")
     return {"status": "LOCAL_CORPUS_VERIFIED", "dataset_sha256": observed,
             "embedding_model": rag["embedding_model"], "embedding_revision": revision,
             "generator_model": model, "max_tokens": max_tokens,
@@ -83,10 +83,10 @@ def main() -> int:
             if options.mode == "smoke":
                 # A development-only end-to-end smoke probe, never a held-out
                 # repository or a measured CI run. No forks or Actions dispatch.
-                with tempfile.TemporaryDirectory(prefix="cloudtune-phase3-smoke-") as folder:
+                with tempfile.TemporaryDirectory(prefix="cloudtune-rag-smoke-") as folder:
                     snapshot = Path(folder)
                     (snapshot / "source").mkdir()
-                    original = ("name: CloudTune synthetic Phase 3 smoke\n"
+                    original = ("name: CloudTune synthetic RAG smoke\n"
                                 "on:\n  workflow_dispatch:\njobs:\n  test:\n"
                                 "    runs-on: ubuntu-latest\n    steps:\n"
                                 "      - uses: actions/checkout@v4\n"
@@ -119,7 +119,7 @@ def main() -> int:
         return 0
     except (OSError, ValueError, RuntimeError, KeyError, TypeError, json.JSONDecodeError) as error:
         # Do not include server response bodies or credential values in reports.
-        print("Phase 3 verification failed: " + type(error).__name__ + ": " + str(error), file=sys.stderr)
+        print("RAG integration verification failed: " + type(error).__name__ + ": " + str(error), file=sys.stderr)
         return 1
 
 

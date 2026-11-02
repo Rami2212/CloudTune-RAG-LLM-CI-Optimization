@@ -23,7 +23,7 @@ from pathlib import Path
 from scripts.experiment_environment import load_env
 from evaluation.third_party.ci_cost.setup import install as install_ci_cost
 
-from evaluation.candidate_validator import validate_candidate
+from evaluation.candidate_validator import validate_and_archive
 from evaluation.ci_executor import ForkExperiment, GitHub, RunPending, summarize_records
 from evaluation.optimizers.ci_cost import generate_ci_cost_candidate
 from evaluation.optimizers.rag_llm import generate_rag_candidate
@@ -398,19 +398,18 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False) -> dict:
             candidates = {"A": original}
             for arm in "BC":
                 result = repo["candidates"][arm]
-                if result["decision"] == "APPLY":
-                    data = _candidate_yaml(snapshot, arm, result, original)
-                    verdict = validate_candidate(original, data)
-                    repo["validation"][arm] = verdict
-                    save()
-                    if verdict["verdict"] == "PASS":
-                        candidates[arm] = data
-                elif result["decision"] == "NO_CHANGE":
-                    repo["validation"][arm] = {"verdict": "NO_CHANGE"}
-                    save()
-                else:
-                    repo["validation"][arm] = {"verdict": "FAIL", "reasons": ["GENERATION_ERROR"]}
-                    save()
+                decision = result.get("decision", "ERROR")
+                # Both optimizers receive the identical, source-bound gate.
+                # Save immutable validation.json before touching candidate forks.
+                data = (_candidate_yaml(snapshot, arm, result, original)
+                        if decision == "APPLY" else None)
+                verdict = validate_and_archive(snapshot, arm, original, data,
+                                               decision=decision if decision in {"APPLY", "NO_CHANGE"} else "ERROR",
+                                               generation=result)
+                repo["validation"][arm] = verdict
+                save()
+                if verdict["verdict"] == "PASS" and data is not None:
+                    candidates[arm] = data
             experiment.provision(repo, save)
             experiment.prepare(repo, save)
             if repo.get("workflow_id") is None:

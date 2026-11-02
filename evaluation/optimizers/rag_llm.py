@@ -87,8 +87,8 @@ def generate_rag_candidate(snapshot_dir: Path, *, retriever: Retriever,
             context_files.append({"path": relative_path, "text": content,
                                   "source_sha256": tracked.get(relative_path)})
             remaining -= len(content)
-    # Phase 1 currently stores an unverified required-check contract. Never
-    # present an observed CI history or verified required check as available.
+    # Repository preparation currently stores an unverified required-check
+    # contract. Never claim observed CI history or verified required checks.
     checks = manifest.get("required_checks", {"status": "not_verified"})
     if not isinstance(checks, dict):
         raise ValueError("Frozen required-check contract is invalid")

@@ -5,6 +5,8 @@ candidate requiring judgment is REVIEW_REQUIRED and is never auto-dispatched.
 """
 from __future__ import annotations
 
+import fnmatch
+import hashlib
 import json
 import re
 import shutil
@@ -13,7 +15,7 @@ import subprocess
 import yaml
 from pathlib import Path
 
-from evaluation.repository_preparation import workflow_doc, safety_findings
+from evaluation.repository_preparation import workflow_doc, safety_findings, write_json_immutable
 
 
 class CandidateValidationError(ValueError):
@@ -147,3 +149,187 @@ def validate_candidate(original: bytes, candidate: bytes, *, actionlint: str | N
     verdict = "FAIL" if any(s.startswith(("INVALID", "UNSAFE", "ACTIONLINT_FAIL")) for s in reasons) else ("REVIEW_REQUIRED" if reasons else "PASS")
     return {"verdict": verdict, "reasons": sorted(set(reasons)), "actionlint": lint,
             "equivalence_scope": "conservative additive cache only; runtime safety is verified on GitHub"}
+
+
+# Frozen repository evidence and immutable candidate admission records.
+POLICY_REVISION = "cloudtune-frozen-cache-v1"
+_HASH_EXPRESSION = re.compile(r"hashFiles\(\s*(['\"])([^'\"]+)\1\s*\)")
+_EXPRESSION = re.compile(r"\$\{\{\s*(.*?)\s*\}\}")
+
+
+def _digest(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _archived_inputs(snapshot: Path) -> tuple[set[str], list[str]]:
+    """Verify immutable dependency evidence from the source commit, not HEAD.
+
+    Missing or unarchived lockfiles cannot justify a cache optimization.
+    The preparer already bounds archived files and rejects symlinks; verify the
+    stored hash again rather than trusting only a filename in a manifest.
+    """
+    path = snapshot / "source" / "files_manifest.json"
+    if not path.is_file():
+        return set(), ["FROZEN_INPUT_MANIFEST_MISSING"]
+    data = json.loads(path.read_text(encoding="utf-8"))
+    entries = data.get("archived")
+    if not isinstance(entries, list):
+        return set(), ["FROZEN_INPUT_MANIFEST_INVALID"]
+    present: set[str] = set()
+    for row in entries:
+        if not isinstance(row, dict) or not isinstance(row.get("path"), str):
+            return set(), ["FROZEN_INPUT_MANIFEST_INVALID"]
+        relative = row["path"]
+        # Never trust path components taken from a persisted JSON artifact.
+        if (not relative or relative.startswith("/") or "\\" in relative or ":" in relative
+                or any(part in ("", ".", "..") for part in relative.split("/"))):
+            return set(), ["FROZEN_INPUT_PATH_UNSAFE"]
+        source = snapshot / "source" / "files" / relative
+        if (not source.is_file() or source.is_symlink() or
+                not re.fullmatch(r"[a-f0-9]{64}", str(row.get("sha256", ""))) or
+                _digest(source.read_bytes()) != row["sha256"]):
+            return set(), ["FROZEN_INPUT_HASH_MISMATCH"]
+        if relative in present:
+            return set(), ["FROZEN_INPUT_DUPLICATE"]
+        present.add(relative)
+    return present, []
+
+
+def _dependency_key_evidence(cache_path: str, cache_key: str, frozen: set[str]) -> tuple[list[str], list[str]]:
+    """Only a runner-specific cache with an actual frozen lockfile can pass."""
+    expressions = _EXPRESSION.findall(cache_key)
+    if len(expressions) != 2 or expressions[0] != "runner.os":
+        return [], ["CACHE_KEY_UNREVIEWED_EXPRESSIONS"]
+    match = _HASH_EXPRESSION.fullmatch(expressions[1])
+    if not match:
+        return [], ["CACHE_KEY_UNREVIEWED_EXPRESSIONS"]
+    # No other expressions, separators, dynamic secrets, or GitHub-context input.
+    literal = _EXPRESSION.sub("", cache_key)
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{0,120}", literal):
+        return [], ["CACHE_KEY_UNREVIEWED_LITERAL"]
+    pattern = match.group(2)
+    approved = CACHE_DEPENDENCY_GLOBS.get(cache_path, ())
+    if not any(pattern == token or pattern == "**/" + token for token in approved):
+        return [], ["CACHE_KEY_UNAPPROVED_DEPENDENCY_PATTERN"]
+    if pattern.startswith("**/"):
+        # The preparer snapshots selected source files, not an exhaustive
+        # manifest of every nested lockfile. A repository-wide glob could
+        # hash files outside frozen evidence; require manual review.
+        return [], ["CACHE_GLOB_SCOPE_REQUIRES_REVIEW"]
+    matched = sorted(path for path in frozen if fnmatch.fnmatchcase(path, pattern))
+    if not matched:
+        return [], ["CACHE_DEPENDENCY_NOT_IN_PINNED_SOURCE"]
+    return matched, []
+
+
+def _cache_evidence(original: bytes, candidate: bytes, frozen: set[str]) -> tuple[list[str], list[str]]:
+    """Check every newly inserted cache step using the same rules for B and C."""
+    before, after = workflow_doc(original), workflow_doc(candidate)
+    reasons: list[str] = []
+    evidence: list[str] = []
+    events = before.get("on")
+    event_names = ({events} if isinstance(events, str) else
+                   set(events) if isinstance(events, (list, dict)) else set())
+    if event_names & {"pull_request_target", "workflow_run", "repository_dispatch"}:
+        reasons.append("CACHE_TRIGGER_REQUIRES_INDEPENDENT_REVIEW")
+    for job_id, job in after["jobs"].items():
+        original_steps = before["jobs"][job_id].get("steps", [])
+        cursor = 0
+        checkout_seen = False
+        for step in job.get("steps", []):
+            if cursor < len(original_steps) and step == original_steps[cursor]:
+                cursor += 1
+                if str(step.get("uses", "")).startswith("actions/checkout@"):
+                    checkout_seen = True
+                continue
+            if step.get("uses") != "actions/cache@v4":
+                # The common validator has already rejected unknown edits.
+                continue
+            if not checkout_seen:
+                reasons.append("CACHE_BEFORE_CHECKOUT:" + str(job_id))
+            path = step["with"]["path"].strip()
+            if path == "node_modules":
+                # Installed packages/build artifacts may hide changes to
+                # dependency install scripts and toolchain behavior.
+                reasons.append("CACHE_INSTALLED_ARTIFACTS_NEED_REVIEW:" + str(job_id))
+            matches, errors = _dependency_key_evidence(path, step["with"]["key"], frozen)
+            reasons.extend(err + ":" + str(job_id) for err in errors)
+            evidence.extend(matches)
+    return sorted(set(evidence)), sorted(set(reasons))
+
+
+def validate_and_archive(snapshot: Path, arm: str, original: bytes, candidate: bytes | None,
+                         *, decision: str, generation: dict, actionlint: str | None = None) -> dict:
+    """Return the shared admission verdict and persist an immutable record.
+
+    Called before any candidate arm branch is created. Saved evidence is reused
+    only with identical source, candidate and policy identity. A new policy must
+    use a new evaluation_id, rather than silently rewriting earlier verdicts.
+    """
+    if arm not in {"B", "C"} or decision not in {"APPLY", "NO_CHANGE", "ERROR"}:
+        raise ValueError("Unsupported evaluation arm/decision")
+    if decision == "APPLY" and not isinstance(candidate, bytes):
+        raise ValueError("APPLY candidate bytes are required")
+    if decision != "APPLY" and candidate is not None:
+        raise ValueError("Non-APPLY outcome must not have candidate bytes")
+    manifest = json.loads((snapshot / "manifest.json").read_text(encoding="utf-8"))
+    before_sha = _digest(original)
+    if manifest.get("workflow_sha256") != before_sha:
+        raise ValueError("Validation source differs from pinned original workflow")
+    after_sha = _digest(candidate) if candidate is not None else None
+    identity = {"arm": arm, "decision": decision, "policy_revision": POLICY_REVISION,
+                "source_commit_sha": manifest["source_commit_sha"],
+                "workflow_path": manifest["workflow_path"],
+                "before_sha256": before_sha, "after_sha256": after_sha}
+    artifact = snapshot / "validation" / arm / "validation.json"
+    if artifact.exists():
+        stored = json.loads(artifact.read_text(encoding="utf-8"))
+        if any(stored.get(k) != value for k, value in identity.items()):
+            raise ValueError("Archived validation identity changed; use a new evaluation_id")
+        verdict = stored.get("validation")
+        if not isinstance(verdict, dict) or verdict.get("verdict") not in {
+                "PASS", "FAIL", "REVIEW_REQUIRED", "INCONCLUSIVE", "NO_CHANGE"}:
+            raise ValueError("Archived validation verdict missing or invalid")
+        return verdict
+
+    evidence = {"source_manifest": "manifest.json", "frozen_files": "source/files_manifest.json",
+                "source_dependency_paths": []}
+    if decision == "NO_CHANGE":
+        verdict = {"verdict": "NO_CHANGE", "reasons": ["OPTIMIZER_ABSTAINED"]}
+    elif decision == "ERROR":
+        verdict = {"verdict": "FAIL", "reasons": ["GENERATION_ERROR"]}
+    else:
+        # The archived generator output must be derived from exactly this
+        # selected workflow at the pinned upstream commit.
+        location = (snapshot / generation.get("candidate_relative_dir", "") if arm == "B"
+                    else snapshot / "candidates" / "C")
+        if not location.resolve().is_relative_to((snapshot / "candidates").resolve()):
+            raise ValueError("Generator artifact path escaped candidate snapshot")
+        archived = location / "candidate.json"
+        if not archived.is_file():
+            verdict = {"verdict": "FAIL", "reasons": ["GENERATOR_PROVENANCE_MISSING"]}
+        else:
+            provenance = json.loads(archived.read_text(encoding="utf-8"))
+            if (provenance.get("before_sha256") != before_sha or
+                    provenance.get("after_sha256") != after_sha or
+                    provenance.get("source_commit_sha", provenance.get("source_sha")) !=
+                    manifest["source_commit_sha"]):
+                verdict = {"verdict": "FAIL", "reasons": ["GENERATOR_PROVENANCE_MISMATCH"]}
+            else:
+                verdict = validate_candidate(original, candidate, actionlint=actionlint)
+                lint = verdict.get("actionlint", {}).get("status")
+                if lint == "INCONCLUSIVE" and verdict["verdict"] != "FAIL":
+                    verdict = {**verdict, "verdict": "INCONCLUSIVE",
+                               "reasons": sorted(set(verdict.get("reasons", []) + ["ACTIONLINT_UNAVAILABLE"]))}
+                elif verdict["verdict"] == "PASS":
+                    frozen, issues = _archived_inputs(snapshot)
+                    if issues:
+                        verdict = {**verdict, "verdict": "INCONCLUSIVE", "reasons": issues}
+                    else:
+                        lockfiles, concerns = _cache_evidence(original, candidate, frozen)
+                        evidence["source_dependency_paths"] = lockfiles
+                        if concerns or not lockfiles:
+                            verdict = {**verdict, "verdict": "REVIEW_REQUIRED",
+                                       "reasons": concerns or ["NO_VERIFIED_CACHE_DEPENDENCY"]}
+    write_json_immutable(artifact, {**identity, "validation": verdict, "evidence": evidence})
+    return verdict

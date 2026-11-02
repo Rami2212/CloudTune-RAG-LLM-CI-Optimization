@@ -1,7 +1,7 @@
-"""Offline Phase 3 contract tests; no live API requests or repository mutations.
+"""Offline RAG pipeline tests; no live API requests or repository mutations.
 
-These tests extend Phases 1/2 and exercise the actual Arm C candidate generator,
-frozen corpus validation, metadata, replay, and request/provenance boundaries.
+These tests exercise the Arm C candidate generator, frozen corpus validation,
+metadata, replay, and request/provenance boundaries.
 """
 from __future__ import annotations
 

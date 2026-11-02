@@ -97,7 +97,7 @@ python3 -m venv .venv
 
 If you already have a working `.venv`, use it rather than creating another one.
 
-### Install the RAG dependencies (Phase 3 / Arm C)
+### Install RAG dependencies for Arm C
 
 The lightweight `requirements.txt` installs PyYAML for preparation, validation,
 and Arm B. **Real BGE-M3 retrieval and the Arm C smoke test additionally require
@@ -189,12 +189,10 @@ installed; do not mix mismatched PyTorch/torchvision wheels.
 
 After verifying `torch.cuda.is_available() == True`, set
 `CLOUDTUNE_RAG_DEVICE=cuda` in the ignored root `.env`. To keep CPU inference,
-use `CLOUDTUNE_RAG_DEVICE=cpu` (or omit the setting). **Device selection works
-only when `evaluation/rag_retriever.py` includes the `CLOUDTUNE_RAG_DEVICE`
-reader**; the original Phase 3 remote commit hardcodes `device="cpu"` until
-the local device-selection edit is committed. Do not claim a GPU run without
-verifying which device the retriever actually used. On a 6-GB laptop GPU,
-CUDA out-of-memory is possible; switch to CPU if necessary. The current
+use `CLOUDTUNE_RAG_DEVICE=cpu` (or omit the setting). The committed
+`evaluation/rag_retriever.py` reads this device setting. Do not claim a GPU run
+without verifying which device the retriever actually used. On a 6-GB laptop
+GPU, CUDA out-of-memory is possible; switch to CPU if necessary. The current
 candidate metadata does not automatically record the selected inference
 device: keep it fixed and record it in experiment environment notes.
 
@@ -597,6 +595,62 @@ The earlier `.github/workflows/cloudtune-evaluation.yml`, `evaluation/hosted_pip
 
 The process screens and freezes each repository, prepares original A, source-corrected `ci-cost` B and frozen RAG+LLM C candidates, applies the common conservative validator, creates isolated refs on a **research-owned candidate fork**, dispatches workflows using GitHub APIs, collects real GitHub job timestamps and stores all results in `evaluation/results/<evaluation_id>/`. Local setup and model latency are never measured as target CI duration. Long queues and gaps between jobs are excluded from active execution-time metrics.
 
+### Shared candidate validation (local, no CI dispatch)
+
+The local controller uses `evaluation/candidate_validator.py` as one common gate
+for Arm B (`ci-cost`) and Arm C (RAG). Every outcome produces immutable evidence
+under `evaluation/results/<evaluation_id>/repositories/<repository>/validation/<arm>/validation.json`
+_before_ an optimized arm branch can be created. This records the pinned source
+and candidate hashes, selected workflow, policy revision, `actionlint` status,
+reasons and verified frozen lockfile paths. Existing records can only be reused
+when identities match; a policy change requires a new `evaluation_id`.
+
+Only narrow additive dependency-download caches can automatically receive
+`PASS`. Such a cache must follow checkout, use a static OS-and-lockfile cache
+key, and hash a dependency input verified in the pinned source snapshot.
+Missing input files, unsafe/dynamic expressions, installed-artifact caches,
+complex triggers or unreviewed workflow changes cannot be auto-dispatched.
+`FAIL`, `REVIEW_REQUIRED`, `INCONCLUSIVE` and `NO_CHANGE` never create optimized
+arm branches. `actionlint` must be installed locally for approval. The validator
+checks duplicate YAML keys through the existing Actions loader, but even `PASS`
+is not a mathematical proof that execution behavior is equivalent.
+
+Install `actionlint` from the [official releases](https://github.com/rhysd/actionlint/releases)
+(or use the commands below); verify that `actionlint -version` works before
+launching an evaluation. On Windows PowerShell:
+
+```powershell
+winget install --id rhysd.actionlint --exact
+actionlint -version
+```
+
+On Linux Bash, with a compatible installed Go toolchain:
+
+```bash
+go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+export PATH="$(go env GOPATH)/bin:$PATH"
+actionlint -version
+```
+
+Run the offline candidate admission tests before starting a pilot:
+
+**Windows PowerShell**
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p test_candidate_validator.py -v
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+**Linux Bash**
+
+```bash
+./.venv/bin/python -m unittest discover -s tests -p 'test_candidate_validator.py' -v
+./.venv/bin/python -m unittest discover -s tests -v
+```
+
+These tests use temporary snapshots and mocked validation tools. They do not
+create forks, run GitHub Actions, or prove Phase 5 live execution and cleanup.
+
 ### Safe automatic fork cleanup
 
 Once a candidate repository's runs are finalized and raw GitHub run/job evidence is persisted locally, the controller attempts to delete its temporary fork. Deletion requires explicit proof that the fork was created by this evaluation, a matching fork identity, no pending dispatch and no non-completed GitHub Actions runs on that fork. A pre-existing fork is **never deleted**. The deletion intent is checkpointed before the GitHub DELETE. Missing delete permissions are recorded as `BLOCKED_PERMISSION`; uncertain responses are reconciled without blindly sending another DELETE. Active runs postpone cleanup and remain visible in `cleanup_status`.
@@ -619,7 +673,7 @@ Once a candidate repository's runs are finalized and raw GitHub run/job evidence
 
 `--check-config` performs no GitHub writes. The `--watch` option is for actual experiments after repository selection, credentials, dependencies and study eligibility are reviewed. **Do not use held-out evaluation rows as a development smoke test.** The implementation has mock-based verification, not a confirmed live fork-execution-and-deletion test. Keep existing `scripts/`, RAG data and README files unchanged.
 
-### Phase 3 local, remote, retrieval, and synthetic smoke verification
+### RAG integration verification (local, remote, retrieval, synthetic smoke)
 
 Run these modes **in order**. `local` verifies the frozen on-disk hash with no
 network access. `remote` reads and audits the existing Supabase index without
@@ -640,27 +694,27 @@ follow the CPU/CUDA setup instructions in Section 3.
 **Windows PowerShell**
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest discover -s tests -p test_phase3_rag.py -v
-.\.venv\Scripts\python.exe -m evaluation.phase3_check --mode local
-.\.venv\Scripts\python.exe -m evaluation.phase3_check --mode remote
-.\.venv\Scripts\python.exe -m evaluation.phase3_check --mode retrieve
-.\.venv\Scripts\python.exe -m evaluation.phase3_check --mode smoke
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p test_rag_pipeline.py -v
+.\.venv\Scripts\python.exe -m evaluation.rag_verification --mode local
+.\.venv\Scripts\python.exe -m evaluation.rag_verification --mode remote
+.\.venv\Scripts\python.exe -m evaluation.rag_verification --mode retrieve
+.\.venv\Scripts\python.exe -m evaluation.rag_verification --mode smoke
 ```
 
 **Linux Bash**
 
 ```bash
-./.venv/bin/python -m unittest discover -s tests -p 'test_phase3_rag.py' -v
-./.venv/bin/python -m evaluation.phase3_check --mode local
-./.venv/bin/python -m evaluation.phase3_check --mode remote
-./.venv/bin/python -m evaluation.phase3_check --mode retrieve
-./.venv/bin/python -m evaluation.phase3_check --mode smoke
+./.venv/bin/python -m unittest discover -s tests -p 'test_rag_pipeline.py' -v
+./.venv/bin/python -m evaluation.rag_verification --mode local
+./.venv/bin/python -m evaluation.rag_verification --mode remote
+./.venv/bin/python -m evaluation.rag_verification --mode retrieve
+./.venv/bin/python -m evaluation.rag_verification --mode smoke
 ```
 
 A successful local preflight is **not** proof that the live Supabase index,
-OpenRouter generation, or Phase 5 GitHub Actions execution works. Preserve all
-Phase 1/2 changes and experimental evidence. On Windows, Git CRLF checkout
-conversion can change the raw SHA256 of the frozen JSONL corpus; preserve its
-committed LF bytes rather than changing the pinned dataset SHA256 or re-ingesting
+OpenRouter generation, or fork-based GitHub Actions execution works. Preserve
+existing implementation and experimental evidence. On Windows, Git CRLF
+checkout conversion can change the frozen JSONL corpus SHA256; preserve its
+committed LF bytes rather than changing the pinned dataset hash or re-ingesting
 it. Confirm `remote`, `retrieve`, and optional `smoke` independently before
-marking Phase 3 live-verified.
+claiming the RAG integration is live-verified.
