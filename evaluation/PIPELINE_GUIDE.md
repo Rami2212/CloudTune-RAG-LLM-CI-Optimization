@@ -778,6 +778,46 @@ Candidate validity is not proof of a runtime speedup; measure it on GitHub.
 Prior validation evidence is immutable: use a **new** `dev-` evaluation ID after
 this policy change, and never reuse a prior trial's saved rejection as PASS.
 
+### Offline A/B/C admission preflight (no research fork)
+
+For a complete development-only A/B/C comparison, first run the existing local
+fork controller with `--preflight`. It performs **read-only GitHub screening**,
+freezes A, generates B using pinned source-corrected ci-cost, generates C using
+the frozen Supabase/BGE-M3 index and free OpenRouter model, then archives both
+validation outcomes. Supabase and OpenRouter calls can incur quota use; no
+forks, GitHub writes, candidate branches or Actions dispatches occur.
+
+The trial must use a fresh `dev-` evaluation ID and a separately screened,
+non-held-out development repository. On completion, inspect `fork_report.json`,
+the exact B/C `change.patch` files and immutable `validation.json` artifacts.
+`PREFLIGHT_READY` means both B and C received **PASS** under the common gate,
+not that either has completed CI or saved time. `PREFLIGHT_BLOCKED` indicates
+one or both optimized arms were rejected, required review, or abstained;
+exit status 2 is expected, and **no fork is created**. Do not manually modify
+generated YAML, relax policy to force PASS, or retroactively validate an old ID.
+
+After **independent review** of the eligible source, B/C diffs, GitHub token,
+remaining Actions minutes and fork cleanup policy, use the **same frozen ID**
+with `--watch --require-all-arms`. The latter flag also prevents a new fork
+when either optimized arm is not admitted. Without this flag, the existing
+controller still permits scientifically labeled incomplete/baseline-only runs.
+
+**PowerShell (run from the repository root):**
+
+```powershell
+.\.venv\Scripts\python.exe -m evaluation.fork_pipeline --config evaluation/results/development_smoke.json --preflight
+# ONLY after both B and C PASS and fork/budget safety is reviewed:
+.\.venv\Scripts\python.exe -m evaluation.fork_pipeline --config evaluation/results/development_smoke.json --watch --require-all-arms
+```
+
+**Linux Bash (run from the repository root):**
+
+```bash
+./.venv/bin/python -m evaluation.fork_pipeline --config evaluation/results/development_smoke.json --preflight
+# ONLY after both B and C PASS and fork/budget safety is reviewed:
+./.venv/bin/python -m evaluation.fork_pipeline --config evaluation/results/development_smoke.json --watch --require-all-arms
+```
+
 ### Development-only fork execution smoke (no held-out repository)
 
 The A/B/C fork controller now supports a separately labeled, bounded development

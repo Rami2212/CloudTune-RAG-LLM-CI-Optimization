@@ -367,6 +367,27 @@ def _ensure_preparation(config: dict, state: dict, store: StateStore, token: str
     return output
 
 
+def _hold_for_preflight(repo: dict, candidates: dict, *, preflight_only: bool,
+                        require_all_arms: bool) -> bool:
+    """Archive the admission outcome before allowing any research-fork writes.
+
+    The preflight never provisions a fork, even when B/C both pass. A later
+    hosted run with the same frozen ID reuses the exact candidate artifacts.
+    A complete three-arm study must not silently degrade to baseline-only CI.
+    """
+    if not (preflight_only or require_all_arms):
+        return False
+    missing = [arm for arm in ("B", "C") if arm not in candidates]
+    repo["admitted_arms"] = list(candidates)
+    repo["status"] = "PREFLIGHT_BLOCKED" if missing else "PREFLIGHT_READY"
+    repo["failure_reason"] = (
+        "Optimized arms not admitted: " + ", ".join(
+            f"{arm}={repo.get('validation', {}).get(arm, {}).get('verdict', 'UNKNOWN')}"
+            for arm in missing)
+        if missing else None)
+    return preflight_only or bool(missing)
+
+
 def _save_report(output: Path, state: dict) -> dict:
     summaries = {}
     for repo_id, record in state.get("repositories", {}).items():
@@ -379,6 +400,7 @@ def _save_report(output: Path, state: dict) -> dict:
         summaries[repo_id] = {"status": record.get("status", "UNKNOWN"),
                               "candidates": record.get("candidates", {}),
                               "validation": record.get("validation", {}),
+                              "admitted_arms": record.get("admitted_arms", []),
                               "run_statistics": results,
                               "run_records": record.get("records", []),
                               "failure_reason": record.get("failure_reason"),
@@ -407,7 +429,9 @@ def _save_report(output: Path, state: dict) -> dict:
     return report
 
 
-def run_fork_evaluation(config: dict, *, resume_only: bool = False) -> dict:
+def run_fork_evaluation(config: dict, *, resume_only: bool = False,
+                        preflight_only: bool = False,
+                        require_all_arms: bool = False) -> dict:
     # GitHub credentials authorize research-owned forks only. This process does
     # not modify CloudTune's GitHub repository or execute target build scripts.
     # Validate before any GitHub writes; reject ambiguous deletion preferences.
@@ -451,6 +475,9 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False) -> dict:
         state["repositories"].setdefault(repo_id, {"status": "SELECTED", "candidates": {},
                                                    "validation": {}, "records": [], "pending": None})
         repo = state["repositories"][repo_id]
+        if preflight_only and (repo.get("fork_repo") or repo.get("pending") or
+                               repo.get("records") or repo.get("measurements_finalized")):
+            raise ValueError("Cannot preflight a trial with hosted execution state; use a new dev- ID")
         noncomparable = [record for record in repo.get("records", [])
                          if record.get("comparable") is False]
         if noncomparable:
@@ -472,7 +499,8 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False) -> dict:
                 experiment.cleanup_fork(repo, lambda: store.save(state, snapshots={repo_id: snapshot}))
             continue
         if row["status"] not in {"prepared", "needs_harness"}:
-            repo.update(status="SKIPPED", failure_reason=row["status"])
+            repo.update(status="PREFLIGHT_BLOCKED" if (preflight_only or require_all_arms)
+                        else "SKIPPED", failure_reason=row["status"])
             log_progress("REPO", f"{repo_id}: skipped by eligibility screening: {row['status']}")
             store.save(state)
             continue
@@ -555,6 +583,11 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False) -> dict:
                 log_progress("VALIDATION", f"{repo_id}: arm {arm} verdict={verdict['verdict']}")
                 if verdict["verdict"] == "PASS" and data is not None:
                     candidates[arm] = data
+            if _hold_for_preflight(repo, candidates, preflight_only=preflight_only,
+                                   require_all_arms=require_all_arms):
+                save()  # Archive every verdict without creating any fork/arm.
+                log_progress("PREFLIGHT", f"{repo_id}: {repo['status']}; admitted={','.join(candidates)}")
+                continue
             log_progress("REPO", f"{repo_id}: admitted arms={','.join(candidates)}; preparing research fork")
             experiment.provision(repo, save)
             experiment.prepare(repo, save)
@@ -644,6 +677,10 @@ def main() -> int:
     parser.add_argument("--rerun", action="store_true",
                         help="Run completed cases in a preserved generation (-r2/-r3/...)")
     parser.add_argument("--check-config", action="store_true")
+    parser.add_argument("--preflight", action="store_true",
+                        help="Screen, generate and validate A/B/C without creating a fork or dispatching CI")
+    parser.add_argument("--require-all-arms", action="store_true",
+                        help="Block hosted fork creation unless B and C both pass admission")
     parser.add_argument("--resume-only", action="store_true",
                         help="Continue only a previously started evaluation")
     parser.add_argument("--watch", action="store_true",
@@ -652,6 +689,8 @@ def main() -> int:
                         help="Seconds between long-queue resume cycles (default 120)")
     args = parser.parse_args()
     try:
+        if args.preflight and (args.watch or args.resume_only or args.rerun):
+            raise ValueError("--preflight cannot be combined with --watch, --resume-only or --rerun")
         config = configure_batch(_config(args.config), start_at=args.start_at,
                                  stop_at=args.stop_at, limit=args.limit,
                                  batch_id=args.batch_id)
@@ -682,11 +721,17 @@ def main() -> int:
         load_env(ROOT / ".env")
         with exclusive_controller(config["evaluation_id"]):
             while True:
-                report = run_fork_evaluation(config, resume_only=args.resume_only)
+                report = run_fork_evaluation(config, resume_only=args.resume_only,
+                    preflight_only=args.preflight, require_all_arms=args.require_all_arms)
                 status = {k: v["status"] for k, v in report["repositories"].items()}
                 cleanup = {k: v.get("cleanup_status") for k, v in report["repositories"].items()}
                 print(json.dumps({"evaluation_id": report["evaluation_id"],
                                   "repositories": status, "fork_cleanup": cleanup}, indent=2), flush=True)
+                if (args.preflight or args.require_all_arms) and any(
+                        value == "PREFLIGHT_BLOCKED" for value in status.values()):
+                    print("A/B/C admission blocked; no fork created for blocked repositories.",
+                          file=sys.stderr, flush=True)
+                    return 2
                 active = {"SELECTED", "WAITING_FOR_GITHUB_RUN", "READY_FOR_NEXT_CONTROLLER_RUN"}
                 needs_cleanup = any(row.get("cleanup_status") in {
                                     "WAITING_FOR_OTHER_RUNS", "DELETE_OUTCOME_UNKNOWN"}
