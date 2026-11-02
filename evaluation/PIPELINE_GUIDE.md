@@ -673,6 +673,57 @@ Once a candidate repository's runs are finalized and raw GitHub run/job evidence
 
 `--check-config` performs no GitHub writes. The `--watch` option is for actual experiments after repository selection, credentials, dependencies and study eligibility are reviewed. **Do not use held-out evaluation rows as a development smoke test.** The implementation has mock-based verification, not a confirmed live fork-execution-and-deletion test. Keep existing `scripts/`, RAG data and README files unchanged.
 
+### Development-only fork execution smoke (no held-out repository)
+
+The A/B/C fork controller now supports a separately labeled, bounded development
+smoke. This is **not** an evaluation outcome and must not use a held-out
+repository, a pre-existing fork, or a repository with deployment/publishing
+workflows. Its cleanup pins the fork's immutable numeric GitHub repository ID,
+not merely its name, before any DELETE. A missing or mismatched ID prevents
+automatic deletion and requires manual review. GitHub Actions run evidence is
+still archived before cleanup, and uncertain DELETE responses are never retried
+blindly.
+
+1. Pick **one** development repository that is absent from the held-out 4,000
+   repositories and the excluded training/batch case list. Review the workflow's
+   runner, permissions, job commands and expected spending first. It must be safe
+   for a research-owned fork. The preparation screen rejects excluded repositories.
+2. In `evaluation/results/development_repositories.csv` (ignored by Git), write
+   exactly `repo_id,split` on the first line and `OWNER/REPO,development` on the
+   second line, substituting an authorized public development repository.
+3. Copy `evaluation/configs/development_smoke.example.json` to
+   `evaluation/results/development_smoke.json` (ignored by Git). Use a **new** `dev-` prefixed
+   `evaluation_id` for each independent trial. Keep `repository_limit: 1` and
+   `repetitions: 1`; never change an existing evaluation's frozen config.
+4. Run offline tests and `--check-config` first. For a real dispatch, use a
+   dedicated authorized GitHub token and reviewed Supabase/OpenRouter credentials
+   in the ignored `.env`. **Only the explicit non-check command below writes to
+   GitHub.** It creates and deletes a research-owned candidate fork.
+
+**Windows PowerShell**
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe -m evaluation.fork_pipeline --config evaluation/results/development_smoke.json --check-config
+# Only after verifying repository selection, credentials, and deletion permissions:
+.\.venv\Scripts\python.exe -m evaluation.fork_pipeline --config evaluation/results/development_smoke.json --watch
+```
+
+**Linux Bash**
+
+```bash
+./.venv/bin/python -m unittest discover -s tests -v
+./.venv/bin/python -m evaluation.fork_pipeline --config evaluation/results/development_smoke.json --check-config
+# Only after verifying repository selection, credentials, and deletion permissions:
+./.venv/bin/python -m evaluation.fork_pipeline --config evaluation/results/development_smoke.json --watch
+```
+
+Do not run the last command until the research token's fork-creation,
+Actions-dispatch, and deletion rights have been reviewed. This development
+smoke can legitimately produce only A if B/C abstain or fail validation; record
+that result without claiming a complete A/B/C speedup. A completed mocked test
+suite alone does not establish live GitHub run or deletion correctness.
+
 ### RAG integration verification (local, remote, retrieval, synthetic smoke)
 
 Run these modes **in order**. `local` verifies the frozen on-disk hash with no

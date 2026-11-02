@@ -175,6 +175,9 @@ def _config(path: Path) -> dict:
         raise ValueError("Evaluation repository_limit must be 1..100; partition larger cohorts")
     if not 1 <= config.get("repetitions", 0) <= 5:
         raise ValueError("Fork repetitions must be 1..5")
+    if config.get("execution", {}).get("development_smoke") is True:
+        if config["repository_limit"] != 1 or config["repetitions"] != 1:
+            raise ValueError("Development smoke is limited to one repository and one repetition per arm")
     if config.get("execution", {}).get("cache_regime") != "uncontrolled":
         raise ValueError("This protocol only supports explicitly reported uncontrolled caches")
     if config.get("warmup_runs") != 0:
@@ -505,7 +508,8 @@ def main() -> int:
                 if not args.watch or not (any(value in active for value in status.values()) or needs_cleanup):
                     unresolved = {k: v for k, v in cleanup.items()
                                   if v in {"BLOCKED_PERMISSION", "DELETE_OUTCOME_UNKNOWN",
-                                           "WAITING_FOR_OTHER_RUNS", "PRESERVED_NOT_OWNED"}}
+                                           "WAITING_FOR_OTHER_RUNS", "PRESERVED_NOT_OWNED",
+                                           "PRESERVED_UNVERIFIED_ID"}}
                     if unresolved:
                         print("Fork cleanup is not complete: " + json.dumps(unresolved),
                               file=sys.stderr, flush=True)

@@ -41,9 +41,18 @@ def load_config(path: Path, *, allow_hosted: bool = False) -> dict:
         raise ValueError("repository_limit must be between 1 and 100")
     if not isinstance(config.get("repository_start_at", 1), int) or config.get("repository_start_at", 1) < 1:
         raise ValueError("repository_start_at must be a positive integer")
+    if config.get("execution", {}).get("development_smoke") is True and not allow_hosted:
+        raise ValueError("Development smoke requires fork controller")
     if config.get("execution", {}).get("dry_run") is not True and not allow_hosted:
         raise ValueError("Preparation and local candidate generation require execution.dry_run=true")
-    if config.get("dataset_split", "evaluation") != "evaluation":
+    development_smoke = config.get("execution", {}).get("development_smoke") is True
+    if development_smoke:
+        # A development-only smoke uses separate, labeled repositories.
+        # It must never be accepted by the read-only preparation CLI.
+        if (not allow_hosted or config.get("dataset_split") != "development" or
+                not evaluation_id.startswith("dev-")):
+            raise ValueError("Development smoke requires fork controller, development split and dev- evaluation ID")
+    elif config.get("dataset_split", "evaluation") != "evaluation":
         raise ValueError("Evaluation requires the held-out evaluation dataset")
     return config
 
@@ -52,7 +61,9 @@ def prepare(config: dict, *, reader: GitHubReader | None = None, project_root: P
     """Screen a fixed set of source rows, retain outcomes, and create A snapshots."""
     dataset = project_root / config["dataset"]
     training = project_root / "research-data/zenodo_20340547/pattern_repo_candidates_20.csv"
-    rows = read_evaluation_rows(dataset)
+    development_smoke = config.get("execution", {}).get("development_smoke") is True
+    dataset_split = "development" if development_smoke else "evaluation"
+    rows = read_evaluation_rows(dataset, expected_split=dataset_split)
     start_at = config.get("repository_start_at", 1)
     selected = rows[start_at - 1:start_at - 1 + config["repository_limit"]]
     if not selected:
@@ -62,6 +73,10 @@ def prepare(config: dict, *, reader: GitHubReader | None = None, project_root: P
         training,
         (project_root / "research-data/experiments", project_root / "research-data/scenario-experiments"),
     )
+    if development_smoke:
+        # Fail closed on the entire held-out cohort, including case-insensitive IDs.
+        held_out = project_root / "evaluation/evaluation_repositories_4000.csv"
+        exclusions.update(row["repo_id"].casefold() for row in read_evaluation_rows(held_out))
     output = project_root / "evaluation/results" / config["evaluation_id"]
     output.mkdir(parents=True, exist_ok=True)
     write_json_immutable(output / "config.json", config)
@@ -126,7 +141,8 @@ def generate_b(config: dict, *, project_root: Path = ROOT,
 
     with screening.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
-    selected = read_evaluation_rows(project_root / config["dataset"])
+    split = "development" if config.get("execution", {}).get("development_smoke") is True else "evaluation"
+    selected = read_evaluation_rows(project_root / config["dataset"], expected_split=split)
     start = config.get("repository_start_at", 1) - 1
     expected_ids = [row["repo_id"] for row in selected[start:start + config["repository_limit"]]]
     if [row["repo_id"] for row in rows] != expected_ids:

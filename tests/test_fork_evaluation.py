@@ -145,7 +145,7 @@ class HostedProtocolTests(unittest.TestCase):
 
     def _cleanup_state(self):
         return {"fork_repo": "research/test", "fork_owner": "research",
-                "fork_creation_intent": "research/test",
+                "fork_creation_intent": "research/test", "fork_id": 4242,
                 "fork_created_by_evaluation": True,
                 "measurements_finalized": True, "pending": None,
                 "records": [{"arm": "A", "run_id": 901}]}
@@ -169,7 +169,7 @@ class HostedProtocolTests(unittest.TestCase):
             def request(self, method, path, body=None):
                 events.append((method, path))
                 if method == "GET":
-                    return {"owner": {"login": "research"}, "fork": True,
+                    return {"id": 4242, "owner": {"login": "research"}, "fork": True,
                             "permissions": {"push": True},
                             "source": {"full_name": "source/test"}}
                 if method == "DELETE":
@@ -212,7 +212,7 @@ class HostedProtocolTests(unittest.TestCase):
         class Fake:
             def request(self, method, path, body=None):
                 assert method == "GET"
-                return {"owner": {"login": "research"}, "fork": True,
+                return {"id": 4242, "owner": {"login": "research"}, "fork": True,
                         "permissions": {"push": True},
                         "source": {"full_name": "source/test"}}
             def all(self, path, key):
@@ -231,7 +231,7 @@ class HostedProtocolTests(unittest.TestCase):
                 methods.append(method)
                 if method == "DELETE":
                     raise RuntimeError("GitHub DELETE response uncertain")
-                return {"owner": {"login": "research"}, "fork": True,
+                return {"id": 4242, "owner": {"login": "research"}, "fork": True,
                         "permissions": {"push": True},
                         "source": {"full_name": "source/test"}}
             def all(self, path, key): return []
@@ -261,7 +261,7 @@ class HostedProtocolTests(unittest.TestCase):
         class Fake:
             def request(self, method, path, body=None):
                 if method == "DELETE": raise GitHubError(403, path)
-                return {"owner": {"login": "research"}, "fork": True,
+                return {"id": 4242, "owner": {"login": "research"}, "fork": True,
                         "permissions": {"push": True},
                         "source": {"full_name": "source/test"}}
             def all(self, path, key): return []

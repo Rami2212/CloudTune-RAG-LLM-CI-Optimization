@@ -156,7 +156,9 @@ def job_timing_metrics(records: list[dict]) -> dict:
             "idle_gap_seconds": max(0.0, makespan-active)}
 
 
-def verify_fork(fork: dict, upstream_repo: str, owner: str) -> None:
+def verify_fork(fork: dict, upstream_repo: str, owner: str,
+                *, expected_id: int | None = None) -> None:
+    """Verify source and owner, plus the immutable repository ID when pinned."""
     if fork.get("owner", {}).get("login", "").lower() != owner.lower():
         raise ValueError("Experimental fork owner is not the authorized account")
     if not fork.get("fork") or not fork.get("permissions", {}).get("push"):
@@ -166,6 +168,11 @@ def verify_fork(fork: dict, upstream_repo: str, owner: str) -> None:
         raise ValueError("Fork belongs to a different source family")
     if fork.get("archived") or fork.get("disabled"):
         raise ValueError("Experimental fork is archived or disabled")
+    # A fork can be deleted and recreated with the same owner/name/source.
+    # The numeric GitHub repository ID prevents adopting or deleting its replacement.
+    if expected_id is not None and (type(fork.get("id")) is not int or
+                                    fork["id"] != expected_id):
+        raise ValueError("Fork repository ID changed; refuse unsafe reuse or deletion")
 
 
 def _branch_slug(evaluation_id: str, repo_id: str) -> str:
@@ -193,8 +200,11 @@ class ForkExperiment:
     def provision(self, state: dict, save) -> None:
         """Create only research-owned forks; refuse pre-existing untracked ones."""
         if state.get("fork_repo"):
+            if type(state.get("fork_id")) is not int or state["fork_id"] <= 0:
+                raise ValueError("Pinned fork repository ID missing; do not reuse fork")
             fork = self.gh.request("GET", "/repos/" + state["fork_repo"])
-            verify_fork(fork, self.upstream, state["fork_owner"])
+            verify_fork(fork, self.upstream, state["fork_owner"],
+                        expected_id=state["fork_id"])
             return
         owner = self.gh.request("GET", "/user")["login"]
         expected = owner + "/" + self.upstream.split("/", 1)[1]
@@ -212,7 +222,9 @@ class ForkExperiment:
                 raise ValueError(
                     f"Existing fork {existing['full_name']} is not proven to be "
                     "created by this evaluation; preserve it for manual review")
-            verify_fork(existing, self.upstream, owner)
+            if type(state.get("fork_id")) is not int or state["fork_id"] <= 0:
+                raise ValueError("Pinned fork repository ID missing; preserve existing fork")
+            verify_fork(existing, self.upstream, owner, expected_id=state["fork_id"])
             state.update(fork_repo=existing["full_name"], fork_owner=owner)
             save()
             return
@@ -221,13 +233,21 @@ class ForkExperiment:
         # A lost response is deliberately NOT automatically retried. A rerun
         # checks existing fork identity and requires explicit recovery approval.
         created = self.gh.request("POST", "/repos/" + self.upstream + "/forks", {})
-        fork_id = created["full_name"]
-        state.update(fork_repo=fork_id, fork_owner=owner, fork_created_by_evaluation=True)
+        fork_name = created["full_name"]
+        if fork_name.casefold() != expected.casefold():
+            # GitHub may return a previously existing differently named fork.
+            # A 202 response alone does not grant deletion ownership.
+            raise ValueError("Fork creation returned unexpected name; preserve existing repository")
+        numeric_id = created.get("id")
+        if type(numeric_id) is not int or numeric_id <= 0:
+            raise ValueError("GitHub fork response lacks a numeric repository ID; manual recovery required")
+        state.update(fork_repo=fork_name, fork_owner=owner, fork_id=numeric_id,
+                     fork_created_by_evaluation=True)
         save()
         for _ in range(40):
             try:
-                fork = self.gh.request("GET", "/repos/" + fork_id)
-                verify_fork(fork, self.upstream, owner)
+                fork = self.gh.request("GET", "/repos/" + fork_name)
+                verify_fork(fork, self.upstream, owner, expected_id=numeric_id)
                 return
             except GitHubError as exc:
                 if exc.code != 404:
@@ -574,6 +594,11 @@ class ForkExperiment:
             state["cleanup_status"] = "PRESERVED_NOT_OWNED"
             save()
             return "PRESERVED_NOT_OWNED"
+        if type(state.get("fork_id")) is not int or state["fork_id"] <= 0:
+            # Older/partial state has no immutable fork identity. Refuse DELETE.
+            state["cleanup_status"] = "PRESERVED_UNVERIFIED_ID"
+            save()
+            return "PRESERVED_UNVERIFIED_ID"
 
         try:
             fork = self.gh.request("GET", "/repos/" + fork_name)
@@ -583,7 +608,7 @@ class ForkExperiment:
                 save()
                 return "DELETED"
             raise
-        verify_fork(fork, self.upstream, owner)
+        verify_fork(fork, self.upstream, owner, expected_id=state["fork_id"])
         if not state.get("cleanup_intent"):
             # Fail closed if ANY workflow is still queued, waiting, requested,
             # pending, or running, including workflows unrelated to the target.
