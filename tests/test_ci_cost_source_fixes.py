@@ -16,7 +16,8 @@ from unittest.mock import patch
 
 from evaluation.repository_preparation import workflow_doc
 from evaluation.candidate_validator import validate_candidate, _cache_evidence
-from evaluation.optimizers.ci_cost import generate_ci_cost_candidate
+from evaluation.fork_pipeline import DEFAULT_CI_COST_DIR
+from evaluation.optimizers.ci_cost import DEFAULT_TOOL_DIR, generate_ci_cost_candidate
 from hashlib import sha256
 from evaluation.third_party.ci_cost import setup
 from evaluation.third_party.ci_cost.source_fixes import (
@@ -67,6 +68,13 @@ class SourceFixTests(unittest.TestCase):
                     self.assertNotIn(old.encode("utf-8"), fixed[name])
         self.assertEqual(len(fix_identity()), 64)
         self.assertEqual(FIX_REVISION, "cloudtune-ci-cost-npm-download-v4-compatibility")
+
+    def test_ci_cost_installer_optimizer_and_controller_share_default_directory(self):
+        # Fresh clones must not install multiple independently named copies.
+        self.assertEqual(DEFAULT_CI_COST_DIR, setup.DEFAULT_DIR)
+        self.assertEqual(DEFAULT_TOOL_DIR, setup.DEFAULT_DIR)
+        if not os.environ.get("CI_COST_DIR"):
+            self.assertEqual(setup.DEFAULT_DIR.name, "ci-cost")
 
     def test_unknown_upstream_source_fails_closed(self):
         (self.root / "src/optimizer.ts").write_text("different version", encoding="utf-8")

@@ -5,6 +5,42 @@ not the separate RAG training-pattern batch. Run development-only smoke tests
 before freezing the held-out study. Do not use held-out outcomes to tune the
 optimizer, choose repositories, or relax the validator.
 
+## Fresh-clone reproducibility for every team member
+
+Each member can reproduce the installation and evaluator from a **separate
+Windows workstation**, using the same pinned CloudTune Git commit and the
+same 4,000-row source/assignment hashes. New machines need no pre-existing
+CI-Cost installation or trial results. Git, Python 3.11+, Node.js 20+ with npm,
+and `actionlint.exe` on PATH are required; install the Windows release of
+actionlint from https://github.com/rhysd/actionlint/releases if it is missing.
+
+```powershell
+git clone --branch feature/evaluation-pipeline https://github.com/Rami2212/CloudTune-RAG-LLM-CI-Optimization.git
+Set-Location .\CloudTune-RAG-LLM-CI-Optimization
+git rev-parse HEAD
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements-rag.txt
+Copy-Item .env.example .env
+.\.venv\Scripts\python.exe -m scripts.prepare_evaluation_workspace
+```
+
+Each person fills in **their own** GitHub/OpenRouter credentials privately in
+`.env`; use authorized access to the **same frozen, populated Supabase corpus**
+without retraining or modifying it. Never commit or send `.env`, tokens, or raw
+provider responses to teammates. Agree on the same free model and token ceiling
+before collecting comparable measurements. Select one `--member` from 1–4 and
+verify `evaluation/assignments/manifest.json` is identical across clones.
+The remainder of this guide contains the setup verification and run commands.
+
+The main 4,000-row cohort has **one assignment per member**. Independent
+repetitions of an already evaluated repository are separate experiments: give
+them fresh, explicit `--batch-id` values and report them separately, **not** as
+additional rows in the primary four-member merge. To restart an _interrupted_
+experiment, however, always reuse its existing batch ID and raw checkpoints.
+Resetting results is appropriate only when previous trials are abandoned or
+completely settled; see [results reset](results/README.md#intentional-fresh-reset-all-platforms).
+
 ## 1. Fixed and reproducible assignments
 
 | Member | Dataset                                | Source rows | Default batch ID |
@@ -50,11 +86,19 @@ repositories. Only GitHub Actions on research-owned candidate forks executes
 target CI. Ensure compiled CI-Cost tests actually execute, rather than skip:
 
 ```powershell
-$env:CI_COST_DIR = (Join-Path (Get-Location).Path 'evaluation/results/.tools/ci-cost-npm-download-v4')
-.\.venv\Scripts\python.exe -m evaluation.third_party.ci_cost.setup --tool-dir $env:CI_COST_DIR
-.\.venv\Scripts\python.exe -m evaluation.third_party.ci_cost.setup --verify --tool-dir $env:CI_COST_DIR
+# Remove any old per-session override pointing at a version-suffixed directory.
+Remove-Item Env:CI_COST_DIR -ErrorAction SilentlyContinue
+.\.venv\Scripts\python.exe -m evaluation.third_party.ci_cost.setup
+.\.venv\Scripts\python.exe -m evaluation.third_party.ci_cost.setup --verify
 .\.venv\Scripts\python.exe -m unittest discover -s tests -p test_ci_cost_source_fixes.py -v
 ```
+
+CI-Cost is installed to `.venv/ci-cost` on **each machine**, not into results.
+This optional explicit setup verifies the compiled-tool tests without skips;
+normal preflight also installs the tool automatically when first needed.
+Keep the `source_fix_revision` recorded in evaluation JSON unchanged: it is the
+versioned research method, not a local directory name. If `.env` contains an
+old `CI_COST_DIR` setting, remove it or point it at the same location.
 
 Keep your existing `.env`; if it does not exist, create a private one:
 

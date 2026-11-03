@@ -802,22 +802,24 @@ Candidate validity is not proof of a runtime speedup; measure it on GitHub.
 Prior validation evidence is immutable: use a **new** `dev-` evaluation ID after
 this policy change, and never reuse a prior trial's saved rejection as PASS.
 
-CI-Cost source-fix v2 additionally recognizes unnamed `- run: npm ci` install
-steps when inserting its existing cache proposal. It preserves the upstream
-cache mechanism; `node_modules` caches and broad restore keys still require
-review. Install v2 in a fresh tool directory with
-`python -m evaluation.third_party.ci_cost.setup --tool-dir evaluation/results/.tools/ci-cost-v2`
-and set `CI_COST_DIR` to that absolute directory before running a new trial.
-Existing v1 installations and archived trial outputs must remain intact.
+Historical CI-Cost source-fix v2 recognized unnamed `- run: npm ci` steps
+but retained upstream installed-artifact caching, which required manual review.
+Its version-specific checkout directories must not be used for new evaluation
+trials. Existing v1/v2 installations and archived evidence are historical
+records and should not be rewritten during an active experiment.
 
 The current `cloudtune-ci-cost-npm-download-v4-compatibility` baseline replaces the npm
 installed-artifact proposal with `cache: npm` on an existing reviewed setup-node
 step in the affected job. It preserves commands and action references and
 leaves unsupported setup-node refs unchanged. Admission still requires frozen
 root lockfile evidence. This is an explicitly adapted baseline, not unmodified
-upstream CI-Cost. Install it into `evaluation/results/.tools/ci-cost-npm-download-v4` and set
-`CI_COST_DIR` to that absolute path. The fork controller defaults to this v4
-directory. Use a fresh trial ID and the updated source_fix_revision.
+upstream CI-Cost. The installer, optimizer and fork controller share the
+stable local checkout `.venv/ci-cost`, outside the results folder. `CI_COST_DIR`
+remains an optional override; leave it unset for normal runs. When Arm B first
+needs a missing checkout, the controller downloads the pinned source, applies
+reviewed fixes, compiles and verifies the tool. An incomplete or stale checkout
+fails closed; delete that checkout only for an intentional reinstall.
+Keep `source_fix_revision` unchanged for research provenance and use new trial IDs.
 
 ### Offline A/B/C admission preflight (no research fork)
 

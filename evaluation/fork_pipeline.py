@@ -21,7 +21,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from scripts.experiment_environment import load_env
-from evaluation.third_party.ci_cost.setup import install as install_ci_cost
+from evaluation.third_party.ci_cost.setup import (
+    DEFAULT_DIR as DEFAULT_CI_COST_DIR, install as install_ci_cost,
+)
 
 from evaluation.candidate_validator import validate_and_archive
 from evaluation.ci_executor import (
@@ -537,8 +539,9 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False,
                 try:
                     # Local candidate generation only; the target's CI still
                     # runs exclusively on GitHub Actions in its research fork.
-                    tool_dir = Path(os.environ.get("CI_COST_DIR", str(
-                        ROOT / "evaluation/results/.tools/ci-cost-npm-download-v4"))).resolve()
+                    # Share the installer/optimizer's stable, unversioned tool path.
+                    # Source-fix revisions remain versioned for scientific provenance.
+                    tool_dir = Path(os.environ.get("CI_COST_DIR", str(DEFAULT_CI_COST_DIR))).resolve()
                     log_progress("OPTIMIZER", f"{repo_id}: preparing CI-Cost optimizer")
                     install_ci_cost(tool_dir)
                     b = generate_ci_cost_candidate(snapshot, version=version, tool_dir=tool_dir)
