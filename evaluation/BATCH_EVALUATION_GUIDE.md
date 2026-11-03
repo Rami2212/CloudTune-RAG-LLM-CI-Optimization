@@ -7,6 +7,18 @@ optimizer, choose repositories, or relax the validator.
 
 ## Fresh-clone reproducibility for every team member
 
+Protocol v3 admits an optimizer's `NO_CHANGE` outcome as an unchanged arm only
+when the original workflow passes baseline syntax and safety validation. The
+arm runs the original bytes and remains labeled `NO_CHANGE`, with
+`descriptive_zero_change` in its statistics. This is not evidence that an
+optimization was applied. Generated candidates still require `PASS`; failed or
+review-required candidates never fall back to the original automatically.
+
+Use a new batch ID after upgrading from v2; its immutable checkpoints cannot
+be resumed under v3. Keep v2 and v3 results separate. Validation console output
+now includes admission and rejection reasons. Preflight itself creates no forks
+and dispatches no hosted workflows.
+
 Each member can reproduce the installation and evaluator from a **separate
 Windows workstation**, using the same pinned CloudTune Git commit and the
 same 4,000-row source/assignment hashes. New machines need no pre-existing

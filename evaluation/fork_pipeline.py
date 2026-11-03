@@ -25,7 +25,7 @@ from evaluation.third_party.ci_cost.setup import (
     DEFAULT_DIR as DEFAULT_CI_COST_DIR, install as install_ci_cost,
 )
 
-from evaluation.candidate_validator import validate_and_archive
+from evaluation.candidate_validator import validate_and_archive, validate_baseline
 from evaluation.ci_executor import (
     ForkExperiment, GitHub, RunPending, automatic_fork_deletion_enabled,
     arm_name, log_progress, summarize_records,
@@ -41,7 +41,7 @@ from evaluation.repository_preparation import (GitHubReader, file_sha256, read_e
 from evaluation.run_pipeline import ROOT, load_config, prepare
 
 
-PROTOCOL = "cloudtune-local-fork-abc-v2"
+PROTOCOL = "cloudtune-local-fork-abc-v3-unchanged-arms"
 
 
 class StateStore:
@@ -373,6 +373,22 @@ def _ensure_preparation(config: dict, state: dict, store: StateStore, token: str
     return output
 
 
+def _admitted_workflow(original: bytes, data: bytes | None, verdict: dict) -> bytes | None:
+    """An abstention measures the unchanged input, never a fabricated optimization.
+
+    Unlike rejected generated changes, unchanged inputs need no cache evidence.
+    They still have to pass the baseline syntax and safety checks.
+    """
+    if verdict["verdict"] == "PASS":
+        return data
+    if verdict["verdict"] == "NO_CHANGE":
+        baseline = validate_baseline(original)
+        verdict["baseline_validation"] = baseline
+        if baseline["verdict"] == "PASS":
+            return original
+    return None
+
+
 def _hold_for_preflight(repo: dict, candidates: dict, *, preflight_only: bool,
                         require_all_arms: bool) -> bool:
     """Archive the admission outcome before allowing any research-fork writes.
@@ -602,9 +618,16 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False,
                                                generation=result)
                 repo["validation"][arm] = verdict
                 save()
-                log_progress("VALIDATION", f"{repo_id}: {arm_name(arm)} verdict={verdict['verdict']}")
-                if verdict["verdict"] == "PASS" and data is not None:
-                    candidates[arm] = data
+                admitted = _admitted_workflow(original, data, verdict)
+                save()  # Include unchanged-arm baseline evidence in the checkpoint.
+                details = verdict.get("reasons", [])
+                baseline = verdict.get("baseline_validation", {})
+                if baseline.get("verdict") == "FAIL":
+                    details = [*details, *baseline.get("reasons", [])]
+                log_progress("VALIDATION", f"{repo_id}: {arm_name(arm)} verdict={verdict['verdict']}; "
+                             f"admitted={admitted is not None}; reasons={', '.join(details) or 'none'}")
+                if admitted is not None:
+                    candidates[arm] = admitted
             repo["admitted_arms"] = list(candidates)
             if _hold_for_preflight(repo, candidates, preflight_only=preflight_only,
                                    require_all_arms=require_all_arms):

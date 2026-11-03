@@ -16,6 +16,31 @@ import evaluation.fork_pipeline as pipeline
 
 
 class PreflightGateTests(unittest.TestCase):
+    def test_unchanged_arm_is_admitted_only_with_valid_baseline(self):
+        verdict = {"verdict": "NO_CHANGE", "reasons": ["OPTIMIZER_ABSTAINED"]}
+        with patch.object(pipeline, "validate_baseline", return_value={"verdict": "PASS"}):
+            data = pipeline._admitted_workflow(b"original", None, verdict)
+        self.assertEqual(data, b"original")
+        self.assertEqual(verdict["verdict"], "NO_CHANGE")
+        repo = {"validation": {"B": verdict, "C": verdict}}
+        self.assertTrue(pipeline._hold_for_preflight(
+            repo, {"A": data, "B": data, "C": data},
+            preflight_only=True, require_all_arms=True))
+        self.assertEqual(repo["status"], "PREFLIGHT_READY")
+
+    def test_unchanged_arm_with_invalid_baseline_remains_blocked(self):
+        verdict = {"verdict": "NO_CHANGE"}
+        with patch.object(pipeline, "validate_baseline", return_value={
+                "verdict": "FAIL", "reasons": ["ACTIONLINT_FAIL"]}):
+            self.assertIsNone(pipeline._admitted_workflow(b"invalid", None, verdict))
+        self.assertEqual(verdict["baseline_validation"]["verdict"], "FAIL")
+
+    def test_rejected_candidate_never_falls_back_to_original(self):
+        for verdict in ("FAIL", "REVIEW_REQUIRED", "INCONCLUSIVE"):
+            with self.subTest(verdict=verdict):
+                self.assertIsNone(pipeline._admitted_workflow(
+                    b"original", b"unsafe", {"verdict": verdict}))
+
     def test_preflight_holds_even_when_all_three_arms_pass(self):
         repo = {"validation": {"B": {"verdict": "PASS"}, "C": {"verdict": "PASS"}}}
         hold = pipeline._hold_for_preflight(

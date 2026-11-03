@@ -26,7 +26,7 @@ def _hash(raw: bytes) -> str:
 
 def generate_rag_candidate(snapshot_dir: Path, *, retriever: Retriever,
                            model: str, top_k: int, max_tokens: int,
-                           prompt_version: str = "cloudtune-eval-rag-v2",
+                           prompt_version: str = "cloudtune-eval-rag-v3-admission-contract",
                            required_job_names: list[str] | None = None) -> dict:
     if not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9_./:-]+:free", model):
         raise ValueError("Pin a specific available OpenRouter :free model for Arm C")
@@ -134,7 +134,14 @@ def generate_rag_candidate(snapshot_dir: Path, *, retriever: Retriever,
                    "workflow_yaml (complete YAML when APPLY, null when NO_CHANGE), rationale, "
                    "and evidence_ids (array). Preserve workflow triggers, permissions, all original "
                    "jobs, matrices, steps and commands. Only make a narrowly scoped, additive, "
-                   "dependency-download caching change where appropriate. Do not introduce privileged "
+                   "dependency-download caching change where appropriate. The admission gate accepts "
+                   "actions/cache@v4 steps with exactly name, uses, and with; with must contain only "
+                   "path and key (no restore-keys). Use a single dependency-download directory, an "
+                   "explicit runner.os expression and hashFiles of a frozen dependency file in the key. "
+                   "Do not cache installed artifacts, change concurrency, upgrade actions, or edit commands. "
+                   "For npm, prefer adding only cache: npm to an existing compatible setup-node step "
+                   "when a root npm lockfile is frozen and checkout precedes setup-node. "
+                   "Return NO_CHANGE when these prerequisites cannot be verified. Do not introduce privileged "
                    "actions, uploads, external commands or new network destinations. Do not fabricate data.")
     prompt = {"prompt_version": prompt_version, "original_workflow": original.decode("utf-8-sig"),
               "repository_context": context,
