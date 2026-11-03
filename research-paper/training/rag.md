@@ -4,13 +4,12 @@
 
 The retrieval dataset is generated from `knowledge/extracted_patterns.jsonl` and experiment records under `research-data/experiments/` and `research-data/scenario-experiments/`.
 
-| Record type | Count | Description |
-| --- | ---: | --- |
-| `pattern` | 25 | Literature-derived CI optimization patterns and their evidence, conditions, and source details. |
-| `experiment_example` | 49 | Experiments marked `pattern_satisfied: true`; inconclusive cases are retained with the `outcome` field omitted. |
-| **Total retrieval-eligible records** | **74** | Every emitted record is approved for retrieval. |
+| Record type |  Count | Description |
+| --- |-------:| --- |
+| `pattern` |     16 | Literature-derived CI optimization patterns and their evidence, conditions, and source details. |
+| `experiment_example` |     49 | Experiments marked `pattern_satisfied: true` |
+| **Total retrieval-eligible records** | **74** | Every record is approved for retrieval. |
 
-Of the 49 examples, 39 are synthetic scenario results: 31 use service-policy replay and 8 use a dedicated fork fixture. The other 10 are main-batch cases whose source outcome was inconclusive; their inconclusive `outcome` field is omitted, while their evidence scope, limitations, and measurements are retained. Synthetic scenarios are not verified speedups on real repositories. Every pattern has at least one example; 24 have two and one has one. The records retain evidence scope, limitations, metrics, and artifacts so retrieved results are not presented as general performance claims.
 
 Dataset snapshot (2026-10-31): `rag_dataset.jsonl` has 74 records (25 patterns + 49 experiment examples), is 2,658,800 bytes, and contains 1,016,341 searchable-text characters (mean 13,734; median 3,036 per record). Pattern text averages 1,423 characters; experiment-example text averages 20,016. Dataset counts describe generated files, not rows currently stored in Supabase.
 
@@ -47,8 +46,7 @@ The nested `pattern` fields in this build are: `pattern_id`, `paper_id`, `title`
   "record_type": "experiment_example",
   "pattern_id": "<pattern_id>",
   "title": "<pattern and outcome title>",
-  "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
-  "evidence_scope": "<measured or synthetic evidence scope>",
+  "evidence_scope": "<evidence scope>",
   "rag_status": "approved_for_rag",
   "retrieval_eligible": true,
   "text": "<searchable experiment summary and file contents>",
@@ -59,8 +57,6 @@ The nested `pattern` fields in this build are: `pattern_id`, `paper_id`, `title`
   "artifacts": {"before": {"sha256": "...", "encoding": "utf-8", "content": "..."}}
 }
 ```
-
-For the 10 source cases with `outcome: "inconclusive"`, the record is retained because `pattern_satisfied` is true, but the inconclusive `outcome` field is omitted from the outer document, nested `experiment`, searchable text, and nested objects. Other outcome values are retained (the current 39 scenario examples use `scenario_passed`).
 
 The nested `experiment` fields in this build are: `case_id`, `record_kind`, `split`, `pattern_id`, `pattern_satisfied`, `rag_admission`, `outcome` (omitted if inconclusive), `evidence_scope`, `arms`, `elapsed_savings_percent`, `realized_optimization_savings_percent`, `min_savings_percent`, `limitations`, `safe_for_repository_use`, `runtime_improved`, `required_status_validated`, `real_repo_optimization_verified`, `direct_speedup_claimed`, `no_change`, `absence_window_seconds`, `required_job_names`, `required_checks_source`, `run_ids`, `before_sha256`, `after_sha256`, `patch_sha256`, `model`, and `review`. `arms` contains `baseline` and `optimized` measurements; exact metrics depend on the experiment. `review` may be empty.
 
@@ -77,11 +73,9 @@ Each optional artifact entry has `sha256`, `encoding`, and `content`. Common art
 - **Input:** only each approved record's `text` field is embedded. The full cleaned record is retained as JSON metadata.
 - **Chunking:** default 1,024 tokenizer tokens per chunk with 128-token overlap; the model supports up to 8,192 tokens. Each chunk is embedded separately.
 - **Revision:** the embed script resolves the model's `main` revision to a fixed Hugging Face commit and stores it, so searches can use the matching revision.
-- **Generation metadata:** `model: nvidia/nemotron-3-ultra-550b-a55b:free` is carried over from the research records. It is not the embedding model and is not called by the embedding/search script.
 
 ## Supabase database
 
-The migration `supabase/migrations/202610310001_cloudtune_rag.sql` defines two tables in the `public` schema:
 
 | Table | Contents |
 | --- | --- |
@@ -111,12 +105,3 @@ From the repository root in PowerShell:
 The first embedding run downloads the local BGE-M3 model weights. Ingestion skips unchanged records; changed records and their chunks are replaced atomically. Records missing from a later dataset are not automatically deleted. Search returns evidence chunks and cosine-similarity scores; an answer-generation model must consume those results separately.
 
 See `RUN_RAG_COMMANDS.md` for setup options, CPU/GPU flags, and connection checks.
-
-## Populate Supabase from Google Colab
-
-Before running Colab, apply the SQL migration in Supabase SQL Editor and add `SUPABASE_URL` and `SUPABASE_SECRET_KEY` under Google Colab → Secrets. Upload these two files to the Colab session:
-
-- `scripts/colab_populate_rag.py`
-- `research-data/rag/rag_dataset.jsonl`
-
-Then run `%pip install -q sentence-transformers` and `%run /content/colab_populate_rag.py`. The script embeds locally with BGE-M3, skips unchanged records, and uploads chunks through the Supabase RPC. It does not create tables or delete records missing from the dataset.
