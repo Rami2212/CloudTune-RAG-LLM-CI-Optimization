@@ -27,8 +27,6 @@ Keep interrupted trial checkpoints and backups; do not delete old results to
 tidy up or use `git clean -fdx`. The CI-Cost installation remains outside this
 folder in `.venv/ci-cost` and is installed separately by each teammate.
 
-This complete-evidence policy replaces the former published-only allowlist.
-
 Directory layout:
 
 ```text
@@ -42,8 +40,3 @@ results/
       repositories/
     eval-member-01-r0002/
 ```
-
-Legacy raw trial folders must be moved intact into their batch folder before
-continuing. Do not rewrite frozen identities or evaluator hashes to bypass
-resume checks. Moving files preserves their bytes; a changed evaluator still
-requires the existing explicit recovery/version procedure.

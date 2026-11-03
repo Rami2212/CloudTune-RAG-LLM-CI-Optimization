@@ -374,7 +374,10 @@ def prepare_repository(
         except (ValueError, UnicodeError, yaml.YAMLError) as error:
             raise PreparationError(f"Unparseable workflow {path}: {error}", "inconclusive") from error
         if has_workflow_run(doc):
-            raise PreparationError(f"Unsafe workflow_run listener present: {path}")
+            # The isolated fork harness removes every unselected workflow.
+            # Never select a listener, but do not discard unrelated safe CI.
+            dismissed.append(f"{path}: workflow_run listener excluded from isolated harness")
+            continue
         findings = safety_findings(doc)
         if findings:
             dismissed.append(f"{path}: {', '.join(findings)}")

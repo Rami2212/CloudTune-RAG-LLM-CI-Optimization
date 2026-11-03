@@ -122,11 +122,13 @@ def validate_baseline(workflow: bytes, *, actionlint: str | None = None) -> dict
             "reasons": reasons, "actionlint": lint}
 
 
-def validate_candidate(original: bytes, candidate: bytes, *, actionlint: str | None = None) -> dict:
+def validate_candidate(original: bytes, candidate: bytes, *, actionlint: str | None = None,
+                       isolated_serial_dispatch: bool = False) -> dict:
     """Reject changes to observable CI coverage; allow only additive caching.
 
-    Conservative by design: even a valid concurrency/timeout optimization needs
-    separate change-specific approval. This gate treats both B and C alike.
+    General callers require review for concurrency/timeout edits. The isolated
+    serial fork protocol may allow one exact branch-scoped concurrency addition.
+    This gate treats both B and C alike.
     """
     reasons: list[str] = []
     try:
@@ -138,12 +140,20 @@ def validate_candidate(original: bytes, candidate: bytes, *, actionlint: str | N
         return {"verdict": "NO_CHANGE", "reasons": [], "actionlint": {"status": "NOT_RUN"}}
     if safety_findings(after):
         reasons.append("UNSAFE_WORKFLOW:" + ",".join(safety_findings(after)))
-    if set(before) != set(after):
+    # The fork evaluator uses unique arm refs and waits for each run to finish
+    # before dispatching another. This exact group cannot cancel a peer arm or
+    # another repetition under that protocol. General callers remain strict.
+    concurrency_allowed = (isolated_serial_dispatch and "concurrency" not in before
+                           and after.get("concurrency") == {
+                               "group": "${{ github.workflow }}-${{ github.ref }}",
+                               "cancel-in-progress": True})
+    ignored = {"concurrency"} if concurrency_allowed else set()
+    if set(before) - ignored != set(after) - ignored:
         reasons.append("TOP_LEVEL_KEYS_CHANGED")
     # In the initial fork evaluation protocol, require exactly the same
     # trigger, permissions, jobs, matrix, runner, dependencies and commands.
     for key in set(before) | set(after):
-        if key not in {"jobs"} and before.get(key) != after.get(key):
+        if key not in {"jobs"} | ignored and before.get(key) != after.get(key):
             reasons.append("CHANGED_TOP_LEVEL:" + str(key))
     pre_jobs, post_jobs = before.get("jobs", {}), after.get("jobs", {})
     if set(pre_jobs) != set(post_jobs):
@@ -200,11 +210,12 @@ def validate_candidate(original: bytes, candidate: bytes, *, actionlint: str | N
     # than silently weakening protections in the name of efficiency.
     verdict = "FAIL" if any(s.startswith(("INVALID", "UNSAFE", "ACTIONLINT_FAIL")) for s in reasons) else ("REVIEW_REQUIRED" if reasons else "PASS")
     return {"verdict": verdict, "reasons": sorted(set(reasons)), "actionlint": lint,
-            "equivalence_scope": "conservative additive cache only; runtime safety is verified on GitHub"}
+            "isolated_serial_concurrency": concurrency_allowed,
+            "equivalence_scope": "additive cache; exact branch-scoped concurrency only with isolated serial dispatch; runtime safety is verified on GitHub"}
 
 
 # Frozen repository evidence and immutable candidate admission records.
-POLICY_REVISION = "cloudtune-frozen-cache-v5-setup-node-npm-compatibility"
+POLICY_REVISION = "cloudtune-frozen-cache-v6-isolated-serial-concurrency"
 _HASH_EXPRESSION = re.compile(r"hashFiles\(\s*(['\"])([^'\"]+)\1\s*\)")
 _EXPRESSION = re.compile(r"\$\{\{\s*(.*?)\s*\}\}")
 
@@ -407,12 +418,20 @@ def validate_and_archive(snapshot: Path, arm: str, original: bytes, candidate: b
                     manifest["source_commit_sha"]):
                 verdict = {"verdict": "FAIL", "reasons": ["GENERATOR_PROVENANCE_MISMATCH"]}
             else:
-                verdict = validate_candidate(original, candidate, actionlint=actionlint)
+                verdict = validate_candidate(original, candidate, actionlint=actionlint,
+                                             isolated_serial_dispatch=True)
                 lint = verdict.get("actionlint", {}).get("status")
                 if lint == "INCONCLUSIVE" and verdict["verdict"] != "FAIL":
                     verdict = {**verdict, "verdict": "INCONCLUSIVE",
                                "reasons": sorted(set(verdict.get("reasons", []) + ["ACTIONLINT_UNAVAILABLE"]))}
                 elif verdict["verdict"] == "PASS":
+                    before_doc, after_doc = workflow_doc(original), workflow_doc(candidate)
+                    concurrency_only = (verdict.get("isolated_serial_concurrency") and
+                                        {k: v for k, v in after_doc.items() if k != "concurrency"} == before_doc)
+                    if concurrency_only:
+                        evidence["concurrency_scope"] = "unique fork arm refs; one dispatched trial at a time"
+                        write_json_immutable(artifact, {**identity, "validation": verdict, "evidence": evidence})
+                        return verdict
                     frozen, issues = _archived_inputs(snapshot)
                     if issues:
                         verdict = {**verdict, "verdict": "INCONCLUSIVE", "reasons": issues}

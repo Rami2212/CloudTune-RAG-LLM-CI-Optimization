@@ -16,6 +16,85 @@ from scripts.merge_evaluation_results import merge_published
 
 
 class TeamEvaluationTests(unittest.TestCase):
+    def test_same_batch_rerun_allocates_generations_and_preserves_success(self):
+        self._save_trial(1, status="PREFLIGHT_BLOCKED")
+        self._save_trial(2, status="COMPLETE", finalized=True)
+        self._save_trial(3, status="FAILED_TARGET_CI", finalized=True)
+        original = team.trial_directory(team.RESULTS, "eval-member-01-r0001") / "state.json"
+        original_bytes = original.read_bytes()
+        rows = [{"repo_id": f"owner/repo-{i:04d}"} for i in range(1, 5)]
+        plan = team.prepare_failed_rerun("eval-member-01", rows)
+        self.assertEqual(plan["positions"], [1, 3])
+        self.assertEqual(team._trial_id("eval-member-01", 1), "eval-member-01-r0001-r2")
+        self.assertEqual(team._trial_id("eval-member-01", 2), "eval-member-01-r0002")
+        self.assertEqual(team.prepare_failed_rerun("eval-member-01", rows), plan)
+        self.assertEqual(original.read_bytes(), original_bytes)
+        self._save_trial(1, status="PREFLIGHT_BLOCKED")
+        self._save_trial(3, status="COMPLETE", finalized=True)
+        plan["active"] = False
+        team._atomic_json(team.RESULTS / "eval-member-01/rerun_state.json", plan)
+        next_plan = team.prepare_failed_rerun("eval-member-01", rows)
+        self.assertEqual(next_plan["positions"], [1])
+        self.assertEqual(team._trial_id("eval-member-01", 1), "eval-member-01-r0001-r3")
+        self.assertEqual(team._trial_id("eval-member-01", 3), "eval-member-01-r0003-r2")
+
+    def test_same_batch_rerun_resumes_round_and_publishes_latest_generation(self):
+        rows = team._assignment(1)
+        team.freeze_batch(1, "eval-member-01")
+        self._save_trial(1, status="PREFLIGHT_BLOCKED")
+        self._save_trial(2, status="COMPLETE", finalized=True)
+        invoked = []
+
+        def invoke(member, position, mode, batch_id):
+            invoked.append((position, mode, team._trial_id(batch_id, position)))
+            self._save_trial(position, status="PREFLIGHT_READY" if mode == "preflight" else "COMPLETE",
+                             finalized=mode == "hosted", cleanup="RETAINED_BY_CONFIGURATION")
+            return 0
+
+        with patch.object(team, "_invoke", side_effect=invoke):
+            self.assertEqual(team.run_batch(1, "eval-member-01", preflight_only=True,
+                                           max_repositories=1, rerun_failed=True), 0)
+            self.assertEqual(team.run_batch(1, "eval-member-01", preflight_only=False,
+                                           max_repositories=1, rerun_failed=True), 0)
+        self.assertEqual(invoked, [(1, "preflight", "eval-member-01-r0001-r2"),
+                                   (1, "hosted", "eval-member-01-r0001-r2")])
+        plan = team._read_json(team.RESULTS / "eval-member-01/rerun_state.json")
+        self.assertFalse(plan["active"])
+        with (team.RESULTS / "eval-member-01/published/attempts.csv").open(newline="") as handle:
+            published = list(csv.DictReader(handle))
+        self.assertEqual(published[0]["evaluation_id"], "eval-member-01-r0001-r2")
+        self.assertEqual(published[1]["evaluation_id"], "eval-member-01-r0002")
+
+    def test_rerun_preserves_original_identity_and_still_rejects_model_change(self):
+        team._assignment(1)
+        identity_path = team.freeze_batch(1, "eval-member-01")
+        identity = json.loads(identity_path.read_text())
+        identity["runner_sha256"] = "previous-runner"
+        identity_path.write_text(json.dumps(identity))
+        original = identity_path.read_bytes()
+        team.freeze_batch(1, "eval-member-01", rerun_failed=True)
+        self.assertEqual(identity_path.read_bytes(), original)
+        with patch.dict("os.environ", {"OPENROUTER_MODEL": "other/model:free"}):
+            with self.assertRaisesRegex(ValueError, "Frozen batch identity changed"):
+                team.freeze_batch(1, "eval-member-01", rerun_failed=True)
+
+    def test_retry_selection_excludes_successful_and_unattempted_repositories(self):
+        self._save_trial(1, status="PREFLIGHT_BLOCKED")
+        self._save_trial(2, status="COMPLETE", finalized=True)
+        self._save_trial(3, status="FAILED_TARGET_CI", finalized=True)
+        self._save_trial(4, status="INCOMPLETE")
+        rows = [{"repo_id": f"owner/repo-{i:04d}"} for i in range(1, 6)]
+        self.assertEqual(team.failed_positions("eval-member-01", rows), [1, 3, 4])
+
+    def test_retry_selection_refuses_pending_trial(self):
+        self._save_trial(1, status="LLM_PAUSED")
+        path = team.trial_directory(team.RESULTS, "eval-member-01-r0001") / "state.json"
+        state = json.loads(path.read_text())
+        state["repositories"]["owner/repo-0001"]["pending"] = {"run_id": 123}
+        path.write_text(json.dumps(state))
+        with self.assertRaisesRegex(ValueError, "pending CI"):
+            team.failed_positions("eval-member-01", [{"repo_id": "owner/repo-0001"}])
+
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -38,7 +117,7 @@ class TeamEvaluationTests(unittest.TestCase):
             monkey.start()
             self.addCleanup(monkey.stop)
 
-    def test_trial_paths_group_batches_and_reject_unmigrated_checkpoints(self):
+    def test_trial_paths_group_batches_and_reject_misplaced_checkpoints(self):
         trial = "custom-batch-r0017"
         expected = team.RESULTS / "custom-batch" / trial
         self.assertEqual(team.trial_directory(team.RESULTS, trial), expected)
@@ -47,7 +126,7 @@ class TeamEvaluationTests(unittest.TestCase):
         self.assertEqual(team.trial_directory(team.RESULTS, "dev-smoke"),
                          team.RESULTS / "dev-smoke")
         (team.RESULTS / trial).mkdir(parents=True)
-        with self.assertRaisesRegex(ValueError, "Move legacy checkpoint"):
+        with self.assertRaisesRegex(ValueError, "Checkpoint outside batch directory"):
             team.trial_directory(team.RESULTS, trial)
 
     def test_assignments_are_disjoint_and_byte_stable(self):

@@ -124,12 +124,12 @@ If your cloned revision contains the workspace-preparation script, you can also 
 
 Each member receives a different 1,000-repository assignment:
 
-| Member | Assignment CSV                         | Default batch ID |
-| ------ | -------------------------------------- | ---------------- |
-| 1      | `evaluation/assignments/member_01.csv` | `eval-member-01` |
-| 2      | `evaluation/assignments/member_02.csv` | `eval-member-02` |
-| 3      | `evaluation/assignments/member_03.csv` | `eval-member-03` |
-| 4      | `evaluation/assignments/member_04.csv` | `eval-member-04` |
+| Member | Name    | Assignment CSV                         | Default batch ID |
+| ------ | ------- | -------------------------------------- | ---------------- |
+| 1      | Ishara  | `evaluation/assignments/member_01.csv` | `eval-member-01` |
+| 2      | Ramitha | `evaluation/assignments/member_02.csv` | `eval-member-02` |
+| 3      | Isuru   | `evaluation/assignments/member_03.csv` | `eval-member-03` |
+| 4      | Hiruni  | `evaluation/assignments/member_04.csv` | `eval-member-04` |
 
 Choose **one member number** and preview the assigned repository order without dispatching anything (replace `1` with your member number):
 

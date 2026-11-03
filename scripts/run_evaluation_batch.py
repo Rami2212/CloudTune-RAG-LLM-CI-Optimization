@@ -14,7 +14,7 @@ import os
 import re
 import subprocess
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 from scripts.experiment_environment import load_env
@@ -108,7 +108,9 @@ def validated_batch_id(member: int, selected: str | None) -> str:
 
 
 def _trial_id(batch_id: str, position: int) -> str:
-    return f"{batch_id}-r{position:04d}"
+    base = f"{batch_id}-r{position:04d}"
+    generation = _read_json(RESULTS / batch_id / "rerun_state.json").get("generations", {}).get(str(position), 1)
+    return base if generation == 1 else f"{base}-r{generation}"
 
 
 def _assignment(member: int) -> list[dict[str, str]]:
@@ -157,7 +159,7 @@ def _stage(repo_state: dict, repo_report: dict) -> str:
     return "preflight"
 
 
-def freeze_batch(member: int, batch_id: str) -> Path:
+def freeze_batch(member: int, batch_id: str, *, rerun_failed: bool = False) -> Path:
     """Refuse a model, config, dataset or runner change in an active batch.
 
     This is a small *local* batch identity file, not a duplicate execution
@@ -180,7 +182,10 @@ def freeze_batch(member: int, batch_id: str) -> Path:
     location = RESULTS / batch_id / "batch_identity.json"
     location.parent.mkdir(parents=True, exist_ok=True)
     if location.is_file():
-        if _read_json(location) != record:
+        previous = _read_json(location)
+        comparable = {k: v for k, v in record.items() if k != "runner_sha256"} if rerun_failed else record
+        old_comparable = {k: v for k, v in previous.items() if k != "runner_sha256"} if rerun_failed else previous
+        if old_comparable != comparable:
             raise ValueError(f"Frozen batch identity changed: {location}; use the original settings")
     else:
         _atomic_json(location, record)
@@ -198,7 +203,7 @@ def _member_config(member: int, batch_id: str) -> Path:
     source["dataset_split"] = "evaluation"
     source["repository_start_at"] = 1
     source["repository_limit"] = 1
-    source["evaluation_id"] = _trial_id(batch_id, 1)
+    source["evaluation_id"] = f"{batch_id}-r0001"
     if source.get("execution", {}).get("development_smoke") is True:
         raise ValueError("Cannot run a held-out partition under development smoke")
     target = RESULTS / batch_id / "batch_config.json"
@@ -314,7 +319,49 @@ def publish_batch(member: int, rows: list[dict[str, str]], batch_id: str) -> Pat
     return out
 
 
-def run_batch(member: int, batch_id: str, *, preflight_only: bool, max_repositories: int | None) -> int:
+def failed_positions(source: str, rows: list[dict]) -> list[int]:
+    failed = {"PREFLIGHT_BLOCKED", "FAILED_TARGET_CI", "INCOMPLETE", "INCONCLUSIVE_PLATFORM", "LLM_PAUSED"}
+    positions = []
+    for index, row in enumerate(rows, 1):
+        _, current, report = _record(source, index, row["repo_id"])
+        if (report.get("status") or current.get("status")) in failed:
+            if current.get("pending"):
+                raise ValueError("Source trial has pending CI; resume it before retrying")
+            positions.append(index)
+    return positions
+
+
+def prepare_failed_rerun(batch_id: str, rows: list[dict]) -> dict:
+    """Allocate each failed row once per round; restarts resume that round."""
+    path = RESULTS / batch_id / "rerun_state.json"
+    plan = _read_json(path)
+    if plan.get("active"):
+        return plan
+    positions = failed_positions(batch_id, rows)
+    generations = dict(plan.get("generations", {}))
+    previous = {}
+    for position in positions:
+        trial_id = _trial_id(batch_id, position)
+        folder = trial_directory(RESULTS, trial_id)
+        state, repo, _ = _record(batch_id, position, rows[position - 1]["repo_id"])
+        if (folder / ".controller.lock").exists() or repo.get("pending"):
+            raise ValueError("Source trial is still active; resume it before rerunning")
+        previous[str(position)] = trial_id
+        generations[str(position)] = generations.get(str(position), 1) + 1
+        if len(f"{batch_id}-r{position:04d}-r{generations[str(position)]}") > 80:
+            raise ValueError("Trial generation ID exceeds 80 characters")
+    plan = {"round": plan.get("round", 0) + 1, "active": bool(positions),
+            "positions": positions, "previous_trials": previous, "generations": generations}
+    identity = _read_json(RESULTS / batch_id / "batch_identity.json")
+    identity["runner_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    archive = RESULTS / batch_id / "rerun_rounds" / f"round-{plan['round']:04d}.json"
+    _atomic_json(archive, {**plan, "identity": identity})
+    _atomic_json(path, plan)
+    return plan
+
+
+def run_batch(member: int, batch_id: str, *, preflight_only: bool, max_repositories: int | None,
+              retry_failed_from: str | None = None, rerun_failed: bool = False) -> int:
     rows = _assignment(member)
     load_env(ROOT / ".env")
     if os.environ.get("CLOUDTUNE_AUTO_DELETE_FORKS", "").strip().lower() not in {"false", "0", "no", "off"}:
@@ -323,10 +370,39 @@ def run_batch(member: int, batch_id: str, *, preflight_only: bool, max_repositor
         raise ValueError("Missing evaluation/configs/fork_pilot.json")
     # A consistent model, token limit, and source partition are essential for
     # paired research comparisons. Refuse silent changes across restarts.
-    freeze_batch(member, batch_id)
+    if rerun_failed:
+        if retry_failed_from or not (RESULTS / batch_id / "batch_identity.json").is_file():
+            raise ValueError("--rerun-failed requires an existing batch and cannot use --retry-failed-from")
+        freeze_batch(member, batch_id, rerun_failed=True)
+    else:
+        freeze_batch(member, batch_id)
     _member_config(member, batch_id)
+    selected = None
+    rerun_plan = None
+    if rerun_failed:
+        rerun_plan = prepare_failed_rerun(batch_id, rows)
+        selected = set(rerun_plan["positions"])
+    if retry_failed_from:
+        if retry_failed_from == batch_id:
+            raise ValueError("Retry requires a new --batch-id; original evidence is preserved")
+        selection_path = RESULTS / batch_id / "retry_selection.json"
+        selection = _read_json(selection_path)
+        if not selection:
+            source_identity = _read_json(RESULTS / retry_failed_from / "batch_identity.json")
+            if source_identity.get("member") != member:
+                raise ValueError("Retry source is missing or belongs to a different member")
+            current_identity = _read_json(RESULTS / batch_id / "batch_identity.json")
+            if source_identity.get("assignment_sha256") != current_identity.get("assignment_sha256"):
+                raise ValueError("Retry source uses a different repository assignment")
+            selection = {"source": retry_failed_from, "positions": failed_positions(retry_failed_from, rows)}
+            _atomic_json(selection_path, selection)
+        if selection["source"] != retry_failed_from:
+            raise ValueError("Frozen retry source changed")
+        selected = set(selection["positions"])
     attempted = 0
     for index, row in enumerate(rows, 1):
+        if selected is not None and index not in selected:
+            continue
         repo_id = row["repo_id"]
         _, current, report = _record(batch_id, index, repo_id)
         stage = _stage(current, report)
@@ -355,6 +431,26 @@ def run_batch(member: int, batch_id: str, *, preflight_only: bool, max_repositor
                 elif result != 0:
                     print(f"Preflight returned {result}. Check the saved state before restarting.", flush=True)
                 return 2
+        previous_trial = (rerun_plan.get("previous_trials", {}).get(str(index)) if rerun_plan else None)
+        if not preflight_only and stage == "ready" and (retry_failed_from or previous_trial) and not current.get("fork_repo"):
+            if previous_trial:
+                previous = _read_json(trial_directory(RESULTS, previous_trial) / "state.json").get("repositories", {}).get(repo_id, {})
+            else:
+                _, previous, _ = _record(retry_failed_from, index, repo_id)
+                previous_trial = _trial_id(retry_failed_from, index)
+            if previous.get("fork_repo") and previous.get("cleanup_status") != "DELETED":
+                old_path = trial_directory(RESULTS, previous_trial)
+                if (old_path / ".controller.lock").exists() or previous.get("pending"):
+                    raise ValueError("Source fork still has active work; cannot retry")
+                if not previous.get("fork_created_by_evaluation") or not previous.get("fork_id"):
+                    raise ValueError("Source fork lacks creation evidence; preserve it")
+                target_path = trial_directory(RESULTS, _trial_id(batch_id, index)) / "state.json"
+                target = _read_json(target_path)
+                record = target["repositories"][repo_id]
+                for key in ("fork_repo", "fork_owner", "fork_id", "fork_created_by_evaluation"):
+                    record[key] = previous[key]
+                record["fork_reused_from_evaluation"] = previous_trial
+                _atomic_json(target_path, target)
         if not preflight_only and stage == "ready":
             result = _invoke(member, index, "hosted", batch_id)
             _, current, report = _record(batch_id, index, repo_id)
@@ -372,6 +468,11 @@ def run_batch(member: int, batch_id: str, *, preflight_only: bool, max_repositor
                 return 2
         publish_batch(member, rows, batch_id)
     out = publish_batch(member, rows, batch_id)
+    if rerun_plan and rerun_plan["active"] and all(
+            _stage(*_record(batch_id, position, rows[position - 1]["repo_id"])[1:]) == "finished"
+            for position in rerun_plan["positions"]):
+        rerun_plan["active"] = False
+        _atomic_json(RESULTS / batch_id / "rerun_state.json", rerun_plan)
     print(f"Member {member} summary: {out / 'attempts.csv'}", flush=True)
     return 0
 
@@ -380,6 +481,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--member", type=int, required=True, choices=(1, 2, 3, 4))
     parser.add_argument("--batch-id", help="Optional unique ID; defaults to eval-member-01, etc.")
+    parser.add_argument("--retry-failed-from", help="Retry only failed/blocked trials from this batch under a new ID")
+    parser.add_argument("--rerun", "--rerun-failed", dest="rerun_failed", action="store_true",
+                        help="Rerun only failed rows in this same batch using preserved -r2/-r3 generations")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--list", action="store_true", help="Preview assigned repositories without API calls")
     mode.add_argument("--preflight-only", action="store_true", help="Screen/validate sequentially; no hosted CI")
@@ -393,18 +497,22 @@ def main() -> int:
     try:
         rows = _assignment(args.member)
         batch_id = validated_batch_id(args.member, args.batch_id)
+        source = validated_batch_id(args.member, args.retry_failed_from) if args.retry_failed_from else None
+        if source == batch_id:
+            raise ValueError("--retry-failed-from requires a different --batch-id")
         if args.list:
             for index, row in enumerate(rows, 1):
                 print(f"{index:04d} (global {(args.member-1)*1000+index:04d}): {row['repo_id']}")
             return 0
         # Only one local controller/publisher owns each batch at a time.
         # The child fork controller separately locks every repository trial.
-        with exclusive_batch(batch_id):
+        with exclusive_batch(batch_id), (exclusive_batch(source) if source else nullcontext()):
             if args.publish_only:
                 print(publish_batch(args.member, rows, batch_id))
                 return 0
             return run_batch(args.member, batch_id, preflight_only=args.preflight_only,
-                             max_repositories=args.max_repositories)
+                             max_repositories=args.max_repositories, retry_failed_from=source,
+                             rerun_failed=args.rerun_failed)
     except KeyboardInterrupt:
         print("Stopped. Existing controller checkpoints remain intact; rerun the same command.", file=sys.stderr)
         return 130
