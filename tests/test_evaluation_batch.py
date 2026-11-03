@@ -16,6 +16,58 @@ from scripts.merge_evaluation_results import merge_published
 
 
 class TeamEvaluationTests(unittest.TestCase):
+    def test_member_position_bounds(self):
+        self.assertEqual(team.position_bounds(), (1, 1000))
+        self.assertEqual(team.position_bounds(14, 16), (14, 16))
+        self.assertEqual(team.position_bounds(14, limit=3), (14, 16))
+        self.assertEqual(team.position_bounds(1000, limit=1), (1000, 1000))
+        for args in ((0, None, None), (1001, None, None), (14, 13, None),
+                     (1, 1001, None), (1, None, 0), (1000, None, 2), (1, 3, 2)):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                team.position_bounds(*args)
+
+    def test_range_limits_active_rerun_without_losing_unvisited_positions(self):
+        rows = team._assignment(1)
+        team.freeze_batch(1, "eval-member-01")
+        for i in (13, 14, 15, 16):
+            self._save_trial(i, status="PREFLIGHT_BLOCKED")
+        calls = []
+        def invoke(member, position, mode, batch_id):
+            calls.append(position)
+            self._save_trial(position, status="PREFLIGHT_BLOCKED")
+            return 2
+        with patch.object(team, "_invoke", side_effect=invoke):
+            self.assertEqual(team.run_batch(1, "eval-member-01", preflight_only=True,
+                max_repositories=None, rerun_failed=True, start_at=14, limit=2), 0)
+        self.assertEqual(calls, [14, 15])
+        plan = team._read_json(team.RESULTS / "eval-member-01/rerun_state.json")
+        self.assertTrue(plan["active"])
+        self.assertEqual(plan["positions"], [13, 14, 15, 16])
+        with patch.object(team, "_invoke", side_effect=invoke):
+            self.assertEqual(team.run_batch(1, "eval-member-01", preflight_only=True,
+                max_repositories=None, rerun_failed=True, start_at=13, stop_at=13), 0)
+        self.assertEqual(calls, [14, 15, 13])
+
+    def test_finalized_cancelled_trial_with_preserved_fork_can_advance(self):
+        state = {"status": "FAILED_TARGET_CI", "measurements_finalized": True,
+                 "fork_repo": "research/breakpad", "cleanup_status": "PRESERVED_NOT_OWNED"}
+        self.assertEqual(team._stage(state, {}), "finished")
+        for cleanup in ("WAITING_FOR_OTHER_RUNS", "DELETE_OUTCOME_UNKNOWN", "BLOCKED_PERMISSION"):
+            self.assertEqual(team._stage({**state, "cleanup_status": cleanup}, {}), "hosted")
+        self.assertEqual(team._stage({**state, "pending": {"run_id": 123}}, {}), "hosted")
+        self.assertEqual(team._stage({**state, "measurements_finalized": False}, {}), "hosted")
+
+    def test_preserved_fork_controller_exit_allows_batch_to_continue(self):
+        state = {"status": "FAILED_TARGET_CI", "measurements_finalized": True,
+                 "fork_repo": "research/breakpad", "cleanup_status": "PRESERVED_NOT_OWNED"}
+        with patch.object(team, "_member_config", return_value=Path("config.json")), \
+             patch.object(team, "_assignment", return_value=[{"repo_id": "google/breakpad"}]), \
+             patch.object(team, "_record", return_value=({}, state, {})), \
+             patch.object(team.subprocess, "run", return_value=subprocess.CompletedProcess([], 2)):
+            self.assertEqual(team._invoke(1, 1, "hosted", "batch"), 0)
+            state["pending"] = {"run_id": 123}
+            self.assertEqual(team._invoke(1, 1, "hosted", "batch"), 2)
+
     def test_same_batch_rerun_allocates_generations_and_preserves_success(self):
         self._save_trial(1, status="PREFLIGHT_BLOCKED")
         self._save_trial(2, status="COMPLETE", finalized=True)

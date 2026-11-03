@@ -19,12 +19,13 @@ from pathlib import Path
 
 from scripts.experiment_environment import load_env
 from evaluation.result_paths import trial_directory
-from evaluation.prepare_evaluation_assignments import ROOT, DESTINATION, split_dataset
+from evaluation.prepare_evaluation_assignments import ROOT, DESTINATION, ROWS_PER_MEMBER, split_dataset
 
 RESULTS = ROOT / "evaluation" / "results"
 BASE_CONFIG = ROOT / "evaluation" / "configs" / "fork_pilot.json"
 COMPLETED = {"COMPLETE", "SKIPPED", "FAILED_TARGET_CI", "INCONCLUSIVE_PLATFORM", "INCOMPLETE"}
-RETAINED_OR_DONE = {"RETAINED_BY_CONFIGURATION", "NOT_CREATED", "NOT_STARTED"}
+RETAINED_OR_DONE = {"RETAINED_BY_CONFIGURATION", "NOT_CREATED", "NOT_STARTED",
+                    "PRESERVED_NOT_OWNED"}
 EXPORT_COLUMNS = ("batch_id", "member", "position", "source_position", "repo_id", "evaluation_id", "status",
                   "ci_cost_verdict", "rag_verdict", "admitted_arms", "original_runs", "ci_cost_runs",
                   "rag_runs", "original_comparable", "ci_cost_comparable", "rag_comparable",
@@ -137,6 +138,8 @@ def _record(batch_id: str, position: int, repo_id: str) -> tuple[dict, dict, dic
 
 
 def _terminal(repo_state: dict, repo_report: dict) -> bool:
+    if repo_state.get("pending"):
+        return False
     status = repo_report.get("status") or repo_state.get("status", "NOT_STARTED")
     if status == "PREFLIGHT_BLOCKED":
         return not repo_state.get("fork_repo")
@@ -228,7 +231,15 @@ def _invoke(member: int, position: int, mode: str, batch_id: str) -> int:
         args.extend(("--watch", "--require-all-arms"))
     else:
         raise ValueError("Unrecognized trial stage")
-    return subprocess.run(args, cwd=ROOT, check=False).returncode
+    result = subprocess.run(args, cwd=ROOT, check=False).returncode
+    if result == 2:
+        # The controller refuses deletion without ownership proof, including
+        # reused evidence forks. Finalized measurements may still advance the
+        # team batch; preserve the cleanup verdict and never grant DELETE rights.
+        _, current, report = _record(batch_id, position, _assignment(member)[position - 1]["repo_id"])
+        if current.get("cleanup_status") == "PRESERVED_NOT_OWNED" and _terminal(current, report):
+            return 0
+    return result
 
 
 def _index_row(member: int, position: int, repo_id: str, batch_id: str) -> tuple[dict, dict | None]:
@@ -360,8 +371,25 @@ def prepare_failed_rerun(batch_id: str, rows: list[dict]) -> dict:
     return plan
 
 
+def position_bounds(start_at: int = 1, stop_at: int | None = None,
+                    limit: int | None = None) -> tuple[int, int]:
+    """Select original member-local row positions, including finished/skipped rows."""
+    if not 1 <= start_at <= ROWS_PER_MEMBER:
+        raise ValueError("--start-at must be between 1 and 1000")
+    if stop_at is not None and limit is not None:
+        raise ValueError("--stop-at and --limit cannot be used together")
+    if limit is not None and limit < 1:
+        raise ValueError("--limit must be positive")
+    end = stop_at if stop_at is not None else (start_at + limit - 1 if limit is not None else ROWS_PER_MEMBER)
+    if not start_at <= end <= ROWS_PER_MEMBER:
+        raise ValueError("Selected end position must be between --start-at and 1000")
+    return start_at, end
+
+
 def run_batch(member: int, batch_id: str, *, preflight_only: bool, max_repositories: int | None,
-              retry_failed_from: str | None = None, rerun_failed: bool = False) -> int:
+              retry_failed_from: str | None = None, rerun_failed: bool = False,
+              start_at: int = 1, stop_at: int | None = None, limit: int | None = None) -> int:
+    begin, end = position_bounds(start_at, stop_at, limit)
     rows = _assignment(member)
     load_env(ROOT / ".env")
     if os.environ.get("CLOUDTUNE_AUTO_DELETE_FORKS", "").strip().lower() not in {"false", "0", "no", "off"}:
@@ -401,6 +429,8 @@ def run_batch(member: int, batch_id: str, *, preflight_only: bool, max_repositor
         selected = set(selection["positions"])
     attempted = 0
     for index, row in enumerate(rows, 1):
+        if not begin <= index <= end:
+            continue
         if selected is not None and index not in selected:
             continue
         repo_id = row["repo_id"]
@@ -491,10 +521,18 @@ def main() -> int:
     mode.add_argument("--publish-only", action="store_true", help="Refresh commit-ready results without running CI")
     parser.add_argument("--max-repositories", type=int,
                         help="Limit new nonterminal rows processed in this invocation")
+    parser.add_argument("--start-at", type=int, default=1,
+                        help="First member-local row position (1-1000)")
+    bounds = parser.add_mutually_exclusive_group()
+    bounds.add_argument("--stop-at", type=int, help="Last member-local row position, inclusive")
+    bounds.add_argument("--limit", type=int, help="Number of member-local row positions from --start-at")
     args = parser.parse_args()
     if args.max_repositories is not None and args.max_repositories < 1:
         parser.error("--max-repositories must be positive")
     try:
+        begin, end = position_bounds(args.start_at, args.stop_at, args.limit)
+        if args.publish_only and (args.start_at != 1 or args.stop_at is not None or args.limit is not None):
+            raise ValueError("Position flags do not apply to --publish-only; publication always covers the full batch")
         rows = _assignment(args.member)
         batch_id = validated_batch_id(args.member, args.batch_id)
         source = validated_batch_id(args.member, args.retry_failed_from) if args.retry_failed_from else None
@@ -502,6 +540,8 @@ def main() -> int:
             raise ValueError("--retry-failed-from requires a different --batch-id")
         if args.list:
             for index, row in enumerate(rows, 1):
+                if not begin <= index <= end:
+                    continue
                 print(f"{index:04d} (global {(args.member-1)*1000+index:04d}): {row['repo_id']}")
             return 0
         # Only one local controller/publisher owns each batch at a time.
@@ -512,7 +552,8 @@ def main() -> int:
                 return 0
             return run_batch(args.member, batch_id, preflight_only=args.preflight_only,
                              max_repositories=args.max_repositories, retry_failed_from=source,
-                             rerun_failed=args.rerun_failed)
+                             rerun_failed=args.rerun_failed, start_at=args.start_at,
+                             stop_at=args.stop_at, limit=args.limit)
     except KeyboardInterrupt:
         print("Stopped. Existing controller checkpoints remain intact; rerun the same command.", file=sys.stderr)
         return 130

@@ -7,6 +7,25 @@ optimizer, choose repositories, or relax the validator.
 
 ## Fresh-clone reproducibility for every team member
 
+### Select member-local positions
+
+The team runner supports `--start-at`, inclusive `--stop-at`, and `--limit`.
+Positions refer to the member's original 1–1000 assignment rows. Use either
+`--stop-at` or `--limit`, not both; ranges must stay within 1–1000.
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.run_evaluation_batch --member 1 --list --start-at 14 --limit 3
+.\.venv\Scripts\python.exe -m scripts.run_evaluation_batch --member 1 --run --rerun --start-at 14 --stop-at 16
+```
+
+`--limit 3` selects three row positions, including rows already finished or
+outside the retry selection. `--max-repositories` separately caps unfinished
+repositories processed per invocation and can be combined with the range flags.
+Ranges constrain execution, not the frozen assignment or retry plan: unvisited
+retry rows remain pending in the same round and can be resumed with another
+range or no range. Finished trials are skipped. Published results always cover
+the full batch; range flags are rejected with `--publish-only`.
+
 ### Protocol v5: retry failed trials after compatibility fixes
 
 The dispatch harness accepts single-line event strings/lists such as

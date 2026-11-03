@@ -23,3 +23,11 @@ Run the command again to verify; it refuses to overwrite a modified assignment
 or a modified manifest. Commit the generated assignments and manifest before
 starting the held-out experiment. A CSV row is **not** evidence of a completed
 experiment. See [Batch Evaluation Guide](../BATCH_EVALUATION_GUIDE.md).
+
+Assignment CSVs and `manifest.json` must retain LF line endings. The root
+`.gitattributes` enforces this on Git checkout, including on Windows with
+`core.autocrlf=true`. Editors must also preserve LF when saving these files.
+Do not regenerate assignments or delete checkpoints to resolve a restart error.
+After Ctrl+C, resume with the same batch command and flags; an active retry
+round must keep `--rerun`. The verification command above checks assignments
+without launching CI.
