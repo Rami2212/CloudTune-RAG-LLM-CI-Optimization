@@ -26,6 +26,14 @@ class BatchControlTests(unittest.TestCase):
         batch.directory, batch.model = self.root, "fixture:free"
         batch.save = lambda: None
         batch.cleanup_fork = lambda row, target: True
+
+        # These tests verify batch quotas and resumption, not CI measurement.
+        # Simulate verified runtime improvement for satisfied fixture examples.
+        # Production code still checks the real case.json measurement evidence.
+        batch.case_has_runtime_improvement = (
+            lambda item: item.get("example_satisfied") is True
+        )
+
         attempted = []
         values = iter(flags)
         def prepare(row):

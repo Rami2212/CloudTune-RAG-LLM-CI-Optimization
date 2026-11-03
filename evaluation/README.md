@@ -8,12 +8,12 @@ The current RAG corpus contains 25 literature patterns and 49 pattern-satisfied 
 
 ## Comparison arms
 
-| Arm | Method | Purpose |
-| --- | --- | --- |
-| **A — Original** | Run the original pinned workflow without optimization. | Measures baseline time and runner use. |
-| **B — `ci-cost`** | Run a pinned version of `ci-cost` and evaluate its generated candidate. | Rule-based optimizer comparison. |
-| **C — LLM + RAG** | Give the same repository context and original workflow to a fixed LLM, with relevant retrieved RAG patterns/examples. | Proposed method. |
-| **Optional D — LLM-only** | Same as C, using the same model and prompt, but without retrieved material. | Separates the effect of RAG from the effect of using an LLM. Recommended if the claim is that RAG itself helps. |
+| Arm                       | Method                                                                                                                | Purpose                                                                                                         |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| **A — Original**          | Run the original pinned workflow without optimization.                                                                | Measures baseline time and runner use.                                                                          |
+| **B — `ci-cost`**         | Run a pinned version of `ci-cost` and evaluate its generated candidate.                                               | Rule-based optimizer comparison.                                                                                |
+| **C — LLM + RAG**         | Give the same repository context and original workflow to a fixed LLM, with relevant retrieved RAG patterns/examples. | Proposed method.                                                                                                |
+| **Optional D — LLM-only** | Same as C, using the same model and prompt, but without retrieved material.                                           | Separates the effect of RAG from the effect of using an LLM. Recommended if the claim is that RAG itself helps. |
 
 Keep the generator model, base prompt, repository files, output format, safety limits, retry count, and token budget the same for C and D. The embedding model is `BAAI/bge-m3`; it retrieves evidence and does not generate the workflow patch.
 
@@ -89,15 +89,19 @@ It computes paired elapsed-time, runner-time, and optional billed-cost reduction
 
 ## Result table template
 
-| Arm | Repositories | Safe candidates | Required checks passed | Median elapsed saving vs A | Median runner-time saving vs A | `NO_CHANGE` / rejected | Median optimizer latency |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| A — Original |  | N/A |  | 0% | 0% | N/A | N/A |
-| B — `ci-cost` |  |  |  |  |  |  |  |
-| C — LLM + RAG |  |  |  |  |  |  |  |
-| D — LLM-only (optional) |  |  |  |  |  |  |  |
+| Arm                     | Repositories | Safe candidates | Required checks passed | Median elapsed saving vs A | Median runner-time saving vs A | `NO_CHANGE` / rejected | Median optimizer latency |
+| ----------------------- | -----------: | --------------: | ---------------------: | -------------------------: | -----------------------------: | ---------------------: | -----------------------: |
+| A — Original            |              |             N/A |                        |                         0% |                             0% |                    N/A |                      N/A |
+| B — `ci-cost`           |              |                 |                        |                            |                                |                        |                          |
+| C — LLM + RAG           |              |                 |                        |                            |                                |                        |                          |
+| D — LLM-only (optional) |              |                 |                        |                            |                                |                        |                          |
 
 ## Current status and interpretation
 
-This document defines a planned evaluation; it does not report completed `ci-cost` vs RAG results. The RAG dataset has been built, but Supabase ingestion is pending. Before running the comparison, apply the Supabase migration and upload the frozen dataset, or use an equivalent frozen local index. Do not claim RAG improves CI time until generated candidates have passed the same safety checks and repeated CI runs on the held-out repositories.
+This document defines a planned evaluation; it does not report completed `ci-cost` vs RAG results. The frozen 74-record RAG dataset is built. Before running the comparison, **audit the existing Supabase index read-only** with `python -m evaluation.rag_verification --mode remote`; do not assume ingestion is missing or re-ingest the frozen corpus unnecessarily. `--mode retrieve` tests real BGE-M3 embeddings and pgvector retrieval, while `--mode smoke` additionally calls the configured free OpenRouter model on a synthetic fixture. None of these modes dispatches CI. Do not claim RAG improves CI time until generated candidates pass the same safety checks and repeated CI runs on the held-out repositories.
+
+### Dependency installation and optional GPU acceleration
+
+See [Evaluation Pipeline Guide — RAG dependencies and NVIDIA CUDA](PIPELINE_GUIDE.md#install-rag-dependencies-for-arm-c) for complete Windows PowerShell and Linux Bash instructions. Install both `requirements.txt` (PyYAML) and `requirements-rag.txt` (`sentence-transformers` / Supabase support) into the same `.venv`. CPU execution works by default. Users with an NVIDIA GPU may replace an incompatible CPU-only PyTorch build with an official compatible CUDA build, verify `torch.cuda.is_available()`, and enable `CLOUDTUNE_RAG_DEVICE=cuda` in `.env`. The committed `evaluation/rag_retriever.py` reads the device setting. Keep device and model revision fixed for reproducibility.
 
 The broader research protocol is in [`01_Research_Workflow_Data_Training_Evaluation.md`](../workflow/01_Research_Workflow_Data_Training_Evaluation.md); architecture notes are in [`02_System_Architecture_AI_Implementation_Blueprint.md`](../workflow/02_System_Architecture_AI_Implementation_Blueprint.md).
