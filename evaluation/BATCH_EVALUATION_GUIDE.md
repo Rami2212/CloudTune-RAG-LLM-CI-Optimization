@@ -19,6 +19,23 @@ be resumed under v3. Keep v2 and v3 results separate. Validation console output
 now includes admission and rejection reasons. Preflight itself creates no forks
 and dispatches no hosted workflows.
 
+Protocol v4 additionally removes every unrelated `.github/workflows/*.yml`
+or `.yaml` file from both the research fork's default branch and the common
+pinned trial tree. Actions is disabled during default-branch registration.
+All A/B/C arms inherit the same removals; source files and the selected test
+workflow are preserved. The upstream repository is never modified.
+
+For a v3 checkpoint that stopped before harness preparation (no registration
+intent, arm branches, pending dispatch, or measurements), recover explicitly:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.upgrade_unstarted_evaluation --evaluation-id eval-member-01-r0005
+```
+
+Recovery saves the original ledger and records the implementation upgrade. It
+refuses prepared or dispatched trials, which must retain their frozen evaluator.
+Then resume the same batch command. Do not combine measured v3 and v4 trials.
+
 Each member can reproduce the installation and evaluator from a **separate
 Windows workstation**, using the same pinned CloudTune Git commit and the
 same 4,000-row source/assignment hashes. New machines need no pre-existing
@@ -226,21 +243,21 @@ freezes the evaluator implementation/config digest.
 
 ## 5. Commit-ready evidence saved by batch ID
 
-This is a **two-level storage policy**:
+All raw trials and published summaries are grouped under their batch ID:
 
 ```text
 evaluation/results/
   eval-member-01/
-    batch_identity.json         # ignored: immutable operational identity
-    batch_config.json           # ignored: controller template
+    batch_identity.json         # immutable operational identity
+    batch_config.json           # controller template
     published/
       attempts.csv              # Git-eligible: 1,000 source rows/statuses
       manifest.json             # Git-eligible: assignment SHA and counts
       trials/
         r0386.json              # Git-eligible: allowlisted provenance and metrics
-  eval-member-01-r0386/
-    state.json                  # ignored: live checkpoint, NEVER delete
-    repositories/               # ignored: frozen source, prompts, API responses
+    eval-member-01-r0386/
+      state.json                # live checkpoint, preserve for resumption
+      repositories/             # frozen source, prompts, API responses
   cohort/published/
     attempts_4000.csv           # Git-eligible: checked union of four members
     manifest.json
@@ -251,7 +268,7 @@ verdict/reason codes, CI run IDs, job timings, conclusions, and measured run
 statistics. It excludes API tokens, raw prompts, request bodies, original
 workflow source, and arbitrary raw GitHub response files. Published summaries
 **are not sufficient to resume** a pending trial; raw checkpoint directories
-must be preserved privately and backed up.
+must be preserved and backed up alongside the summaries.
 
 Refresh the published evidence without running CI or calling APIs:
 
@@ -265,19 +282,17 @@ For a custom batch ID:
 .\.venv\Scripts\python.exe -m scripts.run_evaluation_batch --member 1 --batch-id isharas-heldout-v1 --publish-only
 ```
 
-Stage **only** published results and the new code/assignments (not raw state):
+Stage all results, including raw checkpoints:
 
 ```powershell
-git add evaluation/assignments evaluation/results/.gitignore evaluation/results/README.md evaluation/results/eval-member-01/published
+git add evaluation/assignments evaluation/results
 git status --short
 git diff --cached --check
 git diff --cached --stat
 ```
 
-The `.gitignore` is deliberately allowlisted so live state and local tools
-remain ignored even after a broad `git add`. Never use `git add -f` for raw
-results. Do not delete old results to tidy up: the remote branch contains only
-`evaluation/results/.gitignore`, but local runs can have important evidence.
+The results `.gitignore` permits all artifacts, including patches and logs.
+Review file contents before committing. Do not delete old checkpoint evidence.
 
 ## 6. Combine four member result batches
 

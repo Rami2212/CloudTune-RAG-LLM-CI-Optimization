@@ -36,18 +36,19 @@ from evaluation.openrouter_settings import resolve_openrouter_env
 from evaluation.optimizers.rag_llm import generate_rag_candidate
 from evaluation.rag_retriever import Retriever
 from evaluation.results_exporter import summarize_cohort
+from evaluation.result_paths import trial_directory
 from evaluation.repository_preparation import (GitHubReader, file_sha256, read_evaluation_rows,
                                                workflow_doc)
 from evaluation.run_pipeline import ROOT, load_config, prepare
 
 
-PROTOCOL = "cloudtune-local-fork-abc-v3-unchanged-arms"
+PROTOCOL = "cloudtune-local-fork-abc-v4-isolated-workflows"
 
 
 class StateStore:
     """Crash-safe local experiment ledger; never writes to CloudTune GitHub.
 
-    Frozen snapshots remain in evaluation/results/<evaluation_id>/repositories.
+    Batch snapshots live in results/<batch-id>/<evaluation_id>/repositories.
     Restart the same command after interruption: a pending GitHub dispatch is
     discovered from its recorded intent instead of sent again.
     """
@@ -56,7 +57,7 @@ class StateStore:
         output_root = output_root if output_root is not None else ROOT
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", evaluation_id):
             raise ValueError("Unsafe evaluation_id for local state path")
-        self.root = output_root / "evaluation" / "results" / evaluation_id
+        self.root = trial_directory(output_root / "evaluation" / "results", evaluation_id)
         self.root.mkdir(parents=True, exist_ok=True)
         self.path = self.root / "state.json"
 
@@ -136,7 +137,7 @@ def exclusive_controller(evaluation_id: str):
     An interrupted process may leave the lock. Verify no evaluation process is
     running before deleting the stale .controller.lock file to resume.
     """
-    folder = ROOT / "evaluation/results" / evaluation_id
+    folder = trial_directory(ROOT / "evaluation/results", evaluation_id)
     folder.mkdir(parents=True, exist_ok=True)
     lock = folder / ".controller.lock"
     try:
@@ -306,7 +307,7 @@ def resolve_rerun_batch(config: dict, selection: list[tuple[int, str]]) -> dict:
             raise ValueError("Batch ID is too long for numbered rerun generations")
         trial = dict(config)
         trial["evaluation_id"] = trial_id
-        folder = ROOT / "evaluation/results" / trial_id
+        folder = trial_directory(ROOT / "evaluation/results", trial_id)
         state_file = folder / "state.json"
         if not state_file.exists():
             if generation == 1:
@@ -340,7 +341,7 @@ def _candidate_yaml(snapshot: Path, arm: str, outcome: dict, original: bytes) ->
 
 def _ensure_preparation(config: dict, state: dict, store: StateStore, token: str | None = None) -> Path:
     """Freeze once; later runner invocations restore identical archived blobs."""
-    output = ROOT / "evaluation/results" / config["evaluation_id"]
+    output = trial_directory(ROOT / "evaluation/results", config["evaluation_id"])
     if "screening" not in state:
         # Reuse the same research-account token for read-only screening.
         log_progress("PREP", f"Screening selected repository range for {config['evaluation_id']}")

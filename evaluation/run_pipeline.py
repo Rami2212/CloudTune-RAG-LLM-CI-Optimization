@@ -5,6 +5,8 @@ candidates. Neither stage creates forks, dispatches CI or measures savings.
 """
 from __future__ import annotations
 
+from evaluation.result_paths import trial_directory
+
 import argparse
 import csv
 import json
@@ -77,7 +79,7 @@ def prepare(config: dict, *, reader: GitHubReader | None = None, project_root: P
         # Fail closed on the entire held-out cohort, including case-insensitive IDs.
         held_out = project_root / "evaluation/evaluation_repositories_4000.csv"
         exclusions.update(row["repo_id"].casefold() for row in read_evaluation_rows(held_out))
-    output = project_root / "evaluation/results" / config["evaluation_id"]
+    output = trial_directory(project_root / "evaluation/results", config["evaluation_id"])
     output.mkdir(parents=True, exist_ok=True)
     write_json_immutable(output / "config.json", config)
     reader = reader or GitHubReader()
@@ -124,7 +126,7 @@ def generate_b(config: dict, *, project_root: Path = ROOT,
     ``screening.csv`` includes ineligible rows for transparent attrition counts;
     only prepared/needs_harness repositories have valid original snapshots.
     """
-    output = project_root / "evaluation/results" / config["evaluation_id"]
+    output = trial_directory(project_root / "evaluation/results", config["evaluation_id"])
     frozen_config = output / "config.json"
     screening = output / "screening.csv"
     if not frozen_config.exists() or not screening.exists():

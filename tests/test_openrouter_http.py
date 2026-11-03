@@ -5,6 +5,7 @@ import io
 import json
 import threading
 import unittest
+from contextlib import redirect_stdout
 from urllib.error import HTTPError, URLError
 
 from evaluation.openrouter_http import OpenRouterPaused, request_openrouter_json
@@ -139,13 +140,17 @@ class EvaluationPauseTests(unittest.TestCase):
         retriever = Retriever()
         opts = {'retriever': retriever, 'model': 'example/free:free', 'top_k': 1,
                 'max_tokens': 24000}
+        terminal = io.StringIO()
         with patch.dict(os.environ, {'OPENROUTER_API_KEY': 'fake-token'}):
             with patch('evaluation.optimizers.rag_llm.urlopen', side_effect=HTTPError(
                     'https://example.invalid', 429, 'quota', {}, None)):
-                with self.assertRaisesRegex(OpenRouterPaused, 'HTTP 429'):
+                with redirect_stdout(terminal), self.assertRaisesRegex(OpenRouterPaused, 'HTTP 429'):
                     generate_rag_candidate(self.path, **opts)
             folder = self.path / 'candidates/C'
             self.assertTrue((folder / 'llm_error.json').exists())
+            self.assertEqual(json.loads(terminal.getvalue()),
+                             json.loads((folder / 'llm_error.json').read_text()))
+            self.assertNotIn('fake-token', terminal.getvalue())
             self.assertTrue((folder / 'llm_request.json').exists())
             self.assertTrue((folder / 'retrieval.json').exists())
             self.assertFalse((folder / 'candidate.json').exists())

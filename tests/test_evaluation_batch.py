@@ -38,6 +38,18 @@ class TeamEvaluationTests(unittest.TestCase):
             monkey.start()
             self.addCleanup(monkey.stop)
 
+    def test_trial_paths_group_batches_and_reject_unmigrated_checkpoints(self):
+        trial = "custom-batch-r0017"
+        expected = team.RESULTS / "custom-batch" / trial
+        self.assertEqual(team.trial_directory(team.RESULTS, trial), expected)
+        self.assertEqual(team.trial_directory(team.RESULTS, trial + "-r2"),
+                         expected.with_name(trial + "-r2"))
+        self.assertEqual(team.trial_directory(team.RESULTS, "dev-smoke"),
+                         team.RESULTS / "dev-smoke")
+        (team.RESULTS / trial).mkdir(parents=True)
+        with self.assertRaisesRegex(ValueError, "Move legacy checkpoint"):
+            team.trial_directory(team.RESULTS, trial)
+
     def test_assignments_are_disjoint_and_byte_stable(self):
         first = split_dataset(root=self.root)
         second = split_dataset(root=self.root)
@@ -56,7 +68,7 @@ class TeamEvaluationTests(unittest.TestCase):
             split_dataset(root=self.root)
 
     def _save_trial(self, position, *, status, finalized=False, cleanup="NOT_STARTED"):
-        directory = team.RESULTS / team._trial_id(team.default_batch_id(1), position)
+        directory = team.trial_directory(team.RESULTS, team._trial_id(team.default_batch_id(1), position))
         directory.mkdir(parents=True, exist_ok=True)
         repo = f"owner/repo-{position:04d}"
         (directory / "state.json").write_text(json.dumps({
@@ -146,7 +158,7 @@ class TeamEvaluationTests(unittest.TestCase):
         split_dataset(root=self.root)
         self._save_trial(1, status="COMPLETE", finalized=True,
                          cleanup="RETAINED_BY_CONFIGURATION")
-        raw = team.RESULTS / team._trial_id(team.default_batch_id(1), 1) / "secret_prompt.json"
+        raw = team.trial_directory(team.RESULTS, team._trial_id(team.default_batch_id(1), 1)) / "secret_prompt.json"
         raw.write_text('{"token":"NOT_FOR_GIT"}')
         rows = team._assignment(1)
         folder = team.publish_batch(1, rows, team.default_batch_id(1))

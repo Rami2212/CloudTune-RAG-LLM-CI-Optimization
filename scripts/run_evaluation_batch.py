@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from scripts.experiment_environment import load_env
+from evaluation.result_paths import trial_directory
 from evaluation.prepare_evaluation_assignments import ROOT, DESTINATION, split_dataset
 
 RESULTS = ROOT / "evaluation" / "results"
@@ -125,7 +126,7 @@ def _assignment(member: int) -> list[dict[str, str]]:
 
 
 def _record(batch_id: str, position: int, repo_id: str) -> tuple[dict, dict, dict]:
-    trial = RESULTS / _trial_id(batch_id, position)
+    trial = trial_directory(RESULTS, _trial_id(batch_id, position))
     state = _read_json(trial / "state.json")
     report = _read_json(trial / "fork_report.json")
     repo_state = state.get("repositories", {}).get(repo_id, {})
@@ -246,10 +247,10 @@ def _index_row(member: int, position: int, repo_id: str, batch_id: str) -> tuple
             "github_fork": repo_state.get("fork_repo") or ""}
     if not state:
         return data, None
-    manifest = (RESULTS / _trial_id(batch_id, position) / "repositories")
+    manifest = (trial_directory(RESULTS, _trial_id(batch_id, position)) / "repositories")
     candidates = list(manifest.glob("*/manifest.json")) if manifest.exists() else []
     pinned = _read_json(candidates[0]) if len(candidates) == 1 else {}
-    frozen_config = _read_json(RESULTS / data["evaluation_id"] / "config.json")
+    frozen_config = _read_json(trial_directory(RESULTS, data["evaluation_id"]) / "config.json")
     # Only explicitly allowlisted research metadata/measurements leave ignored
     # local checkpoints. Never export prompts, source files, API responses or keys.
     summary = {"repo_id": repo_id, "evaluation_id": data["evaluation_id"],
@@ -279,9 +280,9 @@ def _index_row(member: int, position: int, repo_id: str, batch_id: str) -> tuple
                                 "jobs": [{k: job.get(k) for k in JOB_COLUMNS}
                                          for job in row.get("jobs", [])]}
                                for row in records],
-               "controller_report_sha256": (hashlib.sha256((RESULTS / data["evaluation_id"] /
+               "controller_report_sha256": (hashlib.sha256((trial_directory(RESULTS, data["evaluation_id"]) /
                    "fork_report.json").read_bytes()).hexdigest() if
-                   (RESULTS / data["evaluation_id"] / "fork_report.json").exists() else None)}
+                   (trial_directory(RESULTS, data["evaluation_id"]) / "fork_report.json").exists() else None)}
     return data, summary
 
 

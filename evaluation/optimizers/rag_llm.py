@@ -178,13 +178,15 @@ def generate_rag_candidate(snapshot_dir: Path, *, retriever: Retriever,
             # Store a sanitized status, never the Authorization header or
             # provider error body. The frozen request/retrieval can be reused
             # by an explicit resume, without fabricating a candidate.
-            (target / "llm_error.json").write_text(json.dumps({
+            error_json = json.dumps({
                 "failure_class": "OPENROUTER_PAUSED",
                 "http_status": exc.http_status,
                 "reason": str(exc),
                 "request_sha256": _hash((target / "llm_request.json").read_bytes()),
                 "recorded_utc": datetime.now(timezone.utc).isoformat(),
-            }, indent=2) + "\n", encoding="utf-8")
+            }, indent=2)
+            (target / "llm_error.json").write_text(error_json + "\n", encoding="utf-8")
+            print(error_json, flush=True)
             raise
         # Save the original provider response before validating generated JSON.
         # Provider responses are untrusted; never archive request headers/tokens.

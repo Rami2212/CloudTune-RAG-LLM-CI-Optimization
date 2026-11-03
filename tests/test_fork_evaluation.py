@@ -59,6 +59,77 @@ class FakeRunnerGitHub:
 
 
 class HostedProtocolTests(unittest.TestCase):
+    def test_ancillary_workflow_isolation_preserves_source_files(self):
+        experiment = self.experiment()
+        tree = {"tree": [
+            {"type": "blob", "path": ".github/workflows/ci.yml"},
+            {"type": "blob", "path": ".github/workflows/release-drafter.yml"},
+            {"type": "blob", "path": ".github/workflows/publish.yaml"},
+            {"type": "blob", "path": "src/main.py"},
+            {"type": "blob", "path": ".github/release-drafter.yml"}]}
+        removals = experiment._ancillary_paths(tree)
+        self.assertEqual(removals, [".github/workflows/publish.yaml",
+                                    ".github/workflows/release-drafter.yml"])
+        github = MagicMock()
+        github.request.side_effect = [{"sha": "blob"}, {"sha": "isolated-tree"}]
+        experiment.gh = github
+        self.assertEqual(experiment._new_tree("research/test", "source", ORIGINAL,
+                                             remove_workflows=removals), "isolated-tree")
+        payload = github.request.call_args.args[2]
+        self.assertEqual(payload["base_tree"], "source")
+        self.assertEqual([entry["path"] for entry in payload["tree"]],
+                         [experiment.workflow_path, *removals])
+        self.assertTrue(all(entry["sha"] is None for entry in payload["tree"][1:]))
+
+    def test_workflow_isolation_rejects_incomplete_tree(self):
+        with self.assertRaisesRegex(ValueError, "cannot prove"):
+            self.experiment()._ancillary_paths({"truncated": True, "tree": []})
+
+    def test_prepare_isolates_default_and_source_before_enabling_actions(self):
+        experiment = self.experiment()
+        github = MagicMock()
+        experiment.gh = github
+        listing = {"tree": [
+            {"type": "blob", "path": ".github/workflows/ci.yml"},
+            {"type": "blob", "path": ".github/workflows/release-drafter.yml"}]}
+        events = []
+
+        def request(method, path, body=None):
+            events.append((method, path, body))
+            if path == "/repos/research/test":
+                return {"default_branch": "main"}
+            if "/git/commits/" in path:
+                return {"tree": {"sha": "source-tree"}}
+            if "/git/trees/" in path:
+                return listing
+            return {}
+
+        github.request.side_effect = request
+        current = {"sha": "head", "commit": {"tree": {"sha": "default-tree"}}}
+        state = {"fork_repo": "research/test"}
+        with (patch.object(experiment, "_selected_tree", return_value=(current, listing)),
+              patch.object(experiment, "_new_tree", return_value="isolated") as new_tree,
+              patch.object(experiment, "_commit", side_effect=["registration", "prepared"]),
+              patch.object(experiment, "_wait_for_workflow"),
+              patch("evaluation.ci_executor.validate_baseline", return_value={"verdict": "PASS"})):
+            experiment.prepare(state, lambda: None)
+        self.assertEqual(new_tree.call_count, 2)
+        for call in new_tree.call_args_list:
+            self.assertEqual(call.kwargs["remove_workflows"],
+                             [".github/workflows/release-drafter.yml"])
+        changes = [body for method, path, body in events if path.endswith("actions/permissions")]
+        self.assertEqual(changes, [{"enabled": False}, {"enabled": True}])
+        self.assertEqual(state["isolated_workflows"]["source"],
+                         [".github/workflows/release-drafter.yml"])
+
+    def test_workflow_isolation_cannot_delete_selected_workflow_or_source(self):
+        experiment = self.experiment()
+        experiment.gh = MagicMock()
+        experiment.gh.request.return_value = {"sha": "blob"}
+        for path in (experiment.workflow_path, "src/main.py"):
+            with self.subTest(path=path), self.assertRaisesRegex(ValueError, "removal path"):
+                experiment._new_tree("research/test", "base", ORIGINAL, remove_workflows=[path])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

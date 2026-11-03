@@ -309,12 +309,26 @@ class ForkExperiment:
             raise ValueError("GitHub tree truncated; cannot prove isolation")
         return commit, tree
 
-    def _new_tree(self, fork: str, base: str, workflow: bytes) -> str:
+    def _ancillary_paths(self, tree: dict) -> list[str]:
+        """Remove unrelated executable workflows from the common fork harness."""
+        if tree.get("truncated") or not isinstance(tree.get("tree"), list):
+            raise ValueError("GitHub tree truncated; cannot prove workflow isolation")
+        return sorted(entry["path"] for entry in tree["tree"]
+                      if entry.get("type") == "blob"
+                      and re.fullmatch(r"\.github/workflows/[^/]+\.ya?ml", entry["path"])
+                      and entry["path"] != self.workflow_path)
+
+    def _new_tree(self, fork: str, base: str, workflow: bytes,
+                  *, remove_workflows: list[str] | tuple[str, ...] = ()) -> str:
         blob = self.gh.request("POST", f"/repos/{fork}/git/blobs", {
             "encoding": "base64", "content": base64.b64encode(workflow).decode("ascii")})["sha"]
+        entries = [{"path": self.workflow_path, "mode": "100644", "type": "blob", "sha": blob}]
+        for path in remove_workflows:
+            if path == self.workflow_path or not re.fullmatch(r"\.github/workflows/[^/]+\.ya?ml", path):
+                raise ValueError("Invalid ancillary workflow removal path")
+            entries.append({"path": path, "mode": "100644", "type": "blob", "sha": None})
         tree = self.gh.request("POST", f"/repos/{fork}/git/trees", {
-            "base_tree": base, "tree": [{"path": self.workflow_path,
-                                         "mode": "100644", "type": "blob", "sha": blob}]})
+            "base_tree": base, "tree": entries})
         return tree["sha"]
 
     def _commit(self, fork: str, tree: str, parent: str, label: str) -> str:
@@ -356,17 +370,14 @@ class ForkExperiment:
         info = self.gh.request("GET", "/repos/" + fork)
         default = info["default_branch"]
         current, tree = self._selected_tree(fork, default)
-        # Every default-branch workflow is inspected: chained listeners,
-        # deployments or secrets must never run via test activity.
-        for entry in tree["tree"]:
-            if entry["type"] != "blob" or not re.fullmatch(r"\.github/workflows/[^/]+\.ya?ml", entry["path"]):
-                continue
-            doc = workflow_doc(self.gh.blob(fork, entry["sha"]))
-            if has_workflow_run(doc) or safety_findings(doc):
-                raise ValueError("Unsafe ancillary workflow on fork default branch: " + entry["path"])
+        # Isolate the selected workflow instead of executing unrelated inherited
+        # release/push workflows. Apply the same removals to every trial arm.
+        default_removals = self._ancillary_paths(tree)
         # Test source revision must actually exist in the fork's Git object DB.
         source = self.gh.request("GET", f"/repos/{fork}/git/commits/{self.source_sha}")
         source_tree = source["tree"]["sha"]
+        source_listing = self.gh.request("GET", f"/repos/{fork}/git/trees/{source_tree}?recursive=1")
+        source_removals = self._ancillary_paths(source_listing)
         common = ensure_dispatch(self.original)
         log_progress("WORKFLOW", f"Common dispatch harness validated for {self.workflow_path}")
         static_check = validate_baseline(common)
@@ -391,7 +402,8 @@ class ForkExperiment:
                 self.gh.request("PUT", f"/repos/{fork}/actions/permissions", {"enabled": False})
                 state["actions_disabled_for_setup"] = True
                 save()
-            default_tree = self._new_tree(fork, current["commit"]["tree"]["sha"], common)
+            default_tree = self._new_tree(fork, current["commit"]["tree"]["sha"], common,
+                                          remove_workflows=default_removals)
             registration = self._commit(fork, default_tree, current["sha"], "register-dispatch")
             state["registration_intent"] = {
                 "default_branch": default, "original_default_sha": current["sha"],
@@ -402,12 +414,14 @@ class ForkExperiment:
                 "sha": registration, "force": False})
         # Create a common source commit from the exact pinned tree, rather than
         # the moving default branch. Every A/B/C ref derives from this commit.
-        prepared_tree = self._new_tree(fork, source_tree, common)
+        prepared_tree = self._new_tree(fork, source_tree, common,
+                                       remove_workflows=source_removals)
         prepared = self._commit(fork, prepared_tree, self.source_sha, "common-dispatch-harness")
         state.update(prepared_commit=prepared, prepared_tree=prepared_tree,
                      default_branch=default, default_branch_commit=registration,
                      harness_sha256=digest(common), original_sha256=digest(self.original),
-                     common_workflow=base64.b64encode(common).decode("ascii"), arms={})
+                     common_workflow=base64.b64encode(common).decode("ascii"), arms={},
+                     isolated_workflows={"default": default_removals, "source": source_removals})
         save()
         log_progress("WORKFLOW", "Enabling GitHub Actions for the research fork")
         self.gh.request("PUT", f"/repos/{fork}/actions/permissions", {"enabled": True})
