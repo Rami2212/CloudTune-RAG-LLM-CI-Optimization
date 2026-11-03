@@ -126,8 +126,8 @@ def digest(value: bytes) -> str:
 def ensure_dispatch(raw: bytes) -> bytes:
     """Common experimental harness, applied identically to A/B/C.
 
-    Only a block YAML mapping with a plain or quoted `on` key may be extended. Other trigger syntax
-    requires review; this function does not perform broad YAML reformatting.
+    Extend block mappings or a single-line scalar/event list. Only the trigger
+    header is rewritten; jobs and commands are never reformatted.
     """
     before = workflow_doc(raw)
     # Existing workflow_dispatch inputs may require values that our common
@@ -139,6 +139,28 @@ def ensure_dispatch(raw: bytes) -> bytes:
             raise ValueError("Workflow cannot be safely dispatched: " + ", ".join(problems))
         return raw
     text = raw.decode("utf-8-sig")
+    old_events = before.get("on")
+    if isinstance(old_events, str) or (
+            isinstance(old_events, list) and old_events
+            and all(isinstance(event, str) for event in old_events)):
+        # Rewrite only the trigger header; preserve every job and command byte.
+        events = [old_events] if isinstance(old_events, str) else old_events
+        headers = list(re.finditer(r'''^(?:on|'on'|"on"):[^\r\n]*''', text, re.MULTILINE))
+        if len(headers) != 1 or len(set(events)) != len(events):
+            raise ValueError("Workflow trigger header requires independent review")
+        header = headers[0]
+        if not text[header.start():header.end()].split(":", 1)[1].strip():
+            raise ValueError("Block sequence triggers require independent review")
+        newline = "\r\n" if "\r\n" in text else "\n"
+        replacement = "on:" + newline + "  workflow_dispatch:" + newline
+        replacement += newline.join("  " + json.dumps(event) + ":" for event in events)
+        amended = (text[:header.start()] + replacement + text[header.end():]).encode("utf-8")
+        after = workflow_doc(amended)
+        expected = dict(before)
+        expected["on"] = {"workflow_dispatch": None, **{event: None for event in events}}
+        if after != expected:
+            raise ValueError("Dispatch harness changed the original workflow contract")
+        return amended
     matches = list(re.finditer(r'''^(?:on|'on'|"on"):[ \t]*(?:#[^\r\n]*)?(?=\r?$)''',
                                text, re.MULTILINE))
     if len(matches) != 1:

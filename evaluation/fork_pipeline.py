@@ -42,7 +42,7 @@ from evaluation.repository_preparation import (GitHubReader, file_sha256, read_e
 from evaluation.run_pipeline import ROOT, load_config, prepare
 
 
-PROTOCOL = "cloudtune-local-fork-abc-v4-isolated-workflows"
+PROTOCOL = "cloudtune-local-fork-abc-v5-dispatch-compatibility"
 
 
 class StateStore:

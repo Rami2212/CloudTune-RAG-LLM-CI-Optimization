@@ -59,6 +59,27 @@ class FakeRunnerGitHub:
 
 
 class HostedProtocolTests(unittest.TestCase):
+    def test_inline_dispatch_harness_preserves_events_and_jobs(self):
+        from evaluation.repository_preparation import workflow_doc
+        for trigger, events in (("[ push ]", ["push"]), ("push", ["push"]),
+                                ("[push, pull_request]", ["push", "pull_request"])):
+            for newline in ("\n", "\r\n"):
+                source = ORIGINAL.replace(b"on:\n  workflow_dispatch:", ("on: " + trigger).encode())
+                source = source.replace(b"\n", newline.encode())
+                result = ensure_dispatch(source)
+                doc = workflow_doc(result)
+                self.assertEqual(doc["on"], {"workflow_dispatch": None, **{e: None for e in events}})
+                self.assertEqual(result.split(b"jobs:", 1)[1], source.split(b"jobs:", 1)[1])
+                self.assertEqual(ensure_dispatch(result), result)
+
+    def test_concurrency_allowed_only_for_isolated_serial_branch_scope(self):
+        candidate = ORIGINAL + b"concurrency:\n  group: ${{ github.workflow }}-${{ github.ref }}\n  cancel-in-progress: true\n"
+        with patch("evaluation.candidate_validator._actionlint", return_value={"status": "PASS"}):
+            self.assertEqual(validate_candidate(ORIGINAL, candidate)["verdict"], "REVIEW_REQUIRED")
+            self.assertEqual(validate_candidate(ORIGINAL, candidate, isolated_serial_dispatch=True)["verdict"], "PASS")
+            bad = candidate.replace(b"-${{ github.ref }}", b"")
+            self.assertEqual(validate_candidate(ORIGINAL, bad, isolated_serial_dispatch=True)["verdict"], "REVIEW_REQUIRED")
+
     def test_ancillary_workflow_isolation_preserves_source_files(self):
         experiment = self.experiment()
         tree = {"tree": [

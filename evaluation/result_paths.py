@@ -11,6 +11,6 @@ def trial_directory(results: Path, evaluation_id: str) -> Path:
         target = results / match[1] / evaluation_id
         legacy = results / evaluation_id
         if legacy.exists():
-            raise ValueError(f"Move legacy checkpoint {legacy} to {target} before continuing")
+            raise ValueError(f"Checkpoint outside batch directory: {legacy}; expected {target}")
         return target
     return results / evaluation_id

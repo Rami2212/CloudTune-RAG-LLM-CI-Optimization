@@ -5,12 +5,12 @@ The deterministic builder `evaluation/prepare_evaluation_assignments.py` keeps
 all source metadata, source-row order, and held-out `split=evaluation` status.
 No repository is selected based on an optimization outcome.
 
-| Member | CSV | Original source rows | Member-local rows |
-| --- | --- | ---: | ---: |
-| 1 | `member_01.csv` | 1–1000 | 1–1000 |
-| 2 | `member_02.csv` | 1001–2000 | 1–1000 |
-| 3 | `member_03.csv` | 2001–3000 | 1–1000 |
-| 4 | `member_04.csv` | 3001–4000 | 1–1000 |
+| Member | Name    | CSV             | Original source rows | Member-local rows |
+| ------ | ------- | --------------- | -------------------: | ----------------: |
+| 1      | Ishara  | `member_01.csv` |               1–1000 |            1–1000 |
+| 2      | Ramitha | `member_02.csv` |            1001–2000 |            1–1000 |
+| 3      | Isuru   | `member_03.csv` |            2001–3000 |            1–1000 |
+| 4      | Hiruni  | `member_04.csv` |            3001–4000 |            1–1000 |
 
 From the project root, Windows PowerShell:
 

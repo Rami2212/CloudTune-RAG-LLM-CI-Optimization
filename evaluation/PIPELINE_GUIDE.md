@@ -705,6 +705,11 @@ effective range but does not require the CSV file to exist.
 Example for a 500-row shared evaluation dataset, divided into five non-overlapping
 100-row batches:
 
+This is a generic range example. The actual four-member held-out evaluation
+assignments are **1 — Ishara, 2 — Ramitha, 3 — Isuru, 4 — Hiruni**; use the
+[Batch Evaluation Guide](BATCH_EVALUATION_GUIDE.md#1-fixed-and-reproducible-assignments)
+for their 1,000-repository partitions and commands.
+
 | Member | Batch ID | Start | Stop |
 | ------ | -------- | ----: | ---: |
 | 1      | team-01  |     1 |  100 |

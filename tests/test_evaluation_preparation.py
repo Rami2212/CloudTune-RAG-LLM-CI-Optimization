@@ -118,7 +118,7 @@ class RepositoryPreparationTests(unittest.TestCase):
         self.assertEqual((folder / "source/original.yml").read_bytes(), MISSING_DISPATCH)
         self.assertFalse(original_candidate(folder)["dispatch_ready"])
 
-    def test_workflow_run_listener_blocks_repository(self):
+    def test_workflow_run_listener_is_excluded_from_selected_harness(self):
         listener = b"""on: workflow_run
 jobs:
   deploy:
@@ -126,8 +126,10 @@ jobs:
     steps:
       - run: echo release
 """
-        with self.assertRaisesRegex(PreparationError, "workflow_run listener"):
-            self._prepare(FakeReader(extra_workflows={".github/workflows/listener.yml": listener}))
+        result = self._prepare(FakeReader(extra_workflows={".github/workflows/listener.yml": listener}))
+        folder = Path(result["manifest_path"]).parent
+        manifest = json.loads((folder / "manifest.json").read_text())
+        self.assertEqual(manifest["workflow_path"], ".github/workflows/ci.yml")
 
     def test_deployment_and_secret_workflows_are_rejected(self):
         unsafe = BASIC_WORKFLOW.replace(b"run: pytest -q", b"run: npm publish")

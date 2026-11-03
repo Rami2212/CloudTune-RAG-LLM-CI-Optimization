@@ -7,6 +7,49 @@ optimizer, choose repositories, or relax the validator.
 
 ## Fresh-clone reproducibility for every team member
 
+### Protocol v5: retry failed trials after compatibility fixes
+
+The dispatch harness accepts single-line event strings/lists such as
+`on: [push]` without rewriting jobs. Ancillary `workflow_run` listeners are
+excluded from workflow selection and removed by the isolated fork harness.
+Secrets/publishing restrictions on the selected workflow still apply.
+
+The shared candidate gate now accepts exactly the added concurrency mapping
+`group: ${{ github.workflow }}-${{ github.ref }}` with
+`cancel-in-progress: true` only in the isolated, serial fork evaluator. Unique
+arm refs separate the cancellation groups, and the controller finishes each
+trial before dispatching another. General validation remains strict, as do
+checks on jobs, commands, runners, matrices, permissions and cache evidence.
+This concurrency-only change is not expected to save time in serial trials;
+timing variation alone must not be presented as its optimization benefit.
+
+Retry only previously failed/blocked trials under the same batch name, leaving
+successful and unattempted repositories untouched:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.run_evaluation_batch --member 1 --run --rerun
+```
+
+`--rerun-failed` is an alias for `--rerun`. Failed rows receive fresh per-row
+generations such as `eval-member-01-r0003-r2` inside the original batch folder.
+`rerun_state.json` freezes the active round and stores the generation map;
+`rerun_rounds/` preserves each round's selection and runner identity. Restart
+the same command after a provider pause to resume its unfinished generation.
+Once the whole round finishes, another `--rerun` starts the next generation
+only for rows that still failed. Published summaries point to the latest
+generation; raw earlier evidence and successful rows remain intact. The
+original batch identity is not overwritten. Reruns allow an updated runner but
+still enforce the frozen assignment, model and settings.
+
+The separate `--retry-failed-from SOURCE --batch-id NEW` mode remains available
+when a separately named retry batch is wanted. Report protocol v5 separately
+from earlier measurements. Retained source forks
+may be reused only with archived creation/owner/numeric-ID evidence, which the
+hosted executor verifies against GitHub before writing. The source batch is
+locked during retries, forks must be retained, and pending source runs are
+never adopted. Actual upstream build failures, invalid original workflows and
+unsupported candidate edits can still fail or remain blocked.
+
 Protocol v3 admits an optimizer's `NO_CHANGE` outcome as an unchanged arm only
 when the original workflow passes baseline syntax and safety validation. The
 arm runs the original bytes and remains labeled `NO_CHANGE`, with
@@ -72,12 +115,12 @@ completely settled; see [results reset](results/README.md#intentional-fresh-rese
 
 ## 1. Fixed and reproducible assignments
 
-| Member | Dataset                                | Source rows | Default batch ID |
-| ------ | -------------------------------------- | ----------- | ---------------- |
-| 1      | `evaluation/assignments/member_01.csv` | 1–1000      | `eval-member-01` |
-| 2      | `evaluation/assignments/member_02.csv` | 1001–2000   | `eval-member-02` |
-| 3      | `evaluation/assignments/member_03.csv` | 2001–3000   | `eval-member-03` |
-| 4      | `evaluation/assignments/member_04.csv` | 3001–4000   | `eval-member-04` |
+| Member | Name    | Dataset                                | Source rows | Default batch ID |
+| ------ | ------- | -------------------------------------- | ----------- | ---------------- |
+| 1      | Ishara  | `evaluation/assignments/member_01.csv` | 1–1000      | `eval-member-01` |
+| 2      | Ramitha | `evaluation/assignments/member_02.csv` | 1001–2000   | `eval-member-02` |
+| 3      | Isuru   | `evaluation/assignments/member_03.csv` | 2001–3000   | `eval-member-03` |
+| 4      | Hiruni  | `evaluation/assignments/member_04.csv` | 3001–4000   | `eval-member-04` |
 
 All 4,000 rows remain in the denominator, including screened-out, rejected,
 failed, and no-change cases. The builder never reshuffles or overwrites the
