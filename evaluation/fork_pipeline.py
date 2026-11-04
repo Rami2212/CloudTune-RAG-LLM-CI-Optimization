@@ -33,8 +33,8 @@ from evaluation.ci_executor import (
 from evaluation.optimizers.ci_cost import generate_ci_cost_candidate
 from evaluation.openrouter_http import OpenRouterPaused
 from evaluation.openrouter_settings import resolve_openrouter_env
-from evaluation.optimizers.rag_llm import generate_rag_candidate
-from evaluation.rag_retriever import Retriever
+from evaluation.optimizers.rag_llm import generate_rag_candidate, PROMPT_VERSION
+from evaluation.rag_retriever import Retriever, RagDevicePaused
 from evaluation.results_exporter import summarize_cohort
 from evaluation.result_paths import trial_directory
 from evaluation.repository_preparation import (GitHubReader, file_sha256, read_evaluation_rows,
@@ -581,11 +581,20 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False,
                             dataset_sha256=config["rag"]["dataset_sha256"])
                         state["rag_revision"] = retriever.revision
                         save()
-                    log_progress("OPTIMIZER", f"{repo_id}: requesting free LLM + RAG candidate")
+                    log_progress("OPTIMIZER", f"{repo_id}: requesting free LLM + RAG candidate; "
+                                 f"prompt={PROMPT_VERSION}; patterns={len(retriever.pattern_catalogue)}")
                     c = generate_rag_candidate(snapshot, retriever=retriever,
                              model=config["rag"]["generator_model"], top_k=config["rag"]["top_k"],
                              max_tokens=config["rag"]["max_tokens"],
                              required_job_names=config["execution"].get("required_job_names", []))
+                except RagDevicePaused as exc:
+                    # Hardware unavailability is not an optimizer verdict.
+                    # Keep C absent so explicit resume retries this same trial.
+                    repo["status"] = "RAG_PAUSED"
+                    repo["failure_reason"] = str(exc)
+                    save()
+                    log_progress("ERROR", f"{repo_id}: LLM + RAG paused: {exc}")
+                    return _save_report(output, state)
                 except OpenRouterPaused as exc:
                     # Unlike an invalid candidate, an unavailable free provider
                     # must not become a permanent C=ERROR on this checkpoint.
@@ -819,6 +828,11 @@ def main() -> int:
                     print("OpenRouter request paused; inspect archived llm_error.json "
                           "and resume explicitly with the same frozen evaluation ID. "
                           "No automatic LLM retry or CI dispatch occurred.",
+                          file=sys.stderr, flush=True)
+                    return 2
+                if any(value == "RAG_PAUSED" for value in status.values()):
+                    print("RAG embedding device failed; restore the requested GPU and restart "
+                          "the SAME command. No automatic retry, CPU fallback or CI dispatch occurred.",
                           file=sys.stderr, flush=True)
                     return 2
                 active = {"SELECTED", "WAITING_FOR_GITHUB_RUN", "READY_FOR_NEXT_CONTROLLER_RUN"}

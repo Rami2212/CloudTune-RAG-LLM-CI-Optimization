@@ -12,10 +12,10 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 from evaluation.optimizers.rag_llm import generate_rag_candidate
-from evaluation.rag_retriever import Retriever, verify_corpus
+from evaluation.rag_retriever import Retriever, verify_corpus, RagDevicePaused
 from evaluation.repository_preparation import GitHubReader, PreparationError
 
 MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
@@ -107,6 +107,30 @@ class GenerationTests(unittest.TestCase):
         self.assertEqual(payload["repository_context"]["repository_context"][0]["path"], "package-lock.json")
         self.assertEqual(payload["evidence"][0]["limitations"], ["Synthetic fixture only"])
 
+    def test_noncache_candidate_can_cite_catalogue_outside_similarity_top_k(self):
+        self.kwargs["retriever"].pattern_catalogue = [{
+            "document_id": "pattern:P-LIT-CANCEL-STALE", "pattern_id": "P-LIT-CANCEL-STALE",
+            "pattern": {"mechanism": "cancel_superseded_runs"}}]
+        changed = ORIGINAL + (b"concurrency:\n"
+            b"  group: ${{ github.workflow }}-${{ github.ref }}\n"
+            b"  cancel-in-progress: true\n")
+        result, _ = self.run_model({"decision": "APPLY", "workflow_yaml": changed.decode(),
+            "rationale": "Cancel superseded runs within the same workflow and ref.",
+            "evidence_ids": ["pattern:P-LIT-CANCEL-STALE"]})
+        request = json.loads((self.folder / "candidates/C/llm_request.json").read_text())
+        payload = json.loads(request["messages"][1]["content"])
+        self.assertEqual(payload["pattern_catalogue"], self.kwargs["retriever"].pattern_catalogue)
+        self.assertIn("ALL mechanisms", payload["instruction"])
+        self.assertNotIn("Only make a narrowly scoped", payload["instruction"])
+        self.assertEqual(result["retrieved_ids"], ["pattern:P-LIT-CANCEL-STALE"])
+        self.assertEqual((self.folder / "candidates/C/optimized.yml").read_bytes(), changed)
+        # This non-cache treatment also passes the existing isolated-serial gate.
+        # Neither the CI-Cost generator nor shared admission policy was changed.
+        from evaluation.candidate_validator import validate_candidate
+        with patch("evaluation.candidate_validator._actionlint", return_value={"status": "PASS"}):
+            self.assertEqual(validate_candidate(ORIGINAL, changed,
+                isolated_serial_dispatch=True)["verdict"], "PASS")
+
     def test_resume_after_archived_response_does_not_call_model_again(self):
         response = {"model": MODEL, "choices": [{"finish_reason": "stop", "message": {
             "content": json.dumps({"decision": "NO_CHANGE", "workflow_yaml": None,
@@ -142,6 +166,14 @@ class GenerationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "missing or changed"):
                 generate_rag_candidate(self.folder, **self.kwargs)
         self.assertEqual(outcome["decision"], "APPLY")
+
+    def test_completed_catalogue_is_immutable(self):
+        self.run_model({"decision": "NO_CHANGE", "workflow_yaml": None,
+                        "rationale": "No supported treatment", "evidence_ids": []})
+        (self.folder / "candidates/C/pattern_catalogue.json").write_text('[{"changed": true}]')
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "TEST_TOKEN"}):
+            with self.assertRaisesRegex(ValueError, "catalogue is missing or changed"):
+                generate_rag_candidate(self.folder, **self.kwargs)
 
     def test_frozen_manifest_rejects_changed_context(self):
         (self.folder / "source/files/package.json").write_text('{"name":"altered"}')
@@ -189,6 +221,19 @@ class GenerationTests(unittest.TestCase):
 
 
 class CorpusTests(unittest.TestCase):
+    def test_retriever_exposes_all_frozen_patterns_without_top_k_filtering(self):
+        dataset = Path(__file__).resolve().parents[1] / "research-data/rag/rag_dataset.jsonl"
+        docs = [json.loads(line) for line in dataset.read_text(encoding="utf-8").splitlines() if line.strip()]
+        identity = {"eligible_document_ids": [doc["document_id"] for doc in docs
+                    if doc.get("retrieval_eligible")], "embedding_revision": "a" * 40}
+        with patch("evaluation.rag_retriever.verify_corpus", return_value=identity):
+            retriever = Retriever(revision="a" * 40, dataset_path=dataset,
+                                  dataset_sha256=hashlib.sha256(dataset.read_bytes()).hexdigest())
+        self.assertEqual(len(retriever.pattern_catalogue), 25)
+        self.assertEqual({row["pattern_id"] for row in retriever.pattern_catalogue},
+                         {doc["pattern_id"] for doc in docs if doc["record_type"] == "pattern"})
+        self.assertTrue(all(row["pattern"]["preconditions"] for row in retriever.pattern_catalogue))
+
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -323,6 +368,48 @@ class CorpusTests(unittest.TestCase):
                     "chunk_index": 0, "content": "unsafe", "similarity": .9}]):
             with self.assertRaisesRegex(ValueError, "unapproved"):
                 retriever.retrieve("cache", top_k=5)
+
+
+class DevicePauseTests(unittest.TestCase):
+    def test_unavailable_cuda_pauses_before_loading_weights_or_querying_index(self):
+        retriever = Retriever.__new__(Retriever)
+        retriever.model = None
+        retriever.revision = "a" * 40
+        with patch.dict(os.environ, {"CLOUDTUNE_RAG_DEVICE": "cuda"}), \
+             patch("torch.cuda.is_available", return_value=False), \
+             patch("evaluation.rag_retriever.SentenceTransformer") as loader, \
+             patch("evaluation.rag_retriever._json_request") as index:
+            with self.assertRaisesRegex(RagDevicePaused, "No CUDA GPUs are available"):
+                retriever.retrieve("CI patterns", top_k=5)
+        loader.assert_not_called()
+        index.assert_not_called()
+
+    def test_cuda_failure_during_encoding_pauses_without_fallback(self):
+        retriever = Retriever.__new__(Retriever)
+        retriever.model = MagicMock()
+        retriever.model.tokenizer.return_value = {"input_ids": [1]}
+        retriever.model.max_seq_length = 8192
+        retriever.model.encode.side_effect = RuntimeError("CUDA out of memory")
+        with patch.dict(os.environ, {"CLOUDTUNE_RAG_DEVICE": "cuda:0"}), \
+             patch("evaluation.rag_retriever.SentenceTransformer") as loader, \
+             patch("evaluation.rag_retriever._json_request") as index:
+            with self.assertRaisesRegex(RagDevicePaused, "CUDA out of memory"):
+                retriever.retrieve("CI patterns", top_k=5)
+        retriever.model.encode.assert_called_once()
+        loader.assert_not_called()
+        index.assert_not_called()
+
+    def test_cpu_does_not_probe_cuda_or_reclassify_unrelated_errors(self):
+        retriever = Retriever.__new__(Retriever)
+        retriever.model = None
+        retriever.revision = "a" * 40
+        with patch.dict(os.environ, {"CLOUDTUNE_RAG_DEVICE": "cpu"}), \
+             patch("evaluation.rag_retriever._check_cuda_device") as probe, \
+             patch("evaluation.rag_retriever.SentenceTransformer", side_effect=RuntimeError("missing model")):
+            with self.assertRaises(RuntimeError) as caught:
+                retriever.retrieve("CI patterns", top_k=5)
+        self.assertNotIsInstance(caught.exception, RagDevicePaused)
+        probe.assert_not_called()
 
 
 class HistoryTests(unittest.TestCase):

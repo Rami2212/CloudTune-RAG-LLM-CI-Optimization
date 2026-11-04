@@ -250,15 +250,17 @@ class TeamEvaluationTests(unittest.TestCase):
 
     def test_openrouter_pause_stops_without_skipping_or_retrying(self):
         split_dataset(root=self.root)
-        calls = []
-        def fake_invoke(member, position, mode, batch_id):
-            calls.append((position, mode))
-            self._save_trial(position, status="LLM_PAUSED")
-            return 2
-        with patch.object(team, "_invoke", side_effect=fake_invoke):
-            self.assertEqual(team.run_batch(1, team.default_batch_id(1), preflight_only=False, max_repositories=4), 2)
-        self.assertEqual(calls, [(1, "preflight")])
-        self.assertEqual(team._stage({"status": "LLM_PAUSED"}, {}), "preflight")
+        for status in ("LLM_PAUSED", "RAG_PAUSED"):
+            with self.subTest(status=status):
+                calls = []
+                def fake_invoke(member, position, mode, batch_id):
+                    calls.append((position, mode))
+                    self._save_trial(position, status=status)
+                    return 2
+                with patch.object(team, "_invoke", side_effect=fake_invoke):
+                    self.assertEqual(team.run_batch(1, team.default_batch_id(1), preflight_only=False, max_repositories=4), 2)
+                self.assertEqual(calls, [(1, "preflight")])
+                self.assertEqual(team._stage({"status": status}, {}), "preflight")
 
     def test_member_config_uses_its_own_partition_and_fails_on_changes(self):
         split_dataset(root=self.root)

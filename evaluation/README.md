@@ -6,6 +6,26 @@ Evaluate whether a RAG-assisted optimizer can recommend safe CI workflow changes
 
 The current RAG corpus contains 25 literature patterns and 49 pattern-satisfied experiment examples: 39 synthetic scenarios and 10 main-batch cases whose source outcome was inconclusive (the inconclusive `outcome` field is omitted in the RAG record). These examples provide context, not proof of speedups on the evaluation repositories. This evaluation must measure each proposed change on the target repository.
 
+The normal `scripts.run_evaluation_batch` command retains the original A/B/C flow,
+UTC stage logs, batch IDs, range flags and checkpoint handling. Arm C's v4 prompt
+considers all 25 frozen patterns, with their prerequisites and limitations, plus
+the top-k retrieved examples. Its catalogue is archived with the candidate. This
+broadens proposal generation; the existing independent admission gate still
+requires review for changes outside its automatic policy. Patterns requiring
+other files, event histories or external infrastructure cannot be measured by
+inventing those prerequisites in a single-workflow dispatch trial. The separate
+`evaluation.full_patterns` study is experimental tooling, never the normal batch
+command's destination. Earlier candidates retain their frozen identities and
+must not be resumed under a changed prompt or evaluator implementation.
+
+CUDA embedding failures pause with `RAG_PAUSED`, preserving the current trial
+without recording a permanent Arm C error or advancing to the next repository.
+The existing optimizer log includes the underlying device error. Restore the
+requested GPU and explicitly restart the same command; there is no automatic
+retry or CPU fallback. CPU remains the default unless `CLOUDTUNE_RAG_DEVICE`
+selects CUDA. This recovery applies to newly paused trials; previously archived
+`C=ERROR` attempts remain unchanged and require a new rerun generation.
+
 ## Comparison arms
 
 | Arm                       | Method                                                                                                                | Purpose                                                                                                         |

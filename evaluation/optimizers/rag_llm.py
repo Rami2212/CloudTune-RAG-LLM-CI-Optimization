@@ -19,6 +19,8 @@ from evaluation.openrouter_http import OpenRouterPaused, request_openrouter_json
 from evaluation.repository_preparation import MANIFEST_NAMES, workflow_doc, write_immutable, write_json_immutable
 from evaluation.rag_retriever import Retriever
 
+PROMPT_VERSION = "cloudtune-eval-rag-v4-full-patterns"
+
 
 def _hash(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
@@ -26,7 +28,7 @@ def _hash(raw: bytes) -> str:
 
 def generate_rag_candidate(snapshot_dir: Path, *, retriever: Retriever,
                            model: str, top_k: int, max_tokens: int,
-                           prompt_version: str = "cloudtune-eval-rag-v3-admission-contract",
+                           prompt_version: str = PROMPT_VERSION,
                            required_job_names: list[str] | None = None) -> dict:
     if not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9_./:-]+:free", model):
         raise ValueError("Pin a specific available OpenRouter :free model for Arm C")
@@ -42,6 +44,7 @@ def generate_rag_candidate(snapshot_dir: Path, *, retriever: Retriever,
     if _hash(original) != manifest["workflow_sha256"]:
         raise ValueError("Original workflow snapshot changed")
     target = snapshot_dir / "candidates/C"
+    catalogue = getattr(retriever, "pattern_catalogue", [])
     existing = target / "candidate.json"
     if existing.exists():
         row = json.loads(existing.read_text(encoding="utf-8"))
@@ -51,6 +54,11 @@ def generate_rag_candidate(snapshot_dir: Path, *, retriever: Retriever,
                 row.get("corpus_sha256") != retriever.identity["dataset_sha256"] or
                 row.get("prompt_version") != prompt_version):
             raise ValueError("Previously generated Arm C identity changed; use a new evaluation_id")
+        archived_catalogue = target / "pattern_catalogue.json"
+        if (not archived_catalogue.is_file() or
+                _hash(archived_catalogue.read_bytes()) != row.get("pattern_catalogue_sha256") or
+                json.loads(archived_catalogue.read_text(encoding="utf-8")) != catalogue):
+            raise ValueError("Previously saved Arm C pattern catalogue is missing or changed")
         # Archived candidate bytes are immutable and independently checked on reuse.
         if row.get("decision") == "APPLY":
             saved = target / "optimized.yml"
@@ -104,7 +112,9 @@ def generate_rag_candidate(snapshot_dir: Path, *, retriever: Retriever,
                "required_checks": {"status": "configured" if frozen_jobs else checks.get("status", "not_verified"),
                                    "names": frozen_jobs}, "ci_history": history,
                "repository_context": context_files}
-    query = ("Find applicable, safe dependency-download caching evidence for GitHub Actions CI.\n"
+    query = ("Find applicable CI optimization patterns for this GitHub Actions workflow: "
+             "caching, parallelism, fail-fast, cancellation, scheduling, selection, "
+             "timeouts, build configuration and redundant work. Do not restrict to caching.\n"
              + original.decode("utf-8-sig")[:3500] + "\nRepository evidence: "
              + json.dumps(context, ensure_ascii=False, sort_keys=True)[:4000])
     archived_retrieval = target / "retrieval.json"
@@ -133,18 +143,23 @@ def generate_rag_candidate(snapshot_dir: Path, *, retriever: Retriever,
                    "Return ONLY a JSON object with fields decision (APPLY or NO_CHANGE), "
                    "workflow_yaml (complete YAML when APPLY, null when NO_CHANGE), rationale, "
                    "and evidence_ids (array). Preserve workflow triggers, permissions, all original "
-                   "jobs, matrices, steps and commands. Only make a narrowly scoped, additive, "
-                   "dependency-download caching change where appropriate. The admission gate accepts "
-                   "actions/cache@v4 steps with exactly name, uses, and with; with must contain only "
-                   "path and key (no restore-keys). Use a single dependency-download directory, an "
-                   "explicit runner.os expression and hashFiles of a frozen dependency file in the key. "
-                   "Do not cache installed artifacts, change concurrency, upgrade actions, or edit commands. "
-                   "For npm, prefer adding only cache: npm to an existing compatible setup-node step "
-                   "when a root npm lockfile is frozen and checkout precedes setup-node. "
-                   "Return NO_CHANGE when these prerequisites cannot be verified. Do not introduce privileged "
-                   "actions, uploads, external commands or new network destinations. Do not fabricate data.")
+                   "required checks and their behavior. Consider ALL mechanisms in pattern_catalogue, "
+                   "including those absent from the top-k examples. There is no caching-only proposal rule. "
+                   "Propose one minimal, evidence-backed workflow treatment using any applicable corpus "
+                   "pattern; cite its document_id from the catalogue or retrieved evidence. "
+                   "Changes to commands, ordering, matrices or conditions need concrete evidence that "
+                   "required work is preserved. Missing history, dependency graphs, contracts or external "
+                   "services must not be assumed. This evaluator applies one workflow file, so mechanisms "
+                   "requiring other files or infrastructure cannot be implemented by inventing them. "
+                   "The independent admission gate may require review; do not equate that with pattern "
+                   "inapplicability or restrict generation to its automatic cache allowlist. "
+                   "Keep triggers and permissions unchanged for this workflow-dispatch experiment. "
+                   "For caching, retain installation and required tests, use dependency/environment-bound "
+                   "keys and avoid unchecked installed artifacts. Do not introduce privileged "
+                   "actions, uploads, untrusted downloads or new network destinations. Do not fabricate data.")
     prompt = {"prompt_version": prompt_version, "original_workflow": original.decode("utf-8-sig"),
               "repository_context": context,
+              "pattern_catalogue": catalogue,
               "evidence": evidence, "instruction": instruction}
     prompt_sha256 = _hash(json.dumps(prompt, ensure_ascii=False, sort_keys=True).encode("utf-8"))
     # The pinned free Nemotron endpoint does not support response_format.
@@ -156,6 +171,7 @@ def generate_rag_candidate(snapshot_dir: Path, *, retriever: Retriever,
     target.mkdir(parents=True, exist_ok=True)
     write_json_immutable(target / "retrieval.json", {"corpus": retriever.identity,
                                                      "query": query, "results": evidence})
+    write_json_immutable(target / "pattern_catalogue.json", catalogue)
     write_json_immutable(target / "llm_request.json", request_body)
     started = time.monotonic()
     req = Request("https://openrouter.ai/api/v1/chat/completions", method="POST",
@@ -216,7 +232,7 @@ def generate_rag_candidate(snapshot_dir: Path, *, retriever: Retriever,
     if decision not in {"APPLY", "NO_CHANGE"}:
         raise ValueError("Arm C returned unsupported decision")
     cited = proposal.get("evidence_ids", [])
-    available = {row["document_id"] for row in evidence}
+    available = {row["document_id"] for row in evidence + catalogue}
     if (not isinstance(cited, list) or
             any(not isinstance(i, str) or i not in available for i in cited) or
             len(cited) != len(set(cited))):
@@ -254,6 +270,7 @@ def generate_rag_candidate(snapshot_dir: Path, *, retriever: Retriever,
                "top_k": top_k, "max_tokens": max_tokens,
                "required_job_names": required_job_names or [],
                "corpus_sha256": retriever.identity["dataset_sha256"],
+               "pattern_catalogue_sha256": _hash((target / "pattern_catalogue.json").read_bytes()),
                "embedding_revision": retriever.revision, "retrieved_ids": cited}
     write_json_immutable(target / "candidate.json", outcome)
     return outcome

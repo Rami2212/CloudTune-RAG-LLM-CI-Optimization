@@ -118,6 +118,12 @@ class PreflightGateTests(unittest.TestCase):
         run.assert_not_called()
 
     def test_controller_preflight_archives_both_passes_without_fork_writes(self):
+        self._controller_preflight()
+
+    def test_cuda_pause_preserves_trial_and_resumes_without_regenerating_b(self):
+        self._controller_preflight(pause_device=True)
+
+    def _controller_preflight(self, pause_device=False):
         """Exercise the actual coordinator path up to the fork safety boundary."""
         original = b"on: workflow_dispatch\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n"
         with tempfile.TemporaryDirectory() as folder:
@@ -166,11 +172,25 @@ class PreflightGateTests(unittest.TestCase):
                   patch.object(pipeline, "install_ci_cost") as install,
                   patch.object(pipeline, "generate_ci_cost_candidate", return_value=b) as generate,
                   patch.object(pipeline, "Retriever") as retriever,
-                  patch.object(pipeline, "generate_rag_candidate", return_value=c),
+                  patch.object(pipeline, "generate_rag_candidate", side_effect=(
+                      [pipeline.RagDevicePaused("No CUDA GPUs are available"), c]
+                      if pause_device else [c])) as rag,
                   patch.object(pipeline, "_candidate_yaml", return_value=b"safe-cache-workflow"),
-                  patch.object(pipeline, "validate_and_archive", return_value={"verdict": "PASS"})):
+                  patch.object(pipeline, "validate_and_archive", return_value={"verdict": "PASS"}) as validate):
                 retriever.return_value.revision = "a" * 40
+                retriever.return_value.pattern_catalogue = [{}] * 25
                 report = pipeline.run_fork_evaluation(config, preflight_only=True)
+                if pause_device:
+                    paused = report["repositories"]["owner/repo"]
+                    self.assertEqual(paused["status"], "RAG_PAUSED")
+                    self.assertIn("No CUDA GPUs", paused["failure_reason"])
+                    self.assertNotIn("C", paused["candidates"])
+                    validate.assert_not_called()
+                    experiment.provision.assert_not_called()
+                    experiment.execute.assert_not_called()
+                    report = pipeline.run_fork_evaluation(config, preflight_only=True)
+                    self.assertEqual(rag.call_count, 2)
+                generate.assert_called_once()
                 install.assert_called_once_with((root / "reviewed-ci-cost-v2").resolve())
                 self.assertEqual(generate.call_args.kwargs["tool_dir"],
                                  (root / "reviewed-ci-cost-v2").resolve())
@@ -182,6 +202,10 @@ class PreflightGateTests(unittest.TestCase):
             experiment.prepare.assert_not_called()
             experiment.make_arm.assert_not_called()
             experiment.execute.assert_not_called()
+
+    def test_cuda_paused_cli_exits_nonzero(self):
+        code, run = self._run_cli(["--preflight"], "RAG_PAUSED")
+        self.assertEqual(code, 2)
 
 
 if __name__ == "__main__":
