@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 from contextlib import contextmanager, nullcontext
+from datetime import datetime, timezone
 from pathlib import Path
 
 from scripts.experiment_environment import load_env
@@ -162,16 +163,12 @@ def _stage(repo_state: dict, repo_report: dict) -> str:
     return "preflight"
 
 
-def freeze_batch(member: int, batch_id: str, *, rerun_failed: bool = False) -> Path:
-    """Refuse a model, config, dataset or runner change in an active batch.
-
-    This is a small *local* batch identity file, not a duplicate execution
-    ledger. The fork controller remains authoritative for each repository.
-    """
+def _batch_identity_record(member: int, batch_id: str, batch_name: str | None = None) -> dict:
     assignment = DESTINATION / f"member_{member:02d}.csv"
     record = {
-        "schema": 1,
+        "schema": 2,
         "batch_id": batch_id,
+        "batch_name": batch_name or batch_id,
         "member": member,
         "assignment_sha256": hashlib.sha256((ROOT / assignment).read_bytes()).hexdigest(),
         "config_template_sha256": hashlib.sha256(BASE_CONFIG.read_bytes()).hexdigest(),
@@ -182,38 +179,87 @@ def freeze_batch(member: int, batch_id: str, *, rerun_failed: bool = False) -> P
     }
     if not record["openrouter_model"].endswith(":free") or not record["openrouter_max_tokens"]:
         raise ValueError("Set a :free OPENROUTER_MODEL and OPENROUTER_MAX_TOKENS before running")
+    return record
+
+
+def _identity_fields(record: dict) -> dict:
+    return {key: value for key, value in record.items()
+            if key not in {"schema", "batch_name", "revision", "change_history", "last_change_fields"}}
+
+
+def freeze_batch(member: int, batch_id: str, *, rerun_failed: bool = False,
+                 allow_config_changes: bool = False, batch_name: str | None = None) -> Path:
+    """Freeze batch settings, or explicitly append a recorded config revision."""
+    if batch_name is not None:
+        batch_name = batch_name.strip()
+        if not batch_name or len(batch_name) > 120:
+            raise ValueError("--batch-name must contain 1-120 non-space characters")
+    record = _batch_identity_record(member, batch_id, batch_name)
     location = RESULTS / batch_id / "batch_identity.json"
     location.parent.mkdir(parents=True, exist_ok=True)
     if location.is_file():
         previous = _read_json(location)
-        comparable = {k: v for k, v in record.items() if k != "runner_sha256"} if rerun_failed else record
-        old_comparable = {k: v for k, v in previous.items() if k != "runner_sha256"} if rerun_failed else previous
-        if old_comparable != comparable:
+        if batch_name is None:
+            record["batch_name"] = previous.get("batch_name", batch_id)
+        comparable = _identity_fields(record)
+        old_comparable = _identity_fields(previous)
+        if rerun_failed:
+            comparable.pop("runner_sha256", None)
+            old_comparable.pop("runner_sha256", None)
+        immutable = {"batch_id", "member", "assignment_sha256"}
+        changed_immutable = sorted(
+            key for key in immutable if old_comparable.get(key) != comparable.get(key))
+        if changed_immutable:
+            raise ValueError(
+                "Batch identity cannot change member, batch ID, or assignment: "
+                + ", ".join(changed_immutable))
+        if old_comparable != comparable and not allow_config_changes:
             raise ValueError(f"Frozen batch identity changed: {location}; use the original settings")
+        if old_comparable != comparable:
+            history = list(previous.get("change_history", []))
+            history.append({"changed_at_utc": datetime.now(timezone.utc).isoformat(),
+                            "from": old_comparable, "to": comparable})
+            record["revision"] = int(previous.get("revision", 1)) + 1
+            record["change_history"] = history
+            record["last_change_fields"] = sorted(
+                key for key in set(old_comparable) | set(comparable)
+                if old_comparable.get(key) != comparable.get(key))
+            _atomic_json(location, record)
+        else:
+            # Keep a stable revision marker in schema-1 batches upgraded in place.
+            record["revision"] = int(previous.get("revision", 1))
+            record["change_history"] = previous.get("change_history", [])
+            record["last_change_fields"] = previous.get("last_change_fields", [])
+            if (previous.get("schema") != 2 or
+                    previous.get("batch_name", batch_id) != record["batch_name"]):
+                _atomic_json(location, record)
     else:
+        record["revision"] = 1
+        record["change_history"] = []
+        record["last_change_fields"] = []
         _atomic_json(location, record)
     return location
 
 
-def _member_config(member: int, batch_id: str) -> Path:
-    """Pin each member to THEIR partition, not rows 1–1000 of the full CSV.
-
-    The file is private operational state. Once written it cannot be silently
-    rewritten after a trial has frozen the dataset/evaluator identities.
-    """
+def _member_config(member: int, batch_id: str, position: int | None = None) -> Path:
+    """Write a per-trial config, preserving the config already frozen for it."""
     source = json.loads(BASE_CONFIG.read_text(encoding="utf-8"))
     source["dataset"] = (DESTINATION / f"member_{member:02d}.csv").as_posix()
     source["dataset_split"] = "evaluation"
     source["repository_start_at"] = 1
     source["repository_limit"] = 1
-    source["evaluation_id"] = f"{batch_id}-r0001"
+    source["evaluation_id"] = (f"{batch_id}-r0001" if position is None else
+                                _trial_id(batch_id, position))
     if source.get("execution", {}).get("development_smoke") is True:
         raise ValueError("Cannot run a held-out partition under development smoke")
-    target = RESULTS / batch_id / "batch_config.json"
+    target = (RESULTS / batch_id / "batch_config.json" if position is None else
+              RESULTS / batch_id / "configs" / f"{source['evaluation_id']}.json")
     serialized = (json.dumps(source, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists() and target.read_bytes() != serialized:
-        raise ValueError(f"Frozen member configuration has changed: {target}")
+        if position is None:
+            raise ValueError(f"Frozen member configuration has changed: {target}")
+        raise ValueError(f"Frozen trial configuration has changed: {target}; use --override-existing")
     if not target.exists():
         target.write_bytes(serialized)
     return target
@@ -221,7 +267,7 @@ def _member_config(member: int, batch_id: str) -> Path:
 
 def _invoke(member: int, position: int, mode: str, batch_id: str) -> int:
     """Give every repository its own immutable ID; retries use that same ID."""
-    args = [sys.executable, "-m", "evaluation.fork_pipeline", "--config", str(_member_config(member, batch_id)),
+    args = [sys.executable, "-m", "evaluation.fork_pipeline", "--config", str(_member_config(member, batch_id, position)),
             "--batch-id", _trial_id(batch_id, position),
             "--start-at", str(position), "--limit", "1"]
     # The fork controller remains responsible for pending-run reconciliation.
@@ -371,6 +417,40 @@ def prepare_failed_rerun(batch_id: str, rows: list[dict]) -> dict:
     return plan
 
 
+def prepare_override(batch_id: str, rows: list[dict], positions: list[int]) -> dict:
+    """Start fresh generations for selected rows without deleting old evidence."""
+    path = RESULTS / batch_id / "rerun_state.json"
+    plan = _read_json(path)
+    if plan.get("active"):
+        if (not plan.get("override_existing") or
+                plan.get("positions") != positions):
+            raise ValueError("Another rerun/override round is active; resume its original range first")
+        return plan
+    generations = dict(plan.get("generations", {}))
+    previous = {}
+    for position in positions:
+        trial_id = _trial_id(batch_id, position)
+        folder = trial_directory(RESULTS, trial_id)
+        state, repo, _ = _record(batch_id, position, rows[position - 1]["repo_id"])
+        if (folder / ".controller.lock").exists() or repo.get("pending"):
+            raise ValueError(f"Position {position} has active or pending work; resume it before overriding")
+        has_existing_run = bool(state or (folder / "fork_report.json").is_file())
+        if has_existing_run:
+            previous[str(position)] = trial_id
+            generations[str(position)] = int(generations.get(str(position), 1)) + 1
+            if len(f"{batch_id}-r{position:04d}-r{generations[str(position)]}") > 80:
+                raise ValueError("Trial generation ID exceeds 80 characters")
+    plan = {"round": int(plan.get("round", 0)) + 1, "active": bool(positions),
+            "override_existing": True, "positions": positions,
+            "previous_trials": previous, "generations": generations}
+    identity = _read_json(RESULTS / batch_id / "batch_identity.json")
+    identity["runner_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    archive = RESULTS / batch_id / "rerun_rounds" / f"round-{plan['round']:04d}.json"
+    _atomic_json(archive, {**plan, "identity": identity})
+    _atomic_json(path, plan)
+    return plan
+
+
 def position_bounds(start_at: int = 1, stop_at: int | None = None,
                     limit: int | None = None) -> tuple[int, int]:
     """Select original member-local row positions, including finished/skipped rows."""
@@ -388,7 +468,9 @@ def position_bounds(start_at: int = 1, stop_at: int | None = None,
 
 def run_batch(member: int, batch_id: str, *, preflight_only: bool, max_repositories: int | None,
               retry_failed_from: str | None = None, rerun_failed: bool = False,
-              start_at: int = 1, stop_at: int | None = None, limit: int | None = None) -> int:
+              start_at: int = 1, stop_at: int | None = None, limit: int | None = None,
+              allow_config_changes: bool = False, override_existing: bool = False,
+              batch_name: str | None = None) -> int:
     begin, end = position_bounds(start_at, stop_at, limit)
     rows = _assignment(member)
     load_env(ROOT / ".env")
@@ -396,19 +478,43 @@ def run_batch(member: int, batch_id: str, *, preflight_only: bool, max_repositor
         raise ValueError("Set CLOUDTUNE_AUTO_DELETE_FORKS=false in .env to retain evidence forks")
     if not BASE_CONFIG.is_file():
         raise ValueError("Missing evaluation/configs/fork_pilot.json")
-    # A consistent model, token limit, and source partition are essential for
-    # paired research comparisons. Refuse silent changes across restarts.
+    if override_existing and (rerun_failed or retry_failed_from):
+        raise ValueError("--override-existing cannot be combined with rerun or retry options")
+    identity_path = RESULTS / batch_id / "batch_identity.json"
+    previous_identity = _read_json(identity_path)
+    requested_identity = _batch_identity_record(member, batch_id, batch_name)
+    identity_changed = bool(previous_identity and
+                            _identity_fields(previous_identity) != _identity_fields(requested_identity))
+    if override_existing:
+        for index in range(begin, end + 1):
+            _, current, _ = _record(batch_id, index, rows[index - 1]["repo_id"])
+            folder = trial_directory(RESULTS, _trial_id(batch_id, index))
+            if (folder / ".controller.lock").exists() or current.get("pending"):
+                raise ValueError(
+                    f"Position {index} has active or pending work; resume it before overriding")
+    if identity_changed and allow_config_changes and not override_existing and not rerun_failed:
+        for index in range(begin, end + 1):
+            _, current, report = _record(batch_id, index, rows[index - 1]["repo_id"])
+            if _stage(current, report) != "finished" and (current or report):
+                raise ValueError(
+                    f"Position {index} has an unfinished run under the previous settings; "
+                    "use --override-existing to start a preserved new generation")
     if rerun_failed:
         if retry_failed_from or not (RESULTS / batch_id / "batch_identity.json").is_file():
             raise ValueError("--rerun-failed requires an existing batch and cannot use --retry-failed-from")
-        freeze_batch(member, batch_id, rerun_failed=True)
+        freeze_batch(member, batch_id, rerun_failed=True,
+                     allow_config_changes=allow_config_changes, batch_name=batch_name)
     else:
-        freeze_batch(member, batch_id)
-    _member_config(member, batch_id)
+        freeze_batch(member, batch_id, allow_config_changes=allow_config_changes,
+                     batch_name=batch_name)
     selected = None
     rerun_plan = None
     if rerun_failed:
         rerun_plan = prepare_failed_rerun(batch_id, rows)
+        selected = set(rerun_plan["positions"])
+    elif override_existing:
+        positions = list(range(begin, end + 1))
+        rerun_plan = prepare_override(batch_id, rows, positions)
         selected = set(rerun_plan["positions"])
     if retry_failed_from:
         if retry_failed_from == batch_id:
@@ -513,9 +619,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--member", type=int, required=True, choices=(1, 2, 3, 4))
     parser.add_argument("--batch-id", help="Optional unique ID; defaults to eval-member-01, etc.")
+    parser.add_argument("--batch-name", help="Optional human-readable label; defaults to the batch ID")
     parser.add_argument("--retry-failed-from", help="Retry only failed/blocked trials from this batch under a new ID")
     parser.add_argument("--rerun", "--rerun-failed", dest="rerun_failed", action="store_true",
                         help="Rerun only failed rows in this same batch using preserved -r2/-r3 generations")
+    parser.add_argument("--allow-config-changes", action="store_true",
+                        help="Record changed runner/model/config settings as a new batch revision")
+    parser.add_argument("--override-existing", action="store_true",
+                        help="Rerun selected existing positions in a new preserved generation")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--list", action="store_true", help="Preview assigned repositories without API calls")
     mode.add_argument("--preflight-only", action="store_true", help="Screen/validate sequentially; no hosted CI")
@@ -523,10 +634,11 @@ def main() -> int:
     mode.add_argument("--publish-only", action="store_true", help="Refresh commit-ready results without running CI")
     parser.add_argument("--max-repositories", type=int,
                         help="Limit new nonterminal rows processed in this invocation")
-    parser.add_argument("--start-at", type=int, default=1,
+    parser.add_argument("--start-at", "--start-position", dest="start_at", type=int, default=1,
                         help="First member-local row position (1-1000)")
     bounds = parser.add_mutually_exclusive_group()
-    bounds.add_argument("--stop-at", type=int, help="Last member-local row position, inclusive")
+    bounds.add_argument("--stop-at", "--stop-position", dest="stop_at", type=int,
+                        help="Last member-local row position, inclusive")
     bounds.add_argument("--limit", type=int, help="Number of member-local row positions from --start-at")
     args = parser.parse_args()
     if args.max_repositories is not None and args.max_repositories < 1:
@@ -555,7 +667,10 @@ def main() -> int:
             return run_batch(args.member, batch_id, preflight_only=args.preflight_only,
                              max_repositories=args.max_repositories, retry_failed_from=source,
                              rerun_failed=args.rerun_failed, start_at=args.start_at,
-                             stop_at=args.stop_at, limit=args.limit)
+                             stop_at=args.stop_at, limit=args.limit,
+                             allow_config_changes=args.allow_config_changes,
+                             override_existing=args.override_existing,
+                             batch_name=args.batch_name)
     except KeyboardInterrupt:
         print("Stopped. Existing controller checkpoints remain intact; rerun the same command.", file=sys.stderr)
         return 130

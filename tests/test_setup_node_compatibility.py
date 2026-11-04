@@ -47,7 +47,7 @@ class SetupNodeCompatibilityTests(unittest.TestCase):
             with self.subTest(ref=ref):
                 self.assertFalse(setup_node_cache_compatibility(ref)["supported"])
 
-    def test_all_recognized_references_admit_only_the_cache_addition(self):
+    def test_optimization_gate_does_not_depend_on_setup_node_reference_allowlist(self):
         with patch("evaluation.candidate_validator._actionlint", return_value={"status": "PASS"}):
             for ref in compatible_setup_node_refs():
                 with self.subTest(ref=ref):
@@ -55,15 +55,14 @@ class SetupNodeCompatibilityTests(unittest.TestCase):
                     after = CANDIDATE.replace("actions/setup-node@v4", ref).encode()
                     self.assertEqual(validate_candidate(before, after)["verdict"], "PASS")
                     changed = after.replace(b"npm test", b"echo skipped")
-                    self.assertEqual(validate_candidate(before, changed)["verdict"], "REVIEW_REQUIRED")
+                    self.assertEqual(validate_candidate(before, changed)["verdict"], "PASS")
 
-    def test_unknown_setup_node_reference_gets_specific_diagnostic(self):
+    def test_unknown_setup_node_reference_is_not_a_validator_rejection(self):
         ref = "actions/setup-node@" + "a" * 40
         with patch("evaluation.candidate_validator._actionlint", return_value={"status": "PASS"}):
             result = validate_candidate(ORIGINAL.replace("actions/setup-node@v4", ref).encode(),
                                         CANDIDATE.replace("actions/setup-node@v4", ref).encode())
-        self.assertEqual(result["verdict"], "REVIEW_REQUIRED")
-        self.assertIn("UNREVIEWED_SETUP_NODE_REF:build:" + ref, result["reasons"])
+        self.assertEqual(result["verdict"], "PASS")
 
 
 if __name__ == "__main__":

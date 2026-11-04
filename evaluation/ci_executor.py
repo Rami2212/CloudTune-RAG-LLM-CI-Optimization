@@ -14,7 +14,7 @@ import os
 import re
 import time
 from pathlib import Path
-from statistics import mean, median
+from statistics import median
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -877,33 +877,14 @@ def summarize_records(records: list[dict], *, repetitions: int | None = None) ->
         results[arm] = {"attempted": len(runs), "comparable": len(valid),
                         "failed": len(runs) - len(valid), "complete": complete,
                         "median_elapsed_seconds": median(r["workflow_elapsed_seconds"] for r in valid) if complete else None,
-                        "mean_elapsed_seconds": mean(r["workflow_elapsed_seconds"] for r in valid) if complete else None,
                         "median_runner_seconds": median(r["sum_job_runtime_seconds"] for r in valid) if complete else None,
-                        "mean_runner_seconds": mean(r["sum_job_runtime_seconds"] for r in valid) if complete else None,
-                        "mean_initial_queue_seconds": (mean(r["initial_queue_seconds"] for r in valid
-                                                        if r.get("initial_queue_seconds") is not None)
-                                  if complete and all(r.get("initial_queue_seconds") is not None for r in valid)
-                                  else None),
-                        "median_initial_queue_seconds": (median(r["initial_queue_seconds"] for r in valid
-                                                         if r.get("initial_queue_seconds") is not None)
-                                  if complete and all(r.get("initial_queue_seconds") is not None for r in valid)
-                                  else None)}
+                        }
     for target, baseline_arm in (("B", "A"), ("C", "A"), ("C", "B")):
         suffix = ("vs_A" if baseline_arm == "A" else "vs_B")
         for kind in ("elapsed", "runner"):
             baseline = results[baseline_arm][f"median_{kind}_seconds"]
             optimized = results[target][f"median_{kind}_seconds"]
             results[target][f"{kind}_saving_percent_{suffix}"] = (
-                100 * (baseline - optimized) / baseline
-                if baseline is not None and optimized is not None and baseline > 0 else None)
-    # Descriptive arithmetic-mean comparisons supplement, but never replace,
-    # the existing median-based primary outcome. Incomplete arms remain null.
-    for target, baseline_arm in (("B", "A"), ("C", "A"), ("C", "B")):
-        suffix = "vs_A" if baseline_arm == "A" else "vs_B"
-        for kind in ("elapsed", "runner"):
-            baseline = results[baseline_arm][f"mean_{kind}_seconds"]
-            optimized = results[target][f"mean_{kind}_seconds"]
-            results[target][f"mean_{kind}_saving_percent_{suffix}"] = (
                 100 * (baseline - optimized) / baseline
                 if baseline is not None and optimized is not None and baseline > 0 else None)
     return results

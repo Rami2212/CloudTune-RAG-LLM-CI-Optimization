@@ -69,6 +69,16 @@ locked during retries, forks must be retained, and pending source runs are
 never adopted. Actual upstream build failures, invalid original workflows and
 unsupported candidate edits can still fail or remain blocked.
 
+### Protocol v6: narrower execution-safety eligibility screening
+
+The evaluator is not a security assessment. Eligibility screening flags
+explicit publishing/deployment commands or release actions, self-hosted
+runners, secret references and reusable workflows that cannot be inspected.
+Descriptive workflow text that merely mentions deploy, publish, release or
+signing no longer blocks a repository. YAML/actionlint and existing unsafe
+workflow checks remain part of candidate admission. Use a new evaluation ID
+for v6; an in-flight or archived v5 checkpoint keeps its original policy.
+
 Protocol v3 admits an optimizer's `NO_CHANGE` outcome as an unchanged arm only
 when the original workflow passes baseline syntax and safety validation. The
 arm runs the original bytes and remains labeled `NO_CHANGE`, with
@@ -377,6 +387,27 @@ of the original 4,000 repositories**, whether completed or not. The manifest
 reports status counts; it does not invent savings for missing measurements.
 
 ## 7. Safety and limits
+
+### Protocol v9: general candidate admission and report policy
+
+The shared B/C gate has no optimization-type allowlist. It checks that
+candidate YAML parses, actionlint passes, and existing unsafe-workflow checks
+find no issue. It no longer requires npm lockfile evidence or unchanged
+workflow fields and steps. Both pinned CI-Cost and RAG+LLM candidates pass
+through this same gate and then the repository's GitHub CI correctness
+workflow. Candidate NO_CHANGE and rejected candidates remain recorded.
+
+The main arm summary reports attempts, comparable/failed runs, completion,
+median workflow elapsed time, median summed runner time, and savings against
+the applicable arm. Per-run and per-job timing remains available in raw trial
+evidence. This policy uses a new evaluation ID; previous reports and active
+trials retain their frozen policy.
+
+When CI-Cost returns `NO_CHANGE`, Arm B is not dispatched. Its report copies
+Arm A's median timing values, records zero savings, and marks the measurement
+source as reused baseline; Arm B's actual attempt count stays zero. Only A and
+C run CI for that repository. This avoids spending runs on an identical
+workflow while retaining an explicit no-change comparison in the report.
 
 - `--preflight-only` never creates a fork; `--run` requires both optimized arms
   to pass independent admission before hosted A/B/C execution.

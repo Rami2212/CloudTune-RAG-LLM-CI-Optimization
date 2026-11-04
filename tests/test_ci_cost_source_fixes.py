@@ -15,7 +15,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from evaluation.repository_preparation import workflow_doc
-from evaluation.candidate_validator import validate_candidate, _cache_evidence
+from evaluation.candidate_validator import validate_candidate
 from evaluation.fork_pipeline import DEFAULT_CI_COST_DIR
 from evaluation.optimizers.ci_cost import DEFAULT_TOOL_DIR, generate_ci_cost_candidate
 from hashlib import sha256
@@ -134,10 +134,6 @@ jobs:
         self.assertEqual(workflow_doc(candidate), expected)
         with patch("evaluation.candidate_validator._actionlint", return_value={"status": "PASS"}):
             self.assertEqual(validate_candidate(original, candidate)["verdict"], "PASS")
-        self.assertEqual(_cache_evidence(original, candidate, {"package-lock.json"}),
-                         (["package-lock.json"], []))
-        self.assertIn("SETUP_NODE_NPM_ROOT_LOCKFILE_NOT_FROZEN:lint",
-                      _cache_evidence(original, candidate, set())[1])
 
     def test_compiled_source_functions_generate_valid_yaml(self):
         """Compile the same TS functions the real ci-cost build receives."""

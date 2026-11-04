@@ -107,7 +107,7 @@ class GenerationTests(unittest.TestCase):
         self.assertEqual(payload["repository_context"]["repository_context"][0]["path"], "package-lock.json")
         self.assertEqual(payload["evidence"][0]["limitations"], ["Synthetic fixture only"])
 
-    def test_noncache_candidate_can_cite_catalogue_outside_similarity_top_k(self):
+    def test_concurrency_candidate_is_supported_by_general_prompt_and_gate(self):
         self.kwargs["retriever"].pattern_catalogue = [{
             "document_id": "pattern:P-LIT-CANCEL-STALE", "pattern_id": "P-LIT-CANCEL-STALE",
             "pattern": {"mechanism": "cancel_superseded_runs"}}]
@@ -120,16 +120,13 @@ class GenerationTests(unittest.TestCase):
         request = json.loads((self.folder / "candidates/C/llm_request.json").read_text())
         payload = json.loads(request["messages"][1]["content"])
         self.assertEqual(payload["pattern_catalogue"], self.kwargs["retriever"].pattern_catalogue)
-        self.assertIn("ALL mechanisms", payload["instruction"])
-        self.assertNotIn("Only make a narrowly scoped", payload["instruction"])
+        self.assertIn("no fixed optimization-type allowlist", payload["instruction"])
         self.assertEqual(result["retrieved_ids"], ["pattern:P-LIT-CANCEL-STALE"])
         self.assertEqual((self.folder / "candidates/C/optimized.yml").read_bytes(), changed)
-        # This non-cache treatment also passes the existing isolated-serial gate.
-        # Neither the CI-Cost generator nor shared admission policy was changed.
+        # Generation can return a proposal; the common gate decides admission.
         from evaluation.candidate_validator import validate_candidate
         with patch("evaluation.candidate_validator._actionlint", return_value={"status": "PASS"}):
-            self.assertEqual(validate_candidate(ORIGINAL, changed,
-                isolated_serial_dispatch=True)["verdict"], "PASS")
+            self.assertEqual(validate_candidate(ORIGINAL, changed)["verdict"], "PASS")
 
     def test_resume_after_archived_response_does_not_call_model_again(self):
         response = {"model": MODEL, "choices": [{"finish_reason": "stop", "message": {

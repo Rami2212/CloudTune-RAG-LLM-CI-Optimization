@@ -102,10 +102,27 @@ def has_workflow_run(doc: dict) -> bool:
 
 
 def safety_findings(doc: dict) -> list[str]:
-    """Conservative version of existing batch-runner screening; manual review remains necessary."""
+    """Screen only explicit high-risk workflow features for evaluation eligibility.
+
+    This is a narrow execution-safety gate, not a comprehensive security audit.
+    In particular, do not reject workflows merely because descriptive text
+    mentions deployment, publishing, release, or signing.
+    """
     serialized = yaml.safe_dump(doc).lower()
     findings = []
-    if re.search(r"\b(deploy\w*|publish\w*|release|signing)\b|npm\s+publish|docker\s+push", serialized):
+    side_effect = re.compile(
+        r"\b(?:npm\s+publish|docker\s+push|git\s+push|gh\s+release\s+create|"
+        r"kubectl\s+(?:apply|set\s+image)|helm\s+upgrade)\b", re.IGNORECASE)
+    explicit_publish_action = re.compile(
+        r"(?:docker/build-push-action|softprops/action-gh-release|ncipollo/release-action)",
+        re.IGNORECASE)
+    has_explicit_side_effect = any(
+        (isinstance(step.get("run"), str) and side_effect.search(step["run"])) or
+        (isinstance(step.get("uses"), str) and explicit_publish_action.search(step["uses"]))
+        for job in doc["jobs"].values()
+        for step in job.get("steps", [])
+    )
+    if has_explicit_side_effect:
         findings.append("POSSIBLE_DEPLOY_PUBLISH_RELEASE")
     if "self-hosted" in serialized:
         findings.append("SELF_HOSTED_RUNNER")

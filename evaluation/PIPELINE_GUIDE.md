@@ -271,7 +271,7 @@ A repeated run with the same evaluation ID reuses already frozen repository snap
 - Never automatically change an upstream repository. This preparation stage is completely read-only.
 - Archive inputs with pinned source commit/tree and SHA-256 hashes; record omitted manifests and files.
 - Exclude known training/development repository IDs, and check fork provenance where available.
-- Conservatively flag deployment/release/publishing, secret references, self-hosted runners, reusable workflows without inspection and dangerous listeners.
+- Use narrow execution-safety eligibility screening: explicit publishing/deployment commands or release actions, secret references, self-hosted runners and reusable workflows without inspection. Descriptive text alone is not a blocker. This is not a security audit.
 - These are **heuristic screens**, not a proof of behavioral equivalence. Required checks remain **not verified** at this stage.
 - Keep RAG indexing, candidate generation, safety validation, and actual CI execution as separate stages.
 - Preserve `NO_CHANGE`, failures, rejected candidates and incomplete runs in eventual A/B/C reporting; never invent savings.
@@ -531,15 +531,13 @@ heads. The controller uploads an additional per-invocation GitHub Actions
 artifact from `evaluation/results/`; that artifact is **not** the durable
 source of truth across separate hosted runner instances.
 
-The conservative initial shared validator automatically admits only narrow
-**additive dependency-cache** proposals preserving the original job IDs,
-steps, commands, matrices, triggers and permissions. Cache keys must be
-bound to the runner OS and dependency input hashes. Required dispatch inputs
-without defaults are rejected before experiment branch creation. Other valid optimization
-mechanisms are `REVIEW_REQUIRED` and **not** automatically executed. Neither
-YAML parsing, actionlint nor a successful CI conclusion alone proves general
-behavioral equivalence; a broader study needs a predeclared mechanism-specific
-safety protocol and independent review.
+The current shared validator has no optimization-type allowlist. It accepts a
+candidate after YAML parsing, actionlint and existing unsafe-workflow checks;
+it does not require original job IDs, steps, commands, matrices, triggers,
+permissions or dependency files to remain unchanged. Required dispatch inputs
+without defaults are still rejected before experiment branch creation. Static
+checks and successful CI do not prove behavioral equivalence, so inspect
+candidate diffs and report correctness failures separately from speedups.
 
 Initial baseline required-job names are inferred from the successful first
 GitHub Actions run only when an explicit list is absent. This is a **heuristic
@@ -601,19 +599,17 @@ The local controller uses `evaluation/candidate_validator.py` as one common gate
 for Arm B (`ci-cost`) and Arm C (RAG). Every outcome produces immutable evidence
 under `evaluation/results/<evaluation_id>/repositories/<repository>/validation/<arm>/validation.json`
 _before_ an optimized arm branch can be created. This records the pinned source
-and candidate hashes, selected workflow, policy revision, `actionlint` status,
-reasons and verified frozen lockfile paths. Existing records can only be reused
-when identities match; a policy change requires a new `evaluation_id`.
+and candidate hashes, selected workflow, policy revision, `actionlint` status
+and reasons. Existing records can only be reused when identities match; a
+policy change requires a new `evaluation_id`.
 
-Only narrow additive dependency-download caches can automatically receive
-`PASS`. Such a cache must follow checkout, use a static OS-and-lockfile cache
-key, and hash a dependency input verified in the pinned source snapshot.
-Missing input files, unsafe/dynamic expressions, installed-artifact caches,
-complex triggers or unreviewed workflow changes cannot be auto-dispatched.
-`FAIL`, `REVIEW_REQUIRED`, `INCONCLUSIVE` and `NO_CHANGE` never create optimized
-arm branches. `actionlint` must be installed locally for approval. The validator
-checks duplicate YAML keys through the existing Actions loader, but even `PASS`
-is not a mathematical proof that execution behavior is equivalent.
+There is no longer an automatic allowlist for optimization patterns. A
+candidate must parse, pass actionlint and avoid findings from the existing
+unsafe-workflow screen. `FAIL`, `REVIEW_REQUIRED`, `INCONCLUSIVE` and
+`NO_CHANGE` do not create optimized arm branches. `actionlint` must be
+installed locally for approval. Passing these static checks is not a proof
+that the candidate preserves behavior; hosted CI supplies the correctness
+check, and candidate diffs should be reviewed when interpreting results.
 
 Install `actionlint` from the [official releases](https://github.com/rhysd/actionlint/releases)
 (or use the commands below); verify that `actionlint -version` works before
@@ -767,6 +763,10 @@ pending trial. Preserve any retained forks for review until manually cleared.
 
 ### Reviewed `setup-node` npm download-cache admission (policy v5)
 
+Historical policy description. Protocol v9 supersedes this admission restriction;
+the details below document the earlier npm-only evaluation and remain relevant
+only to archived trials and the pinned CI-Cost generator's adaptation logic.
+
 The common B/C admission gate can now approve one exact additive edit:
 adding `with.cache: npm` to an existing official setup-node release reference
 recognized by `evaluation/setup_node_compatibility.py`. It uses the frozen
@@ -806,6 +806,17 @@ A missing root lockfile or a non-root npm installation requires review.
 Candidate validity is not proof of a runtime speedup; measure it on GitHub.
 Prior validation evidence is immutable: use a **new** `dev-` evaluation ID after
 this policy change, and never reuse a prior trial's saved rejection as PASS.
+
+The current A/B/C protocol has no optimization-type allowlist. The shared gate
+checks YAML validity, actionlint, and existing unsafe-workflow findings for
+both CI-Cost and RAG+LLM candidates. Arm C can consider patterns from the full
+RAG corpus. Primary arm summaries use median workflow elapsed and runner time,
+completion counts, and savings; raw run and job timing remains supporting
+evidence. This protocol is `cloudtune-local-fork-abc-v9-general-candidate-admission`
+with candidate policy `cloudtune-candidate-gate-v9-general-workflow-optimizations`.
+If CI-Cost returns `NO_CHANGE`, Arm B is not dispatched; its summary reuses
+Arm A's timing and reports zero savings with zero actual B runs. Arm A and any
+admitted Arm C still run their configured repetitions.
 
 Historical CI-Cost source-fix v2 recognized unnamed `- run: npm ci` steps
 but retained upstream installed-artifact caching, which required manual review.

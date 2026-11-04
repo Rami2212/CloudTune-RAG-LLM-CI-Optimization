@@ -42,7 +42,7 @@ from evaluation.repository_preparation import (GitHubReader, file_sha256, read_e
 from evaluation.run_pipeline import ROOT, load_config, prepare
 
 
-PROTOCOL = "cloudtune-local-fork-abc-v5-dispatch-compatibility"
+PROTOCOL = "cloudtune-local-fork-abc-v9-general-candidate-admission"
 
 
 class StateStore:
@@ -417,7 +417,22 @@ def _save_report(output: Path, state: dict) -> dict:
         results = summarize_records(record.get("records", []),
                                     repetitions=state.get("repetitions"))
         if record.get("candidates", {}).get("B", {}).get("decision") == "NO_CHANGE":
-            results["B"]["descriptive_zero_change"] = True
+            # Arm B did not execute. Reuse A's measured values as the
+            # descriptive no-change result, while keeping actual B run counts
+            # at zero and preserving only real GitHub runs in run_records.
+            baseline = results["A"]
+            results["B"] = {
+                "attempted": 0, "comparable": 0, "failed": 0,
+                "complete": baseline["complete"],
+                "actual_arm_complete": False,
+                "median_elapsed_seconds": baseline["median_elapsed_seconds"],
+                "median_runner_seconds": baseline["median_runner_seconds"],
+                "measurement_source": "A_baseline_reused_no_B_runs",
+                "reported_baseline_repetitions": baseline["comparable"],
+                "descriptive_zero_change": True,
+                "elapsed_saving_percent_vs_A": 0.0 if baseline["complete"] else None,
+                "runner_saving_percent_vs_A": 0.0 if baseline["complete"] else None,
+            }
         if record.get("candidates", {}).get("C", {}).get("decision") == "NO_CHANGE":
             results["C"]["descriptive_zero_change"] = True
         summaries[repo_id] = {"status": record.get("status", "UNKNOWN"),
@@ -649,7 +664,10 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False,
             experiment.prepare(repo, save)
             if repo.get("workflow_id") is None:
                 raise RuntimeError("Fork workflow is not registered/active")
+            b_no_change = repo.get("candidates", {}).get("B", {}).get("decision") == "NO_CHANGE"
             for arm, data in candidates.items():
+                if arm == "B" and b_no_change:
+                    continue
                 experiment.make_arm(repo, arm, data, save)
             # Measure only admitted arms. A failure in Original Workflow
             # invalidates the baseline and stops the entire repository. A failed
@@ -667,6 +685,8 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False,
                 # required jobs; subsequent repetitions use rotating orders.
                 for arm in order:
                     if arm not in candidates or arm in failed_optimized_arms:
+                        continue
+                    if arm == "B" and b_no_change:
                         continue
                     if any(r["arm"] == arm and r["repeat"] == repeat for r in repo["records"]):
                         continue
@@ -693,8 +713,9 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False,
                     if platform else
                     f"Original Workflow run {failed_trial['run_id']} failed correctness or protocol checks")
             else:
+                measured_arms = 2 if b_no_change and "B" in candidates else len(candidates)
                 complete = (len(candidates) == 3 and
-                            len(repo["records"]) == reps * 3 and
+                            len(repo["records"]) == reps * measured_arms and
                             all(record.get("comparable") for record in repo["records"]))
                 if complete:
                     repo["status"] = "COMPLETE"

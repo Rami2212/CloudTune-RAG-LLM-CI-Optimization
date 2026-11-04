@@ -113,7 +113,7 @@ class ThreeTrialProtocolTests(unittest.TestCase):
         self.assertEqual(state["pending"]["run_id"], 908)
         self.assertEqual(len(attempts), 21)
 
-    def test_three_complete_runs_report_mean_and_median_but_never_partial_savings(self):
+    def test_three_complete_runs_report_compact_median_stats_and_no_partial_savings(self):
         def record(arm, number, elapsed):
             return {"arm": arm, "repeat": number, "comparable": True,
                     "workflow_elapsed_seconds": elapsed,
@@ -124,16 +124,14 @@ class ThreeTrialProtocolTests(unittest.TestCase):
         stats = summarize_records(records, repetitions=3)
         self.assertTrue(stats["A"]["complete"])
         self.assertEqual(stats["A"]["median_elapsed_seconds"], 10)
-        self.assertEqual(stats["A"]["mean_elapsed_seconds"], 40)
-        self.assertAlmostEqual(stats["B"]["mean_elapsed_seconds"], 28/3)
+        self.assertEqual(stats["A"]["median_runner_seconds"], 20)
+        self.assertNotIn("mean_elapsed_seconds", stats["A"])
         self.assertAlmostEqual(stats["B"]["elapsed_saving_percent_vs_A"], 10)
-        self.assertAlmostEqual(stats["B"]["mean_elapsed_saving_percent_vs_A"], 100*(40-28/3)/40)
-        self.assertEqual(stats["A"]["mean_initial_queue_seconds"], 3600)
-        self.assertIsNone(stats["C"]["mean_elapsed_seconds"])
+        self.assertIsNone(stats["C"]["median_elapsed_seconds"])
         partial = summarize_records(records[:-1], repetitions=3)
         self.assertFalse(partial["B"]["complete"])
-        self.assertIsNone(partial["B"]["mean_elapsed_seconds"])
-        self.assertIsNone(partial["B"]["mean_elapsed_saving_percent_vs_A"])
+        self.assertIsNone(partial["B"]["median_elapsed_seconds"])
+        self.assertIsNone(partial["B"]["elapsed_saving_percent_vs_A"])
 
     def test_undiscoverable_dispatch_stops_without_resending(self):
         runner = ForkExperiment(
