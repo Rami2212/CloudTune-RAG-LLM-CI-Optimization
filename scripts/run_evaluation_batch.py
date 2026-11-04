@@ -331,7 +331,7 @@ def publish_batch(member: int, rows: list[dict[str, str]], batch_id: str) -> Pat
 
 
 def failed_positions(source: str, rows: list[dict]) -> list[int]:
-    failed = {"PREFLIGHT_BLOCKED", "FAILED_TARGET_CI", "INCOMPLETE", "INCONCLUSIVE_PLATFORM", "LLM_PAUSED"}
+    failed = {"PREFLIGHT_BLOCKED", "FAILED_TARGET_CI", "INCOMPLETE", "INCONCLUSIVE_PLATFORM", "LLM_PAUSED", "RAG_PAUSED"}
     positions = []
     for index, row in enumerate(rows, 1):
         _, current, report = _record(source, index, row["repo_id"])
@@ -458,6 +458,8 @@ def run_batch(member: int, batch_id: str, *, preflight_only: bool, max_repositor
                 publish_batch(member, rows, batch_id)
                 if report.get("status") == "LLM_PAUSED" or current.get("status") == "LLM_PAUSED":
                     print("OpenRouter paused; inspect llm_error.json, then restart this SAME command.", flush=True)
+                elif report.get("status") == "RAG_PAUSED" or current.get("status") == "RAG_PAUSED":
+                    print("RAG paused; restore the requested GPU, then restart this SAME command.", flush=True)
                 elif result != 0:
                     print(f"Preflight returned {result}. Check the saved state before restarting.", flush=True)
                 return 2

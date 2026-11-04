@@ -10,6 +10,7 @@ from collections import Counter
 import json
 import math
 import os
+import re
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
@@ -23,6 +24,19 @@ except ImportError:  # Lightweight config/validator tests do not need ML weights
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL = "BAAI/bge-m3"
+
+
+class RagDevicePaused(RuntimeError):
+    """Local embedding hardware failed; preserve this trial for explicit resume."""
+
+
+def _check_cuda_device(device: str) -> None:
+    import torch
+    if not torch.cuda.is_available():
+        raise RuntimeError("No CUDA GPUs are available")
+    # Detect a disabled GPU/driver failure before loading the embedding weights.
+    probe = torch.empty(1, device=device)
+    torch.cuda.synchronize(probe.device)
 
 
 def _json_request(url: str, key: str, *, body: dict | None = None):
@@ -132,6 +146,18 @@ def verify_corpus(dataset_path: Path, *, expected_sha256: str, revision: str | N
 
 
 class Retriever:
+    def _device_operation(self, operation):
+        device = getattr(self, "device", os.environ.get("CLOUDTUNE_RAG_DEVICE", "cpu"))
+        try:
+            return operation()
+        except (RuntimeError, AssertionError, OSError, ValueError) as exc:
+            if device.startswith("cuda") or re.search(r"cuda|cublas|cudnn|nvidia", str(exc), re.I):
+                raise RagDevicePaused(
+                    f"Embedding device {device} failed: {type(exc).__name__}: {str(exc)[:600]}. "
+                    "Restore the requested GPU and restart the same command; no CPU fallback occurred."
+                ) from exc
+            raise
+
     def __init__(self, *, revision: str | None, dataset_path: Path, dataset_sha256: str):
         self.identity = verify_corpus(dataset_path, expected_sha256=dataset_sha256, revision=revision)
         self.revision = self.identity["embedding_revision"]
@@ -139,12 +165,21 @@ class Retriever:
         # Only pinned, locally verified corpus metadata can provide provenance.
         # Supabase returns chunk text and similarity; a chunk may omit caveats.
         self.metadata = {}
+        # Keep every eligible pattern available to Arm C. Similarity top-k adds
+        # examples; it must not restrict which corpus mechanisms can be proposed.
+        self.pattern_catalogue = []
         for line in dataset_path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
             doc = json.loads(line)
             if doc.get("document_id") not in self.identity["eligible_document_ids"]:
                 continue
+            if doc["record_type"] == "pattern":
+                self.pattern_catalogue.append({
+                    "document_id": doc["document_id"], "pattern_id": doc["pattern_id"],
+                    "title": doc["title"], "evidence_scope": doc.get("evidence_scope"),
+                    "pattern": doc["pattern"],
+                })
             detail = doc.get("pattern", {}) if doc["record_type"] == "pattern" else doc.get("experiment", {})
             self.metadata[doc["document_id"]] = {
                 "evidence_scope": doc.get("evidence_scope", "unspecified"),
@@ -167,16 +202,17 @@ class Retriever:
             # Keep the selected device consistent and record it for research reproducibility.
             self.device = os.environ.get("CLOUDTUNE_RAG_DEVICE", "cpu")
 
-            self.model = SentenceTransformer(
-                MODEL,
-                revision=self.revision,
-                device=self.device,
-            )
+            def load_model():
+                if self.device.startswith("cuda"):
+                    _check_cuda_device(self.device)
+                return SentenceTransformer(MODEL, revision=self.revision, device=self.device)
+            self.model = self._device_operation(load_model)
             
         if len(self.model.tokenizer(query, add_special_tokens=True)["input_ids"]) > self.model.max_seq_length:
             raise ValueError("RAG retrieval query exceeds model token limit")
-        vector = self.model.encode([query], normalize_embeddings=True, show_progress_bar=False,
-                                   convert_to_numpy=True)[0].tolist()
+        vector = self._device_operation(lambda: self.model.encode(
+            [query], normalize_embeddings=True, show_progress_bar=False,
+            convert_to_numpy=True)[0].tolist())
         if len(vector) != 1024:
             raise ValueError("Embedding vector dimensions are incorrect")
         url, key = _client_settings()

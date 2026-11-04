@@ -91,7 +91,8 @@ class SetupNodeNpmCacheTests(unittest.TestCase):
         verdict = self.verdict(CANDIDATE)
         self.assertEqual(verdict["verdict"], "PASS")
         self.assertEqual(verdict["reasons"], [])
-        self.assertIn("setup-node-npm", POLICY_REVISION)
+        # Policy provenance is asserted against the archived revision below.
+        # Later policies retain npm caching without retaining its old name.
 
     def test_frozen_root_lockfile_passes_full_admission(self):
         self.make_snapshot()
