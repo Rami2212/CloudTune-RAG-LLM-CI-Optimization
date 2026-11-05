@@ -24,9 +24,10 @@ from evaluation.prepare_evaluation_assignments import ROOT, DESTINATION, ROWS_PE
 
 RESULTS = ROOT / "evaluation" / "results"
 BASE_CONFIG = ROOT / "evaluation" / "configs" / "fork_pilot.json"
-COMPLETED = {"COMPLETE", "SKIPPED", "FAILED_TARGET_CI", "INCONCLUSIVE_PLATFORM", "INCOMPLETE"}
+COMPLETED = {"COMPLETE", "SKIPPED", "FAILED_TARGET_CI", "INCONCLUSIVE_PLATFORM",
+             "INCOMPLETE", "QUEUE_TIMEOUT", "IN_PROGRESS_TIMEOUT"}
 RETAINED_OR_DONE = {"RETAINED_BY_CONFIGURATION", "NOT_CREATED", "NOT_STARTED",
-                    "PRESERVED_NOT_OWNED"}
+                    "PRESERVED_NOT_OWNED", "REUSED_EXISTING_PRESERVED"}
 EXPORT_COLUMNS = ("batch_id", "member", "position", "source_position", "repo_id", "evaluation_id", "status",
                   "ci_cost_verdict", "rag_verdict", "admitted_arms", "original_runs", "ci_cost_runs",
                   "rag_runs", "original_comparable", "ci_cost_comparable", "rag_comparable",
@@ -35,7 +36,8 @@ RUN_COLUMNS = ("arm", "repeat", "run_id", "run_attempt", "source_commit_sha",
                "config_commit_sha", "workflow_sha256", "conclusion", "protocol_valid",
                "required_checks_pass", "comparable", "workflow_elapsed_seconds",
                "sum_job_runtime_seconds", "workflow_makespan_seconds", "inter_job_idle_seconds",
-               "initial_queue_seconds", "failure_class", "run_created_at",
+               "initial_queue_seconds", "queue_timeout_seconds", "in_progress_seconds",
+               "in_progress_timeout_seconds", "cancel_status", "failure_class", "run_created_at",
                "github_run_started_at", "first_job_started_at", "last_job_completed_at")
 JOB_COLUMNS = ("id", "name", "status", "conclusion", "started_at", "completed_at",
                "duration_seconds")
@@ -148,6 +150,10 @@ def _terminal(repo_state: dict, repo_report: dict) -> bool:
         return True
     if not repo_state.get("measurements_finalized") or status not in COMPLETED:
         return False
+    if status in {"QUEUE_TIMEOUT", "IN_PROGRESS_TIMEOUT"}:
+        # Move to the next repository even when GitHub has not yet confirmed
+        # cancellation and fork cleanup must wait for the active run to settle.
+        return True
     cleanup = repo_state.get("cleanup_status", "NOT_STARTED")
     return not repo_state.get("fork_repo") or cleanup in RETAINED_OR_DONE | {"DELETED"}
 
@@ -175,6 +181,9 @@ def _batch_identity_record(member: int, batch_id: str, batch_name: str | None = 
         "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "openrouter_model": os.environ.get("OPENROUTER_MODEL", "").strip(),
         "openrouter_max_tokens": os.environ.get("OPENROUTER_MAX_TOKENS", "").strip(),
+        "rag_device": os.environ.get("CLOUDTUNE_RAG_DEVICE", "cpu").strip().lower(),
+        "rag_index_url_sha256": hashlib.sha256(
+            os.environ.get("SUPABASE_URL", "").strip().encode("utf-8")).hexdigest(),
         "auto_delete_forks": os.environ.get("CLOUDTUNE_AUTO_DELETE_FORKS", "").strip().lower(),
     }
     if not record["openrouter_model"].endswith(":free") or not record["openrouter_max_tokens"]:
@@ -189,7 +198,11 @@ def _identity_fields(record: dict) -> dict:
 
 def freeze_batch(member: int, batch_id: str, *, rerun_failed: bool = False,
                  allow_config_changes: bool = False, batch_name: str | None = None) -> Path:
-    """Freeze batch settings, or explicitly append a recorded config revision."""
+    """Record batch identity and append a revision when settings have changed.
+
+    ``allow_config_changes`` remains accepted for older callers; revisions are
+    now recorded automatically for append-only work.
+    """
     if batch_name is not None:
         batch_name = batch_name.strip()
         if not batch_name or len(batch_name) > 120:
@@ -203,9 +216,6 @@ def freeze_batch(member: int, batch_id: str, *, rerun_failed: bool = False,
             record["batch_name"] = previous.get("batch_name", batch_id)
         comparable = _identity_fields(record)
         old_comparable = _identity_fields(previous)
-        if rerun_failed:
-            comparable.pop("runner_sha256", None)
-            old_comparable.pop("runner_sha256", None)
         immutable = {"batch_id", "member", "assignment_sha256"}
         changed_immutable = sorted(
             key for key in immutable if old_comparable.get(key) != comparable.get(key))
@@ -213,8 +223,6 @@ def freeze_batch(member: int, batch_id: str, *, rerun_failed: bool = False,
             raise ValueError(
                 "Batch identity cannot change member, batch ID, or assignment: "
                 + ", ".join(changed_immutable))
-        if old_comparable != comparable and not allow_config_changes:
-            raise ValueError(f"Frozen batch identity changed: {location}; use the original settings")
         if old_comparable != comparable:
             history = list(previous.get("change_history", []))
             history.append({"changed_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -377,7 +385,8 @@ def publish_batch(member: int, rows: list[dict[str, str]], batch_id: str) -> Pat
 
 
 def failed_positions(source: str, rows: list[dict]) -> list[int]:
-    failed = {"PREFLIGHT_BLOCKED", "FAILED_TARGET_CI", "INCOMPLETE", "INCONCLUSIVE_PLATFORM", "LLM_PAUSED", "RAG_PAUSED"}
+    failed = {"PREFLIGHT_BLOCKED", "FAILED_TARGET_CI", "INCOMPLETE", "INCONCLUSIVE_PLATFORM",
+              "QUEUE_TIMEOUT", "IN_PROGRESS_TIMEOUT", "LLM_PAUSED", "RAG_PAUSED"}
     positions = []
     for index, row in enumerate(rows, 1):
         _, current, report = _record(source, index, row["repo_id"])
@@ -492,13 +501,14 @@ def run_batch(member: int, batch_id: str, *, preflight_only: bool, max_repositor
             if (folder / ".controller.lock").exists() or current.get("pending"):
                 raise ValueError(
                     f"Position {index} has active or pending work; resume it before overriding")
-    if identity_changed and allow_config_changes and not override_existing and not rerun_failed:
+    if identity_changed and not override_existing and not rerun_failed:
         for index in range(begin, end + 1):
             _, current, report = _record(batch_id, index, rows[index - 1]["repo_id"])
             if _stage(current, report) != "finished" and (current or report):
                 raise ValueError(
-                    f"Position {index} has an unfinished run under the previous settings; "
-                    "use --override-existing to start a preserved new generation")
+                    f"Position {index} already has unfinished work under its saved settings; "
+                    "resume it with the original per-position settings or use "
+                    "--override-existing to start a preserved generation")
     if rerun_failed:
         if retry_failed_from or not (RESULTS / batch_id / "batch_identity.json").is_file():
             raise ValueError("--rerun-failed requires an existing batch and cannot use --retry-failed-from")
@@ -624,7 +634,7 @@ def main() -> int:
     parser.add_argument("--rerun", "--rerun-failed", dest="rerun_failed", action="store_true",
                         help="Rerun only failed rows in this same batch using preserved -r2/-r3 generations")
     parser.add_argument("--allow-config-changes", action="store_true",
-                        help="Record changed runner/model/config settings as a new batch revision")
+                        help="Compatibility alias; changed settings are recorded automatically")
     parser.add_argument("--override-existing", action="store_true",
                         help="Rerun selected existing positions in a new preserved generation")
     mode = parser.add_mutually_exclusive_group(required=True)

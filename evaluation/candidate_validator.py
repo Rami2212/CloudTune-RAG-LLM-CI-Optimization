@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import subprocess
+from collections import Counter
 
 import yaml
 from pathlib import Path
@@ -25,8 +27,14 @@ def _actionlint(data: bytes, executable: str | None = None) -> dict:
                            check=False, timeout=90)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"status": "INCONCLUSIVE", "reason": type(exc).__name__}
+    output = (p.stdout + p.stderr).decode("utf-8", "replace")[-3000:]
+    diagnostics = []
+    for line in output.splitlines():
+        match = re.match(r"^<stdin>:\d+:\d+:\s*(.*?)\s+\[([^]]+)\]\s*$", line)
+        if match:
+            diagnostics.append(f"{match.group(1)} [{match.group(2)}]")
     return {"status": "PASS" if p.returncode == 0 else "FAIL",
-            "reason": (p.stdout + p.stderr).decode("utf-8", "replace")[-3000:]}
+            "reason": output, "diagnostics": sorted(set(diagnostics))}
 
 
 def validate_baseline(workflow: bytes, *, actionlint: str | None = None) -> dict:
@@ -41,10 +49,11 @@ def validate_baseline(workflow: bytes, *, actionlint: str | None = None) -> dict
     findings = safety_findings(document)
     lint = _actionlint(workflow, actionlint)
     reasons = ["UNSAFE_WORKFLOW:" + v for v in findings]
+    warnings = []
     if lint["status"] != "PASS":
-        reasons.append("ACTIONLINT_" + lint["status"])
+        warnings.append("ACTIONLINT_" + lint["status"])
     return {"verdict": "PASS" if not reasons else "FAIL",
-            "reasons": reasons, "actionlint": lint}
+            "reasons": reasons, "warnings": warnings, "actionlint": lint}
 
 
 def validate_candidate(original: bytes, candidate: bytes, *, actionlint: str | None = None) -> dict:
@@ -62,18 +71,37 @@ def validate_candidate(original: bytes, candidate: bytes, *, actionlint: str | N
                 "actionlint": {"status": "NOT_RUN"}}
     if original == candidate:
         return {"verdict": "NO_CHANGE", "reasons": [], "actionlint": {"status": "NOT_RUN"}}
-    findings = safety_findings(after)
+    original_findings = set(safety_findings(workflow_doc(original)))
+    findings = set(safety_findings(after)) - original_findings
+    baseline_lint = _actionlint(original, actionlint)
     lint = _actionlint(candidate, actionlint)
+    baseline_diagnostics = Counter(baseline_lint.get("diagnostics", []))
+    candidate_diagnostics = Counter(lint.get("diagnostics", []))
+    new_diagnostics = sorted(
+        diagnostic
+        for diagnostic, count in (candidate_diagnostics - baseline_diagnostics).items()
+        for _ in range(count)
+    )
+    if lint["status"] == "FAIL" and not candidate_diagnostics:
+        # Do not silently waive a lint failure if actionlint's output format
+        # was unexpected and could not be compared with the baseline.
+        new_diagnostics = ["unparsed actionlint failure; inspect actionlint.reason"]
     reasons = ["UNSAFE_WORKFLOW:" + finding for finding in findings]
-    if lint["status"] != "PASS":
-        reasons.append("ACTIONLINT_" + lint["status"])
-    verdict = "FAIL" if any(s.startswith(("INVALID", "UNSAFE", "ACTIONLINT_FAIL")) for s in reasons) else ("REVIEW_REQUIRED" if reasons else "PASS")
-    return {"verdict": verdict, "reasons": sorted(set(reasons)), "actionlint": lint,
+    reasons.extend("ACTIONLINT_NEW:" + diagnostic for diagnostic in new_diagnostics)
+    warnings = []
+    if lint["status"] == "INCONCLUSIVE":
+        warnings.append("ACTIONLINT_" + lint["status"])
+    elif lint["status"] != "PASS" and not new_diagnostics:
+        warnings.append("ACTIONLINT_PREEXISTING_FINDINGS")
+    verdict = "FAIL" if reasons else "PASS"
+    return {"verdict": verdict, "reasons": sorted(set(reasons)), "warnings": warnings,
+            "actionlint": lint, "baseline_actionlint": baseline_lint,
+            "new_actionlint_diagnostics": new_diagnostics,
             "equivalence_scope": "general workflow candidate; static checks plus the same GitHub CI correctness workflow"}
 
 
 # Frozen repository evidence and immutable candidate admission records.
-POLICY_REVISION = "cloudtune-candidate-gate-v9-general-workflow-optimizations"
+POLICY_REVISION = "cloudtune-candidate-gate-v10-differential-actionlint"
 
 
 def _digest(value: bytes) -> str:

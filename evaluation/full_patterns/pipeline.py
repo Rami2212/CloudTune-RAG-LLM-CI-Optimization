@@ -120,7 +120,7 @@ def request_json(stage: Path, *, model: str, max_tokens: int, instruction: str,
         req = Request("https://openrouter.ai/api/v1/chat/completions", method="POST",
                       data=json.dumps(body).encode(), headers={"Authorization": "Bearer " + token,
                       "Content-Type": "application/json", "X-Title": "CloudTune Full Pattern Evaluation"})
-        progress("LLM",f"{stage.name}: requesting {model}; max_tokens={max_tokens}; waiting for provider response (120s deadline)")
+        progress("LLM",f"{stage.name}: requesting {model}; max_tokens={max_tokens}; waiting for provider response (300s deadline)")
         started=time.monotonic()
         try:
             reply = transport(req)

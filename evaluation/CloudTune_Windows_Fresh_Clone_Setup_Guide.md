@@ -85,7 +85,7 @@ To name a batch, set `--batch-name`; it defaults to the batch ID. To provide a c
 
 Positions include both endpoints. `--start-position` and `--stop-position` are aliases; use `--limit` instead of a stop option if preferred. Resume interrupted work with the same member, batch ID, settings, and range.
 
-By default, batch settings are frozen. To change configuration in the same batch, add `--allow-config-changes`. If you also want to rerun selected positions that already have results, add `--override-existing`; earlier results are kept in prior trial generations. Do not override while CI work is active or pending. Keep the range narrow: a changed batch can contain results from multiple settings revisions. Member, batch ID, and assignment cannot be changed within a batch.
+Code, configuration and environment changes are recorded as a new revision automatically when appending rows to the same batch. Completed positions remain unchanged and are skipped; new positions use the current revision. An unfinished selected position keeps its saved settings, so resume it with its original settings or use `--override-existing` to start a preserved generation. Do not override while CI work is active or pending. Member, batch ID, and assignment cannot change within a batch. `--allow-config-changes` remains accepted as a compatibility flag but is no longer required.
 
 ## 5. Publish results
 

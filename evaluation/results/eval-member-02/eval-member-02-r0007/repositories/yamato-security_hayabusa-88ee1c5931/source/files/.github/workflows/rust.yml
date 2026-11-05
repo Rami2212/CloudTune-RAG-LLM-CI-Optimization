@@ -1,0 +1,77 @@
+name: Rust
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches:
+      - "*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        info:
+          # NOTE: Reduced to Windows x86_64 only to cut GitHub Actions load. The full
+          # platform matrix still runs in release.yml. Uncomment the entries below to
+          # restore per-push/PR coverage for the other targets.
+          # - {
+          #     os: "ubuntu-latest",
+          #     target: "x86_64-unknown-linux-gnu",
+          #     cross: false,
+          #   }
+          # - {
+          #     os: "ubuntu-latest",
+          #     target: "x86_64-unknown-linux-musl",
+          #     cross: true,
+          #   }
+          # - { os: "macOS-latest", target: "x86_64-apple-darwin", cross: false }
+          # - { os: "macOS-latest", target: "aarch64-apple-darwin", cross: false }
+          - {
+              os: "windows-latest",
+              target: "x86_64-pc-windows-msvc",
+              cross: false,
+            }
+          # - {
+          #     os: "windows-latest",
+          #     target: "i686-pc-windows-msvc",
+          #     cross: true,
+          #   }
+    runs-on: ${{ matrix.info.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+      - name: Set up Rust toolchain
+        if: ${{ steps.skip_check.outputs.should_skip != 'true' }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+          targets: ${{ matrix.info.target }}
+      - name: Enable Rust cache
+        if: ${{ steps.skip_check.outputs.should_skip != 'true' }}
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Fmt Check
+        run: cargo fmt -- --check
+      - name: Prepare Clippy
+        run: rustup component add clippy
+      - name: Run clippy action to produce annotations
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Build tests
+        if: ${{ steps.skip_check.outputs.should_skip != 'true' }}
+        uses: ClementTsang/cargo-action@2438cc5f3ba4e971289fffca2a00dedea6911f14 # v0.0.7
+        with:
+          command: test
+          args: --no-run --locked ${{ matrix.features }} --target=${{ matrix.info.target }}
+          use-cross: ${{ matrix.info.cross }}
+          cross-version: 0.2.4
+        env:
+          RUST_BACKTRACE: full
+      - name: Run tests
+        run: cargo test --verbose

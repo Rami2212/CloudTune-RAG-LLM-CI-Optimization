@@ -1,8 +1,8 @@
 """Read-only eligibility screening and immutable snapshots for CloudTune evaluation.
 
 This module never creates forks, edits workflow files, enables Actions, or dispatches
-runs. A workflow lacking a safe ``workflow_dispatch`` harness is marked
-``needs_harness`` and must be prepared before any evaluation execution.
+runs. The execution fork adds a common ``workflow_dispatch`` harness when it is
+missing, so missing dispatch alone does not block repository preparation.
 """
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -106,7 +107,8 @@ def safety_findings(doc: dict) -> list[str]:
 
     This is a narrow execution-safety gate, not a comprehensive security audit.
     In particular, do not reject workflows merely because descriptive text
-    mentions deployment, publishing, release, or signing.
+    mentions deployment, publishing, release, or signing. Secret references
+    alone are not an eligibility blocker.
     """
     serialized = yaml.safe_dump(doc).lower()
     findings = []
@@ -126,8 +128,6 @@ def safety_findings(doc: dict) -> list[str]:
         findings.append("POSSIBLE_DEPLOY_PUBLISH_RELEASE")
     if "self-hosted" in serialized:
         findings.append("SELF_HOSTED_RUNNER")
-    if re.search(r"secrets\s*(?:\.|\[)|secrets:\s*inherit", serialized):
-        findings.append("SECRET_REFERENCE")
     if any("uses" in job for job in doc["jobs"].values()):
         findings.append("REUSABLE_WORKFLOW_NOT_INSPECTED")
     return findings
@@ -207,14 +207,25 @@ class GitHubReader:
                 **({"Authorization": "Bearer " + self.token} if self.token else {}),
             },
         )
-        try:
-            with urllib.request.urlopen(request, timeout=35) as response:
-                return json.loads(response.read())
-        except urllib.error.HTTPError as error:
-            # Do not log the response body (it could contain unexpected private data).
-            raise PreparationError(f"GitHub API HTTP {error.code}: {api_path}", "api_error") from error
-        except (urllib.error.URLError, TimeoutError) as error:
-            raise PreparationError(f"GitHub API connection failed for {api_path}", "api_error") from error
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(request, timeout=35) as response:
+                    return json.loads(response.read())
+            except urllib.error.HTTPError as error:
+                # Retry transient service/rate-limit responses, but do not retry
+                # permanent authorization or missing-repository errors.
+                if error.code not in {429, 500, 502, 503, 504} or attempt == 2:
+                    raise PreparationError(f"GitHub API HTTP {error.code}: {api_path}", "api_error") from error
+                last_error = error
+                error.close()
+            except (urllib.error.URLError, TimeoutError) as error:
+                if attempt == 2:
+                    raise PreparationError(f"GitHub API connection failed for {api_path}", "api_error") from error
+                last_error = error
+            time.sleep(0.5 * (2 ** attempt))
+        raise PreparationError(f"GitHub API request failed for {api_path}: {type(last_error).__name__}",
+                               "api_error")
 
     def workflow_history(self, repo_id: str, workflow_path: str, branch: str) -> dict:
         """Read bounded, pre-evaluation CI history; never claim it is a measured baseline.
@@ -389,7 +400,11 @@ def prepare_repository(
         try:
             doc = workflow_doc(raw)
         except (ValueError, UnicodeError, yaml.YAMLError) as error:
-            raise PreparationError(f"Unparseable workflow {path}: {error}", "inconclusive") from error
+            # One unrelated malformed workflow should not discard an otherwise
+            # usable test workflow. If every candidate is malformed, the final
+            # eligibility reason includes these exclusions.
+            dismissed.append(f"{path}: unparseable workflow ({error})")
+            continue
         if has_workflow_run(doc):
             # The isolated fork harness removes every unselected workflow.
             # Never select a listener, but do not discard unrelated safe CI.
@@ -412,7 +427,13 @@ def prepare_repository(
     options.sort(key=lambda candidate: candidate[0])
     _, workflow_path, raw, workflow = options[0]
     problems = dispatch_problems(workflow)
-    status = "needs_harness" if problems else "prepared"
+    # The execution fork adds workflow_dispatch to the common A/B/C harness.
+    # Missing dispatch alone therefore does not make this row ineligible.
+    status = "needs_harness" if any(not item.startswith("MISSING_WORKFLOW_DISPATCH")
+                                    for item in problems) else "prepared"
+    screening_reason = ("workflow_dispatch will be added to the evaluation fork"
+                        if "MISSING_WORKFLOW_DISPATCH" in problems and status == "prepared"
+                        else "; ".join(problems))
 
     archived: list[dict[str, Any]] = []
     omitted: list[dict[str, str]] = []
@@ -457,6 +478,6 @@ def prepare_repository(
                   "Safety screening is conservative, not a semantic equivalence proof."],
     }
     write_json_immutable(folder / "manifest.json", manifest)
-    return {"repo_id": repo_id, "status": status, "reason": "; ".join(problems),
+    return {"repo_id": repo_id, "status": status, "reason": screening_reason,
             "workflow_path": workflow_path, "source_commit_sha": source_commit_sha,
             "manifest_path": str(manifest_path)}

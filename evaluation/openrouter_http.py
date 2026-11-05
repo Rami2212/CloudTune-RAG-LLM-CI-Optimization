@@ -13,7 +13,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
 # Maximum time allowed for one complete OpenRouter API response.
-OPENROUTER_REQUEST_SECONDS = 120
+OPENROUTER_REQUEST_SECONDS = 300
 
 
 class OpenRouterPaused(RuntimeError):

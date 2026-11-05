@@ -1,0 +1,166 @@
+# This workflow executes the various RepoSense tests
+
+name: Continuous Integration
+
+on:
+  push:
+    branches-ignore:
+      - gh-pages
+  pull_request:
+    branches-ignore:
+      - gh-pages
+
+env:
+  NODE_VER: '22.x'
+  JAVA_DISTRIBUTION: 'zulu'
+  JAVA_VER: 11
+
+jobs:
+  mainbuild:
+    name: ${{ matrix.os }} JDK 11
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04, macos-14, macos-15, windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: 1 # Prevent time-consuming brew update
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up JDK 11
+      uses: actions/setup-java@v3
+      with:
+        distribution: ${{ env.JAVA_DISTRIBUTION }}
+        java-version: ${{ env.JAVA_VER }}
+
+    - name: Verify Java version
+      run: echo "Actual JDK in use -- "; java -version
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: ${{ env.NODE_VER }}
+
+    - name: Set up Gradle caching
+      uses: actions/cache@v3
+      with:
+        path: |
+          $HOME/.gradle/caches
+          $HOME/.gradle/wrapper
+        key: ${{ matrix.os }}-gradle-${{ hashFiles('**/*.gradle*') }}
+        restore-keys: |
+          ${{ matrix.os }}-gradle-
+
+    - name: Set up Node caching
+      uses: actions/cache@v3
+      with:
+        path: $HOME/.npm
+        key: ${{ matrix.os }}-node-${{ hashFiles('**/package-lock.json') }}
+        restore-keys: |
+          ${{ matrix.os }}-node-
+
+    - name: Grant execute permission for gradlew
+      if: ${{ runner.os != 'Windows' }}
+      run: chmod +x gradlew # Windows does not need this
+
+    - name: Run environmental checks
+      run: ./gradlew environmentalChecks
+
+    - name: Run linter
+      run: ./gradlew lintFrontend
+
+    - name: Build with Gradle
+      run: ./gradlew clean checkstyleAll test systemTest coverage
+
+    - name: Run code coverage
+      if: ${{ success() && ( matrix.os == 'ubuntu-24.04' || matrix.os == 'macos-15' || matrix.os == 'windows-2022' ) }}
+      uses: codecov/codecov-action@v5
+      with:
+        directory: ${{ github.workspace }}/build/reports/jacoco/coverage
+        files: coverage.xml
+        fail_ci_if_error: false
+
+    - name: Build preview website (pull request)
+      if: ${{ success() && github.event_name == 'pull_request' && matrix.os == 'ubuntu-24.04' }}
+      run: |
+        git fetch --all && git config --global user.email "-" && git config --global user.name "-" && ./gradlew run -Dargs="--since d1"
+        sudo apt-get -y install graphviz
+        npm install -g markbind-cli
+        (cd docs && markbind build)
+
+    - name: Save PR number and HEAD commit (pull request)
+      if: ${{ success() && github.event_name == 'pull_request' && matrix.os == 'ubuntu-24.04' }}
+      run: |
+        mkdir -p ./pr
+        echo ${{ github.event.number }} > ./pr/NUMBER
+        echo ${{ github.event.pull_request.head.sha }} > ./pr/SHA
+
+    - name: Upload artifacts (pull request)
+      if: ${{ success() && github.event_name == 'pull_request' && matrix.os == 'ubuntu-24.04' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: reposense-deployment
+        path: |
+          ./reposense-report
+          ./docs/_site
+          ./pr
+
+  cypress:
+    name: Cypress frontend tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up JDK 11
+      uses: actions/setup-java@v3
+      with:
+        distribution: ${{ env.JAVA_DISTRIBUTION }}
+        java-version: ${{ env.JAVA_VER }}
+
+    - name: Verify Java version
+      run: echo "Actual JDK in use -- "; java -version
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: ${{ env.NODE_VER }}
+
+    - name: Set up Gradle caching
+      uses: actions/cache@v3
+      with:
+        path: |
+          $HOME/.gradle/caches
+          $HOME/.gradle/wrapper
+        key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*') }}
+        restore-keys: |
+          ${{ runner.os }}-gradle-
+
+    - name: Set up Node caching
+      uses: actions/cache@v3
+      with:
+        path: $HOME/.npm
+        key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+        restore-keys: |
+          ${{ runner.os }}-node-
+
+    - name: Grant execute permission for gradlew
+      run: chmod +x gradlew
+
+    - name: Set up environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install libgtk2.0-0t64 libgtk-3-0t64 libgbm-dev libnotify-dev libnss3 libxss1 libasound2t64 libxtst6 xauth xvfb
+
+    - name: Run frontend tests
+      run: ./gradlew testFrontend -Pci

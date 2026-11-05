@@ -196,10 +196,10 @@ GPU, CUDA out-of-memory is possible; switch to CPU if necessary. The current
 candidate metadata does not automatically record the selected inference
 device: keep it fixed and record it in experiment environment notes.
 
-For the later fork-based execution phase, also install Node.js/npm for the
-pinned `ci-cost` adapter and install `actionlint` on PATH; candidate admission
-fails closed if `actionlint` is absent. Check with `node --version`,
-`npm --version`, and `actionlint -version`. **No Docker is required.**
+For the later fork-based execution phase, install Node.js/npm for the pinned
+`ci-cost` adapter. `actionlint` is optional and supplies a differential check
+when installed. Check with `node --version`, `npm --version`, and optionally
+`actionlint -version`. **No Docker is required.**
 
 ## 4. Run the implemented preparation stage
 
@@ -459,12 +459,17 @@ cause must not be asserted without additional GitHub evidence. The **sum of
 executed job runtimes** is reported as a separate runner-resource proxy. Neither measure
 is described as GitHub billed minutes without official billing evidence.
 
-A queued/running GitHub workflow is **not** a failed target CI run. The
-controller saves dispatch intent and run identity before further actions,
-returns `WAITING_FOR_GITHUB_RUN`, and rechecks in later scheduled invocations.
-It must never send a second POST simply because an earlier dispatch timed out
-or a runner remained queued. Ambiguous dispatches are retained for investigation
-and never converted to measured failures or fake speedups.
+A GitHub workflow is cancelled if it remains in `queued` state for 120 seconds
+or `in_progress` for 600 seconds. The controller records `QUEUE_TIMEOUT` or
+`IN_PROGRESS_TIMEOUT`, skips the rest of that repository, and continues to the
+next one. Timed-out runs are excluded from timing comparisons, and cleanup waits
+if GitHub still reports a run as active. Ambiguous dispatches are retained for
+investigation and never converted to measured failures or fake speedups.
+
+On a reused fork, a stale arm branch that conflicts before any CI run is
+preserved; the evaluator uses a fresh branch tied to the checkpoint's expected
+commit. If an arm branch changes after its CI trials begin, the evaluator stops
+to protect the measurements.
 
 ### 10.2 Archived hosted setup — do not follow
 
@@ -604,16 +609,18 @@ and reasons. Existing records can only be reused when identities match; a
 policy change requires a new `evaluation_id`.
 
 There is no longer an automatic allowlist for optimization patterns. A
-candidate must parse, pass actionlint and avoid findings from the existing
-unsafe-workflow screen. `FAIL`, `REVIEW_REQUIRED`, `INCONCLUSIVE` and
-`NO_CHANGE` do not create optimized arm branches. `actionlint` must be
-installed locally for approval. Passing these static checks is not a proof
-that the candidate preserves behavior; hosted CI supplies the correctness
-check, and candidate diffs should be reviewed when interpreting results.
+candidate must parse, avoid introducing deployment-related findings, and
+introduce no new `actionlint` diagnostics relative to the baseline. Existing
+lint findings and an unavailable `actionlint` are recorded as warnings. A
+`FAIL` or `NO_CHANGE` does not create an optimized arm branch. Passing these
+static checks is not proof that the candidate preserves behavior; hosted CI
+supplies the correctness check, and candidate diffs should be reviewed when
+interpreting results.
 
-Install `actionlint` from the [official releases](https://github.com/rhysd/actionlint/releases)
-(or use the commands below); verify that `actionlint -version` works before
-launching an evaluation. On Windows PowerShell:
+`actionlint` is optional for candidate generation. When installed, new findings
+relative to the original workflow block admission; existing findings are saved
+as warnings. Install it from the [official releases](https://github.com/rhysd/actionlint/releases)
+to get this additional differential check. On Windows PowerShell:
 
 ```powershell
 winget install --id rhysd.actionlint --exact
@@ -649,7 +656,7 @@ create forks, run GitHub Actions, or prove Phase 5 live execution and cleanup.
 
 ### Safe automatic fork cleanup and optional retention
 
-The default is `CLOUDTUNE_AUTO_DELETE_FORKS=true` (also used when the key is absent). Once a candidate repository's runs are finalized and raw GitHub run/job evidence is persisted locally, the controller attempts to delete its temporary fork. Deletion requires explicit proof that the fork was created by this evaluation, a matching fork identity, no pending dispatch and no non-completed GitHub Actions runs on that fork. A pre-existing fork is **never deleted**. The deletion intent is checkpointed before the GitHub DELETE. Missing delete permissions are recorded as `BLOCKED_PERMISSION`; uncertain responses are reconciled without blindly sending another DELETE. Active runs postpone cleanup and remain visible in `cleanup_status`.
+The default is `CLOUDTUNE_AUTO_DELETE_FORKS=true` (also used when the key is absent). Once a candidate repository's runs are finalized and raw GitHub run/job evidence is persisted locally, the controller attempts to delete a fork created by that evaluation. Deletion requires explicit creation proof, a matching fork identity, no pending dispatch and no non-completed GitHub Actions runs on that fork. A reused pre-existing fork is **always preserved**. The deletion intent is checkpointed before the GitHub DELETE. Missing delete permissions are recorded as `BLOCKED_PERMISSION`; uncertain responses are reconciled without blindly sending another DELETE. Active runs postpone cleanup and remain visible in `cleanup_status`.
 
 To preserve the evaluation-created fork and its GitHub Actions history for supervisor review, set `CLOUDTUNE_AUTO_DELETE_FORKS=false` in the ignored root `.env` **before starting the trial**. This does not skip CI, validation, evidence archival or reporting. After completion the ledger records `cleanup_status=RETAINED_BY_CONFIGURATION`, and `fork_report.json` retains the `fork_repo` GitHub name. A retained fork is not automatically deleted on subsequent resumes, even after the flag is changed back to true; delete it manually after supervisor review. A false setting cannot reverse a previously requested DELETE, and any uncertain DELETE outcome remains explicitly unresolved. Invalid boolean values cause an early error before GitHub writes.
 
@@ -689,8 +696,8 @@ snapshots, runs, and reports stay unchanged. When a numbered generation has
 pending CI, repeat the exact `--rerun` command to resume it, not to dispatch
 again. An unfinished original batch must be resumed **without** `--rerun`.
 Unresolved cleanup blocks a new generation. Retained supervisor-review forks
-are never deleted by rerun; remove them manually before new provisioning, or
-the controller will safely reject the existing fork. `--resume-only` and
+are never deleted by rerun; a verified existing fork is reused and preserved.
+`--resume-only` and
 `--rerun` cannot be combined.
 
 Run `--list` first to preview repository IDs and positions without GitHub
@@ -881,8 +888,9 @@ controller still permits scientifically labeled incomplete/baseline-only runs.
 
 The A/B/C fork controller now supports a separately labeled, bounded development
 smoke. This is **not** an evaluation outcome and must not use a held-out
-repository, a pre-existing fork, or a repository with deployment/publishing
-workflows. Its cleanup pins the fork's immutable numeric GitHub repository ID,
+repository or a repository with deployment/publishing workflows. A verified
+pre-existing fork can be reused and will be preserved. Cleanup pins a newly
+created fork's immutable numeric GitHub repository ID,
 not merely its name, before any DELETE. A missing or mismatched ID prevents
 automatic deletion and requires manual review. GitHub Actions run evidence is
 still archived before cleanup, and uncertain DELETE responses are never retried

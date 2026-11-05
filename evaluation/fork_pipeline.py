@@ -27,7 +27,8 @@ from evaluation.third_party.ci_cost.setup import (
 
 from evaluation.candidate_validator import validate_and_archive, validate_baseline
 from evaluation.ci_executor import (
-    ForkExperiment, GitHub, RunPending, automatic_fork_deletion_enabled,
+    ForkExperiment, GitHub, RunPending, RunQueueTimeout, RunExecutionTimeout,
+    automatic_fork_deletion_enabled,
     arm_name, log_progress, summarize_records,
 )
 from evaluation.optimizers.ci_cost import generate_ci_cost_candidate
@@ -42,7 +43,7 @@ from evaluation.repository_preparation import (GitHubReader, file_sha256, read_e
 from evaluation.run_pipeline import ROOT, load_config, prepare
 
 
-PROTOCOL = "cloudtune-local-fork-abc-v9-general-candidate-admission"
+PROTOCOL = "cloudtune-local-fork-abc-v14-stale-arm-branch-recovery"
 
 
 class StateStore:
@@ -285,11 +286,13 @@ def _batch_generation_finalized(state: dict, config: dict,
         if row.get("status") == "SKIPPED" and not row.get("fork_repo"):
             continue
         if (row.get("status") not in {"COMPLETE", "INCOMPLETE", "FAILED_TARGET_CI",
-                                      "INCONCLUSIVE_PLATFORM"}
+                                      "INCONCLUSIVE_PLATFORM", "QUEUE_TIMEOUT",
+                                      "IN_PROGRESS_TIMEOUT"}
                 or row.get("measurements_finalized") is not True):
             return False
         if row.get("fork_repo") and row.get("cleanup_status") not in {
-                "DELETED", "RETAINED_BY_CONFIGURATION"}:
+                "DELETED", "RETAINED_BY_CONFIGURATION",
+                "REUSED_EXISTING_PRESERVED"}:
             return False
     return True
 
@@ -443,6 +446,7 @@ def _save_report(output: Path, state: dict) -> dict:
                               "run_records": record.get("records", []),
                               "failure_reason": record.get("failure_reason"),
                               "cleanup_status": record.get("cleanup_status", "NOT_STARTED"),
+                              "fork_reused_existing": record.get("fork_reused_existing", False),
                               "fork_repo": record.get("fork_repo")}
     report = {"evaluation_id": state["evaluation_id"], "protocol": PROTOCOL,
               "timing_source": "GitHub Actions REST jobs API exclusively; active job interval union excludes runner queue gaps",
@@ -459,7 +463,9 @@ def _save_report(output: Path, state: dict) -> dict:
                          "config_commit_sha", "conclusion", "protocol_valid", "required_checks_pass",
                          "comparable", "workflow_elapsed_seconds", "sum_job_runtime_seconds",
                          "workflow_makespan_seconds", "inter_job_idle_seconds",
-                         "initial_queue_seconds", "failure_class"])
+                         "initial_queue_seconds", "queue_timeout_seconds", "in_progress_seconds",
+                         "in_progress_timeout_seconds", "cancel_status",
+                         "failure_class"])
         writer.writeheader()
         for repo, record in state.get("repositories", {}).items():
             for r in record.get("records", []):
@@ -495,8 +501,31 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False,
         state = {"evaluation_id": config["evaluation_id"], "config_sha256": config_sha,
                  "implementation_sha256": code_sha, "protocol": PROTOCOL,
                  "repetitions": config["repetitions"], "repositories": {}}
-    elif (state.get("config_sha256"), state.get("implementation_sha256"), state.get("protocol")) != (config_sha, code_sha, PROTOCOL):
-        raise ValueError("Frozen config or evaluator implementation changed; use a new evaluation_id")
+    elif state.get("config_sha256") != config_sha:
+        raise ValueError("Frozen config changed; use a new evaluation_id")
+    elif state.get("protocol") in {
+            "cloudtune-local-fork-abc-v12-queue-timeout-120s",
+            "cloudtune-local-fork-abc-v13-run-timeout-10m"}:
+        # v13/v14 add bounded run recovery and safe handling for stale refs.
+        # Keep checkpoints resumable when the frozen experiment config matches.
+        state["protocol"] = PROTOCOL
+        state["implementation_sha256"] = code_sha
+        store.save(state)
+    elif (state.get("implementation_sha256"), state.get("protocol")) != (code_sha, PROTOCOL):
+        # A checkpoint with no dispatched/recorded arm runs can safely resume
+        # under the current implementation, including after fork setup. Saved
+        # candidate artifacts remain immutable. Once arm execution starts,
+        # preserve the original evaluator lock.
+        repositories = state.get("repositories", {})
+        trial_execution_started = any(
+            any(repo.get(key) for key in (
+                "pending", "records", "measurements_finalized", "arm_branches"))
+            for repo in repositories.values())
+        if trial_execution_started:
+            raise ValueError("Frozen evaluator implementation changed after arm execution began; use a new evaluation_id")
+        state["implementation_sha256"] = code_sha
+        state["protocol"] = PROTOCOL
+        store.save(state)
     output = _ensure_preparation(config, state, store, token=token)
     version = config.get("ci_cost", {}).get("version")
     if version != "1.0.0":
@@ -517,7 +546,9 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False,
                                repo.get("records") or repo.get("measurements_finalized")):
             raise ValueError("Cannot preflight a trial with hosted execution state; use a new dev- ID")
         failed_baseline = next((record for record in repo.get("records", [])
-                                if record["arm"] == "A" and not record.get("comparable")), None)
+                                if record["arm"] == "A" and not record.get("comparable")
+                                and record.get("failure_class") not in {
+                                    "QUEUE_TIMEOUT", "IN_PROGRESS_TIMEOUT"}), None)
         if failed_baseline:
             # Only a failed ORIGINAL baseline invalidates the whole repository.
             # A failed B or C is isolated and its other admitted peer continues
@@ -678,33 +709,52 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False,
                                      if record["arm"] in {"B", "C"}
                                      and not record.get("comparable")}
             failed_trial = None
-            for repeat in range(1, reps + 1):
-                order = (["A", "B", "C"] if repeat % 3 == 1 else
-                         ["B", "C", "A"] if repeat % 3 == 2 else ["C", "A", "B"])
-                # The first actual experiment run must be A to establish
-                # required jobs; subsequent repetitions use rotating orders.
-                for arm in order:
-                    if arm not in candidates or arm in failed_optimized_arms:
-                        continue
-                    if arm == "B" and b_no_change:
-                        continue
-                    if any(r["arm"] == arm and r["repeat"] == repeat for r in repo["records"]):
-                        continue
-                    required = repo.get("required_names") or config["execution"].get("required_job_names", [])
-                    log_progress("CI", f"{repo_id}: measuring {arm_name(arm)}, repeat {repeat}/{reps}")
-                    outcome = experiment.execute(repo, save, arm=arm, repeat=repeat,
-                             required=required, max_total=reps*3)
-                    if not outcome["comparable"]:
-                        if arm == "A":
-                            # A is the reference for every speedup comparison.
-                            failed_trial = outcome
-                            log_progress("CI", f"{repo_id}: Original Workflow failed; stopping this repository")
-                            break
-                        failed_optimized_arms.add(arm)
-                        log_progress("CI", f"{repo_id}: {arm_name(arm)} failed; "
-                                            "stopping only this arm's remaining trials")
-                if failed_trial:
-                    break
+            try:
+                for repeat in range(1, reps + 1):
+                    order = (["A", "B", "C"] if repeat % 3 == 1 else
+                             ["B", "C", "A"] if repeat % 3 == 2 else ["C", "A", "B"])
+                    # The first actual experiment run must be A to establish
+                    # required jobs; subsequent repetitions use rotating orders.
+                    for arm in order:
+                        if arm not in candidates or arm in failed_optimized_arms:
+                            continue
+                        if arm == "B" and b_no_change:
+                            continue
+                        if any(r["arm"] == arm and r["repeat"] == repeat for r in repo["records"]):
+                            continue
+                        required = repo.get("required_names") or config["execution"].get("required_job_names", [])
+                        log_progress("CI", f"{repo_id}: measuring {arm_name(arm)}, repeat {repeat}/{reps}")
+                        outcome = experiment.execute(repo, save, arm=arm, repeat=repeat,
+                                 required=required, max_total=reps*3)
+                        if not outcome["comparable"]:
+                            if arm == "A":
+                                # A is the reference for every speedup comparison.
+                                failed_trial = outcome
+                                log_progress("CI", f"{repo_id}: Original Workflow failed; stopping this repository")
+                                break
+                            failed_optimized_arms.add(arm)
+                            log_progress("CI", f"{repo_id}: {arm_name(arm)} failed; "
+                                                "stopping only this arm's remaining trials")
+                    if failed_trial:
+                        break
+            except (RunQueueTimeout, RunExecutionTimeout) as timeout:
+                repo["status"] = timeout.failure_class
+                repo["failure_reason"] = str(timeout)
+                repo["measurements_finalized"] = True
+                repo.pop("pending_reason", None)
+                save()
+                try:
+                    cleanup = experiment.cleanup_fork(repo, save)
+                except Exception as cleanup_error:
+                    repo["cleanup_status"] = f"DEFERRED_AFTER_{timeout.failure_class}"
+                    repo["cleanup_failure_reason"] = (
+                        type(cleanup_error).__name__ + ": " + str(cleanup_error)[:300])
+                    save()
+                    cleanup = repo["cleanup_status"]
+                log_progress("REPO", f"{repo_id}: {timeout.failure_class}; skipping remaining trials; "
+                                      f"cleanup={cleanup}; moving to next repository")
+                _save_report(output, state)
+                continue
             if failed_trial:
                 platform = failed_trial.get("failure_class") == "PLATFORM_NO_JOB_START"
                 repo["status"] = "INCONCLUSIVE_PLATFORM" if platform else "FAILED_TARGET_CI"
@@ -792,7 +842,7 @@ def main() -> int:
     parser.add_argument("--resume-only", action="store_true",
                         help="Continue only a previously started evaluation")
     parser.add_argument("--watch", action="store_true",
-                        help="Continue checking queued GitHub runs until all rows settle")
+                        help="Continue the batch; cancel runs queued over 2 minutes or running over 10 minutes")
     parser.add_argument("--poll-interval", type=int, default=120,
                         help="Seconds between long-queue resume cycles (default 120)")
     args = parser.parse_args()
