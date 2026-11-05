@@ -1,0 +1,377 @@
+name: test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  # https://users.rust-lang.org/t/cross-compiling-how-to-statically-link-glibc/83907/2
+  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+
+jobs:
+  skip-check:
+    continue-on-error: false
+    runs-on: ubuntu-latest
+    outputs:
+      should_skip: ${{ steps.skip_check.outputs.should_skip }}
+    steps:
+      - id: skip_check
+        uses: fkirc/skip-duplicate-actions@v5
+        with:
+          concurrent_skipping: same_content_newer
+          do_not_skip: '["pull_request"]'
+
+  lint:
+    name: lint (${{ matrix.os }})
+    needs: skip-check
+    if: ${{ needs.skip-check.outputs.should_skip != 'true' }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+          - os: macos-latest
+          - os: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup Rust
+        if: ${{ steps.cache_build.outputs.cache-hit != 'true' }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - name: Setup `cargo-binstall` and `taplo`
+        uses: taiki-e/install-action@v2
+        with:
+          tool: taplo-cli
+      - name: Check TOML format
+        if: ${{ contains(matrix.os, 'ubuntu') }}
+        run: |
+          taplo fmt
+          git diff --exit-code
+      - name: Check Rust format
+        if: ${{ contains(matrix.os, 'ubuntu') }}
+        run: |
+          cargo fmt --all --check
+      - name: Lint Rust
+        run: |
+          cargo clippy --all-targets --all-features
+
+  choco-test:
+    runs-on: windows-latest
+    needs: skip-check
+    if: ${{ needs.skip-check.outputs.should_skip != 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Build and run tests
+        shell: bash
+        env:
+          CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
+        run: |
+          cargo build --locked
+          cargo test --features=test tests
+          cargo test --features=test choco -- --test-threads=1
+          cargo test --features=test choco -- --ignored --test-threads=1
+
+  scoop-winget-test:
+    runs-on: windows-latest
+    needs: skip-check
+    if: ${{ needs.skip-check.outputs.should_skip != 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Install scoop
+        shell: powershell
+        run: |
+          Set-ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
+          iwr -useb 'https://raw.githubusercontent.com/scoopinstaller/install/master/install.ps1' -outfile 'install.ps1'
+          .\install.ps1 -RunAsAdmin
+          (Resolve-Path ~\scoop\shims).Path >> $Env:GITHUB_PATH
+      - name: Verify scoop installation
+        run: |
+          Get-Command scoop
+          powershell scoop help
+      # Ironically, to install winget we need to install scoop first :D
+      # See: https://github.com/microsoft/winget-cli/issues/1328#issuecomment-1208640211
+      - name: Install winget
+        shell: powershell
+        run: scoop install winget
+      - name: Verify winget installation
+        run: |
+          Get-Command winget
+          winget --info
+      - name: Build and run tests
+        shell: bash
+        env:
+          CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
+        run: |
+          cargo build --locked
+          cargo test --features=test tests
+
+          cargo test --features=test scoop
+          cargo test --features=test winget
+
+          cargo test --features=test scoop -- --ignored
+          cargo test --features=test winget -- --ignored
+
+  brew-test:
+    runs-on: macos-latest
+    needs: skip-check
+    if: ${{ needs.skip-check.outputs.should_skip != 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - name: Upgrade Homebrew
+        run: brew update
+      - name: Build and run tests
+        env:
+          CARGO_BUILD_TARGET: aarch64-apple-darwin
+        run: |
+          cargo build --locked
+          cargo test --features=test tests
+          cargo test --features=test brew
+          cargo test --features=test brew -- --ignored
+
+  port-test:
+    runs-on: macos-latest
+    needs: skip-check
+    if: ${{ needs.skip-check.outputs.should_skip != 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install MacPorts
+        if: steps.cache-macports.outputs.cache-hit != 'true'
+        run: |
+          curl -LO https://raw.githubusercontent.com/GiovanniBussi/macports-ci/master/macports-ci
+          source ./macports-ci install
+          sudo port install wget
+          port installed
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - name: Build and run tests
+        env:
+          CARGO_BUILD_TARGET: aarch64-apple-darwin
+        run: |
+          cargo build --locked
+          cargo test --features=test tests
+          cargo test --features=test port
+          cargo test --features=test port -- --ignored
+
+  apt-test:
+    runs-on: ubuntu-latest
+    needs: skip-check
+    if: ${{ needs.skip-check.outputs.should_skip != 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Build and run tests
+        env:
+          CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
+        run: |
+          cargo build --locked
+          cargo test --features=test tests
+          cargo test --features=test apt
+          cargo test --features=test apt -- --ignored
+
+  dnf-test:
+    runs-on: ubuntu-latest
+    needs: skip-check
+    if: ${{ needs.skip-check.outputs.should_skip != 'true' }}
+    container:
+      image: fedora:latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup extra build tools
+        run: dnf install -y make automake gcc gcc-c++ kernel-devel
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Build and run tests
+        env:
+          CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
+        run: |
+          cargo build --locked
+          cargo test --features=test tests
+          cargo test --features=test dnf
+          cargo test --features=test dnf -- --ignored
+
+  emerge-test:
+    runs-on: ubuntu-latest
+    needs: skip-check
+    if: ${{ needs.skip-check.outputs.should_skip != 'true' }}
+    container:
+      image: gentoo/stage3
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup extra build tools
+        run: |
+          # `pacaptr -Ss` might fail without this line.
+          emerge --sync || true
+          emerge curl
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Build and run tests
+        env:
+          CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
+        run: |
+          cargo build --locked
+          cargo test --features=test tests
+          cargo test --features=test emerge
+          cargo test --features=test emerge -- --ignored
+
+  xbps-test:
+    runs-on: ubuntu-latest
+    needs: skip-check
+    if: ${{ needs.skip-check.outputs.should_skip != 'true' }}
+    container:
+      image: ghcr.io/void-linux/void-glibc-full:latest
+    steps:
+      - name: Setup extra build tools
+        run: |
+          xbps-install -y -Su || (xbps-install -y -u xbps && xbps-install -y -Su)
+          xbps-install -y base-devel curl bash
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Build and run tests
+        env:
+          CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
+        run: |
+          cargo build --locked
+          cargo test --features=test tests
+          cargo test --features=test xbps
+          cargo test --features=test xbps -- --ignored
+
+  zypper-test:
+    runs-on: ubuntu-latest
+    needs: skip-check
+    if: ${{ needs.skip-check.outputs.should_skip != 'true' }}
+    container:
+      image: registry.opensuse.org/opensuse/bci/rust:latest
+    steps:
+      - name: Setup extra build tools
+        run: zypper install -y tar gzip curl gcc bash
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Build and run tests
+        env:
+          CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
+        run: |
+          cargo build --locked
+          cargo test --features=test tests
+          cargo test --features=test zypper -- --test-threads=1
+          cargo test --features=test zypper -- --ignored --test-threads=1
+
+  apk-test:
+    runs-on: ubuntu-latest
+    needs: skip-check
+    if: ${{ needs.skip-check.outputs.should_skip != 'true' }}
+    container:
+      image: rust:alpine
+    steps:
+      - name: Setup extra build tools
+        run: |
+          apk add -U build-base tar bash
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Build and run tests
+        env:
+          RUSTFLAGS: "-C target-feature=-crt-static"
+          CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
+        run: |
+          cargo build --locked
+          cargo test --features=test tests
+          cargo test --features=test apk
+          cargo test --features=test apk -- --ignored
+
+  pip-conda-test:
+    runs-on: ubuntu-latest
+    needs: skip-check
+    if: ${{ needs.skip-check.outputs.should_skip != 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup conda
+        uses: conda-incubator/setup-miniconda@v4
+        with:
+          miniconda-version: "latest"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Build and run tests
+        env:
+          CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
+        run: |
+          cargo build --locked
+
+          cargo test --features=test pip
+          cargo test --features=test conda
+
+          cargo test --features=test pip -- --ignored
+          cargo test --features=test conda -- --ignored
+
+  pkcon-test:
+    runs-on: ubuntu-24.04
+    needs: skip-check
+    if: ${{ needs.skip-check.outputs.should_skip != 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup PackageKit tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y packagekit packagekit-tools
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Build and run tests
+        env:
+          CARGO_BUILD_TARGET: x86_64-unknown-linux-musl
+        run: |
+          cargo build --locked
+          cargo test --features=test pkcon
+          cargo test --features=test pkcon -- --ignored
+
+  # https://github.com/PyO3/pyo3/blob/42601f3af94242b017402b763a495798a92da8f8/.github/workflows/ci.yml#L452-L472
+  conclusion:
+    needs:
+      - lint
+      - choco-test
+      - scoop-winget-test
+      - brew-test
+      - port-test
+      - apt-test
+      - dnf-test
+      - emerge-test
+      - xbps-test
+      - zypper-test
+      - apk-test
+      - pip-conda-test
+      - pkcon-test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Result
+        run: |
+          jq -C <<< "${needs}"
+          # Check if all needs were successful or skipped.
+          "$(jq -r 'all(.result as $result | (["success", "skipped"] | contains([$result])))' <<< "${needs}")"
+        env:
+          needs: ${{ toJson(needs) }}

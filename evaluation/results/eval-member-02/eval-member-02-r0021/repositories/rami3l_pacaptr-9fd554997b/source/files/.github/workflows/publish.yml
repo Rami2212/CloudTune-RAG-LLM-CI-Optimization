@@ -1,0 +1,144 @@
+name: publish
+
+on:
+  # pull_request:
+  push:
+    branches:
+      - master
+    tags:
+      - "*"
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  # https://users.rust-lang.org/t/cross-compiling-how-to-statically-link-glibc/83907/2
+  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+
+jobs:
+  create-release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
+
+      - name: Create release
+        if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          prerelease: ${{ contains(github.ref, '-') }}
+
+  build-release:
+    name: Build release binaries for ${{ matrix.target }}
+    needs: [create-release]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup extra build tools
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: |
+          cargo build --bin=pacaptr --release --locked --target=${{ matrix.target }}
+
+      # https://github.com/vercel/turbo/blob/ea934d13038361c24a1f71cad3b490d6c0936f37/.github/workflows/turborepo-release.yml#L268-L272
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: pacaptr-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/pacaptr*
+          retention-days: 1
+
+  publish:
+    name: Publish via GoReleaser
+    needs: [build-release]
+    runs-on: ubuntu-latest
+    container:
+      # NOTE: It is also possible to install `choco` directly:
+      # https://github.com/JetBrains/qodana-cli/blob/29134e654dc4878e0587f02338c5101bce327560/.github/workflows/release.yml#L19-L27
+      image: chocolatey/choco:latest-linux
+    steps:
+      - name: Setup build essential
+        run: |
+          apt-get update && apt-get install -y git curl build-essential
+
+      - uses: actions/checkout@v7
+
+      - name: Setup Golang
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      # https://github.com/vercel/turbo/blob/ea934d13038361c24a1f71cad3b490d6c0936f37/.github/workflows/turborepo-release.yml#L306-L309
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: target/gh-artifacts
+
+      # Here we use `mv` to map Rust targets to Golang ones.
+      # https://github.com/vercel/turbo/blob/ea934d13038361c24a1f71cad3b490d6c0936f37/.github/workflows/turborepo-release.yml#L313-L318
+      - name: Modify and inspect artifacts
+        shell: bash
+        run: |
+          echo $PWD
+          chown -R $(id -u):$(id -g) $PWD
+          chmod -R 744 target/gh-artifacts
+          ls -laR target/gh-artifacts
+          mv -f target/gh-artifacts/pacaptr-x86_64-pc-windows-msvc target/gh-artifacts/pacaptr_windows_amd64
+          mv -f target/gh-artifacts/pacaptr-aarch64-pc-windows-msvc target/gh-artifacts/pacaptr_windows_arm64
+          mv -f target/gh-artifacts/pacaptr-x86_64-apple-darwin target/gh-artifacts/pacaptr_darwin_amd64
+          mv -f target/gh-artifacts/pacaptr-aarch64-apple-darwin target/gh-artifacts/pacaptr_darwin_arm64
+          mv -f target/gh-artifacts/pacaptr-x86_64-unknown-linux-musl target/gh-artifacts/pacaptr_linux_amd64
+          mv -f target/gh-artifacts/pacaptr-aarch64-unknown-linux-musl target/gh-artifacts/pacaptr_linux_arm64
+          echo '======='
+          ls -laR target/gh-artifacts
+
+      # https://goreleaser.com/ci/actions/?h=github+act#usage
+      - name: Publish via GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: latest
+          args: release --clean --verbose ${{ github.event_name == 'push' && contains(github.ref, 'refs/tags/') && ' ' || '--snapshot --skip=publish' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}
+
+      # https://github.com/goreleaser/goreleaser/blob/2a3009757a8996cdcf2a77deb0e5fa413d1f2660/internal/pipe/chocolatey/chocolatey.go#L158
+      - name: Inspect generated artifacts
+        run: |
+          ls -laR dist/
+          cat dist/pacaptr.choco/pacaptr.nuspec
+
+      # https://github.com/goreleaser/goreleaser/blob/2a3009757a8996cdcf2a77deb0e5fa413d1f2660/internal/pipe/chocolatey/chocolatey.go#L201-L208
+      # https://stackoverflow.com/a/75835172
+      - name: Publish app on Chocolatey
+        if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
+        run: |
+          choco push dist/*.nupkg --source https://push.chocolatey.org --api-key ${{ secrets.CHOCO_API_KEY }} --verbose ${{ contains(github.ref, '-') && '--noop' || ' ' }}

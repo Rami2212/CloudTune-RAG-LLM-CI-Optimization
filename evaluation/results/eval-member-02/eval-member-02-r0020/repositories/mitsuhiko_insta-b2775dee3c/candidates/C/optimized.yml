@@ -1,0 +1,117 @@
+name: Tests
+
+on: [push, pull_request]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CLICOLOR_FORCE: 1
+  RUSTDOCFLAGS: "-Dwarnings"
+  RUSTFLAGS: "-D warnings"
+
+# Jobs run on the toolchain pinned in `rust-toolchain.toml`, except where one
+# sets `RUSTUP_TOOLCHAIN` to override it (`check-minver`) or manages its own
+# toolchain (`build-on-msrv`).
+jobs:
+  test-latest:
+    name: Test on Latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - name: Test
+        run: make test
+
+  test-current-cargo-insta:
+    name: Run the in-tree version of cargo-insta on ourselves
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - name: Test
+        run: cargo run -p cargo-insta -- test
+
+  build-on-msrv:
+    name: Check on MSRV
+    runs-on: ubuntu-latest
+    # `cargo msrv` installs and checks the `rust-version` from Cargo.toml itself,
+    # independent of `rust-toolchain.toml`.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: baptiste0928/cargo-install@v3
+        with:
+          crate: cargo-msrv
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify minimum rust version
+        run: make check-msrv
+
+  test-latest-dependencies:
+    name: Test latest deps
+    # Note that we don't test MSRV after running `cargo update`, since that
+    # would increase our maintenance burden — we'd need to be constantly pinning
+    # sub-dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - run: cargo update
+      - name: Test
+        run: make test
+
+  build-docs:
+    name: Build docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: doc
+        run: cargo doc --all-features
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Run clippy
+        run: make lint
+
+  check-minver:
+    name: Test with minimal version resolution
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      # `cargo minimal-versions` needs nightly for `-Z minimal-versions`. Pinned
+      # because newer nightlies reject the `rustc_*` attributes used in `rustix
+      # v0.36.4`, which it resolves to; bump once a newer nightly is known-good.
+      RUSTUP_TOOLCHAIN: nightly-2026-04-25
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-hack
+      - uses: taiki-e/install-action@cargo-minimal-versions
+      - name: Test
+        run: make check-minver
+
+  rustfmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Run rustfmt
+        run: make format-check
