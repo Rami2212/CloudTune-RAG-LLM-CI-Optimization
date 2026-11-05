@@ -242,17 +242,26 @@ def job_timing_metrics(records: list[dict]) -> dict:
     active-wall-clock metric. The raw makespan is retained as a distinct
     operational outcome; it can include GitHub's inter-job scheduling delay.
     """
-    intervals = sorted((_timestamp(job["started_at"]), _timestamp(job["completed_at"]))
-                       for job in records if job.get("started_at") and job.get("completed_at"))
+    try:
+        intervals = sorted((_timestamp(job["started_at"]), _timestamp(job["completed_at"]))
+                           for job in records if job.get("started_at") and job.get("completed_at"))
+    except (KeyError, TypeError, ValueError) as exc:
+        return {"active_seconds": None, "makespan_seconds": None,
+                "idle_gap_seconds": None,
+                "timing_error": f"Invalid GitHub job timestamp: {type(exc).__name__}"}
     if not intervals:
         return {"active_seconds": None, "makespan_seconds": None, "idle_gap_seconds": None}
     start, end = intervals[0]
     if end < start:
-        raise ValueError("GitHub returned a job that ended before its start")
+        return {"active_seconds": None, "makespan_seconds": None,
+                "idle_gap_seconds": None,
+                "timing_error": "GitHub returned a job that ended before its start"}
     active = 0.0
     for left, right in intervals[1:]:
         if right < left:
-            raise ValueError("GitHub returned a job that ended before its start")
+            return {"active_seconds": None, "makespan_seconds": None,
+                    "idle_gap_seconds": None,
+                    "timing_error": "GitHub returned a job that ended before its start"}
         if left > end:
             active += (end-start).total_seconds()
             start, end = left, right
@@ -871,12 +880,26 @@ class ForkExperiment:
         def duration(a, b):
             if not a or not b:
                 return None
-            return (dt.datetime.fromisoformat(b.replace("Z", "+00:00")) -
-                    dt.datetime.fromisoformat(a.replace("Z", "+00:00"))).total_seconds()
+            try:
+                seconds = (dt.datetime.fromisoformat(b.replace("Z", "+00:00")) -
+                           dt.datetime.fromisoformat(a.replace("Z", "+00:00"))).total_seconds()
+            except (AttributeError, TypeError, ValueError):
+                return None
+            return seconds if seconds >= 0 else None
         records = []
+        timing_errors = []
         for job in jobs:
+            started_at, completed_at = job.get("started_at"), job.get("completed_at")
+            if started_at and completed_at:
+                try:
+                    seconds = duration(started_at, completed_at)
+                    if seconds is None:
+                        timing_errors.append("GitHub returned a job that ended before its start")
+                except (AttributeError, TypeError, ValueError):
+                    timing_errors.append("GitHub returned an invalid job timestamp")
             seconds = duration(job.get("started_at"), job.get("completed_at"))
-            if job.get("conclusion") == "skipped" and seconds is None:
+            if (job.get("conclusion") == "skipped" and seconds is None
+                    and not (job.get("started_at") and job.get("completed_at"))):
                 seconds = 0.0
             records.append({"id": job["id"], "name": job["name"],
                             "status": job.get("status"), "conclusion": job.get("conclusion"),
@@ -894,6 +917,9 @@ class ForkExperiment:
             for r in records)
         timing = job_timing_metrics(records) if complete else {
             "active_seconds": None, "makespan_seconds": None, "idle_gap_seconds": None}
+        timing_error = timing_errors[0] if timing_errors else timing.get("timing_error")
+        if timing_error:
+            complete = False
         # Primary evaluation metric is the actual observed time with >=1 GitHub
         # job executing. Internal runner queue gaps are excluded using merged
         # job intervals. Keep makespan separately for end-to-end diagnostics.
@@ -924,9 +950,11 @@ class ForkExperiment:
                    "inter_job_idle_seconds": timing["idle_gap_seconds"],
                    "initial_queue_seconds": initial_queue,
                    "failure_class": ("PLATFORM_NO_JOB_START" if not executed else
+                                    "INVALID_JOB_TIMING" if timing_error else
                                     "CI_FAILURE_OR_PROTOCOL_MISMATCH" if not
                                     (valid and complete and required_pass and run.get("conclusion") == "success")
                                     else None),
+                   "timing_error": timing_error,
                    "first_job_started_at": first, "last_job_completed_at": last,
                    "run_created_at": run.get("created_at"),
                    "github_run_started_at": run.get("run_started_at"), "jobs": records,

@@ -553,11 +553,14 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False,
             # Only a failed ORIGINAL baseline invalidates the whole repository.
             # A failed B or C is isolated and its other admitted peer continues
             # after process restarts; evidence is never silently replayed.
-            platform = failed_baseline.get("failure_class") == "PLATFORM_NO_JOB_START"
+            platform = failed_baseline.get("failure_class") in {
+                "PLATFORM_NO_JOB_START", "INVALID_JOB_TIMING"}
             repo["status"] = "INCONCLUSIVE_PLATFORM" if platform else "FAILED_TARGET_CI"
             repo["failure_reason"] = (
                 f"Original Workflow run {failed_baseline['run_id']} completed without a started job"
-                if platform else
+                if failed_baseline.get("failure_class") == "PLATFORM_NO_JOB_START" else
+                f"Original Workflow run {failed_baseline['run_id']} had invalid GitHub job timing; evidence was not comparable"
+                if failed_baseline.get("failure_class") == "INVALID_JOB_TIMING" else
                 f"Original Workflow run {failed_baseline['run_id']} failed correctness or protocol checks")
             store.save(state)
             if row["status"] in {"prepared", "needs_harness"} and repo.get("fork_repo"):
@@ -756,11 +759,14 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False,
                 _save_report(output, state)
                 continue
             if failed_trial:
-                platform = failed_trial.get("failure_class") == "PLATFORM_NO_JOB_START"
+                platform = failed_trial.get("failure_class") in {
+                    "PLATFORM_NO_JOB_START", "INVALID_JOB_TIMING"}
                 repo["status"] = "INCONCLUSIVE_PLATFORM" if platform else "FAILED_TARGET_CI"
                 repo["failure_reason"] = (
                     f"Original Workflow run {failed_trial['run_id']} completed without a started job"
-                    if platform else
+                    if failed_trial.get("failure_class") == "PLATFORM_NO_JOB_START" else
+                    f"Original Workflow run {failed_trial['run_id']} had invalid GitHub job timing; evidence was not comparable"
+                    if failed_trial.get("failure_class") == "INVALID_JOB_TIMING" else
                     f"Original Workflow run {failed_trial['run_id']} failed correctness or protocol checks")
             else:
                 measured_arms = 2 if b_no_change and "B" in candidates else len(candidates)
@@ -777,7 +783,8 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False,
                                 if record["arm"] in failed_optimized_arms
                                 and not record.get("comparable")]
                     repo["status"] = ("INCONCLUSIVE_PLATFORM" if failures and all(
-                        record.get("failure_class") == "PLATFORM_NO_JOB_START" for record in failures)
+                        record.get("failure_class") in {"PLATFORM_NO_JOB_START", "INVALID_JOB_TIMING"}
+                        for record in failures)
                         else "FAILED_TARGET_CI")
                 else:
                     repo["status"] = "INCOMPLETE"
