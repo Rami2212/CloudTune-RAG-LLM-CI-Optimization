@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - release
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  release:
+    name: Release
+    runs-on: warp-ubuntu-latest-arm64-4x
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: '1.4.4'
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Get version before release
+        id: version_before
+        run: echo "version=$(git describe --tags --abbrev=0 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
+
+      - name: Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
+          HUSKY: 0
+        run: bun run semantic-release
+
+      - name: Check if release was created
+        id: check_release
+        run: |
+          # Get the latest version after semantic-release
+          VERSION_AFTER=$(git describe --tags --abbrev=0 2>/dev/null || echo '')
+          echo "version_after=$VERSION_AFTER" >> $GITHUB_OUTPUT
+
+          # Check if version changed
+          if [ "${{ steps.version_before.outputs.version }}" != "$VERSION_AFTER" ] && [ ! -z "$VERSION_AFTER" ]; then
+            echo "release_created=true" >> $GITHUB_OUTPUT
+          else
+            echo "release_created=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Merge release back to main
+        if: ${{ steps.check_release.outputs.release_created == 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          # Configure git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Fetch all branches to ensure we have latest
+          git fetch origin
+
+          # Checkout main
+          git checkout -B main origin/main
+
+          # Merge release branch (which now has the new release commits)
+          git merge --no-ff origin/release -m "chore: merge release ${{ steps.check_release.outputs.version_after }} back to main [skip ci]"
+
+          # Push to main
+          git push origin main
