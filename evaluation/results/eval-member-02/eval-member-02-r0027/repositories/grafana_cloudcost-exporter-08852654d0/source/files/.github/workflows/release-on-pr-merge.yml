@@ -1,0 +1,288 @@
+name: PR Merge to Main
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  check-release-label:
+    runs-on: ubuntu-latest
+    outputs:
+      should-release: ${{ steps.check.outputs.should-release }}
+      bump: ${{ steps.check.outputs.bump }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Get PR information
+        id: check
+        run: |
+          PR_NUMBER=$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" --jq '.[0].number')
+          PR_DATA=$(gh pr view "$PR_NUMBER" --json labels)
+          LABELS=$(echo "$PR_DATA" | jq -r '.labels[].name' | tr '\n' ' ')
+          
+          echo "PR Labels: $LABELS"
+          
+          # Extract release labels and count them
+          RELEASE_LABELS=$(echo "$LABELS" | grep -oE 'release:(major|minor|patch)' || true)
+          if [ -z "$RELEASE_LABELS" ]; then
+            LABEL_COUNT=0
+          else
+            LABEL_COUNT=$(echo "$RELEASE_LABELS" | wc -l | tr -d ' ')
+          fi
+          
+          # Safeguard: Fail if multiple release labels are present
+          if [ "$LABEL_COUNT" -gt 1 ]; then
+            echo "ERROR: Multiple release labels found:"
+            echo "$RELEASE_LABELS" | sed 's/^/  - /'
+            echo "Please use only ONE release label per PR: release:major, release:minor, or release:patch"
+            exit 1
+          fi
+          
+          # Determine version bump
+          if echo "$LABELS" | grep -q "release:major"; then
+            echo "bump=major" >> $GITHUB_OUTPUT
+            echo "should-release=true" >> $GITHUB_OUTPUT
+          elif echo "$LABELS" | grep -q "release:minor"; then
+            echo "bump=minor" >> $GITHUB_OUTPUT
+            echo "should-release=true" >> $GITHUB_OUTPUT
+          elif echo "$LABELS" | grep -q "release:patch"; then
+            echo "bump=patch" >> $GITHUB_OUTPUT
+            echo "should-release=true" >> $GITHUB_OUTPUT
+          else
+            echo "should-release=false" >> $GITHUB_OUTPUT
+            echo "No release label, will only build and push images"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  tag-and-goreleaser:
+    # Always run, but skip steps if no release label
+    needs: check-release-label
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.final-outputs.outputs.version }}
+      should-release: ${{ needs.check-release-label.outputs.should-release }}
+    steps:
+      - name: Checkout
+        if: needs.check-release-label.outputs.should-release == 'true'
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Calculate version and set outputs
+        id: final-outputs
+        run: |
+          if [ "${{ needs.check-release-label.outputs.should-release }}" = "true" ]; then
+            # Ensure we're on main and have all tags
+            git fetch --tags origin main || true
+            git checkout main || true
+            
+            # Calculate version for release - only consider semver tags (vMAJOR.MINOR.PATCH)
+            # to avoid picking up helm chart tags like vcloudcost-exporter-1.1.0
+            LATEST_TAG=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -1)
+            LATEST_TAG="${LATEST_TAG:-v0.0.0}"
+            VERSION="${LATEST_TAG#v}"
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+            
+            BUMP="${{ needs.check-release-label.outputs.bump }}"
+            case "$BUMP" in
+              major)
+                MAJOR=$((MAJOR + 1))
+                MINOR=0
+                PATCH=0
+                ;;
+              minor)
+                MINOR=$((MINOR + 1))
+                PATCH=0
+                ;;
+              patch)
+                PATCH=$((PATCH + 1))
+                ;;
+            esac
+            
+            NEW_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+            echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+            echo "New version: $NEW_VERSION"
+          else
+            # No release, use default version
+            echo "version=v0.0.0" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create and push tag
+        if: needs.check-release-label.outputs.should-release == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          TAG="${{ steps.final-outputs.outputs.version }}"
+          PR_NUMBER=$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" --jq '.[0].number // empty')
+          PR_DATA=$(gh pr view "$PR_NUMBER" --json title,url)
+          PR_TITLE=$(echo "$PR_DATA" | jq -r '.title')
+          PR_URL=$(echo "$PR_DATA" | jq -r '.url')
+          
+          git tag -a "$TAG" -m "Release $TAG
+
+          From PR #$PR_NUMBER: $PR_TITLE
+          
+          See: $PR_URL"
+          
+          git push origin "$TAG"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Go
+        if: needs.check-release-label.outputs.should-release == 'true'
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Generate changelog
+        if: needs.check-release-label.outputs.should-release == 'true'
+        id: changelog
+        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5 # v4.8.0
+        with:
+          args: --latest --strip header
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare release notes for GoReleaser
+        if: needs.check-release-label.outputs.should-release == 'true'
+        run: |
+          cp "${{ steps.changelog.outputs.changelog }}" /tmp/goreleaser-release-notes.md
+          rm -rf git-cliff/
+
+      - name: Run GoReleaser
+        if: needs.check-release-label.outputs.should-release == 'true'
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser
+          version: 2
+          args: release --clean --release-notes=/tmp/goreleaser-release-notes.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-and-export-digest:
+    # Always build for all PR merges (with or without release labels)
+    # Wait for tag-and-goreleaser to complete first
+    needs: [check-release-label, tag-and-goreleaser]
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      images: ${{ steps.build.outputs.images }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runnerType: ubuntu-24.04-arm
+            platform: linux/arm64
+          - runnerType: ubuntu-24.04
+            platform: linux/amd64
+    runs-on: ${{ matrix.runnerType }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Build and Push Image
+        id: build
+        uses: grafana/shared-workflows/actions/docker-build-push-image@c66d74df41cf4ed28a90da1d91c263f9d1609a21 # docker-build-push-image/v0.3.4
+        with:
+          registries: gar
+          gar-environment: prod
+          gar-repository: dockerhub-cloudcost-exporter-prod-mirror
+          platforms: ${{ matrix.platform }}
+          outputs: "type=image,push-by-digest=true,name-canonical=true,push=true"
+          push: true
+          tags: |
+            type=raw,value=${{ needs.tag-and-goreleaser.outputs.version }},enable=${{ needs.tag-and-goreleaser.outputs.should-release == 'true' }}
+            type=raw,value=latest
+            type=sha,prefix=main-,format=short
+          include-tags-in-push: false
+
+      - name: Export Docker Digest
+        id: export
+        uses: grafana/shared-workflows/actions/docker-export-digest@203d59d1f1962cf24e4e3b288eb6492754f0f53f # docker-export-digest/v0.1.5
+        with:
+          digest: ${{ steps.build.outputs.digest }}
+          platform: ${{ matrix.platform }}
+
+  push-manifest:
+    # Always push manifest for all PR merges
+    needs: [check-release-label, tag-and-goreleaser, build-and-export-digest]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download Multi-Arch Digests, Construct and Upload Manifest (latest and main-{sha})
+        uses: grafana/shared-workflows/actions/docker-import-digests-push-manifest@c5063685e4b5fde3345cd29491a9c6e982eb2bc1 # docker-import-digests-push-manifest/v0.2.3
+        with:
+          images: ${{ needs.build-and-export-digest.outputs.images }}
+          push: true
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=main-,format=short
+
+      - name: Download Multi-Arch Digests, Construct and Upload Manifest (release v{version})
+        if: needs.tag-and-goreleaser.outputs.should-release == 'true'
+        uses: grafana/shared-workflows/actions/docker-import-digests-push-manifest@c5063685e4b5fde3345cd29491a9c6e982eb2bc1 # docker-import-digests-push-manifest/v0.2.3
+        with:
+          images: ${{ needs.build-and-export-digest.outputs.images }}
+          push: true
+          tags: |
+            type=raw,value=${{ needs.tag-and-goreleaser.outputs.version }}
+
+  update-helm-chart:
+    if: needs.tag-and-goreleaser.outputs.should-release == 'true'
+    needs: [check-release-label, tag-and-goreleaser, push-manifest]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Open Helm chart bump PR
+        uses: ./.github/actions/update-helm-chart
+        with:
+          version: ${{ needs.tag-and-goreleaser.outputs.version }}
+
+  deploy:
+    if: needs.tag-and-goreleaser.outputs.should-release == 'true'
+    needs: [check-release-label, tag-and-goreleaser, push-manifest]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    steps:
+      - name: Trigger Argo Workflow
+        uses: grafana/shared-workflows/actions/trigger-argo-workflow@8269e9362f30c5458c2cad54510ea74fd053920c # trigger-argo-workflow/v1.3.0
+        with:
+          namespace: platform-monitoring-cd
+          workflow_template: cloudcost-exporter
+          parameters: |
+            imageName=grafana/cloudcost-exporter
+            dockertag=${{ needs.tag-and-goreleaser.outputs.version }}
+            prCommentContext= Triggered by release ${{ needs.tag-and-goreleaser.outputs.version }} in grafana/cloudcost-exporter
+            commit_author=grafana-delivery-bot

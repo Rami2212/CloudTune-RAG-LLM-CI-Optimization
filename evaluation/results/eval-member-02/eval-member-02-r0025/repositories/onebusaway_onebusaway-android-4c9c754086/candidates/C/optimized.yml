@@ -1,0 +1,187 @@
+name: Android Nightly
+
+# Two nightly legs that both live off the PR critical path:
+#
+# 1. all-brands — the PR/push workflow (android.yml) only exercises the shipping `oba` brand's tests
+#    to keep the grid small (see the beforeVariants filter in onebusaway-android/build.gradle). This
+#    leg restores the full brand × platform grid via -PbuildAllBrands=true so a change breaking the
+#    sample white-label brands (agencyX/agencyY) or the third-party `kiedybus` brand is still caught.
+#    Unit tests + `check` are JVM-only, so it needs no emulator.
+#
+# 2. smoke-api23 — `minSdk` is 23 but no other job *launches* the app below API 33, so runtime-only
+#    floor risks (core-library desugaring, pre-26 platform shims, Compose on a 2015-era runtime,
+#    startup itself) go unbooted; a crash-on-boot at the floor would ship. This leg boots an API 23
+#    emulator, installs obaGoogleDebug, and runs the @SmokeTest-annotated subset of the instrumented
+#    suite (org.onebusaway.android.SmokeTest — see that annotation + issue #1818). Small and stable
+#    on purpose: it answers "does the app boot and do the core flows run on the floor?", not "re-run
+#    everything". Both instrumented suites otherwise remain oba-only in android.yml.
+#
+# 3. lint — every `./gradlew` invocation on the PR/push and other nightly legs passes `-x lint`
+#    because lintObaGoogleDebug is heavyweight (~7-15 min) and would dominate those jobs' wall-clock
+#    (see the NOTE in android.yml). This leg is the promised home for it: no emulator, so it's cheap
+#    to run nightly and catches lint regressions (including `abortOnError` NewApi/minSdk violations
+#    the Kotlin warnings gate can't see) that would otherwise sit invisible until someone runs lint
+#    by hand. See issue #1901.
+#
+# 4. regions-drift — src/main/res/raw/regions_v3.json is the app's first-launch and offline region
+#    config, so a field that has drifted away from the live regions directory is a real behaviour
+#    difference for users who haven't refreshed their region cache yet — and invisible to everyone
+#    who has. Puget Sound's otpBaseGraphqlUrl silently drifted that way, and nothing compared the
+#    two files (the unit test pins the bundled value against itself). This leg diffs them on the
+#    fields the app branches on. It lives here rather than on the PR/push workflow because it needs
+#    network, and it fails on drift. See tools/check-regions-drift.py and issue #2019.
+
+on:
+  schedule:
+    # 07:00 UTC daily (~midnight US Pacific)
+    - cron: '0 7 * * *'
+  # Allow manual runs from the Actions tab
+  workflow_dispatch:
+
+# One nightly run at a time: if a run is still going when the next cron fires (or a manual
+# dispatch overlaps), cancel the stale one so they don't race on the shared Gradle cache.
+concurrency:
+  group: nightly
+  cancel-in-progress: true
+
+jobs:
+  all-brands:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: checkout
+        uses: actions/checkout@v7
+        with:
+          # This job only runs tests; it never pushes, so don't leave the token in git config.
+          persist-credentials: false
+
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          java-version: 21
+          distribution: 'temurin'
+
+      - name: Gradle cache
+        uses: gradle/actions/setup-gradle@v6.4.0
+
+      - name: Full-grid tests + check (all brands)
+        run: ./gradlew test check -PbuildAllBrands=true --build-cache -x lint -PwarningsAsErrors=true --stacktrace
+
+  lint:
+    # No emulator needed: lint is a static analysis task. Independent of the other legs, so it runs
+    # in parallel. See the header for why this exists.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: checkout
+        uses: actions/checkout@v7
+        with:
+          # This job only runs lint; it never pushes, so don't leave the token in git config.
+          persist-credentials: false
+
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          java-version: 21
+          distribution: 'temurin'
+
+      - name: Gradle cache
+        uses: gradle/actions/setup-gradle@v6.4.0
+
+      - name: Android Lint (obaGoogleDebug)
+        run: ./gradlew :onebusaway-android:lintObaGoogleDebug --build-cache -PwarningsAsErrors=true --stacktrace
+
+      - name: Upload lint report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: lint-report-obaGoogleDebug
+          path: onebusaway-android/build/reports/lint-results-obaGoogleDebug.html
+          retention-days: 14
+
+  regions-drift:
+    # No JDK, no Gradle, no emulator — it reads two JSON files. Independent of the other legs, so it
+    # runs in parallel and finishes in seconds. See the header for why this exists.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: checkout
+        uses: actions/checkout@v7
+        with:
+          # This job only reads files and fetches a public URL; it never pushes, so don't leave the
+          # token in git config.
+          persist-credentials: false
+
+      # No report artifact: unlike the lint leg's HTML, this step's whole output is the plain-text
+      # report, and it's already in the job log.
+      - name: Bundled regions file vs. live regions directory
+        run: tools/check-regions-drift.py
+
+  smoke-api23:
+    # Boot the minSdk floor: install obaGoogleDebug on an API 23 emulator and run the @SmokeTest
+    # subset. Independent of all-brands, so it runs in parallel. See the header for why this exists.
+    runs-on: ubuntu-latest
+    # Cap the run so a wedged emulator boot / KVM stall can't hang the nightly and burn CI minutes.
+    # The whole leg (AVD boot + install + smoke subset) is well under this in the normal case.
+    timeout-minutes: 45
+    steps:
+      - name: checkout
+        uses: actions/checkout@v7
+        with:
+          # This job only runs tests; it never pushes, so don't leave the token in git config.
+          persist-credentials: false
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          java-version: 21
+          distribution: 'temurin'
+
+      - name: Gradle cache
+        uses: gradle/actions/setup-gradle@v6.4.0
+
+      - name: AVD cache
+        uses: actions/cache@v6
+        id: avd-cache
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-23
+
+      # API 23 (google_apis) ships only an x86 system image — no x86_64 at this level. If the 23 image
+      # proves too flaky on hosted runners, bump to 24/25 (still pre-26, so still exercises desugaring
+      # + the notification-channel shim floor) before giving up. See issue #1818.
+      - name: create AVD and generate snapshot for caching
+        if: steps.avd-cache.outputs.cache-hit != 'true'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 23
+          force-avd-creation: false
+          arch: x86
+          target: google_apis
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: false
+          script: echo "Generated AVD snapshot for caching."
+
+      - name: run smoke subset
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 23
+          force-avd-creation: false
+          arch: x86
+          target: google_apis
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          # Select only the @SmokeTest-annotated classes; -x lint keeps the ~10-min lint off this leg.
+          # (Lint runs separately in the `lint` job above, which needs no emulator.)
+          script: >-
+            ./gradlew connectedObaGoogleDebugAndroidTest
+            -Pandroid.testInstrumentationRunnerArguments.annotation=org.onebusaway.android.SmokeTest
+            --build-cache -x lint -PwarningsAsErrors=true --stacktrace

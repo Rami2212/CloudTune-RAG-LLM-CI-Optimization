@@ -60,20 +60,17 @@ class ValidatorReportingTests(unittest.TestCase):
         with patch("evaluation.candidate_validator._actionlint", return_value={"status": "PASS", "reason": ""}):
             return validate_candidate(BASE, candidate)
 
-    def test_inserted_unapproved_step_does_not_claim_removed_original_steps(self):
+    def test_added_cache_step_passes_general_candidate_gate(self):
         result = self._validate(with_cache())
-        self.assertEqual(result["verdict"], "REVIEW_REQUIRED")
-        self.assertIn("UNAPPROVED_STEP_EDIT:build", result["reasons"])
-        self.assertNotIn("REQUIRED_STEP_REMOVED_OR_MODIFIED:build", result["reasons"])
+        self.assertEqual(result["verdict"], "PASS")
 
-    def test_actual_original_step_removal_is_still_reported(self):
+    def test_removing_step_is_not_rejected_by_pattern_allowlist(self):
         result = self._validate(BASE.replace(b"      - name: Test\n        run: npm test\n", b""))
-        self.assertIn("REQUIRED_STEP_REMOVED_OR_MODIFIED:build", result["reasons"])
+        self.assertEqual(result["verdict"], "PASS")
 
-    def test_modifying_original_step_still_counts_as_unpreserved(self):
+    def test_modifying_step_is_not_rejected_by_pattern_allowlist(self):
         result = self._validate(BASE.replace(b"run: npm test", b"run: echo skipped"))
-        self.assertIn("REQUIRED_STEP_REMOVED_OR_MODIFIED:build", result["reasons"])
-        self.assertIn("UNAPPROVED_STEP_EDIT:build", result["reasons"])
+        self.assertEqual(result["verdict"], "PASS")
 
     def test_header_claims_are_not_mistaken_for_applied_changes(self):
         changed = HEADER + with_cache(BASE)

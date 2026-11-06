@@ -1,0 +1,122 @@
+[project]
+name = "pyads"
+description = "Python wrapper for TwinCAT ADS library"
+authors = [
+    { name = "Stefan Lehmann", email = "stlm@posteo.de" },
+]
+readme = "README.md"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+]
+license = "MIT"
+license-files = ["LICENSE"]
+dynamic = ["version"]
+requires-python = ">= 3.9,<4"
+# Outdated Python versions are still included, until they cause problems (after which they will bed dropped)
+# Python 3.8 cannot be used anymore because of a setuptoools minimum version
+
+[project.optional-dependencies]
+docs = [
+    "sphinx",
+    "sphinx_rtd_theme",
+    "recommonmark",
+]
+tests = [
+    "pytest",
+    "pytest-cov",
+    "tox",
+]
+dev = [
+    "build",
+    "flake8",
+    "pytest",
+    "coverage",
+    "coveralls",
+]
+
+[project.urls]
+Repository = "https://github.com/stlehmann/pyads"
+Documentation = "https://pyads.readthedocs.io"
+
+[build-system]
+requires = ["setuptools >= 77.0.3", "wheel"]
+# ^ Support for new `license` format
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["pyads", "pyads.testserver"]
+package-dir = { "" = "src" }
+include-package-data = true
+# ^ needed for MANIFEST.in
+
+#[tool.setuptools.package-data]
+# Package data (adslib/) is handled by MANIFEST.in instead
+
+[tool.setuptools.exclude-package-data]
+pyads = ["adslib/**"]
+# ^ Odd trick, put this excludes the adslib source again from a wheel build and from a pip install
+
+[tool.setuptools.dynamic]
+version = {attr = "pyads.__version__"}
+
+[tool.cibuildwheel]
+before-all = "pip install meson ninja"
+
+[tool.cibuildwheel.linux]
+before-all = "yum install -y meson"
+
+[tool.tox]
+legacy_tox_ini = """
+    [tox]
+    envlist = py38, py39, py310, py311, py312, py313, py314
+
+    [testenv]
+    commands = discover
+    deps = discover
+    changedir = tests
+    whitelist_externals=*
+    passenv = TWINCAT3DIR
+
+    [pytest]
+    testpaths = tests
+"""
+
+[tool.black]
+line-length = 88
+target-version = ['py38', 'py39', 'py310', 'py311', 'py312', 'py313', 'py314']
+include = '\.pyi?$'
+exclude = '''
+(
+  /(
+      .eggs
+    | .git
+    | .mypy_cache
+    | .tox
+    | .venv
+    | _build
+    | buck-out
+    | build
+    | dist
+    | adslib
+    | pyads.egg-info
+  )/
+  | pyads/__init__.py
+)
+'''
+
+[tool.pydocstyle]
+ignore = ["D105", "D213", "D203", "D107"]
+
+[tool.coverage.run]
+include = ["pyads/*"]
+omit = ["pyads/testserver/__main__.py"]

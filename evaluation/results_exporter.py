@@ -30,7 +30,11 @@ def summarize_cohort(repositories: dict, *, bootstrap_samples: int = 1000,
               "failed_ci_repositories": sum(r.get("status") == "FAILED_TARGET_CI" for r in repositories.values()),
               "platform_inconclusive_repositories": sum(
                   r.get("status") == "INCONCLUSIVE_PLATFORM" for r in repositories.values()),
-              "incomplete_repositories": sum(r.get("status") not in {"COMPLETE", "SKIPPED", "FAILED_TARGET_CI", "INCONCLUSIVE_PLATFORM"}
+              "queue_timeout_repositories": sum(
+                  r.get("status") == "QUEUE_TIMEOUT" for r in repositories.values()),
+              "in_progress_timeout_repositories": sum(
+                  r.get("status") == "IN_PROGRESS_TIMEOUT" for r in repositories.values()),
+              "incomplete_repositories": sum(r.get("status") not in {"COMPLETE", "SKIPPED", "FAILED_TARGET_CI", "INCONCLUSIVE_PLATFORM", "QUEUE_TIMEOUT", "IN_PROGRESS_TIMEOUT"}
                                              for r in repositories.values()),
               "comparisons": {}}
     comparisons = (("B", "vs_A"), ("C", "vs_A"), ("C", "vs_B"))

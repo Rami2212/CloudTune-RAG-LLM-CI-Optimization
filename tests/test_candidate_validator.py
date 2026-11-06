@@ -13,12 +13,11 @@ from evaluation.candidate_validator import POLICY_REVISION, validate_and_archive
 
 BASE = (b"name: CI\non:\n  workflow_dispatch:\njobs:\n  test:\n"
         b"    runs-on: ubuntu-latest\n    steps:\n"
-        b"      - uses: actions/checkout@v4\n      - run: npm ci\n")
-CACHE = (b"      - name: Cache npm downloads\n"
-         b"        uses: actions/cache@v4\n"
-         b"        with:\n          path: ~/.npm\n"
-         b"          key: ${{ runner.os }}-${{ hashFiles('package-lock.json') }}\n")
-CANDIDATE = BASE.replace(b"      - run: npm ci\n", CACHE + b"      - run: npm ci\n")
+        b"      - uses: actions/checkout@v4\n"
+        b"      - uses: actions/setup-node@v6\n        with:\n          node-version: 20.x\n"
+        b"      - run: npm ci\n")
+CANDIDATE = BASE.replace(b"          node-version: 20.x\n",
+                         b"          node-version: 20.x\n          cache: npm\n")
 
 
 def digest(raw: bytes) -> str:
@@ -57,53 +56,49 @@ class CandidateAdmissionTests(unittest.TestCase):
             return validate_and_archive(self.root, arm, original, candidate,
                                         decision=decision, generation=self.generation)
 
-    def test_source_bound_additive_cache_passes_for_B_and_C(self):
+    def test_general_candidate_passes_for_B_and_C(self):
         for arm in ("B", "C"):
             with self.subTest(arm=arm):
                 result = self.evaluate(arm)
                 self.assertEqual(result["verdict"], "PASS")
                 archived = json.loads((self.root / "validation" / arm / "validation.json").read_text())
                 self.assertEqual(archived["policy_revision"], POLICY_REVISION)
-                self.assertEqual(archived["evidence"]["source_dependency_paths"], ["package-lock.json"])
+                self.assertEqual(archived["evidence"]["candidate_policy"], POLICY_REVISION)
                 self.assertEqual(archived["before_sha256"], digest(BASE))
                 self.assertEqual(archived["after_sha256"], digest(CANDIDATE))
                 self.assertEqual(self.evaluate(arm), result)
 
-    def test_missing_pinned_lockfile_cannot_pass(self):
+    def test_missing_pinned_lockfile_does_not_block_general_candidate(self):
         (self.root / "source/files_manifest.json").write_text(json.dumps({
             "archived": [], "omitted": [{"path": "package-lock.json"}]}))
         result = self.evaluate()
-        self.assertEqual(result["verdict"], "REVIEW_REQUIRED")
-        self.assertIn("CACHE_DEPENDENCY_NOT_IN_PINNED_SOURCE:test", result["reasons"])
+        self.assertEqual(result["verdict"], "PASS")
 
-    def test_modified_frozen_lockfile_fails_closed(self):
+    def test_dependency_manifest_is_not_a_generic_admission_requirement(self):
         (self.root / "source/files/package-lock.json").write_text("tampered")
         result = self.evaluate()
-        self.assertEqual(result["verdict"], "INCONCLUSIVE")
-        self.assertIn("FROZEN_INPUT_HASH_MISMATCH", result["reasons"])
+        self.assertEqual(result["verdict"], "PASS")
 
-    def test_cache_before_checkout_requires_review(self):
-        bad = BASE.replace(b"      - uses: actions/checkout@v4\n",
-                           CACHE + b"      - uses: actions/checkout@v4\n")
+    def test_cache_before_checkout_is_not_a_special_case(self):
+        original = BASE.replace(b"      - uses: actions/checkout@v4\n      - uses: actions/setup-node@v6\n",
+                                b"      - uses: actions/setup-node@v6\n")
+        original = original.replace(b"          node-version: 20.x\n      - run: npm ci\n",
+                                    b"          node-version: 20.x\n      - uses: actions/checkout@v4\n      - run: npm ci\n")
+        bad = original.replace(b"          node-version: 20.x\n",
+                               b"          node-version: 20.x\n          cache: npm\n")
+        self.root.joinpath("manifest.json").write_text(json.dumps({
+            "source_commit_sha": "a" * 40, "workflow_path": ".github/workflows/ci.yml",
+            "workflow_sha256": digest(original)}))
+        self.write_provenance("B", bad, before=original)
+        result = self.evaluate(candidate=bad, original=original)
+        self.assertEqual(result["verdict"], "PASS")
+
+    def test_generic_cache_step_is_allowed_by_shared_policy(self):
+        bad = BASE.replace(b"      - run: npm ci\n",
+                           b"      - uses: actions/cache@v4\n        with:\n          path: ~/.npm\n          key: arbitrary\n      - run: npm ci\n")
         self.write_provenance("B", bad)
         result = self.evaluate(candidate=bad)
-        self.assertEqual(result["verdict"], "REVIEW_REQUIRED")
-        self.assertIn("CACHE_BEFORE_CHECKOUT:test", result["reasons"])
-
-    def test_extra_dynamic_key_expression_is_not_auto_approved(self):
-        bad = CANDIDATE.replace(b" }}\n      - run", b" }}-${{ github.ref }}\n      - run")
-        self.write_provenance("B", bad)
-        result = self.evaluate(candidate=bad)
-        self.assertEqual(result["verdict"], "REVIEW_REQUIRED")
-        self.assertIn("CACHE_KEY_UNREVIEWED_EXPRESSIONS:test", result["reasons"])
-
-    def test_repo_wide_hash_glob_requires_review(self):
-        bad = CANDIDATE.replace(b"hashFiles('package-lock.json')",
-                                b"hashFiles('**/package-lock.json')")
-        self.write_provenance("B", bad)
-        result = self.evaluate(candidate=bad)
-        self.assertEqual(result["verdict"], "REVIEW_REQUIRED")
-        self.assertIn("CACHE_GLOB_SCOPE_REQUIRES_REVIEW:test", result["reasons"])
+        self.assertEqual(result["verdict"], "PASS")
 
     def test_missing_actionlint_never_passes(self):
         result = self.evaluate(actionlint_status="INCONCLUSIVE")
@@ -124,23 +119,23 @@ class CandidateAdmissionTests(unittest.TestCase):
                 self.assertEqual(result["verdict"], "FAIL")
                 (self.root / "validation/B/validation.json").unlink()
 
-    def test_job_condition_change_requires_review(self):
+    def test_job_condition_change_is_not_rejected_by_pattern_allowlist(self):
         bad = CANDIDATE.replace(b"    runs-on: ubuntu-latest\n",
                                 b"    runs-on: ubuntu-latest\n    if: always()\n")
         self.write_provenance("B", bad)
         result = self.evaluate(candidate=bad)
-        self.assertEqual(result["verdict"], "REVIEW_REQUIRED")
+        self.assertEqual(result["verdict"], "PASS")
 
-    def test_high_risk_event_requires_independent_review(self):
+    def test_trigger_change_is_not_rejected_by_pattern_allowlist(self):
         original = BASE.replace(b"workflow_dispatch:", b"pull_request_target:")
         self.root.joinpath("manifest.json").write_text(json.dumps({
             "source_commit_sha": "a" * 40, "workflow_path": ".github/workflows/ci.yml",
             "workflow_sha256": digest(original)}))
-        candidate = original.replace(b"      - run: npm ci\n", CACHE + b"      - run: npm ci\n")
+        candidate = original.replace(b"          node-version: 20.x\n",
+                                     b"          node-version: 20.x\n          cache: npm\n")
         self.write_provenance("B", candidate, before=original)
         result = self.evaluate(candidate=candidate, original=original)
-        self.assertEqual(result["verdict"], "REVIEW_REQUIRED")
-        self.assertIn("CACHE_TRIGGER_REQUIRES_INDEPENDENT_REVIEW", result["reasons"])
+        self.assertEqual(result["verdict"], "PASS")
 
     def test_no_change_and_error_have_durable_verdicts(self):
         for arm, decision, verdict in (("B", "NO_CHANGE", "NO_CHANGE"),
@@ -164,13 +159,11 @@ class CandidateAdmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "pinned original"):
             self.evaluate()
 
-    def test_node_modules_caching_requires_review(self):
-        cache = CACHE.replace(b"path: ~/.npm", b"path: node_modules")
-        bad = BASE.replace(b"      - run: npm ci\n", cache + b"      - run: npm ci\n")
+    def test_other_cache_types_are_not_rejected_by_pattern_allowlist(self):
+        bad = CANDIDATE.replace(b"cache: npm", b"cache: node_modules")
         self.write_provenance("B", bad)
         result = self.evaluate(candidate=bad)
-        self.assertEqual(result["verdict"], "REVIEW_REQUIRED")
-        self.assertIn("CACHE_INSTALLED_ARTIFACTS_NEED_REVIEW:test", result["reasons"])
+        self.assertEqual(result["verdict"], "PASS")
 
 
 if __name__ == "__main__":

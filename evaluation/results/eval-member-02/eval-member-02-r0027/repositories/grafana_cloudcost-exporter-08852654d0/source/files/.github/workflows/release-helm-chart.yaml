@@ -1,0 +1,89 @@
+name: Release Helm Chart
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'charts/cloudcost-exporter/Chart.yaml'
+  workflow_dispatch:
+
+env:
+  CR_INDEX_PATH: "${{ github.workspace }}/.cr-index"
+  CR_PACKAGE_PATH: "${{ github.workspace }}/.cr-release-packages"
+  CR_TOOL_PATH: "${{ github.workspace }}/.cr-tool"
+
+permissions: {}
+
+jobs:
+  validate-chart:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5.0.1
+        with:
+          version: 'v4.3.1'
+
+      - name: Lint Helm chart
+        run: |
+          helm lint charts/cloudcost-exporter
+
+      - name: Template Helm chart with default values
+        run: |
+          helm template cloudcost-exporter charts/cloudcost-exporter
+
+      - name: Template Helm chart with AWS values
+        run: |
+          helm template cloudcost-exporter charts/cloudcost-exporter \
+            -f charts/cloudcost-exporter/values.aws.yaml
+
+  release-chart:
+    needs: validate-chart
+    uses: grafana/helm-charts/.github/workflows/update-helm-repo.yaml@434266a8ba2e1e859b58d82084d976cc411580cc
+    permissions:
+      contents: write
+      id-token: write
+      packages: write
+    with:
+      charts_dir: charts
+      cr_configfile: cr.yaml
+      ct_configfile: charts/cloudcost-exporter/ct.yaml
+      github_app: cloudcost-exporter-helm-publisher
+
+  trigger-deployment-tools-update:
+    needs: release-chart
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+
+      - name: Wait for chart to appear in Helm registry
+        run: |
+          VERSION=$(grep '^version:' charts/cloudcost-exporter/Chart.yaml | awk '{print $2}')
+          echo "Waiting for grafana/cloudcost-exporter ${VERSION} in Helm registry..."
+          for i in $(seq 1 20); do
+            if curl -sf https://grafana.github.io/helm-charts/index.yaml | grep -q "cloudcost-exporter-${VERSION}.tgz"; then
+              echo "Chart ${VERSION} is available."
+              exit 0
+            fi
+            echo "Attempt ${i}/20: not available yet, retrying in 30s..."
+            sleep 30
+          done
+          echo "Timed out after 10 minutes waiting for chart ${VERSION}."
+          exit 1
+
+      - name: Trigger chartfile version update in deployment-tools
+        uses: grafana/shared-workflows/actions/trigger-argo-workflow@8269e9362f30c5458c2cad54510ea74fd053920c # trigger-argo-workflow/v1.3.0
+        with:
+          namespace: platform-monitoring-cd
+          workflow_template: chartfile-version-update
+          parameters: |
+            chartfile_file=ksonnet/lib/cloudcost-exporter/chartfile.yaml
+            chart_name=grafana/cloudcost-exporter
+            workflow_name=cloudcost-exporter-gh-runners
+            workflow_namespace=platform-monitoring-cd

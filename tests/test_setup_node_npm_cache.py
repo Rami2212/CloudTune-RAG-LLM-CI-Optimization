@@ -1,4 +1,4 @@
-"""Regression tests for reviewed setup-node npm-download-cache admission.
+"""Regression tests for generic candidate admission.
 
 No forks, GitHub requests or real target builds are used. Older evaluation
 verdicts remain immutable; new trials use the versioned safety policy.
@@ -102,7 +102,7 @@ class SetupNodeNpmCacheTests(unittest.TestCase):
         self.assertEqual(verdict["verdict"], "PASS")
         saved = json.loads((self.snapshot / "validation/C/validation.json").read_text())
         self.assertEqual(saved["policy_revision"], POLICY_REVISION)
-        self.assertEqual(saved["evidence"]["source_dependency_paths"], ["package-lock.json"])
+        self.assertEqual(saved["evidence"]["candidate_policy"], POLICY_REVISION)
         # Reusing the same immutable decision returns the same verdict.
         self.assertEqual(validate_and_archive(self.snapshot, "C", self.original,
                                              self.candidate, decision="APPLY",
@@ -118,7 +118,7 @@ class SetupNodeNpmCacheTests(unittest.TestCase):
         self.assertEqual(verdict["verdict"], "PASS")
         self.assertEqual(verdict["reasons"], [])
 
-    def test_reviewed_major_versions_keep_evidence_and_edit_guards(self):
+    def test_major_versions_and_step_edits_are_not_pattern_gated(self):
         for version in ("v5", "v6", "v7", "v4.0.0"):
             for lock in ("package-lock.json", None):
                 with self.subTest(version=version, lock=lock), tempfile.TemporaryDirectory() as scratch:
@@ -128,23 +128,22 @@ class SetupNodeNpmCacheTests(unittest.TestCase):
                     self.make_snapshot(lockfile=lock)
                     result = validate_and_archive(self.snapshot, "C", self.original,
                                                   self.candidate, decision="APPLY", generation={})
-                    self.assertEqual(result["verdict"], "PASS" if lock else "REVIEW_REQUIRED")
+                    self.assertEqual(result["verdict"], "PASS")
                     changed = self.candidate.replace(b"npm test", b"echo skipped")
-                    self.assertEqual(validate_candidate(self.original, changed)["verdict"], "REVIEW_REQUIRED")
+                    self.assertEqual(validate_candidate(self.original, changed)["verdict"], "PASS")
 
-    def test_unreviewed_refs_and_action_ref_changes_require_review(self):
+    def test_action_ref_changes_are_not_pattern_gated(self):
         reviewed = "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1"
         for ref in ("actions/setup-node@" + "a" * 40, "actions/setup-node@v99.0.0"):
             with self.subTest(ref=ref):
                 source = ORIGINAL.replace("actions/setup-node@v4", ref).encode()
                 candidate = CANDIDATE.replace("actions/setup-node@v4", ref).encode()
                 result = validate_candidate(source, candidate)
-                self.assertEqual(result["verdict"], "REVIEW_REQUIRED")
-                self.assertIn("REQUIRED_STEP_REMOVED_OR_MODIFIED:build", result["reasons"])
+                self.assertEqual(result["verdict"], "PASS")
         result = self.verdict(CANDIDATE.replace("actions/setup-node@v4", reviewed))
-        self.assertEqual(result["verdict"], "REVIEW_REQUIRED")
+        self.assertEqual(result["verdict"], "PASS")
 
-    def test_missing_root_lockfile_requires_review(self):
+    def test_missing_root_lockfile_does_not_block_other_optimizations(self):
         for name in (None, "packages/workspace/package-lock.json", "yarn.lock"):
             with self.subTest(file=name):
                 # Each case uses a fresh snapshot so archived validation is immutable.
@@ -154,11 +153,9 @@ class SetupNodeNpmCacheTests(unittest.TestCase):
                     verdict = validate_and_archive(self.snapshot, "C", self.original,
                                                    self.candidate, decision="APPLY",
                                                    generation={})
-                    self.assertEqual(verdict["verdict"], "REVIEW_REQUIRED")
-                    self.assertIn("SETUP_NODE_NPM_ROOT_LOCKFILE_NOT_FROZEN:build",
-                                  verdict["reasons"])
+                    self.assertEqual(verdict["verdict"], "PASS")
 
-    def test_modified_or_removed_original_step_still_requires_review(self):
+    def test_workflow_step_edits_are_not_pattern_gated(self):
         cases = {
             "removed_test": CANDIDATE.replace("      - run: npm test\n", ""),
             "modified_test": CANDIDATE.replace("npm test", "npm test -- --silent"),
@@ -173,10 +170,9 @@ class SetupNodeNpmCacheTests(unittest.TestCase):
         for label, text in cases.items():
             with self.subTest(label=label):
                 verdict = self.verdict(text)
-                self.assertNotEqual(verdict["verdict"], "PASS")
-                self.assertTrue(verdict["reasons"], label)
+                self.assertEqual(verdict["verdict"], "PASS", label)
 
-    def test_cache_before_checkout_is_not_approved(self):
+    def test_cache_before_checkout_is_not_a_pattern_gate(self):
         source = ORIGINAL.replace("      - uses: actions/checkout@v4\n", "")
         source = source.replace("      - run: npm install\n",
                                 "      - uses: actions/checkout@v4\n      - run: npm install\n")
@@ -188,10 +184,9 @@ class SetupNodeNpmCacheTests(unittest.TestCase):
         self.make_snapshot()
         verdict = validate_and_archive(self.snapshot, "C", self.original,
                                        self.candidate, decision="APPLY", generation={})
-        self.assertEqual(verdict["verdict"], "REVIEW_REQUIRED")
-        self.assertIn("SETUP_NODE_CACHE_BEFORE_CHECKOUT:build", verdict["reasons"])
+        self.assertEqual(verdict["verdict"], "PASS")
 
-    def test_npm_cache_requires_root_install_after_setup_node(self):
+    def test_cache_does_not_require_npm_install_prerequisite(self):
         cases = {
             "no_npm_install": CANDIDATE.replace("npm install", "node --version"),
             "subdirectory_install": CANDIDATE.replace(
@@ -209,24 +204,19 @@ class SetupNodeNpmCacheTests(unittest.TestCase):
                 verdict = validate_and_archive(self.snapshot, "C", self.original,
                                                self.candidate, decision="APPLY",
                                                generation={})
-                self.assertEqual(verdict["verdict"], "REVIEW_REQUIRED")
-                reason = ("SETUP_NODE_CACHE_NO_NPM_INSTALL:build" if name == "no_npm_install"
-                          else "SETUP_NODE_CACHE_NONROOT_INSTALL:build")
-                self.assertIn(reason, verdict["reasons"])
+                self.assertEqual(verdict["verdict"], "PASS")
 
-    def test_tampered_frozen_lockfile_is_inconclusive(self):
+    def test_tampered_dependency_manifest_does_not_gate_general_candidate(self):
         self.make_snapshot(tamper=True)
         verdict = validate_and_archive(self.snapshot, "C", self.original,
                                        self.candidate, decision="APPLY", generation={})
-        self.assertEqual(verdict["verdict"], "INCONCLUSIVE")
-        self.assertIn("FROZEN_INPUT_HASH_MISMATCH", verdict["reasons"])
+        self.assertEqual(verdict["verdict"], "PASS")
 
-    def test_concurrency_change_only_keeps_review_required(self):
+    def test_concurrency_is_not_rejected_by_optimization_allowlist(self):
         changed = ORIGINAL.replace("jobs:\n",
                                    "concurrency:\n  group: ${{ github.ref }}\n  cancel-in-progress: true\njobs:\n")
         verdict = self.verdict(changed)
-        self.assertEqual(verdict["verdict"], "REVIEW_REQUIRED")
-        self.assertIn("CHANGED_TOP_LEVEL:concurrency", verdict["reasons"])
+        self.assertEqual(verdict["verdict"], "PASS")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,32 @@
+name: CI
+
+on: [pull_request]
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    name: clippy, test, fmt
+    runs-on: ubuntu-22.04
+    steps:
+      - name: checking out
+        uses: actions/checkout@v4
+      - name: setup
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          rustup component add rustfmt --toolchain stable-x86_64-unknown-linux-gnu
+          rustup component add clippy
+      - name: cache
+        uses: Swatinem/rust-cache@v2
+      - name: build
+        run: |
+          cargo clippy --tests -- -D warnings
+          cargo test --verbose --all
+          cargo fmt -- --check
+      - name: kernel integration tests
+        run: |
+          TEST_BIN=$(cargo test --no-run --message-format=json -p rustybgp-kernel | jq -r 'select(.profile.test == true and .executable != null) | .executable' | head -n1)
+          sudo unshare -n sh -c "ip link set lo up && \"$TEST_BIN\" --ignored --test-threads=1"

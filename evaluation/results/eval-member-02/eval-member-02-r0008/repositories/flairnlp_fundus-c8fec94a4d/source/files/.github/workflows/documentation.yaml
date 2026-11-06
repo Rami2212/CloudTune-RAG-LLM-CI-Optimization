@@ -1,0 +1,59 @@
+name: Documentation
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      # For the current generated documentation, these trigger paths are sufficient.
+      # Long-term, job-level triggers are more appropriate.
+      # https://how.wtf/run-workflow-step-or-job-based-on-file-changes-github-actions.html
+      - src/fundus/publishers/**
+      - scripts/generate_tables.py
+
+  workflow_dispatch:
+
+env:
+  PYTHONPATH: .
+
+jobs:
+  supported_publishers:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      # Mints a short-lived token for the 'fundus-docs-bot' GitHub App, which is
+      # allowed to bypass branch protection on 'master'. The default GITHUB_TOKEN
+      # cannot push to the protected branch.
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.DOCS_BOT_APP_ID }}
+          private-key: ${{ secrets.DOCS_BOT_PRIVATE_KEY }}
+
+      - name: Set up Git repository
+        uses: actions/checkout@v6
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v6
+        with:
+          python-version: 3.9
+
+      - name: Install Fundus
+        run: pip install -e .[dev]
+
+      - name: Generate 'supported_publishers.md'
+        run: python scripts/generate_tables.py
+
+      - name: Commit changes
+        # [skip ci] prevents this commit from triggering workflows.
+        # https://github.com/stefanzweifel/git-auto-commit-action
+        uses: stefanzweifel/git-auto-commit-action@v7
+        with:
+          commit_message: "docs: regenerate supported_publishers.md [skip ci]"
+          file_pattern: docs

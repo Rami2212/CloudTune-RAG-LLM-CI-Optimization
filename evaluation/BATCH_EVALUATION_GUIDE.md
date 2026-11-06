@@ -28,9 +28,11 @@ the full batch; range flags are rejected with `--publish-only`.
 
 ### Protocol v5: retry failed trials after compatibility fixes
 
-The dispatch harness accepts single-line event strings/lists such as
-`on: [push]` without rewriting jobs. Ancillary `workflow_run` listeners are
-excluded from workflow selection and removed by the isolated fork harness.
+The dispatch harness accepts event mappings and scalar, inline-list, and
+block-list event triggers such as `on: [push]` or a block list of events. It
+preserves the existing events and adds `workflow_dispatch` without rewriting
+jobs. Ancillary `workflow_run` listeners are excluded from workflow selection
+and removed by the isolated fork harness.
 Secrets/publishing restrictions on the selected workflow still apply.
 
 The shared candidate gate now accepts exactly the added concurrency mapping
@@ -57,17 +59,59 @@ the same command after a provider pause to resume its unfinished generation.
 Once the whole round finishes, another `--rerun` starts the next generation
 only for rows that still failed. Published summaries point to the latest
 generation; raw earlier evidence and successful rows remain intact. The
-original batch identity is not overwritten. Reruns allow an updated runner but
-still enforce the frozen assignment, model and settings.
+batch identity records a new revision when runner, model, environment or
+configuration settings change. The assignment remains fixed, and earlier row
+evidence is preserved.
 
 The separate `--retry-failed-from SOURCE --batch-id NEW` mode remains available
 when a separately named retry batch is wanted. Report protocol v5 separately
-from earlier measurements. Retained source forks
-may be reused only with archived creation/owner/numeric-ID evidence, which the
-hosted executor verifies against GitHub before writing. The source batch is
+from earlier measurements. Retained source forks may be reused when the
+signed-in account owns a writable fork of the expected upstream; the hosted
+executor verifies its owner, source and numeric repository ID before writing.
+Reused forks are preserved and are never deleted by cleanup. The source batch is
 locked during retries, forks must be retained, and pending source runs are
 never adopted. Actual upstream build failures, invalid original workflows and
 unsupported candidate edits can still fail or remain blocked.
+
+### Protocol v10: simplified preflight and differential linting
+
+The evaluator is not a security assessment. Eligibility screening flags
+explicit publishing/deployment commands, self-hosted runners and reusable
+workflows that cannot be inspected in the selected workflow. Secret references
+alone no longer block selection, and malformed unrelated workflows are skipped.
+The isolated evaluation fork adds `workflow_dispatch` to the common A/B/C
+harness. `actionlint` findings already present in the baseline are warnings;
+new candidate findings still block admission. Transient GitHub API failures
+receive bounded retries. Use a new evaluation ID; older checkpoints retain
+their frozen policy.
+
+### Protocol v11: reuse verified existing forks
+
+If the signed-in GitHub account already has a writable fork of the selected
+upstream repository, the evaluator verifies its owner, source and numeric
+repository ID, then reuses it. Reused forks are marked in the report and are
+always preserved during cleanup; preservation counts as finalized so the batch
+continues. Newly created forks follow the configured cleanup policy.
+
+### Protocol v13: skip runs queued over two minutes or running over ten minutes
+
+If a dispatched workflow remains in GitHub's `queued` state for 120 seconds,
+the controller requests cancellation, records a `QUEUE_TIMEOUT`, finalizes that
+repository with that status, and continues to the next repository. If a workflow
+remains `in_progress` for 600 seconds, it requests cancellation, records
+`IN_PROGRESS_TIMEOUT`, finalizes the repository, and continues to the next one.
+Timed-out runs are not timing comparisons. Cleanup is deferred if GitHub still
+reports a run as active; the batch still advances to the next repository.
+Existing v12 checkpoints with unchanged configuration can resume under later
+protocol versions and receive the in-progress limit.
+
+### Protocol v14: recover stale arm branches on reused forks
+
+If an expected experiment branch already exists at another commit before that
+arm has any CI runs, the evaluator preserves the old branch and creates a fresh
+branch tied to the saved expected commit. A branch that changes after CI runs
+have started still stops the evaluation to protect its evidence. Existing v12
+and v13 checkpoints with unchanged configuration can resume under v14.
 
 Protocol v3 admits an optimizer's `NO_CHANGE` outcome as an unchanged arm only
 when the original workflow passes baseline syntax and safety validation. The
@@ -101,9 +145,10 @@ Then resume the same batch command. Do not combine measured v3 and v4 trials.
 Each member can reproduce the installation and evaluator from a **separate
 Windows workstation**, using the same pinned CloudTune Git commit and the
 same 4,000-row source/assignment hashes. New machines need no pre-existing
-CI-Cost installation or trial results. Git, Python 3.11+, Node.js 20+ with npm,
-and `actionlint.exe` on PATH are required; install the Windows release of
-actionlint from https://github.com/rhysd/actionlint/releases if it is missing.
+CI-Cost installation or trial results. Git, Python 3.11+, and Node.js 20+ with
+npm are required. `actionlint.exe` is optional; when present, it blocks only
+new candidate findings relative to the baseline. Install the Windows release
+from https://github.com/rhysd/actionlint/releases for differential linting.
 
 ```powershell
 git clone --branch feature/evaluation-pipeline https://github.com/Rami2212/CloudTune-RAG-LLM-CI-Optimization.git
@@ -281,11 +326,13 @@ Stop with Ctrl+C. Restart with the **same command and batch ID**:
 .\.venv\Scripts\python.exe -m scripts.run_evaluation_batch --member 1 --run
 ```
 
-Example: rows 1–385 are finalized, row 386 has a queued A/B/C run. The runner
-skips rows 1–385 and resumes `eval-member-01-r0386`, restoring its previously
+Example: rows 1–385 are finalized, row 386 has a recent queued A/B/C run. The
+runner skips rows 1–385 and resumes `eval-member-01-r0386`, restoring its
 recorded GitHub run ID, arm measurements, frozen source, and validation. It
-never intentionally dispatches an already-pending run again. Once that repo
-finalizes it proceeds to row 387. No `--start-at` or `--rerun` is necessary.
+never intentionally dispatches an already-pending run again. If that run stays
+queued past 120 seconds or running past 10 minutes, it is cancelled and the
+runner proceeds to row 387.
+No `--start-at` or `--rerun` is necessary.
 
 OpenRouter HTTP 429/503/timeout pauses the **same** unfinished repository; it
 is not treated as a completed failure. Manually inspect `llm_error.json` and
@@ -298,10 +345,14 @@ hard kill, verify that _neither_ the parent batch runner nor the child fork
 controller is running before removing a stale lock file; never delete
 `state.json` or any `repositories/` folder.
 
-The batch identity freezes the CSV hash, model, token limit, controller
-configuration, fork-retention flag, and wrapper source. An incompatible change
-fails before processing another repository. Existing per-repository state also
-freezes the evaluator implementation/config digest.
+The batch identity records the CSV hash, model, token limit, RAG device and
+index endpoint hash, controller configuration, fork-retention flag, and runner
+source. Changes append a revision automatically. Completed rows are preserved
+and skipped; new rows use the current revision. An unfinished selected row
+keeps its original configuration and must be resumed under those settings or
+started as a preserved generation with `--override-existing`. The member,
+batch ID and assignment remain fixed. Per-repository state records its own
+evaluator implementation/config digest.
 
 ## 5. Commit-ready evidence saved by batch ID
 
@@ -377,6 +428,27 @@ of the original 4,000 repositories**, whether completed or not. The manifest
 reports status counts; it does not invent savings for missing measurements.
 
 ## 7. Safety and limits
+
+### Protocol v10: general candidate admission and report policy
+
+The shared B/C gate has no optimization-type allowlist. Candidate YAML must
+parse, deployment-related findings must not be introduced, and actionlint
+must not report new diagnostics relative to the baseline. Existing lint
+findings are warnings. Both pinned CI-Cost and RAG+LLM candidates use this
+same gate and then the repository's GitHub CI correctness workflow. Candidate
+NO_CHANGE and rejected candidates remain recorded.
+
+The main arm summary reports attempts, comparable/failed runs, completion,
+median workflow elapsed time, median summed runner time, and savings against
+the applicable arm. Per-run and per-job timing remains available in raw trial
+evidence. This policy uses a new evaluation ID; previous reports and active
+trials retain their frozen policy.
+
+When CI-Cost returns `NO_CHANGE`, Arm B is not dispatched. Its report copies
+Arm A's median timing values, records zero savings, and marks the measurement
+source as reused baseline; Arm B's actual attempt count stays zero. Only A and
+C run CI for that repository. This avoids spending runs on an identical
+workflow while retaining an explicit no-change comparison in the report.
 
 - `--preflight-only` never creates a fork; `--run` requires both optimized arms
   to pass independent admission before hosted A/B/C execution.

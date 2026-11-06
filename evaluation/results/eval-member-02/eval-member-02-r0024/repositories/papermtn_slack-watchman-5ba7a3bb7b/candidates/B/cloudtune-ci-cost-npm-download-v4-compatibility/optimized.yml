@@ -1,0 +1,44 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [HIGH] Add pip dependency cache to "build-ubuntu" job
+# - [MEDIUM] Add concurrency group to "python_package.yml"
+# Estimated savings: ~5 min/run
+#
+name: Test Python Package
+
+on:
+  push:
+    branches: [ develop, feature/**, release/**, hotfix/** ]
+  pull_request:
+    branches: [ develop, feature/**, release/**, hotfix/** ]
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build-ubuntu:
+
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+    - uses: actions/checkout@v6
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v6
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: Install dependencies
+      run: |
+        pip install poetry
+        poetry install
+    - name: Test setup & install
+      run: |
+        poetry build
+        python3 -m pip install dist/*.whl
+    - name: Test run
+      run: |
+        slack-watchman --version
+        slack-watchman --help

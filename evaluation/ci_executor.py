@@ -14,7 +14,7 @@ import os
 import re
 import time
 from pathlib import Path
-from statistics import mean, median
+from statistics import median
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -33,6 +33,9 @@ ARM_NAMES = {
     "B": "CI-Cost",
     "C": "LLM + RAG",
 }
+
+QUEUE_TIMEOUT_SECONDS = 120
+IN_PROGRESS_TIMEOUT_SECONDS = 600
 
 
 def arm_name(arm: str) -> str:
@@ -55,6 +58,18 @@ class RunPending(RuntimeError):
 
     This is never a target CI failure and must not trigger another dispatch.
     """
+
+
+class RunQueueTimeout(RuntimeError):
+    """A confirmed queued run exceeded the queue budget and was stopped."""
+
+    failure_class = "QUEUE_TIMEOUT"
+
+
+class RunExecutionTimeout(RuntimeError):
+    """A running workflow exceeded the execution-time budget and was stopped."""
+
+    failure_class = "IN_PROGRESS_TIMEOUT"
 
 
 class GitHubError(RuntimeError):
@@ -126,8 +141,8 @@ def digest(value: bytes) -> str:
 def ensure_dispatch(raw: bytes) -> bytes:
     """Common experimental harness, applied identically to A/B/C.
 
-    Extend block mappings or a single-line scalar/event list. Only the trigger
-    header is rewritten; jobs and commands are never reformatted.
+    Extend block mappings, scalar/event lists, or block-sequence event lists.
+    Only the trigger section is changed; jobs and commands are never reformatted.
     """
     before = workflow_doc(raw)
     # Existing workflow_dispatch inputs may require values that our common
@@ -149,8 +164,40 @@ def ensure_dispatch(raw: bytes) -> bytes:
         if len(headers) != 1 or len(set(events)) != len(events):
             raise ValueError("Workflow trigger header requires independent review")
         header = headers[0]
-        if not text[header.start():header.end()].split(":", 1)[1].strip():
-            raise ValueError("Block sequence triggers require independent review")
+        header_value = text[header.start():header.end()].split(":", 1)[1].strip()
+        if not header_value or header_value.startswith("#"):
+            # Preserve list-style triggers by appending one event item. Validate
+            # the complete sequence shape first; never rewrite jobs or infer
+            # events from comments/aliases.
+            lines = text.splitlines(keepends=True)
+            header_line = text.count("\n", 0, header.start())
+            sequence_lines = []
+            sequence_indent = None
+            for index in range(header_line + 1, len(lines)):
+                line = lines[index].rstrip("\r\n")
+                if not line.strip() or line.lstrip().startswith("#"):
+                    continue
+                if not line[0].isspace():
+                    break
+                item = re.match(r"^( *)-\s+(.+?)\s*(?:#.*)?$", line)
+                if not item or (sequence_indent is not None and item.group(1) != sequence_indent):
+                    raise ValueError("Block sequence triggers require independent review")
+                sequence_indent = item.group(1)
+                sequence_lines.append(index)
+            if not sequence_lines or len(sequence_lines) != len(events):
+                raise ValueError("Block sequence triggers require independent review")
+            newline = "\r\n" if "\r\n" in text else "\n"
+            insert_at = sequence_lines[-1] + 1
+            if not lines[sequence_lines[-1]].endswith(("\n", "\r")):
+                lines[sequence_lines[-1]] += newline
+            lines.insert(insert_at, sequence_indent + "- workflow_dispatch" + newline)
+            amended = "".join(lines).encode("utf-8")
+            after = workflow_doc(amended)
+            expected = dict(before)
+            expected["on"] = [*events, "workflow_dispatch"]
+            if after != expected:
+                raise ValueError("Dispatch harness changed the original workflow contract")
+            return amended
         newline = "\r\n" if "\r\n" in text else "\n"
         replacement = "on:" + newline + "  workflow_dispatch:" + newline
         replacement += newline.join("  " + json.dumps(event) + ":" for event in events)
@@ -195,17 +242,26 @@ def job_timing_metrics(records: list[dict]) -> dict:
     active-wall-clock metric. The raw makespan is retained as a distinct
     operational outcome; it can include GitHub's inter-job scheduling delay.
     """
-    intervals = sorted((_timestamp(job["started_at"]), _timestamp(job["completed_at"]))
-                       for job in records if job.get("started_at") and job.get("completed_at"))
+    try:
+        intervals = sorted((_timestamp(job["started_at"]), _timestamp(job["completed_at"]))
+                           for job in records if job.get("started_at") and job.get("completed_at"))
+    except (KeyError, TypeError, ValueError) as exc:
+        return {"active_seconds": None, "makespan_seconds": None,
+                "idle_gap_seconds": None,
+                "timing_error": f"Invalid GitHub job timestamp: {type(exc).__name__}"}
     if not intervals:
         return {"active_seconds": None, "makespan_seconds": None, "idle_gap_seconds": None}
     start, end = intervals[0]
     if end < start:
-        raise ValueError("GitHub returned a job that ended before its start")
+        return {"active_seconds": None, "makespan_seconds": None,
+                "idle_gap_seconds": None,
+                "timing_error": "GitHub returned a job that ended before its start"}
     active = 0.0
     for left, right in intervals[1:]:
         if right < left:
-            raise ValueError("GitHub returned a job that ended before its start")
+            return {"active_seconds": None, "makespan_seconds": None,
+                    "idle_gap_seconds": None,
+                    "timing_error": "GitHub returned a job that ended before its start"}
         if left > end:
             active += (end-start).total_seconds()
             start, end = left, right
@@ -261,7 +317,7 @@ class ForkExperiment:
         self.evidence_root = evidence_root
 
     def provision(self, state: dict, save) -> None:
-        """Create only research-owned forks; refuse pre-existing untracked ones."""
+        """Reuse a verified existing fork, or create and pin a new one."""
         if state.get("fork_repo"):
             log_progress("FORK", f"Verifying saved fork identity: {state['fork_repo']}")
             if type(state.get("fork_id")) is not int or state["fork_id"] <= 0:
@@ -279,19 +335,25 @@ class ForkExperiment:
             if exc.code != 404:
                 raise
         else:
-            # A persisted fork-creation intent does not prove who created an
-            # existing repository after an uncertain POST response. Never
-            # adopt and later delete it without positive creation evidence.
-            if (state.get("fork_creation_intent") != expected or
-                    not state.get("fork_created_by_evaluation")):
-                raise ValueError(
-                    f"Existing fork {existing['full_name']} is not proven to be "
-                    "created by this evaluation; preserve it for manual review")
-            if type(state.get("fork_id")) is not int or state["fork_id"] <= 0:
-                raise ValueError("Pinned fork repository ID missing; preserve existing fork")
-            verify_fork(existing, self.upstream, owner, expected_id=state["fork_id"])
-            state.update(fork_repo=existing["full_name"], fork_owner=owner)
+            numeric_id = existing.get("id")
+            if type(numeric_id) is not int or numeric_id <= 0:
+                raise ValueError("Existing fork has no numeric repository ID; preserve it")
+            if state.get("fork_created_by_evaluation"):
+                expected_id = state.get("fork_id")
+                if type(expected_id) is not int or expected_id <= 0:
+                    raise ValueError("Pinned fork repository ID missing; preserve existing fork")
+                verify_fork(existing, self.upstream, owner, expected_id=expected_id)
+                state.update(fork_repo=existing["full_name"], fork_owner=owner,
+                             fork_reused_existing=False)
+            else:
+                # A matching, writable fork is safe to use for this evaluation,
+                # but it remains user-owned and must never be deleted by cleanup.
+                verify_fork(existing, self.upstream, owner)
+                state.update(fork_repo=existing["full_name"], fork_owner=owner,
+                             fork_id=numeric_id, fork_created_by_evaluation=False,
+                             fork_reused_existing=True)
             save()
+            log_progress("FORK", f"Reusing verified existing fork {existing['full_name']} (id={numeric_id})")
             return
         state["fork_creation_intent"] = expected
         save()
@@ -308,7 +370,7 @@ class ForkExperiment:
         if type(numeric_id) is not int or numeric_id <= 0:
             raise ValueError("GitHub fork response lacks a numeric repository ID; manual recovery required")
         state.update(fork_repo=fork_name, fork_owner=owner, fork_id=numeric_id,
-                     fork_created_by_evaluation=True)
+                     fork_created_by_evaluation=True, fork_reused_existing=False)
         save()
         log_progress("FORK", f"Fork created, numeric identity={numeric_id}; waiting for GitHub readiness")
         for _ in range(40):
@@ -523,13 +585,29 @@ class ForkExperiment:
                 self.gh.request("POST", f"/repos/{fork}/git/refs", {
                     "ref": "refs/heads/" + result["branch"], "sha": result["sha"]})
             elif remote != result["sha"]:
-                raise ValueError("Experimental arm reference changed")
+                pending = state.get("pending") or {}
+                arm_has_runs = any(record.get("arm") == arm
+                                   for record in state.get("records", []))
+                if arm_has_runs or pending.get("arm") == arm:
+                    raise ValueError("Experimental arm reference changed after a CI trial")
+                # A reused fork may contain a stale branch from an earlier
+                # interrupted attempt. Preserve it and move this untouched arm
+                # to a fresh branch tied to the expected commit.
+                result["branch"] = self._available_arm_branch(fork, arm, result["sha"])
+                save()
+                log_progress("ARM", f"Existing {arm_name(arm)} branch differed; preserving it and using {result['branch']}")
+                replacement_ref = self._ref(fork, result["branch"])
+                if replacement_ref is None:
+                    self.gh.request("POST", f"/repos/{fork}/git/refs", {
+                        "ref": "refs/heads/" + result["branch"], "sha": result["sha"]})
+                elif replacement_ref != result["sha"]:
+                    raise ValueError("Fresh experiment arm reference was modified unexpectedly")
             self._verify_arm_tree(fork, state["prepared_tree"], result)
             return result
         log_progress("ARM", f"Creating {arm_name(arm)} on isolated pinned-source branch")
         tree = state["prepared_tree"] if arm == "A" else self._new_tree(fork, state["prepared_tree"], rendered)
         commit = state["prepared_commit"] if arm == "A" else self._commit(fork, tree, state["prepared_commit"], arm)
-        branch = f"{self.prefix}-{arm.lower()}"
+        branch = self._available_arm_branch(fork, arm, commit)
         # Save exact commit BEFORE remote branch creation to survive timeouts.
         result = {"sha": commit, "tree": tree, "branch": branch, "workflow_sha256": digest(rendered)}
         state["arms"][arm] = result
@@ -539,10 +617,23 @@ class ForkExperiment:
             self.gh.request("POST", f"/repos/{fork}/git/refs", {
                 "ref": "refs/heads/" + branch, "sha": commit})
         elif remote != commit:
-            raise ValueError("Experiment arm branch was modified unexpectedly")
+            raise ValueError("Unable to reserve an uncontested experiment arm branch")
         self._verify_arm_tree(fork, state["prepared_tree"], result)
         log_progress("ARM", f"{arm_name(arm)} prepared and verified: {branch}")
         return result
+
+    def _available_arm_branch(self, fork: str, arm: str, commit: str) -> str:
+        """Choose a free deterministic branch without overwriting fork refs."""
+        base = f"{self.prefix}-{arm.lower()}"
+        suffix = commit[:10]
+        candidate = base
+        attempt = 1
+        while True:
+            remote = self._ref(fork, candidate)
+            if remote is None or remote == commit:
+                return candidate
+            candidate = f"{base}-{suffix}" if attempt == 1 else f"{base}-{suffix}-{attempt}"
+            attempt += 1
 
     def _verify_arm_tree(self, fork: str, common_tree: str, arm: dict) -> None:
         """Only the target workflow may differ from the pinned common tree."""
@@ -669,6 +760,111 @@ class ForkExperiment:
             if status == "completed":
                 log_progress("CI", f"Run {run_id} ({arm_name(arm)}) completed with conclusion={run.get('conclusion')}")
                 break
+            if status == "queued":
+                queued_since = run.get("created_at") or state["pending"].get("sent_at")
+                queued_at = dt.datetime.fromisoformat(queued_since.replace("Z", "+00:00"))
+                if queued_at.tzinfo is None:
+                    queued_at = queued_at.replace(tzinfo=dt.timezone.utc)
+                queued_seconds = max(0.0, (dt.datetime.now(dt.timezone.utc) - queued_at).total_seconds())
+                if queued_seconds >= QUEUE_TIMEOUT_SECONDS:
+                    cancel_status = "CANCEL_REQUESTED"
+                    try:
+                        self.gh.request("POST", f"/repos/{fork}/actions/runs/{run_id}/cancel")
+                    except (GitHubError, RuntimeError) as exc:
+                        cancel_status = "CANCEL_UNCONFIRMED:" + type(exc).__name__
+                    arm_ref = state["arms"][arm]
+                    evidence_ref = None
+                    if self.evidence_root:
+                        evidence_ref = f"runs/{run_id}/queue-timeout"
+                        write_json_immutable(self.evidence_root / evidence_ref / "run.json", run)
+                    outcome = {
+                        "arm": arm, "repeat": repeat, "run_id": run_id,
+                        "run_attempt": run.get("run_attempt", 1),
+                        "source_commit_sha": self.source_sha,
+                        "config_commit_sha": arm_ref["sha"],
+                        "workflow_sha256": arm_ref["workflow_sha256"],
+                        "conclusion": "queue_timeout", "protocol_valid": False,
+                        "required_checks_pass": False,
+                        "workflow_elapsed_seconds": None,
+                        "sum_job_runtime_seconds": None,
+                        "workflow_makespan_seconds": None,
+                        "inter_job_idle_seconds": None,
+                        "initial_queue_seconds": queued_seconds,
+                        "failure_class": "QUEUE_TIMEOUT",
+                        "queue_timeout_seconds": QUEUE_TIMEOUT_SECONDS,
+                        "cancel_status": cancel_status,
+                        "first_job_started_at": None, "last_job_completed_at": None,
+                        "run_created_at": run.get("created_at"),
+                        "github_run_started_at": run.get("run_started_at"),
+                        "jobs": [], "raw_evidence_ref": evidence_ref, "comparable": False,
+                    }
+                    state.setdefault("records", []).append(outcome)
+                    state["pending"] = None
+                    state["queue_timeout"] = {"run_id": run_id, "arm": arm,
+                                               "repeat": repeat,
+                                               "cancel_status": cancel_status}
+                    save()
+                    log_progress("CI", f"Run {run_id} remained queued for {int(queued_seconds)}s; "
+                                          f"cancel={cancel_status}; skipping this repository")
+                    raise RunQueueTimeout(
+                        f"GitHub run {run_id} stayed queued for at least "
+                        f"{QUEUE_TIMEOUT_SECONDS}s; repository skipped")
+            if status == "in_progress":
+                in_progress_since = run.get("run_started_at") or state["pending"].get("in_progress_since")
+                if not in_progress_since:
+                    in_progress_since = dt.datetime.now(dt.timezone.utc).isoformat()
+                    state["pending"]["in_progress_since"] = in_progress_since
+                    save()
+                in_progress_at = dt.datetime.fromisoformat(in_progress_since.replace("Z", "+00:00"))
+                if in_progress_at.tzinfo is None:
+                    in_progress_at = in_progress_at.replace(tzinfo=dt.timezone.utc)
+                in_progress_seconds = max(
+                    0.0, (dt.datetime.now(dt.timezone.utc) - in_progress_at).total_seconds())
+                if in_progress_seconds >= IN_PROGRESS_TIMEOUT_SECONDS:
+                    cancel_status = "CANCEL_REQUESTED"
+                    try:
+                        self.gh.request("POST", f"/repos/{fork}/actions/runs/{run_id}/cancel")
+                    except (GitHubError, RuntimeError) as exc:
+                        cancel_status = "CANCEL_UNCONFIRMED:" + type(exc).__name__
+                    arm_ref = state["arms"][arm]
+                    evidence_ref = None
+                    if self.evidence_root:
+                        evidence_ref = f"runs/{run_id}/in-progress-timeout"
+                        write_json_immutable(self.evidence_root / evidence_ref / "run.json", run)
+                    outcome = {
+                        "arm": arm, "repeat": repeat, "run_id": run_id,
+                        "run_attempt": run.get("run_attempt", 1),
+                        "source_commit_sha": self.source_sha,
+                        "config_commit_sha": arm_ref["sha"],
+                        "workflow_sha256": arm_ref["workflow_sha256"],
+                        "conclusion": "in_progress_timeout", "protocol_valid": False,
+                        "required_checks_pass": False,
+                        "workflow_elapsed_seconds": None,
+                        "sum_job_runtime_seconds": None,
+                        "workflow_makespan_seconds": None,
+                        "inter_job_idle_seconds": None,
+                        "initial_queue_seconds": None,
+                        "in_progress_seconds": in_progress_seconds,
+                        "in_progress_timeout_seconds": IN_PROGRESS_TIMEOUT_SECONDS,
+                        "failure_class": "IN_PROGRESS_TIMEOUT",
+                        "cancel_status": cancel_status,
+                        "first_job_started_at": None, "last_job_completed_at": None,
+                        "run_created_at": run.get("created_at"),
+                        "github_run_started_at": run.get("run_started_at"),
+                        "jobs": [], "raw_evidence_ref": evidence_ref, "comparable": False,
+                    }
+                    state.setdefault("records", []).append(outcome)
+                    state["pending"] = None
+                    state["in_progress_timeout"] = {
+                        "run_id": run_id, "arm": arm, "repeat": repeat,
+                        "cancel_status": cancel_status}
+                    save()
+                    log_progress("CI", f"Run {run_id} stayed in progress for "
+                                          f"{int(in_progress_seconds)}s; cancel={cancel_status}; "
+                                          "skipping this repository")
+                    raise RunExecutionTimeout(
+                        f"GitHub run {run_id} stayed in progress for at least "
+                        f"{IN_PROGRESS_TIMEOUT_SECONDS}s; repository skipped")
             if (self.max_wait_seconds is not None and
                     time.monotonic() - started > self.max_wait_seconds):
                 raise RunPending(f"GitHub run {run_id} is queued/in progress; resume observation later")
@@ -684,12 +880,26 @@ class ForkExperiment:
         def duration(a, b):
             if not a or not b:
                 return None
-            return (dt.datetime.fromisoformat(b.replace("Z", "+00:00")) -
-                    dt.datetime.fromisoformat(a.replace("Z", "+00:00"))).total_seconds()
+            try:
+                seconds = (dt.datetime.fromisoformat(b.replace("Z", "+00:00")) -
+                           dt.datetime.fromisoformat(a.replace("Z", "+00:00"))).total_seconds()
+            except (AttributeError, TypeError, ValueError):
+                return None
+            return seconds if seconds >= 0 else None
         records = []
+        timing_errors = []
         for job in jobs:
+            started_at, completed_at = job.get("started_at"), job.get("completed_at")
+            if started_at and completed_at:
+                try:
+                    seconds = duration(started_at, completed_at)
+                    if seconds is None:
+                        timing_errors.append("GitHub returned a job that ended before its start")
+                except (AttributeError, TypeError, ValueError):
+                    timing_errors.append("GitHub returned an invalid job timestamp")
             seconds = duration(job.get("started_at"), job.get("completed_at"))
-            if job.get("conclusion") == "skipped" and seconds is None:
+            if (job.get("conclusion") == "skipped" and seconds is None
+                    and not (job.get("started_at") and job.get("completed_at"))):
                 seconds = 0.0
             records.append({"id": job["id"], "name": job["name"],
                             "status": job.get("status"), "conclusion": job.get("conclusion"),
@@ -707,6 +917,9 @@ class ForkExperiment:
             for r in records)
         timing = job_timing_metrics(records) if complete else {
             "active_seconds": None, "makespan_seconds": None, "idle_gap_seconds": None}
+        timing_error = timing_errors[0] if timing_errors else timing.get("timing_error")
+        if timing_error:
+            complete = False
         # Primary evaluation metric is the actual observed time with >=1 GitHub
         # job executing. Internal runner queue gaps are excluded using merged
         # job intervals. Keep makespan separately for end-to-end diagnostics.
@@ -737,9 +950,11 @@ class ForkExperiment:
                    "inter_job_idle_seconds": timing["idle_gap_seconds"],
                    "initial_queue_seconds": initial_queue,
                    "failure_class": ("PLATFORM_NO_JOB_START" if not executed else
+                                    "INVALID_JOB_TIMING" if timing_error else
                                     "CI_FAILURE_OR_PROTOCOL_MISMATCH" if not
                                     (valid and complete and required_pass and run.get("conclusion") == "success")
                                     else None),
+                   "timing_error": timing_error,
                    "first_job_started_at": first, "last_job_completed_at": last,
                    "run_created_at": run.get("created_at"),
                    "github_run_started_at": run.get("run_started_at"), "jobs": records,
@@ -766,6 +981,11 @@ class ForkExperiment:
         if not state.get("fork_repo"):
             log_progress("CLEANUP", "No fork created; cleanup not required")
             return "NOT_CREATED"
+        if state.get("fork_reused_existing"):
+            state["cleanup_status"] = "REUSED_EXISTING_PRESERVED"
+            save()
+            log_progress("CLEANUP", f"Preserving reused fork: https://github.com/{state['fork_repo']}")
+            return "REUSED_EXISTING_PRESERVED"
         if state.get("cleanup_status") == "DELETED":
             return "DELETED"
         if state.get("cleanup_status") == "RETAINED_BY_CONFIGURATION":
@@ -877,33 +1097,14 @@ def summarize_records(records: list[dict], *, repetitions: int | None = None) ->
         results[arm] = {"attempted": len(runs), "comparable": len(valid),
                         "failed": len(runs) - len(valid), "complete": complete,
                         "median_elapsed_seconds": median(r["workflow_elapsed_seconds"] for r in valid) if complete else None,
-                        "mean_elapsed_seconds": mean(r["workflow_elapsed_seconds"] for r in valid) if complete else None,
                         "median_runner_seconds": median(r["sum_job_runtime_seconds"] for r in valid) if complete else None,
-                        "mean_runner_seconds": mean(r["sum_job_runtime_seconds"] for r in valid) if complete else None,
-                        "mean_initial_queue_seconds": (mean(r["initial_queue_seconds"] for r in valid
-                                                        if r.get("initial_queue_seconds") is not None)
-                                  if complete and all(r.get("initial_queue_seconds") is not None for r in valid)
-                                  else None),
-                        "median_initial_queue_seconds": (median(r["initial_queue_seconds"] for r in valid
-                                                         if r.get("initial_queue_seconds") is not None)
-                                  if complete and all(r.get("initial_queue_seconds") is not None for r in valid)
-                                  else None)}
+                        }
     for target, baseline_arm in (("B", "A"), ("C", "A"), ("C", "B")):
         suffix = ("vs_A" if baseline_arm == "A" else "vs_B")
         for kind in ("elapsed", "runner"):
             baseline = results[baseline_arm][f"median_{kind}_seconds"]
             optimized = results[target][f"median_{kind}_seconds"]
             results[target][f"{kind}_saving_percent_{suffix}"] = (
-                100 * (baseline - optimized) / baseline
-                if baseline is not None and optimized is not None and baseline > 0 else None)
-    # Descriptive arithmetic-mean comparisons supplement, but never replace,
-    # the existing median-based primary outcome. Incomplete arms remain null.
-    for target, baseline_arm in (("B", "A"), ("C", "A"), ("C", "B")):
-        suffix = "vs_A" if baseline_arm == "A" else "vs_B"
-        for kind in ("elapsed", "runner"):
-            baseline = results[baseline_arm][f"mean_{kind}_seconds"]
-            optimized = results[target][f"mean_{kind}_seconds"]
-            results[target][f"mean_{kind}_saving_percent_{suffix}"] = (
                 100 * (baseline - optimized) / baseline
                 if baseline is not None and optimized is not None and baseline > 0 else None)
     return results

@@ -1,0 +1,320 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [HIGH] Add cargo dependency cache to "build" job
+# - [MEDIUM] 14 jobs clone the repo — consider artifact sharing
+# Estimated savings: ~9 min/run
+#
+name: e2e
+
+on: [pull_request]
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    name: Build rustybgpd (musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: setup
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler musl-tools
+          rustup target add x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: build rustybgpd
+        run: cargo build --release --target x86_64-unknown-linux-musl
+      - name: upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustybgpd-musl
+          path: target/x86_64-unknown-linux-musl/release/rustybgpd
+          retention-days: 1
+
+  e2e-add-path:
+    name: Add-Path (RFC 7911)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustybgpd-musl
+          path: /tmp/rustybgp-prebuilt
+      - name: prepare prebuilt context
+        run: |
+          chmod +x /tmp/rustybgp-prebuilt/rustybgpd
+          cp tests/e2e/shared/Dockerfile.rustybgp-prebuilt /tmp/rustybgp-prebuilt/Dockerfile
+      - name: Run Add-Path e2e test
+        working-directory: tests/e2e/add-path
+        env:
+          RUSTYBGP_BUILD_CONTEXT: /tmp/rustybgp-prebuilt
+          RUSTYBGP_DOCKERFILE: Dockerfile
+        run: ./run-test.sh
+
+  e2e-ext-nexthop:
+    name: Extended Nexthop (RFC 8950)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustybgpd-musl
+          path: /tmp/rustybgp-prebuilt
+      - name: prepare prebuilt context
+        run: |
+          chmod +x /tmp/rustybgp-prebuilt/rustybgpd
+          cp tests/e2e/shared/Dockerfile.rustybgp-prebuilt /tmp/rustybgp-prebuilt/Dockerfile
+      - name: Run Extended Nexthop e2e test
+        working-directory: tests/e2e/extended-nexthop
+        env:
+          RUSTYBGP_BUILD_CONTEXT: /tmp/rustybgp-prebuilt
+          RUSTYBGP_DOCKERFILE: Dockerfile
+        run: ./run-test.sh
+
+  e2e-gr-restarting:
+    name: Graceful Restart - restarting speaker (RFC 4724)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustybgpd-musl
+          path: /tmp/rustybgp-prebuilt
+      - name: prepare prebuilt context
+        run: |
+          chmod +x /tmp/rustybgp-prebuilt/rustybgpd
+          cp tests/e2e/shared/Dockerfile.rustybgp-prebuilt /tmp/rustybgp-prebuilt/Dockerfile
+      - name: Run Graceful Restart (restarting speaker) e2e test
+        working-directory: tests/e2e/graceful-restart-restarting
+        env:
+          RUSTYBGP_BUILD_CONTEXT: /tmp/rustybgp-prebuilt
+          RUSTYBGP_DOCKERFILE: Dockerfile
+        run: ./run-test.sh
+
+  e2e-gr-helper:
+    name: Graceful Restart - helper side (RFC 4724)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustybgpd-musl
+          path: /tmp/rustybgp-prebuilt
+      - name: prepare prebuilt context
+        run: |
+          chmod +x /tmp/rustybgp-prebuilt/rustybgpd
+          cp tests/e2e/shared/Dockerfile.rustybgp-prebuilt /tmp/rustybgp-prebuilt/Dockerfile
+      - name: Run Graceful Restart (helper) e2e test
+        working-directory: tests/e2e/graceful-restart-helper
+        env:
+          RUSTYBGP_BUILD_CONTEXT: /tmp/rustybgp-prebuilt
+          RUSTYBGP_DOCKERFILE: Dockerfile
+        run: ./run-test.sh
+
+  e2e-llgr:
+    name: Long-Lived Graceful Restart (RFC 9494)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustybgpd-musl
+          path: /tmp/rustybgp-prebuilt
+      - name: prepare prebuilt context
+        run: |
+          chmod +x /tmp/rustybgp-prebuilt/rustybgpd
+          cp tests/e2e/shared/Dockerfile.rustybgp-prebuilt /tmp/rustybgp-prebuilt/Dockerfile
+      - name: Run Long-Lived Graceful Restart e2e test
+        working-directory: tests/e2e/long-lived-graceful-restart
+        env:
+          RUSTYBGP_BUILD_CONTEXT: /tmp/rustybgp-prebuilt
+          RUSTYBGP_DOCKERFILE: Dockerfile
+        run: ./run-test.sh
+
+  e2e-flowspec:
+    name: BGP Flowspec (RFC 8955/8956)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustybgpd-musl
+          path: /tmp/rustybgp-prebuilt
+      - name: prepare prebuilt context
+        run: |
+          chmod +x /tmp/rustybgp-prebuilt/rustybgpd
+          cp tests/e2e/shared/Dockerfile.rustybgp-prebuilt /tmp/rustybgp-prebuilt/Dockerfile
+      - name: Run Flowspec e2e test
+        working-directory: tests/e2e/flowspec
+        env:
+          RUSTYBGP_BUILD_CONTEXT: /tmp/rustybgp-prebuilt
+          RUSTYBGP_DOCKERFILE: Dockerfile
+        run: ./run-test.sh
+
+  e2e-route-reflector:
+    name: Route Reflector (RFC 4456)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustybgpd-musl
+          path: /tmp/rustybgp-prebuilt
+      - name: prepare prebuilt context
+        run: |
+          chmod +x /tmp/rustybgp-prebuilt/rustybgpd
+          cp tests/e2e/shared/Dockerfile.rustybgp-prebuilt /tmp/rustybgp-prebuilt/Dockerfile
+      - name: Run Route Reflector e2e test
+        working-directory: tests/e2e/route-reflector
+        env:
+          RUSTYBGP_BUILD_CONTEXT: /tmp/rustybgp-prebuilt
+          RUSTYBGP_DOCKERFILE: Dockerfile
+        run: ./run-test.sh
+
+  e2e-confederation:
+    name: BGP Confederation (RFC 5065)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustybgpd-musl
+          path: /tmp/rustybgp-prebuilt
+      - name: prepare prebuilt context
+        run: |
+          chmod +x /tmp/rustybgp-prebuilt/rustybgpd
+          cp tests/e2e/shared/Dockerfile.rustybgp-prebuilt /tmp/rustybgp-prebuilt/Dockerfile
+      - name: Run Confederation e2e test
+        working-directory: tests/e2e/confederation
+        env:
+          RUSTYBGP_BUILD_CONTEXT: /tmp/rustybgp-prebuilt
+          RUSTYBGP_DOCKERFILE: Dockerfile
+        run: ./run-test.sh
+
+  e2e-route-server:
+    name: BGP Route Server (RFC 7947)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustybgpd-musl
+          path: /tmp/rustybgp-prebuilt
+      - name: prepare prebuilt context
+        run: |
+          chmod +x /tmp/rustybgp-prebuilt/rustybgpd
+          cp tests/e2e/shared/Dockerfile.rustybgp-prebuilt /tmp/rustybgp-prebuilt/Dockerfile
+      - name: Run Route Server e2e test
+        working-directory: tests/e2e/route-server
+        env:
+          RUSTYBGP_BUILD_CONTEXT: /tmp/rustybgp-prebuilt
+          RUSTYBGP_DOCKERFILE: Dockerfile
+        run: ./run-test.sh
+
+  e2e-rpki:
+    name: RPKI/ROV (RFC 6811/8210)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustybgpd-musl
+          path: /tmp/rustybgp-prebuilt
+      - name: prepare prebuilt context
+        run: |
+          chmod +x /tmp/rustybgp-prebuilt/rustybgpd
+          cp tests/e2e/shared/Dockerfile.rustybgp-prebuilt /tmp/rustybgp-prebuilt/Dockerfile
+      - name: Run RPKI/ROV e2e test
+        working-directory: tests/e2e/rpki
+        env:
+          RUSTYBGP_BUILD_CONTEXT: /tmp/rustybgp-prebuilt
+          RUSTYBGP_DOCKERFILE: Dockerfile
+        run: ./run-test.sh
+
+  e2e-sr-policy:
+    name: SR Policy (RFC 9830)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustybgpd-musl
+          path: /tmp/rustybgp-prebuilt
+      - name: prepare prebuilt context
+        run: |
+          chmod +x /tmp/rustybgp-prebuilt/rustybgpd
+          cp tests/e2e/shared/Dockerfile.rustybgp-prebuilt /tmp/rustybgp-prebuilt/Dockerfile
+      - name: Run SR Policy e2e test
+        working-directory: tests/e2e/sr-policy
+        env:
+          RUSTYBGP_BUILD_CONTEXT: /tmp/rustybgp-prebuilt
+          RUSTYBGP_DOCKERFILE: Dockerfile
+        run: ./run-test.sh
+
+  e2e-link-state:
+    name: BGP-LS (RFC 7752)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustybgpd-musl
+          path: /tmp/rustybgp-prebuilt
+      - name: prepare prebuilt context
+        run: |
+          chmod +x /tmp/rustybgp-prebuilt/rustybgpd
+          cp tests/e2e/shared/Dockerfile.rustybgp-prebuilt /tmp/rustybgp-prebuilt/Dockerfile
+      - name: Run BGP-LS e2e test
+        working-directory: tests/e2e/link-state
+        env:
+          RUSTYBGP_BUILD_CONTEXT: /tmp/rustybgp-prebuilt
+          RUSTYBGP_DOCKERFILE: Dockerfile
+        run: ./run-test.sh
+
+  e2e-rtc:
+    name: Route Target Membership (RFC 4684)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustybgpd-musl
+          path: /tmp/rustybgp-prebuilt
+      - name: prepare prebuilt context
+        run: |
+          chmod +x /tmp/rustybgp-prebuilt/rustybgpd
+          cp tests/e2e/shared/Dockerfile.rustybgp-prebuilt /tmp/rustybgp-prebuilt/Dockerfile
+      - name: Run RTC e2e test
+        working-directory: tests/e2e/rtc
+        env:
+          RUSTYBGP_BUILD_CONTEXT: /tmp/rustybgp-prebuilt
+          RUSTYBGP_DOCKERFILE: Dockerfile
+        run: ./run-test.sh

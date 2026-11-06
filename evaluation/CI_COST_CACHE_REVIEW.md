@@ -1,5 +1,10 @@
 # CI-Cost npm cache admission review
 
+Historical decision recorded before general candidate admission. Protocol v9
+no longer blocks candidates based on optimization type or requires npm lockfile
+evidence. The review below documents why the older npm-cache-only policy was
+introduced; existing archived trial verdicts remain unchanged.
+
 Reviewed 2026-11-02 against source-fix v2 and admission policy v4.
 
 ## Decision
