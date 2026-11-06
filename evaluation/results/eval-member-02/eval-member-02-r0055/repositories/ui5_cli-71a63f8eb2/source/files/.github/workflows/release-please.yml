@@ -1,0 +1,138 @@
+name: Release Please
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      confirm_publish_cli:
+        description: "Type 'publish-cli' to re-run only the publish-cli job against the current main (e.g. when a prior run failed after the other packages were already published). The version published is whatever is in packages/cli/package.json on main."
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  release-please:
+    # Skip on manual dispatch: the manual path exists only to re-run publish-cli.
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      releases_created: ${{ steps.release.outputs.releases_created }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Node.js LTS
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+         node-version: 24.x
+
+      - name: Run Release Please to update PRs and create releases
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+        with:
+          token: "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: "Fix peerDependency and lockfile in Release PR"
+        if: ${{ steps.release.outputs.pr }}
+        run: |
+          set -ex
+          gh pr checkout ${{ fromJson(steps.release.outputs.pr).number }}
+
+          # Update peer dependency: Release Please doesn't handle circular peerDependencies
+          # @ui5/project has peerDependency on @ui5/builder, and @ui5/builder has devDependency on @ui5/project
+          # The node-workspace plugin can't resolve this cycle, so we update it manually
+          # Extract builder version and update project peer dependency
+          BUILDER_VERSION=$(jq -r '.version' packages/builder/package.json)
+          jq --tab --arg new_version "^$BUILDER_VERSION" '.peerDependencies."@ui5/builder" = $new_version' packages/project/package.json > tmp.$$.json && mv tmp.$$.json packages/project/package.json
+
+          # Regenerate package-lock.json to sync with updated workspace packages
+          npm install
+
+          # Commit the change back to the PR branch
+          # Amend the Release Please commit to include our fixes
+          # This keeps the PR clean with a single commit
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add packages/project/package.json package-lock.json
+          git commit --amend --no-edit
+          git push --force-with-lease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-packages:
+    runs-on: ubuntu-24.04
+    needs: release-please
+    # Never run on manual dispatch — the manual path is only for re-running publish-cli when the
+    # other packages were already published in a prior run. Republishing them would fail with 403.
+    if: github.event_name != 'workflow_dispatch' && needs.release-please.outputs.releases_created == 'true'
+    permissions:
+      id-token: write # Required for trusted publishing via OIDC (https://docs.npmjs.com/trusted-publishers)
+    # The GitHub Actions Environment configured for the trusted publisher
+    environment: npmjs:ui5-cli-mono
+    strategy:
+      # Sequential publishing ensures dependencies exist on NPM before dependents are published
+      # Order: logger → fs → builder → server → project (CLI handled separately)
+      max-parallel: 1
+      matrix:
+        package: [logger, fs, builder, server, project]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Node.js LTS
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.x
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Publish ${{ matrix.package }} package
+        working-directory: packages/${{ matrix.package }}
+        run: |
+          echo "🚀 Publishing @ui5/${{ matrix.package }}"
+          npm publish --access public --tag next
+
+  publish-cli:
+    runs-on: ubuntu-24.04
+    needs: [release-please, publish-packages]
+    # Two paths:
+    # 1. Automatic: release-please created releases and publish-packages succeeded
+    # 2. Manual:    workflow_dispatch with the confirmation input set to "publish-cli"
+    # `always()` is required so this job is not auto-skipped when the upstream jobs are skipped
+    # on the manual path.
+    if: |
+      always() && (
+        (
+          github.event_name == 'push'
+          && needs.release-please.outputs.releases_created == 'true'
+          && needs.publish-packages.result == 'success'
+        ) || (
+          github.event_name == 'workflow_dispatch'
+          && inputs.confirm_publish_cli == 'publish-cli'
+        )
+      )
+    permissions:
+      id-token: write # Required for trusted publishing via OIDC (https://docs.npmjs.com/trusted-publishers)
+    # The GitHub Actions Environment configured for the trusted publisher
+    environment: npmjs:ui5-cli-mono
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Node.js LTS
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.x
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Publish @ui5/cli package
+        working-directory: packages/cli
+        run: |
+          echo "🚀 Publishing @ui5/cli"
+          npm publish --access public --tag next

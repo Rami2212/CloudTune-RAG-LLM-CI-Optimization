@@ -1,0 +1,33 @@
+name: Dependabot auto-merge
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  dependabot:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.pull_request.user.login == 'dependabot[bot]' && github.event.pull_request.auto_merge == null }}
+    steps:
+      - name: Dependabot metadata
+        id: metadata
+        # A force-pushed (e.g. amended) commit is no longer signed by Dependabot, which makes this
+        # step fail signature verification. Tolerate that failure and skip the merge step below,
+        # just as we skip the whole job for PRs that aren't from Dependabot.
+        continue-on-error: true
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        with:
+          github-token: "${{ secrets.GITHUB_TOKEN }}"
+      - name: Approve and auto-merge PRs for minor/patch updates of github-actions
+        if: |
+          steps.metadata.outcome == 'success' &&
+          steps.metadata.outputs.package-ecosystem == 'github_actions' &&
+          contains(fromJSON('["version-update:semver-minor", "version-update:semver-patch"]'), steps.metadata.outputs.update-type)
+        run: gh pr review --approve "$PR_URL" && gh pr merge --auto --rebase "$PR_URL"
+        env:
+          PR_URL: ${{github.event.pull_request.html_url}}
+          GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}

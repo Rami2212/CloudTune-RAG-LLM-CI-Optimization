@@ -1,0 +1,479 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [MEDIUM] 6 jobs clone the repo — consider artifact sharing
+# - [LOW] Explicitly set fail-fast for large matrix job "build" (6 combinations)
+# Estimated savings: ~3 min/run
+#
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cancel an in-progress run when the same PR (or branch) gets a new push. For
+# pull_request events github.ref is refs/pull/<n>/merge, so runs are grouped per PR
+# and pushing a new commit -- or force-pushing during a rebase -- no longer leaves a
+# full matrix running to completion against a commit nobody will merge.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # RuboCop and YARD analyze source text, so their results do not depend on the
+  # runtime executing them: RuboCop's verdict is fixed by TargetRubyVersion in
+  # .rubocop.yml, not by the host Ruby. Running them once here instead of inside the
+  # matrix removes the single largest cost in the build -- RuboCop alone accounted for
+  # over half the wall time of the JRuby and TruffleRuby jobs -- while checking exactly
+  # the same things.
+  #
+  # Ruby 3.4 hosts this job rather than the newest supported Ruby because it gates
+  # merges: a lint gate should be insulated from churn in a brand-new major, and Ruby
+  # 4.0 deprecations still surface through the matrix jobs below, which do run 4.0.
+  # It also has to be MRI, since YARD and yard-lint cannot build on JRuby or
+  # TruffleRuby (see the gemspec).
+  lint:
+    name: Lint and Docs
+
+    # Skip this job if triggered by a release PR
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && !startsWith(github.event.pull_request.head.ref, 'release-please--'))
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true # runs 'bundle install' and caches installed gems automatically
+
+      # Separate steps, not `rake rubocop yard`, because Rake stops at the first failure.
+      # Each step after the first has `if: !cancelled()`, so it runs even when an earlier
+      # step failed. The YARD tasks don't read each other's output.
+      - name: Run RuboCop
+        run: bundle exec rake rubocop
+        timeout-minutes: 15
+
+      - name: Build YARD Docs
+        if: ${{ !cancelled() }}
+        run: bundle exec rake yard:build
+        timeout-minutes: 15
+
+      - name: Lint YARD Docs
+        if: ${{ !cancelled() }}
+        run: bundle exec rake yard:lint
+        timeout-minutes: 15
+
+      - name: Test YARD Examples
+        if: ${{ !cancelled() }}
+        run: bundle exec rake yard:example-test
+        timeout-minutes: 15
+
+  # Lint the workflow files with actionlint. Run the same check locally with:
+  #
+  #     rake lint:actions
+  #
+  # This is its own job rather than a step in Lint and Docs so that it needs no Ruby
+  # setup and reports even when RuboCop or YARD fails. The runner has shellcheck, which
+  # actionlint uses to lint the shell in `run:` steps.
+  workflow-lint:
+    name: Workflow Lint
+
+    # Skip this job if triggered by a release PR
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && !startsWith(github.event.pull_request.head.ref, 'release-please--'))
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+
+      # The action downloads the newest actionlint release, which is its default. There
+      # is no config file here that a release could outgrow, so the only cost of
+      # tracking the newest release is that a release which adds a check can fail this
+      # job until the workflow it flagged is fixed. That is cheaper than a pinned
+      # checker that silently ages. To unblock an unrelated PR, pin an exact release
+      # with the `version` input and open an issue to unpin. The action does not verify
+      # the download against the release's checksums. pyflakes is off because no
+      # workflow here has a Python step.
+      - name: Lint GitHub Actions Workflows
+        uses: raven-actions/actionlint@v2
+        with:
+          pyflakes: false
+        timeout-minutes: 5
+
+  # Ensure that local links in markdown docs are valid.
+  #
+  # The checker is configured in .lychee.toml. Run the same check locally with:
+  #
+  #     rake markdown:links
+  #
+  links:
+    name: Markdown Links
+
+    # Skip this job if triggered by a release PR
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && !startsWith(github.event.pull_request.head.ref, 'release-please--'))
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+
+      # Track the newest lychee release rather than pinning one. Without this the
+      # action installs whatever version its own default names, which moves when the
+      # `@v2` tag moves -- pinned, but pinned by someone else and bumped without a
+      # commit here. `latest` at least makes the choice ours and keeps the checker
+      # current. The action accepts `latest`, `nightly`, or an exact tag; there is no
+      # major-version form, and lychee is 0.x, so a "compatible range" is not on offer.
+      #
+      # This can break the build on a release nobody here asked for. .lychee.toml is
+      # coupled to the lychee version -- `include_fragments` took a bare boolean before
+      # 0.24 and an enum string from 0.24 on -- and a future release is free to change
+      # a key again. That trade is deliberate: an occasional known-cause failure is
+      # cheaper than a checker that silently ages.
+      #
+      # When it does break, read the parse error, fix .lychee.toml against the current
+      # lychee docs, and commit that. Pin `lycheeVersion` to the last good tag only to
+      # unblock an unrelated PR, and open an issue to unpin.
+      - name: Check Markdown Links
+        uses: lycheeverse/lychee-action@v2
+        with:
+          lycheeVersion: latest
+          args: --config .lychee.toml .
+          fail: true
+
+  build:
+    name: Ruby ${{ matrix.ruby }} on ${{ matrix.operating-system }}
+
+    # Skip this job if triggered by a release PR
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && !startsWith(github.event.pull_request.head.ref, 'release-please--'))
+
+    runs-on: ${{ matrix.operating-system }}
+    env: { JAVA_OPTS: -Djdk.io.File.enableADS=true }
+
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby: ["3.3", "4.0"]
+        operating-system: [ubuntu-latest]
+        include:
+          - ruby: "3.3"
+            operating-system: windows-latest
+
+          # Only the minimum required versions of JRuby and TruffleRuby are tested (see the
+          # Ruby version support policy in README.md). setup-ruby builds only the latest
+          # patch of each series for a new runner image, so these pins run on a fixed image
+          # that has them instead of on ubuntu-latest. warm_bundler_caches.yml must use the
+          # same image, so the two files change together.
+          #
+          # ubuntu-24.04 is a dated label that GitHub will retire in time, not a permanent
+          # choice. Before moving the image or dropping the pin, check that ruby/ruby-builder
+          # publishes each pinned release for the new image. Raising the MRI floor does not
+          # remove the pin by itself: an earliest-release floor is rarely the latest patch of
+          # its series, and only the latest patch is built for a newer image.
+          - ruby: "truffleruby-24.2.1"
+            operating-system: ubuntu-24.04
+
+          - ruby: "jruby-10.0.0.1"
+            operating-system: ubuntu-24.04
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true # runs 'bundle install' and caches installed gems automatically
+
+      # Specs only. RuboCop and YARD run once in the lint job above instead of being
+      # repeated identically on every runtime. The gem is still built on every
+      # platform, by the Test Gem step below.
+      - name: Run Specs
+        run: bundle exec rake spec
+        timeout-minutes: 15
+
+      # The unit suite enforces 100% line and branch coverage (see the "Test coverage
+      # policy" section of CONTRIBUTING.md). The failure log names the uncovered lines
+      # and branches; this artifact adds the browsable HTML report for the same run.
+      - name: Upload Coverage Report
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-ruby-${{ matrix.ruby }}-${{ matrix.operating-system }}
+          path: coverage/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Test Gem
+        run: bundle exec rake test:gem
+        timeout-minutes: 10
+
+  # The branch ruleset cannot require the matrix jobs above directly. A required status
+  # check is matched by name, and `build`'s name is a template -- GitHub only expands it
+  # into "Ruby 3.3 on ubuntu-latest" and friends when it evaluates the matrix. The
+  # job-level `if:` short-circuits before that happens, so a release PR reports one check
+  # named literally "Ruby ${{ matrix.ruby }} on ${{ matrix.operating-system }}" and the
+  # five expanded names never report at all. Required checks that never report block a PR
+  # indefinitely rather than passing, which is what stranded the v5.0.5 release PR.
+  #
+  # So the ruleset requires this job instead: one stable name, no matrix, no template to
+  # expand. It also decouples the required-check list from the matrix, so adding or
+  # dropping a Ruby version no longer needs a matching ruleset edit.
+  #
+  # This job carries the same release-PR guard as every job above, so that a release PR
+  # reports it as skipped rather than as a success for specs that never ran. Skipping is
+  # safe here and was not safe for `build`: this job's name is a literal string, so the
+  # check run exists and reports a skipped conclusion whether or not the job runs, and
+  # rulesets treat skipped as passing. A matrix job's name does not exist at all until the
+  # matrix is evaluated, which is the whole reason this job exists.
+  #
+  # `always()` is load-bearing and must stay. Without a status check function a job-level
+  # `if:` implies `success()`, so a failing matrix would skip this job -- and a skipped
+  # required check counts as passing, meaning a red build would merge. `always()` forces a
+  # real verdict on every run that is not a release PR. `!cancelled()` is not a substitute:
+  # a cancelled run would then skip the gate, and a skipped conclusion is one rulesets treat
+  # as passing -- so a build that never finished would stop blocking the merge.
+  #
+  # The case below accepts `success` only. `build` and this job now carry the same release-PR
+  # guard, so this job runs exactly when `build` ran; a `skipped` result would mean the two
+  # guards have drifted apart, and failing closed on it turns that into a loud failure rather
+  # than a silent pass.
+  build-complete:
+    name: All Specs Passed
+
+    needs: [build]
+
+    # Report a verdict on every non-release PR regardless of the matrix result, and skip
+    # on release PRs, where the matrix was never meant to run.
+    if: >-
+      always() &&
+      (github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && !startsWith(github.event.pull_request.head.ref, 'release-please--')))
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check the result of the build job
+        run: |
+          case "${{ needs.build.result }}" in
+            success)
+              echo "build: ${{ needs.build.result }}"
+              ;;
+            *)
+              echo "::error::build: ${{ needs.build.result }}"
+              exit 1
+              ;;
+          esac
+
+  # Everything above runs in English, because GitHub-hosted runners generate no locale
+  # beyond C/C.UTF-8. That makes git's translated diagnostics invisible to CI even
+  # though they are the default experience for any contributor whose shell locale is not
+  # English -- so a spec that matches an English git message passes here and fails for
+  # them, on code they did not touch. This job is what stops such a spec from reaching
+  # this branch. See issue #1670.
+  #
+  # German because git's `de` translation is close enough to complete that a
+  # message-matching assumption cannot hide behind a string that was never translated.
+  # Most of the suite is insulated from this by the LC_ALL pin in Git::ExecutionContext;
+  # what this job really exercises is the code that bypasses that pin.
+  locale:
+    name: Non-English Locale
+
+    # Skip this job if triggered by a release PR
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && !startsWith(github.event.pull_request.head.ref, 'release-please--'))
+
+    runs-on: ubuntu-latest
+
+    # Set at job scope rather than on the spec step so that every step -- including the
+    # check below that the locale is real -- sees exactly the environment the suite runs
+    # under. Setting these before locale-gen is harmless: they are simply inert until
+    # the locale exists.
+    env:
+      LANG: de_DE.UTF-8
+      LC_ALL: de_DE.UTF-8
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+
+      # Two separate things are missing from a stock runner, and skipping either one
+      # leaves the env above inert -- git keeps answering in English and the job proves
+      # nothing:
+      #
+      #   1. The locale itself. Only C and C.UTF-8 are generated, so setlocale fails for
+      #      anything else and every process falls back to English.
+      #   2. git's German message catalog. Unlike Debian, Ubuntu strips gettext catalogs
+      #      out of packages and ships them in language packs, so the installed git has
+      #      no de translation until language-pack-de provides one.
+      #
+      # `update-locale` is deliberately not run: it edits /etc/default/locale, which is
+      # only consulted for logins that do not already set LANG and LC_ALL, and this job
+      # sets both explicitly.
+      #
+      # The two apt settings below exist because this step reaches out to the Ubuntu
+      # archive, which is the only part of this job that can fail for reasons that have
+      # nothing to do with the code under test:
+      #
+      #   * `Acquire::Retries` retries an individual download that fails outright,
+      #     rather than failing the job on one unlucky mirror.
+      #   * `timeout-minutes` bounds a mirror that accepts the connection and then
+      #     stops responding, which retries cannot help with. Without it the step
+      #     inherits the 6 hour job default: run 32087601711 sat here for 12 minutes
+      #     before it was cancelled by hand, and would otherwise have held a runner
+      #     for the rest of the day. The whole job normally finishes in 53-118
+      #     seconds, so 5 minutes is generous while still failing the same morning.
+      #
+      - name: Install the German locale and message catalogs
+        timeout-minutes: 5
+        run: |
+          sudo apt-get -o Acquire::Retries=3 update -qq
+          sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends language-pack-de
+          sudo locale-gen de_DE.UTF-8
+
+      # Ruby 3.4 to share the bundler cache the lint job already warms. Nothing about
+      # this job is Ruby-version specific -- the locale is what is under test.
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true # runs 'bundle install' and caches installed gems automatically
+
+      # Guard against a vacuous pass. Diffing git's output against the same command run
+      # under LC_ALL=C proves translation is actually active, without pinning a German
+      # string that a future git release is free to reword.
+      - name: Verify the Locale Took Effect
+        run: |
+          dir="$(mktemp -d)"
+          localized="$(git -C "$dir" status 2>&1 || true)"
+          english="$(LC_ALL=C git -C "$dir" status 2>&1 || true)"
+          echo "LC_ALL=$LC_ALL -> $localized"
+          echo "LC_ALL=C -> $english"
+          if [ "$localized" = "$english" ]; then
+            echo "::error::git is still emitting English: de_DE.UTF-8 did not take effect, so this job would test nothing"
+            exit 1
+          fi
+
+      - name: Run Specs
+        run: bundle exec rake spec
+        timeout-minutes: 15
+
+  # On the ubuntu jobs above, `C.UTF-8` and `en_US.UTF-8` both resolve to a UTF-8 ctype
+  # (measured on the runner in issue #1669), and on windows the pinned value makes no
+  # difference under any value at all. So the non-ASCII regex coverage those jobs run
+  # passes whatever `Git::ExecutionContext` pins, and cannot tell a correct `LC_ALL`
+  # value from a wrong one. That blind spot is what let the original defect go
+  # unreported for eighteen months: the gem pinned `en_US.UTF-8`, stock Debian, Ubuntu,
+  # and RHEL images generate no such locale, git silently fell back to a C ctype, and
+  # every non-ASCII regex in `grep`, `log`, and the `config` value regexes returned a
+  # wrong answer with exit status zero -- while CI stayed green throughout.
+  #
+  # This job makes one run discriminating. `LOCPATH` overrides where glibc looks for
+  # compiled locale data, so pointing it at an empty directory takes away every locale
+  # that needs a locale archive -- `en_US.UTF-8` among them -- while leaving `C.UTF-8`
+  # working, because glibc 2.35 and later compile that one into the library itself.
+  # The suite then runs in an environment where the value shipped before #1681 fails
+  # and the value shipped now passes: no container image, no second bundle install,
+  # no cache miss. Measured on ubuntu:24.04 (glibc 2.39, the runner's base) with
+  # `en_US.UTF-8` generated first:
+  #
+  #   normal         en_US.UTF-8 charmap=UTF-8           C.UTF-8 charmap=UTF-8
+  #   LOCPATH=empty  en_US.UTF-8 charmap=ANSI_X3.4-1968  C.UTF-8 charmap=UTF-8
+  #
+  # This has to be a property of the run rather than of a spec. Never gate a spec on
+  # whether the pinned locale loads: such a spec skips itself in exactly the
+  # environments where this defect lives, which is how the defect went unreported for
+  # eighteen months.
+  #
+  # LANG is set explicitly so only `en_US.UTF-8` is taken away and the ambient
+  # environment stays UTF-8. The runner already sets this value; pinning it here keeps
+  # the job from depending on the image's default.
+  missing-locale:
+    name: Missing en_US.UTF-8 Locale
+
+    # Skip this job if triggered by a release PR
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && !startsWith(github.event.pull_request.head.ref, 'release-please--'))
+
+    runs-on: ubuntu-latest
+
+    env:
+      LANG: C.UTF-8
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+
+      # Exported through GITHUB_ENV rather than set at job scope because the `runner`
+      # context is not available there, and the directory has to exist before anything
+      # reads a locale -- glibc warns on every process when LOCPATH names a directory
+      # that does not exist. RUNNER_TEMP rather than the workspace so that
+      # actions/checkout cannot clean it away.
+      - name: Point LOCPATH at an Empty Directory
+        run: |
+          mkdir -p "$RUNNER_TEMP/empty-locale-dir"
+          echo "LOCPATH=$RUNNER_TEMP/empty-locale-dir" >> "$GITHUB_ENV"
+
+      # Ruby 3.4 to share the bundler cache the lint job already warms. Nothing about
+      # this job is Ruby-version specific -- the locale environment is what differs.
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true # runs 'bundle install' and caches installed gems automatically
+
+      # Guard against a vacuous pass, functionally. `locale -a` still lists en_US.utf8
+      # under LOCPATH (measured) even though setlocale then refuses it, so asking git
+      # to match is the only assertion worth making: `.` spans the two-byte U+00C4 only
+      # under a UTF-8 ctype. The metacharacter-free control has to keep matching under
+      # the removed locale as well -- it matches bytes under any ctype, so if it fails,
+      # the probe never delivered UTF-8 bytes to git and the rest proves nothing.
+      - name: Verify the Run Discriminates
+        run: |
+          dir="$(mktemp -d)"
+          cd "$dir"
+          git init -q .
+          printf '\xc3\x84PFEL sind gut\n' > w.txt
+          git add w.txt
+
+          if ! LC_ALL=C.UTF-8 git grep -q '^.PFEL' -- w.txt; then
+            echo "::error::C.UTF-8 no longer yields a UTF-8 ctype under LOCPATH, so this job would fail for the wrong reason"
+            exit 1
+          fi
+          if ! LC_ALL=en_US.UTF-8 git grep -q 'PFEL sind' -- w.txt; then
+            echo "::error::the control pattern did not match, so this probe is not delivering UTF-8 bytes to git"
+            exit 1
+          fi
+          if LC_ALL=en_US.UTF-8 git grep -q '^.PFEL' -- w.txt; then
+            echo "::error::en_US.UTF-8 still yields a UTF-8 ctype, so this job cannot detect a wrong LC_ALL pin"
+            exit 1
+          fi
+          echo "en_US.UTF-8 is unusable and C.UTF-8 works: a wrong pin fails this job"
+
+      # The whole suite rather than the non-ASCII regex spec alone: the point is that
+      # this run is indistinguishable from any other except for the missing locale, so
+      # every locale-sensitive surface added later is covered without touching this
+      # file. It also keeps the coverage gate satisfied, which a single spec file
+      # cannot do.
+      - name: Run Specs
+        run: bundle exec rake spec
+        timeout-minutes: 15

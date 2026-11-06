@@ -1,0 +1,514 @@
+name: Build and test
+permissions:
+  contents: read
+# We use `push` events so that we have the actual commit. In `pull_request`
+# events we get a merge commit with main instead. The merge commit can be
+# useful to check that the code would pass tests once merged, but here it just
+# creates confusion and doesn't add anything since the branch must be up to
+# date before merge. It's also nice to have CI running on branches without PRs.
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      no_cache:
+        description: 'no-cache'
+        default: false
+        type: boolean
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+defaults:
+  run:
+    shell: bash -euxlo pipefail {0}
+jobs:
+  build:
+    runs-on: ubuntu-latest-m
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout nns-dapp
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Skip build for testing
+        # Set to true and set a recent `run_id` below to reuse an existing build
+        # instead of building.
+        if: false
+        id: skip_build
+        run: |
+          echo "skip_build=true" >> "$GITHUB_OUTPUT"
+          mkdir out
+          # The run ID is the number at the end of a URL like this:
+          # https://github.com/dfinity/nns-dapp/actions/runs/5801187848
+          run_id=5801187848
+          gh run download "$run_id" --dir ./out -n out
+      - name: Build nns-dapp repo
+        if: steps.skip_build.outputs.skip_build != 'true'
+        uses: ./.github/actions/build_nns_dapp
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: 'Upload nns-dapp wasm module'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: nns-dapp
+          path: out/nns-dapp.wasm.gz
+          retention-days: 3
+      - name: 'Upload nns-dapp test wasm module'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: nns-dapp_test
+          path: out/nns-dapp_test.wasm.gz
+          retention-days: 3
+      - name: 'Upload sns_aggregator wasm module'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: sns_aggregator
+          path: out/sns_aggregator.wasm.gz
+          retention-days: 3
+      - name: 'Upload sns_aggregator_dev wasm module'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: sns_aggregator_dev
+          path: out/sns_aggregator_dev.wasm.gz
+          retention-days: 3
+      - name: 'Upload whole out directory'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: out
+          path: out
+          retention-days: 3
+  test-playwright-e2e-shard-1-of-2:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout nns-dapp
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run Playwright e2e test shard 1/2
+        uses: ./.github/actions/test-e2e
+        with:
+          shard_number: 1
+          shard_count: 2
+  test-playwright-e2e-shard-2-of-2:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout nns-dapp
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run Playwright e2e test shard 2/2
+        uses: ./.github/actions/test-e2e
+        with:
+          shard_number: 2
+          shard_count: 2
+  test-upgrade-downgrade:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout nns-dapp
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Get nns-dapp_test
+        # Note: This may be performed manually with ./scripts/docker-build --network local
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: out
+          path: out
+      - name: Install ic-wasm
+        uses: ./.github/actions/install_ic_wasm
+      - name: Start the local network
+        uses: ./.github/actions/start_icp_network
+      - name: Install tools
+        run: |
+          sudo apt-get update -yy && sudo apt-get install -yy moreutils && command -v sponge
+      - name: Run uprade-downgrade test
+        run: ./scripts/nns-dapp/upgrade-downgrade-test --reuse_network --wasm out/nns-dapp_test.wasm.gz --args out/nns-dapp-arg-local.did --github_step_summary "$GITHUB_STEP_SUMMARY"
+  test-upgrade-stable:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout nns-dapp
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Get nns-dapp_test
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: out
+          path: out
+      - name: Install ic-wasm
+        uses: ./.github/actions/install_ic_wasm
+      - name: Start the local network
+        uses: ./.github/actions/start_icp_network
+      - name: Install tools
+        run: |
+          sudo apt-get update -yy && sudo apt-get install -yy moreutils && command -v sponge
+      - name: Downgrade nns-dapp to prod and upgrade back again
+        run: ./scripts/nns-dapp/migration-test --accounts 1000 --chunk 100
+      - name: Upload the network logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: test-upgrade-stable-network-logs
+          path: .icp/cache/networks/local/network-launcher/
+  test-test-account-api:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout nns-dapp
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Get nns-dapp_test
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nns-dapp_test
+      - name: Start empty nns-dapp
+        # The action also installs `idl2json`, which the test needs.
+        uses: ./.github/actions/start_icp_network
+        with:
+          nns_dapp_wasm: 'nns-dapp_test.wasm.gz'
+      - name: Check that test accounts can be created and read
+        run: ./scripts/nns-dapp/test-account.test
+  test-rest:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      # The Release step creates and updates a GitHub release.
+      contents: write
+    timeout-minutes: 40
+    steps:
+      - name: Checkout nns-dapp
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Get nns-dapp
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nns-dapp
+      - name: Get sns_aggregator
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sns_aggregator
+      - name: Get sns_aggregator_dev
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sns_aggregator_dev
+      - name: Start the local network
+        uses: ./.github/actions/start_icp_network
+        with:
+          nns_dapp_wasm: 'nns-dapp.wasm.gz'
+          sns_aggregator_wasm: 'sns_aggregator_dev.wasm.gz'
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26'
+      - name: Add go to the path
+        run: echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+      - name: Install command line HTML parser
+        run: |
+          go install github.com/ericchiang/pup@latest
+          pup --version
+      - name: Install tools
+        run: |
+          # libarchive-zip-perl is needed for crc32, used by test-cmc-notify.
+          sudo apt-get update -yy && sudo apt-get install -yy libarchive-zip-perl
+      - name: Verify that arguments are set in index.html
+        run: |
+          for ((i=5; i>0; i--)); do
+            (
+              timeout 60 curl --fail --silent --retry 10 --connect-timeout 5 "$(scripts/dfx-canister-url --network local nns-dapp)/" > index.html
+              file index.html
+              < index.html gunzip | pup 'head meta[name="nns-dapp-vars"] json{}' | tee nns_dapp_args_in_page.json
+            ) || { echo "Failed.  Retrying..." ; sleep 5 ; continue ; }
+            break
+          done
+          echo "Check a few values:"
+          for key in data-own-canister-id data-fetch-root-key data-identity-service-url ; do
+            # Verify that the key is non-trivial:
+            # `jq -e` returns an error code if the value is missing
+            # `grep ...` fails if the value is implausibly short.
+            key="$key" jq -re '.[0][env.key]' nns_dapp_args_in_page.json | grep -E ...
+          done
+      - name: Install ic-wasm
+        uses: ./.github/actions/install_ic_wasm
+      - name: Check that metadata is present
+        run: |
+          scripts/dfx-wasm-metadata-add.test --verbose
+      - name: Verify that metrics are present
+        run: scripts/nns-dapp/e2e-test-metrics-present
+      - name: Test TVL
+        run: |
+          scripts/nns-dapp/test-tvl --nns_dapp_wasm nns-dapp.wasm.gz --nns_dapp_arg nns-dapp-arg-local.did
+      - name: Test import canister IDs
+        run: |
+          ./scripts/canister_ids --import-from-index-html "$(scripts/dfx-canister-url --network local nns-dapp)/" --network local --create
+          diff <(jq -r 'keys | .[]' canister_ids.json) <(cat <<-EOF
+          	ckbtc_index
+          	ckbtc_ledger
+          	ckbtc_minter
+          	cketh_index
+          	cketh_ledger
+          	ckusdc_index
+          	ckusdc_ledger
+          	icp-swap
+          	internet_identity
+          	kong-swap
+          	nns-dapp
+          	nns-index
+          	nns-sns-wasm
+          	sns_aggregator
+          	EOF
+          )
+          rm canister_ids.json
+          ./scripts/canister_ids --import-from-index-html https://nns.ic0.app --network mainnet --create
+          diff canister_ids.json scripts/canister_ids.mainnet.golden
+      - name: Release
+        run: |
+          for tag in $(git tag --points-at HEAD) ; do
+            : Creates or updates a release for the tag
+            if gh release view "$tag"
+            then gh release upload --repo dfinity/nns-dapp --clobber "$tag" nns-dapp.wasm.gz || true
+            else gh release create --title "Release for tags/$tag" --draft --notes "Build artefacts from tag: $tag" "$tag" nns-dapp.wasm.gz
+            fi
+            : If the tag is for a proposal or nightly, make it public
+            [[ "$tag" != proposal-* ]] && [[ "$tag" != nightly-* ]] || { echo "Making release public" ; gh release edit "$tag" --draft=false ; }
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Get the postinstall instruction count
+        run: |
+          icp canister install nns-dapp --wasm nns-dapp.wasm.gz --mode upgrade --args-file nns-dapp-arg-local.did --yes --environment local
+          postinstall_instructions="$(scripts/backend/get_upgrade_instructions)"
+          echo "Installation consumed ${postinstall_instructions} instructions."
+          echo "Cycles consumed are instructions * some factor that depends on subnet.  There is no guarantee that that formula will not change."
+      - name: Stop the local network
+        run: icp network stop
+  network_independent_wasm:
+    name: "Same wasms for mainnet and local"
+    # Note: The dockerfile structure SHOULD guarantee that the network is not used in any Wasm build commands.
+    #       As long as that holds, this test is not needed.
+    needs: build
+    runs-on: ubuntu-latest-m
+    timeout-minutes: 45
+    steps:
+      - name: Checkout nns-dapp
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Check dockerfile for changes
+        id: dockerfile_changed
+        run: |
+          common_parent_commit="$(git merge-base HEAD origin/main)"
+          if git diff "$common_parent_commit" Dockerfile | grep -q .
+          then echo "dockerfile_changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Set up docker buildx
+        if: steps.dockerfile_changed.outputs.dockerfile_changed == 'true'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - name: Create a blank global config
+        run: echo "{}" > global-config.json
+      - name: Build wasms
+        if: steps.dockerfile_changed.outputs.dockerfile_changed == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          file: Dockerfile
+          build-args: |
+            DFX_NETWORK=local
+            COMMIT=${{ github.sha }}
+          cache-from: type=gha,scope=cached-stage
+          # Exports the artefacts from the final stage
+          outputs: ./out-mainnet
+      - name: Get nns-dapp
+        if: steps.dockerfile_changed.outputs.dockerfile_changed == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nns-dapp
+          path: out-local
+      - name: Get sns_aggregator
+        if: steps.dockerfile_changed.outputs.dockerfile_changed == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sns_aggregator
+          path: out-local
+      - name: Get sns_aggregator_dev
+        if: steps.dockerfile_changed.outputs.dockerfile_changed == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sns_aggregator_dev
+          path: out-local
+      - name: Compare wasms
+        if: steps.dockerfile_changed.outputs.dockerfile_changed == 'true'
+        run: |
+          set -x
+          ls -l
+          artefacts="sns_aggregator_dev.wasm.gz sns_aggregator.wasm.gz nns-dapp.wasm.gz"
+          networks=(mainnet local)
+          for network in "${networks[@]}" ; do
+            ls -l "out-$network"
+            (cd "out-$network" && sha256sum ${artefacts[@]} ; ) > "${network}_hashes.txt"
+          done
+          diff local_hashes.txt mainnet_hashes.txt  || {
+            echo "ERROR: wasm hashes differ between mainnet and local."
+          }
+  aggregator_test:
+    needs: build
+    runs-on: ubuntu-latest-m
+    timeout-minutes: 60
+    steps:
+      - name: Checkout nns-dapp
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Get sns_aggregator
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sns_aggregator
+      - name: Get sns_aggregator_dev
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sns_aggregator_dev
+      - name: Start the local network
+        uses: ./.github/actions/start_icp_network
+        with:
+          sns_aggregator_wasm: 'sns_aggregator_dev.wasm.gz'
+      - name: Create more SNS projects
+        # The network starts with four SNS projects. The pagination test needs
+        # more than one page of ten.
+        run: |
+          names=("Echo Alot" "Foxtrot" "Golf Stream" "Hotel" "India" "Juliett" "Kilo Byte" "Lima Bean" "Mike Box")
+          symbols=(ECH FXT GLF HTL IND JLT KIO LIM MIK)
+          for ((i = 0; i < ${#names[@]}; i++)); do
+            scripts/icp-sns-create --name "${names[$i]}" --symbol "${symbols[$i]}" --logo mocks/sns/delta.png
+          done
+          scripts/icp-sns-aggregator-wait
+      - name: Verify that configuration is as provided
+        run: scripts/sns/aggregator/test-config
+      - name: Wait for the aggregator to get the data again
+        # The configuration test reinstalls the aggregator, which clears its cache.
+        run: scripts/icp-sns-aggregator-wait
+      - name: Get the latest data from the sns aggregator
+        run: |
+          curl -Lf "$(scripts/dfx-canister-url --network local sns_aggregator)/v1/sns/list/latest/slow.json" | tee aggregate-1.json
+          expect=10
+          actual="$(jq length aggregate-1.json)"
+          (( expect == actual ))  || {
+            echo ERROR: Expected to have $expect SNS in the aggregator but found $actual.
+            scripts/sns/aggregator/get_log
+            exit 1
+          }
+      - name: Test the paginated endpoint
+        run: scripts/sns/aggregator/test-pagination --num 13
+      - name: Get logs
+        run: |
+          scripts/sns/aggregator/get_log > ,logs
+          LOG_LINES="$(wc -l <,logs)"
+          (( LOG_LINES > 10 )) || {
+            echo "ERROR: Expected a non-trivial number of lines to have been logged by now but found only ${LOG_LINES}"
+            cat ,logs
+            exit 1
+          }
+      - name: Upgrade the aggregator to self with a slow refresh rate
+        run: icp canister install sns_aggregator --mode upgrade --wasm sns_aggregator_dev.wasm.gz --args '(opt record { update_interval_ms = 1_000_000_000; fast_interval_ms = 1_000_000_000; })' --yes --environment local
+      - name: Expect the paginated data to be retained over the upgrade
+        run: scripts/sns/aggregator/test-pagination --num 13
+      - name: Expect the latest data to be retained over the upgrade
+        run: |
+          curl -Lf "$(scripts/dfx-canister-url --network local sns_aggregator)/v1/sns/list/latest/slow.json" | tee aggregate-1.json
+          expect=10
+          actual="$(jq length aggregate-1.json)"
+          (( expect == actual ))  || {
+            echo ERROR: Expected to have $expect SNS in the aggregator but found $actual.
+            exit 1
+          }
+      - name: Downgrade sns_aggregator to prod and upgrade back again
+        run: |
+          set -euxo pipefail
+          git fetch --depth 1 origin tag aggregator-prod
+          diff="$(git diff tags/aggregator-prod rs/sns_aggregator .github/workflows/build.yml)"
+          if test -n "${diff:-}"
+          then ./scripts/sns/aggregator/downgrade-upgrade-test -w sns_aggregator_dev.wasm.gz --verbose
+          else echo "Skipping test as there are no relevant code changes"
+          fi
+      # TODO: Verify that fast data is updated fast. scripts/sns/aggregator/test-fast
+      # buys a swap with the snsdemo scripts. Port it to scripts/icp-sns-create.
+      - name: Stop the local network
+        run: icp network stop
+  assets:
+    name: "Upload assets"
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      # The Release step creates a GitHub release. A later step pushes the
+      # refs/notes/mainnet/wasm-sha note.
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Get docker build outputs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: out
+          path: out
+      - name: Print the hash of all assets
+        run: find out -type f | xargs sha256sum
+      - name: 'Record the git commit and any tags'
+        run: git log | head -n1 > out/commit.txt
+      - name: 'Upload ${{ matrix.BUILD_NAME }} nns-dapp wasm module'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: nns-dapp for ${{ matrix.BUILD_NAME }}
+          path: |
+            out/commit.txt
+            out/nns-dapp.wasm.gz
+            out/nns-dapp-arg-${{ matrix.DFX_NETWORK }}.did
+            out/nns-dapp-arg-${{ matrix.DFX_NETWORK }}.bin
+            out/frontend-config.sh
+            out/deployment-config.json
+      - name: 'Upload sns_aggregator wasm module'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: sns_aggregator for ${{ matrix.BUILD_NAME }}
+          path: |
+            out/sns_aggregator.wasm.gz
+            out/sns_aggregator_dev.wasm.gz
+      - name: Release
+        uses: ./.github/actions/release_nns_dapp
+        with:
+          assets_dir: 'out'
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: 'Upload frontend assets'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: NNS frontend assets
+          path: |
+            out/assets.tar.xz
+            out/sourcemaps.tar.xz
+      - name: "Link the build sha to this commit"
+        run: |
+          : Set up git
+          git config user.name "GitHub Actions Bot"
+          git config user.email "<>"
+          : Make a note of the WASM shasum.
+          NOTE="refs/notes/mainnet/wasm-sha"
+          SHA="$(sha256sum < "out/nns-dapp.wasm.gz")"
+          git fetch origin "+${NOTE}:${NOTE}"
+          if git notes --ref="wasm-sha" add -m "$SHA"
+          then git push origin "${NOTE}:${NOTE}" || true
+          else echo SHA already set
+          fi
+      - name: "Verify that the WASM module is small enough to deploy"
+        run: |
+          wasm_size="$(wc -c < "out/nns-dapp.wasm.gz")"
+          max_size=3145728
+          (
+            echo "## NNS Dapp WASM stats"
+            humreadable_size="$(numfmt --to=iec-i --suffix=B --format="%.3f" $wasm_size)"
+            humreadable_max="$(numfmt --to=iec-i --suffix=B --format="%.3f" $max_size )"
+            humreadable_ratio="$(( (wasm_size * 100) / max_size ))%"
+            humreadable_free="$(numfmt --to=iec-i --suffix=B --format="%.3f" $(( max_size - wasm_size )))"
+            echo "**WASM size:** $humreadable_size / $humreadable_max = $humreadable_ratio  ($humreadable_free free)"
+          ) | tee -a $GITHUB_STEP_SUMMARY
+          (( wasm_size <= max_size )) || { echo "The WASM is too large" ; exit 1 ; }
+  build-pass:
+    needs: ["build", "test-playwright-e2e-shard-1-of-2", "test-playwright-e2e-shard-2-of-2", "test-rest", "network_independent_wasm", "assets", "test-upgrade-downgrade", "test-test-account-api", "test-upgrade-stable"]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/needs_success
+        with:
+          needs: '${{ toJson(needs) }}'

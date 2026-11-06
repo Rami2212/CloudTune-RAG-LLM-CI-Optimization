@@ -1,0 +1,82 @@
+# A GitHub Actions workflow that can be used to trigger updates of npm package
+# dependencies.
+name: Update next npm package dependencies
+permissions:
+  contents: read
+on:
+  workflow_dispatch:
+    inputs:
+      gix_components:
+        description: "Update gix-components"
+        default: true
+        type: boolean
+      ic_js:
+        description: "Update ic-js"
+        default: true
+        type: boolean
+jobs:
+  update-next-dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create GitHub App Token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: app-token
+        with:
+          app-id: ${{ vars.PR_AUTOMATION_BOT_PUBLIC_APP_ID }}
+          private-key: ${{ secrets.PR_AUTOMATION_BOT_PUBLIC_PRIVATE_KEY }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Get node version
+        run: jq -r '"NODE_VERSION=\(.volta.node)"' frontend/package.json >> $GITHUB_ENV
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          registry-url: "https://registry.npmjs.org"
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Update gix-components
+        if: ${{ inputs.gix_components }}
+        run: |
+          cd frontend
+          npm run update:gix
+      - name: Update ic-js
+        if: ${{ inputs.ic_js }}
+        run: |
+          cd frontend
+          npm run upgrade:next
+      - name: Create Pull Request
+        id: cpr
+        # Note: If there were no changes, this step creates no PR.
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          commit-message: Bump
+          committer: GitHub <noreply@github.com>
+          author: gix-bot <gix-bot@users.noreply.github.com>
+          branch: bot-bump-next
+          branch-suffix: timestamp
+          add-paths: |
+            frontend
+          delete-branch: true
+          title: "bot: Bump ${{ inputs.gix_components && 'gix-components' || '' }}${{ inputs.gix_components && inputs.ic_js && ' and ' || '' }}${{ inputs.ic_js && 'ic-js' || '' }}"
+          body: |
+            # Motivation
+
+            We want to pull in the latest changes.
+            This PR was requested by ${{ github.actor }}.
+
+            # Changes
+
+            ${{ inputs.gix_components && '* Ran `npm run update:gix`' || '' }}
+            ${{ inputs.ic_js && '* Ran `npm run upgrade:next`' || '' }}
+
+            # Tests
+
+            * CI should pass
+            * The pulled in changes should have been tested before being committed to their repositories.
+      - name: Report on the action
+        run: |
+          (
+            if test -n "${{ steps.cpr.outputs.pull-request-number }}"
+            then echo "Created [PR #${{ steps.cpr.outputs.pull-request-number }}](${{ steps.cpr.outputs.pull-request-url }})."
+            else echo "No changes needed."
+            fi
+          ) | tee -a $GITHUB_STEP_SUMMARY

@@ -1,0 +1,54 @@
+---
+name: Conventional Commits
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches:
+      - main
+
+# Cancel an in-progress run when the same PR gets a new push; only the commit messages
+# as they stand after the latest push are worth linting.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  commit-lint:
+    name: Verify Conventional Commits
+
+    # Skip this job if this is a release PR
+    if: (github.event_name == 'pull_request' && !startsWith(github.event.pull_request.head.ref, 'release-please--'))
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with: { fetch-depth: 0 }
+
+      # commitlint runs from the project's own package.json rather than through
+      # wagoid/commitlint-github-action so that the release-please commitlint plugin
+      # (commitlint/release-please, a file: dependency) and the release-please it
+      # loads are installed in node_modules.
+      # package-lock.json is not committed, so this is npm install, not
+      # npm ci. --ignore-scripts skips the husky prepare script, which would otherwise
+      # install git hooks into the runner's checkout.
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with: { node-version: 22 }
+
+      - name: Install commitlint
+        run: npm install --ignore-scripts
+
+      - name: Test the release-please commitlint plugin
+        run: npm test
+
+      - name: Check Commit Messages
+        run: >
+          npx --no-install commitlint
+          --from "${{ github.event.pull_request.base.sha }}"
+          --to "${{ github.event.pull_request.head.sha }}"
+          --verbose
