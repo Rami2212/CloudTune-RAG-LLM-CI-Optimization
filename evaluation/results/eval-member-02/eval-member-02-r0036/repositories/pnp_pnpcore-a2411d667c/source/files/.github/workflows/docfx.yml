@@ -1,0 +1,57 @@
+name: Refresh documentation
+on: 
+  push:
+    branches:
+      # Only update docs for dev branch pushes
+      - dev
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  # This workflow contains a single job called "build"
+  docfx:
+    if: github.repository_owner == 'pnp'
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: write
+      actions: read
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+    # prevent parallel executions
+    - name: Wait for actions to finish
+      uses: softprops/turnstyle@3805450be63b8c80577dc253e8c17e9132036df4 # v3.3.3
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}    
+    # Checks-out dev branch
+    - name: Checkout dev branch
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with: 
+        ref: dev
+        path: dev
+    # Checks-out gh-pages branch
+    - name: Checkout gh-pages branch
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with: 
+        ref: gh-pages
+        path: gh-pages
+    # Setup .NET (required for DocFx)
+    - name: Setup .NET
+      uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+      with:
+        dotnet-version: 8.x
+    # Install docfx as a .NET global tool
+    - name: Install dependencies
+      run: dotnet tool install -g docfx --version 2.78.5
+    # Build docs
+    - name: Build docs
+      shell: pwsh
+      run: |
+        ./dev/docs/build.ps1
+    # Add, commit and push the changes
+    - name: Add & Commit & Push
+      uses: EndBug/add-and-commit@v10
+      with:
+        # The directory where your repository is located. You should use actions/checkout first to set it up
+        cwd: ./gh-pages
+        push: true
+        github_token: ${{ secrets.GITHUB_TOKEN }}

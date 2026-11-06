@@ -414,6 +414,15 @@ def prepare_repository(
         if findings:
             dismissed.append(f"{path}: {', '.join(findings)}")
             continue
+        # Dispatch inputs without defaults cannot be populated safely by the
+        # common A/B/C runner. Skip such workflows and prefer another test/CI
+        # workflow; if none remains, preparation will mark this repository
+        # ineligible and the batch can continue to the next row.
+        input_problems = [problem for problem in dispatch_problems(doc)
+                          if problem != "MISSING_WORKFLOW_DISPATCH"]
+        if input_problems:
+            dismissed.append(f"{path}: not safely dispatchable ({', '.join(input_problems)})")
+            continue
         serialized = json.dumps(doc, default=str)
         hint_count = len(CI_HINT.findall(serialized))
         if hint_count == 0:
