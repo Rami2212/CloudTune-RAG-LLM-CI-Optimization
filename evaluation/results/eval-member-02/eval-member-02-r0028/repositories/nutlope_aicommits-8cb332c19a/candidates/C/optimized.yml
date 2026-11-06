@@ -1,0 +1,57 @@
+name: Release VSCode Extension
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'vscode-extension/**'
+  workflow_dispatch:
+
+jobs:
+  release:
+    name: Publish Extension
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4.2.0
+        # version from package.json packageManager (pnpm 12)
+
+      - name: Cache pnpm dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.pnpm-store
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('vscode-extension/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-
+
+      - name: Install dependencies
+        working-directory: vscode-extension
+        run: pnpm install
+
+      - name: Build
+        working-directory: vscode-extension
+        run: pnpm run compile
+
+      - name: Publish to VSCode Marketplace
+        working-directory: vscode-extension
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: pnpm run package && npx @vscode/vsce publish --no-dependencies
+
+      - name: Upload VSIX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vscode-extension
+          path: vscode-extension/*.vsix
