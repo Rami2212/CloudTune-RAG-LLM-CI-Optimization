@@ -1,0 +1,426 @@
+name: Publish Test Report
+run-name: ${{ github.event.workflow_run.display_title }}
+on:
+   workflow_run:
+     workflows: [Test]
+     types: [completed]
+   # Rerun report publishing on exising test run
+
+permissions:
+  contents: read
+  checks: write
+  statuses: write
+  pull-requests: write
+  actions: read
+
+jobs:
+   publish:
+      name: Publish Surefire Report
+      runs-on: ubuntu-latest
+      steps:
+        - name: Set run_id based on event type
+          id: run_id
+          run: |
+            echo "runid=${{ github.event.workflow_run.id }}" >> "$GITHUB_OUTPUT"
+
+        # Downloading surefire report artifact containing
+        - name: Download Surefire Report Artifact
+          uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+          with:
+            pattern: surefire-test-report*
+            github-token: ${{ github.token }}
+            run-id: ${{ steps.run_id.outputs.runid }}
+
+        # Downloading github-sha.txt file
+        - name: Get github sha
+          id: github_sha
+          uses: juliangruber/read-file-action@271ff311a4947af354c6abcd696a306553b9ec18 # v1
+          with:
+            path: ./surefire-test-report/github-sha.txt
+
+        # Get GitHub App token to use in API calls
+        - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+          id: app-token
+          with:
+            # required
+            client-id: ${{ secrets.GH_APP_ISPN_ID }}
+            private-key: ${{ secrets.GH_APP_ISPN_KEY }}
+
+        # Get job status, next steps will be executed only if test job was successful
+        - name: Get job status
+          env:
+            GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          id: job-status
+          run: |
+            JOB_STATUS=$(gh api https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ steps.run_id.outputs.runid }}/jobs --jq '.jobs[] | select(.name=="Maven Test") | .conclusion')
+            echo "job_status=$JOB_STATUS" >> "$GITHUB_OUTPUT"
+
+        - name: Download Check Run ID
+          if: (success() || failure()) && steps.job-status.outputs.job_status == 'success'
+          uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+          with:
+            name: check-run-id
+            github-token: ${{ github.token }}
+            run-id: ${{ steps.run_id.outputs.runid }}
+
+        - name: Read Check Run ID
+          if: (success() || failure()) && steps.job-status.outputs.job_status == 'success'
+          id: read_check_id
+          run: |
+            CHECK_RUN_ID=$(cat check-run-id.txt)
+            echo "check_run_id=$CHECK_RUN_ID" >> "$GITHUB_OUTPUT"
+
+        - name: Publish Test Report
+          if: (success() || failure()) && steps.job-status.outputs.job_status == 'success'
+          # Waiting for https://github.com/ScaCap/action-surefire-report/pull/251
+          uses: rigazilla/action-surefire-report@d0798439b2f7845af98fa88187bcc622a6818efd # module-v1
+          with:
+            github_token: ${{ steps.app-token.outputs.token }}
+            check_name: Test Report Result
+            commit: ${{ steps.github_sha.outputs.content }}
+            ignore_flaky_tests: true
+            summary: "Result from workflow run: https://github.com/${{ github.repository }}/actions/runs/${{ steps.run_id.outputs.runid }}"
+            report_paths: |
+              **/surefire-test-report/**/*-reports*/**/TEST-*.xml
+
+        - name: Display Check Run URL
+          if: (success() || failure()) && steps.job-status.outputs.job_status == 'success'
+          run: |
+            echo "::notice title=Test Report Published::View test report: https://github.com/${{ github.repository }}/runs/${{ steps.read_check_id.outputs.check_run_id }}"
+
+        - name: Set failure check if Publish Test Report step failed
+          if: failure() && steps.job-status.outputs.job_status == 'success'
+          env:
+            GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          run: |
+            gh api repos/${{ github.repository }}/check-runs/"${{ steps.read_check_id.outputs.check_run_id }}"\
+              -H "Accept: application/vnd.github+json" \
+              -f status="completed" \
+              -f conclusion="failure" \
+              -f "output[summary]=Result from workflow run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              -f "output[title]=Run Failed" \
+              --method PATCH
+
+        - name: Install xmlstarlet tool
+          shell: bash
+          if: steps.job-status.outputs.job_status == 'success'
+          run: |
+             sudo apt-get update
+             sudo apt-get install -y xmlstarlet
+
+        - name: Check test number
+          id: test-number
+          env:
+            MIN_TEST_NUM: 32300
+            GH_TOKEN: ${{ github.token }}
+          run: |
+            if [ "${{ steps.job-status.outputs.job_status }}" != "success" ]; then
+              echo "Job status is '${{ steps.job-status.outputs.job_status }}', marking as failed."
+              exit 1
+            fi
+            COUNT=$(find . -name "TEST-*.xml" | while read -r f; do xmlstarlet sel -t -c  "count(//testcase)" -n "$f"; done | awk '{s+=$1} END {print s}')
+            {
+              echo "test_count=$COUNT"
+              echo "test_min=$MIN_TEST_NUM"
+              echo "is_valid=true"
+            } >> "$GITHUB_OUTPUT"
+
+        - name: Set test number check status on success
+          if: fromJSON(steps.test-number.outputs.test_count) >= fromJSON(steps.test-number.outputs.test_min)
+          uses: myrotvorets/set-commit-status-action@3730c0a348a2ace3c110851bed53331bc6406e9f # v2.0.1
+          with:
+            status: success
+            sha: ${{ steps.github_sha.outputs.content }}
+            context: Tests number check
+            description: Success. ${{ steps.test-number.outputs.test_count }} test ran, minimum required is ${{ steps.test-number.outputs.test_min }}
+            targetUrl: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+        - name: Set test number check status if failed
+          if: fromJSON(steps.test-number.outputs.test_count) < fromJSON(steps.test-number.outputs.test_min)
+          uses: myrotvorets/set-commit-status-action@3730c0a348a2ace3c110851bed53331bc6406e9f # v2.0.1
+          with:
+            status: failure
+            sha: ${{ steps.github_sha.outputs.content }}
+            context: Tests number check
+            description: Fail. ${{ steps.test-number.outputs.test_count }} test ran, minimum required is ${{ steps.test-number.outputs.test_min }}
+            targetUrl: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+   targets-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        targets:
+          - mssql
+          - oracle
+          - db2
+          - tomcat
+    steps:
+    - name: Set run_id based on event type
+      id: run_id
+      run: |
+         echo "runid=${{ github.event.workflow_run.id }}" >> "$GITHUB_OUTPUT"
+
+    - name: Download a Build Artifact
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        name: surefire-test-report-${{ matrix.targets }}
+        github-token: ${{ github.token }}
+        run-id: ${{ steps.run_id.outputs.runid }}
+
+    - name: Get github sha
+      id: github_sha
+      uses: juliangruber/read-file-action@271ff311a4947af354c6abcd696a306553b9ec18 # v1
+      with:
+        path: ./github-sha.txt
+
+    - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+      id: app-token
+      with:
+        # required
+        client-id: ${{ secrets.GH_APP_ISPN_ID }}
+        private-key: ${{ secrets.GH_APP_ISPN_KEY }}
+
+    - name: Get job status
+      env:
+        GH_TOKEN: ${{ steps.app-token.outputs.token }}
+      id: job-status
+      run: |
+        if [ "${{ matrix.targets }}" = "tomcat" ]; then
+          JOB_NAME="tomcat"
+        else
+          JOB_NAME="db (${{ matrix.targets }})"
+        fi
+
+        JOB_STATUS=$(gh api "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ steps.run_id.outputs.runid }}/jobs" --jq ".jobs[] | select(.name==\"$JOB_NAME\") | .conclusion")
+        echo "job_status=$JOB_STATUS" >> "$GITHUB_OUTPUT"
+
+    - name: Download Check Run ID
+      if: (success() || failure()) && steps.job-status.outputs.job_status == 'success'
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        name: check-run-id-${{ matrix.targets }}
+        github-token: ${{ github.token }}
+        run-id: ${{ steps.run_id.outputs.runid }}
+
+    - name: Read Check Run ID
+      if: (success() || failure()) && steps.job-status.outputs.job_status == 'success'
+      id: read_check_id
+      run: |
+        CHECK_RUN_ID=$(cat "check-run-id-${{ matrix.targets }}.txt")
+        echo "check_run_id=$CHECK_RUN_ID" >> "$GITHUB_OUTPUT"
+
+    - name: Publish Test Report
+      if: (success() || failure()) && steps.job-status.outputs.job_status == 'success'
+      # Waiting for https://github.com/ScaCap/action-surefire-report/pull/251
+      uses: rigazilla/action-surefire-report@d0798439b2f7845af98fa88187bcc622a6818efd # module-v1
+      with:
+        github_token: ${{ steps.app-token.outputs.token }}
+        check_name: Test Report Result ${{ matrix.targets }}
+        commit: ${{ steps.github_sha.outputs.content }}
+        ignore_flaky_tests: true
+        summary: "Result from workflow run: https://github.com/${{ github.repository }}/actions/runs/${{ steps.run_id.outputs.runid }}"
+        report_paths: |
+          **/*-reports*/**/TEST-*.xml
+
+    - name: Display Check Run URL
+      if: (success() || failure()) && steps.job-status.outputs.job_status == 'success'
+      run: |
+        echo "::notice title=Test Report Published (${{ matrix.targets }})::View test report: https://github.com/${{ github.repository }}/runs/${{ steps.read_check_id.outputs.check_run_id }}"
+
+    - name: Set failure check if Publish Test Report step failed
+      if: failure()
+      env:
+        GH_TOKEN: ${{ steps.app-token.outputs.token }}
+      run: |
+        gh api repos/${{ github.repository }}/check-runs/"${{ steps.read_check_id.outputs.check_run_id }}" \
+          -H "Accept: application/vnd.github+json" \
+          -f status="completed" \
+          -f conclusion="failure" \
+          -f "output[summary]=Result from workflow run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+          -f "output[title]=Run Failed" \
+          --method PATCH
+
+   jstack-analysis:
+      name: Analyze Thread Dumps
+      runs-on: ubuntu-latest
+      steps:
+        - name: Set run_id based on event type
+          id: run_id
+          run: |
+            echo "runid=${{ github.event.workflow_run.id }}" >> "$GITHUB_OUTPUT"
+
+        - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+          with:
+            sparse-checkout: |
+              .github/scripts/
+            sparse-checkout-cone-mode: false
+            fetch-depth: 1
+
+        - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+          id: app-token
+          with:
+            client-id: ${{ secrets.GH_APP_ISPN_ID }}
+            private-key: ${{ secrets.GH_APP_ISPN_KEY }}
+
+        - name: Get Maven Test job status
+          id: job-status
+          env:
+            GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          run: |
+            JOB_STATUS=$(gh api "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ steps.run_id.outputs.runid }}/jobs" \
+              --jq '.jobs[] | select(.name=="Maven Test") | .conclusion')
+            echo "job_status=$JOB_STATUS" >> "$GITHUB_OUTPUT"
+
+        - name: Download jstack artifact
+          if: steps.job-status.outputs.job_status == 'failure'
+          id: download-jstack
+          uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+          continue-on-error: true
+          with:
+            name: jstack-report
+            path: jstack-files
+            github-token: ${{ github.token }}
+            run-id: ${{ steps.run_id.outputs.runid }}
+
+        - name: Download surefire report for PR number
+          if: steps.job-status.outputs.job_status == 'failure' && steps.download-jstack.outcome == 'success'
+          uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+          continue-on-error: true
+          with:
+            name: surefire-test-report
+            path: surefire-report
+            github-token: ${{ github.token }}
+            run-id: ${{ steps.run_id.outputs.runid }}
+
+        - name: Get PR number
+          if: steps.job-status.outputs.job_status == 'failure' && steps.download-jstack.outcome == 'success'
+          id: pr-number
+          run: |
+            if [ -f surefire-report/pr-number.txt ]; then
+              PR=$(cat surefire-report/pr-number.txt)
+              if [ -n "$PR" ]; then
+                echo "number=$PR" >> "$GITHUB_OUTPUT"
+              fi
+            fi
+
+        - name: Analyze thread dumps
+          if: >
+            steps.job-status.outputs.job_status == 'failure'
+            && steps.download-jstack.outcome == 'success'
+            && steps.pr-number.outputs.number != ''
+          id: analyze
+          run: |
+            JSTACK_DIR=$(find jstack-files -name "jstack-*.txt" -printf '%h\n' | head -1)
+            if [ -z "$JSTACK_DIR" ]; then
+              echo "No jstack files found in artifact"
+              exit 0
+            fi
+            ANALYSIS=$(.github/scripts/analyze-jstack.sh "$JSTACK_DIR")
+            if [ -n "$ANALYSIS" ]; then
+              RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ steps.run_id.outputs.runid }}"
+              {
+                echo "$ANALYSIS"
+                echo ""
+                echo "---"
+                echo "[View full run]($RUN_URL) | [Download thread dumps]($RUN_URL#:~:text=jstack-report)"
+              } > /tmp/jstack-comment.md
+              echo "has_analysis=true" >> "$GITHUB_OUTPUT"
+            fi
+
+        - name: Post PR comment
+          if: steps.analyze.outputs.has_analysis == 'true'
+          env:
+            GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          run: |
+            PR_URL="https://github.com/${{ github.repository }}/pull/${{ steps.pr-number.outputs.number }}"
+            gh pr comment "$PR_URL" -F /tmp/jstack-comment.md
+
+   rolling-upgrades-report:
+      runs-on: ubuntu-latest
+      strategy:
+        fail-fast: false
+        matrix:
+          name:
+            # The name here should match the names in on_build_do_test workflow file.
+            - latest
+            - first-version
+      steps:
+      - name: Set run_id based on event type
+        id: run_id
+        run: |
+           echo "runid=${{ github.event.workflow_run.id }}" >> "$GITHUB_OUTPUT"
+
+      - name: Download Rolling Upgrade Artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: surefire-test-report-rolling-upgrades-${{ matrix.name }}
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.run_id.outputs.runid }}
+
+      - name: Get github sha
+        id: github_sha
+        uses: juliangruber/read-file-action@271ff311a4947af354c6abcd696a306553b9ec18 # v1
+        with:
+          path: ./github-sha.txt
+
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+        id: app-token
+        with:
+          client-id: ${{ secrets.GH_APP_ISPN_ID }}
+          private-key: ${{ secrets.GH_APP_ISPN_KEY }}
+
+      - name: Get job status
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        id: job-status
+        run: |
+          # Match the specific job name defined inside the rolling-upgrade-test.yml workflow
+          JOB_SUFFIX="Rolling Upgrades (${{ matrix.name }})"
+          
+          # Use 'endswith' to ignore the variable prefix (caller job name + arguments)
+          JOB_STATUS=$(gh api "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ steps.run_id.outputs.runid }}/jobs" \
+          --jq ".jobs[] | select(.name | endswith(\"$JOB_SUFFIX\")) | .conclusion")
+          
+          echo "Found status: $JOB_STATUS"
+          echo "job_status=$JOB_STATUS" >> "$GITHUB_OUTPUT"
+
+      - name: Publish Test Report
+        if: (success() || failure()) && steps.job-status.outputs.job_status == 'success'
+        uses: rigazilla/action-surefire-report@d0798439b2f7845af98fa88187bcc622a6818efd # module-v1
+        with:
+          github_token: ${{ steps.app-token.outputs.token }}
+          check_name: Test Report Rolling Upgrades (${{ matrix.name }})
+          commit: ${{ steps.github_sha.outputs.content }}
+          ignore_flaky_tests: true
+          summary: "Result from workflow run: https://github.com/${{ github.repository }}/actions/runs/${{ steps.run_id.outputs.runid }}"
+          report_paths: |
+            **/*-reports*/**/TEST-*.xml
+
+      - name: Download Check Run ID
+        if: failure()
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: check-run-id-rolling-upgrades-${{ matrix.name }}
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.run_id.outputs.runid }}
+
+      - name: Read Check Run ID
+        if: failure()
+        id: read_check_id
+        run: |
+          CHECK_RUN_ID=$(cat check-run-id.txt)
+          echo "CHECK_RUN_ID=$CHECK_RUN_ID" >> "$GITHUB_ENV"
+
+      - name: Set failure check if Publish Test Report step failed
+        if: failure()
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh api "repos/${{ github.repository }}/check-runs/${CHECK_RUN_ID}" \
+            -H "Accept: application/vnd.github+json" \
+            -f status="completed" \
+            -f conclusion="failure" \
+            -f "output[summary]=Result from workflow run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f "output[title]=Run Failed" \
+            --method PATCH

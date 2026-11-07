@@ -1,0 +1,46 @@
+name: Automated Backporting
+
+on:
+  pull_request_target:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  find_targets:
+    if: github.event.pull_request.merged == true && github.event.pull_request.labels
+    runs-on: ubuntu-latest
+    outputs:
+      backport_branches: ${{ steps.prepare_labels.outputs.backport_branches }}
+    steps:
+      - name: Prepare backport branches list
+        id: prepare_labels
+        run: |
+          labels_json='${{ toJSON(github.event.pull_request.labels) }}'
+          backport_branches=$(echo "$labels_json" | jq -r '[.[] | select(.name | startswith("backport/")) | .name | sub("^backport/"; "")]')
+          {
+            echo 'backport_branches<<EOF'
+            echo "$backport_branches"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+  create_backports:
+    needs: find_targets
+    if: needs.find_targets.outputs.backport_branches != '[]'
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: ${{ fromJSON(needs.find_targets.outputs.backport_branches) }}
+
+    steps:
+      - name: Backport
+        uses: kiegroup/git-backporting@17bab14ff4b362d044e12c18e491b4ef8e69a4b1 # v4.10.0
+        with:
+          target-branch: ${{ matrix.branch }}
+          pull-request: ${{ github.event.pull_request.url }}
+          auth: ${{ secrets.INFINISPAN_RELEASE_TOKEN }}
+          no-squash: true

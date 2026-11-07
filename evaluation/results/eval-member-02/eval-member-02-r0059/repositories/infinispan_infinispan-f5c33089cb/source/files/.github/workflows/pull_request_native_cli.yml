@@ -1,0 +1,108 @@
+name: Native CLI
+
+on:
+  push:
+    branches:
+      - feature/*
+      - main
+      - '*.x'
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE*'
+      - '.gitignore'
+      - '.gitattributes'
+      - '.editorconfig'
+      - 'CODEOWNERS'
+      - 'documentation/**'
+  pull_request:
+    branches:
+      - feature/*
+      - main
+      - '*.x'
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE*'
+      - '.gitignore'
+      - '.gitattributes'
+      - '.editorconfig'
+      - 'CODEOWNERS'
+      - 'documentation/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  # Cancel jobs same head_branch same repo, works
+  # both for pull_request and push
+  group: >
+      ${{ github.workflow }}-${{ github.repository }}-
+      ${{ github.event.pull_request.head.ref || github.event.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-2022]
+        include:
+          - os: ubuntu-latest
+            asset_name: linux-amd64
+            gu_binary: gu
+          - os: macos-latest
+            asset_name: darwin-arm64
+            gu_binary: gu
+            native_extra_args: -Dnative.build.xmx=5500m -Dquarkus.native.native-image-xmx=5500m
+          - os: windows-2022
+            asset_name: windows-amd64
+            gu_binary: gu.cmd
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - if: ${{ matrix.os == 'windows-2022' }}
+        name: Add msbuild to PATH
+        uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57 # v3
+
+      - uses: graalvm/setup-graalvm@f70bc8032f90a104502824a54bcb94b6f01715bc # v1
+        with:
+          version: '25.0'
+          distribution: 'graalvm'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache local Maven repository
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v5
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      - name: Detect CLI module path
+        id: detect-cli
+        shell: bash
+        run: |
+          if [ -f graalvm/cli/pom.xml ]; then
+            echo "module=graalvm/cli" >> $GITHUB_OUTPUT
+          else
+            echo "module=quarkus/cli" >> $GITHUB_OUTPUT
+          fi
+
+      - if: ${{ matrix.os == 'windows-2022' }}
+        name: Build native executable
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x86_amd64
+          mvnw.cmd -V install -Pdistribution -Pnative -Pwindows -am -pl ${{ steps.detect-cli.outputs.module }} ${{ matrix.native_extra_args }}
+        shell: cmd
+
+      - if: ${{ matrix.os != 'windows-2022' }}
+        name: Build native executable
+        run: ./mvnw -V install -Pdistribution -Pnative -am -pl ${{ steps.detect-cli.outputs.module }} ${{ matrix.native_extra_args }}
+
+      - if: failure()
+        name: Upload native-image error reports
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: svm-error-report-${{ matrix.asset_name }}
+          path: '**/svm_err_*.md'
+          if-no-files-found: ignore

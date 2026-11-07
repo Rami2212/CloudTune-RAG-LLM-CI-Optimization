@@ -1,0 +1,347 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "The Infinispan branch to checkout when cutting the release."
+        required: true
+        default: "main"
+      version:
+        description: "Release version (blank = derive from pom.xml, only if micro > 0)"
+        required: false
+      nextVersion:
+        description: "Next version (blank = next micro SNAPSHOT)"
+        required: false
+      type:
+         type: choice
+         description: The type of release
+         required: true
+         default: "default"
+         options:
+            - default
+            - latest
+            - prerelease
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      version: ${{ steps.resolve-versions.outputs.RELEASE_VERSION }}
+      nextVersion: ${{ steps.resolve-versions.outputs.NEXT_VERSION }}
+
+    steps:
+      - name: Set up Java
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          java-version: '25'
+          distribution: 'zulu'
+          server-id: central
+          server-username: MAVEN_USERNAME
+          server-password: MAVEN_PASSWORD
+
+      - name: Checkout Source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          ref: ${{ inputs.branch }}
+          token: ${{ secrets.INFINISPAN_RELEASE_TOKEN }}
+
+      - name: Configure Git User
+        run: |
+          git config user.email "infinispan@infinispan.org"
+          git config user.name "Infinispan"
+
+      - name: Resolve versions
+        id: resolve-versions
+        run: |
+          POM_VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+          echo "POM version: $POM_VERSION"
+
+          RELEASE_VERSION="${{ inputs.version }}"
+          if [ -z "$RELEASE_VERSION" ]; then
+            # Derive from pom.xml: strip -SNAPSHOT suffix
+            if [[ "$POM_VERSION" != *-SNAPSHOT ]]; then
+              echo "::error::POM version '$POM_VERSION' is not a SNAPSHOT version"
+              exit 1
+            fi
+            RELEASE_VERSION="${POM_VERSION%-SNAPSHOT}"
+            # Extract micro version and check it's non-zero
+            MICRO=$(echo "$RELEASE_VERSION" | cut -d. -f3)
+            if [ "$MICRO" = "0" ]; then
+              echo "::error::Cannot derive release version from '$POM_VERSION' (micro is 0). Please specify 'Release version' explicitly."
+              exit 1
+            fi
+          fi
+
+          NEXT_VERSION="${{ inputs.nextVersion }}"
+          if [ -z "$NEXT_VERSION" ]; then
+            # Bump micro: 16.1.2 -> 16.1.3-SNAPSHOT
+            MAJOR=$(echo "$RELEASE_VERSION" | cut -d. -f1)
+            MINOR=$(echo "$RELEASE_VERSION" | cut -d. -f2)
+            MICRO=$(echo "$RELEASE_VERSION" | cut -d. -f3)
+            NEXT_MICRO=$((MICRO + 1))
+            NEXT_VERSION="${MAJOR}.${MINOR}.${NEXT_MICRO}-SNAPSHOT"
+          fi
+
+          echo "Release version: $RELEASE_VERSION"
+          echo "Next version: $NEXT_VERSION"
+          echo "RELEASE_VERSION=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "NEXT_VERSION=$NEXT_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Update proto.lock files
+        run: |
+          mvn -B clean install -DskipTests -DcommitProtoLockChanges=true -Dcheckstyle.skip
+
+      - name: Set release version
+        run: |
+          mvn -B versions:set -DprocessAllModules=true -DnewVersion=${{ steps.resolve-versions.outputs.RELEASE_VERSION }}
+          mvn -B versions:set-property -Dproperty=version.infinispan -DnewVersion=${{ steps.resolve-versions.outputs.RELEASE_VERSION }}
+          sed -i "s/^:ispn_version:.*\$/:ispn_version: ${{ steps.resolve-versions.outputs.RELEASE_VERSION }}/" documentation/src/main/asciidoc/topics/attributes/community-attributes.adoc
+          git commit --no-verify -a -m "Releasing ${{ steps.resolve-versions.outputs.RELEASE_VERSION }}"
+
+      - name: Publish to Central
+        run: mvn -B -Drelease-mode=upstream -Pdistribution -Pcommunity-release -DskipTests -Dgpg.signer=bc clean deploy -Dinfinispan.brand.version=${{ steps.resolve-versions.outputs.RELEASE_VERSION }}
+        env:
+          MAVEN_USERNAME: ${{ secrets.SONATYPE_CENTRAL_USERNAME }}
+          MAVEN_PASSWORD: ${{ secrets.SONATYPE_CENTRAL_PASSWORD }}
+          MAVEN_GPG_KEY: ${{ secrets.INFINISPAN_MAVEN_GPG_ARMORED }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.INFINISPAN_MAVEN_GPG_PASSPHRASE }}
+
+      - name: Tag Release
+        run: |
+          git tag -a ${{ steps.resolve-versions.outputs.RELEASE_VERSION }} -m ${{ steps.resolve-versions.outputs.RELEASE_VERSION }}
+
+      - name: Next Version
+        run: |
+          mvn -B versions:set -DprocessAllModules=true -DnewVersion=${{ steps.resolve-versions.outputs.NEXT_VERSION }}
+          mvn -B versions:set-property -Dproperty=version.infinispan -DnewVersion=${{ steps.resolve-versions.outputs.NEXT_VERSION }}
+          git commit --no-verify -a -m "Next version ${{ steps.resolve-versions.outputs.NEXT_VERSION }}"
+
+      - name: Push changes
+        run: |
+          git push --tags origin ${{ inputs.branch }}
+
+      - name: Create default release
+        if: ${{ inputs.type == 'default' }}
+        run: |
+           gh release create ${{ steps.resolve-versions.outputs.RELEASE_VERSION }} --generate-notes --latest=false
+        env:
+           GITHUB_TOKEN: ${{ secrets.INFINISPAN_RELEASE_TOKEN }}
+
+      -  name: Create pre-release
+         if: ${{ inputs.type == 'prerelease' }}
+         run: |
+            gh release create ${{ steps.resolve-versions.outputs.RELEASE_VERSION }} --generate-notes --latest=false --prerelease
+         env:
+            GITHUB_TOKEN: ${{ secrets.INFINISPAN_RELEASE_TOKEN }}
+
+      -  name: Create latest release
+         if: ${{ inputs.type == 'latest' }}
+         run: |
+            gh release create ${{ steps.resolve-versions.outputs.RELEASE_VERSION }} --generate-notes --latest=true
+         env:
+            GITHUB_TOKEN: ${{ secrets.INFINISPAN_RELEASE_TOKEN }}
+
+      - name: Attach server distribution
+        run: |
+          gh release upload ${{ steps.resolve-versions.outputs.RELEASE_VERSION }} distribution/target/distribution/infinispan-server-${{ steps.resolve-versions.outputs.RELEASE_VERSION }}.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.INFINISPAN_RELEASE_TOKEN }}
+
+      - name: Check SBOM availability
+        id: sbom-check
+        run: |
+          if [ -f distribution/target/bom.json ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Attach SBOM
+        if: steps.sbom-check.outputs.exists == 'true'
+        run: |
+          gh release upload ${{ steps.resolve-versions.outputs.RELEASE_VERSION }} "distribution/target/bom.json#infinispan-sbom-${{ steps.resolve-versions.outputs.RELEASE_VERSION }}.cdx.json"
+        env:
+          GITHUB_TOKEN: ${{ secrets.INFINISPAN_RELEASE_TOKEN }}
+
+      - name: Attest server distribution provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: distribution/target/distribution/infinispan-server-${{ steps.resolve-versions.outputs.RELEASE_VERSION }}.zip
+
+      - name: Attest SBOM
+        if: steps.sbom-check.outputs.exists == 'true'
+        uses: actions/attest-sbom@v4
+        with:
+          subject-path: distribution/target/distribution/infinispan-server-${{ steps.resolve-versions.outputs.RELEASE_VERSION }}.zip
+          sbom-path: distribution/target/bom.json
+
+  published:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: GOSCHEN/http-status-code@944938ed534b092b9f7e1e5c6b08c5d9bbc35162 # v1.1.0
+        with:
+          url: https://repo1.maven.org/maven2/org/infinispan/infinispan-distribution/${{ needs.release.outputs.version }}/infinispan-distribution-${{ needs.release.outputs.version }}.pom
+          code: 200
+          timeout: 10800000
+          interval: 1200
+
+  native-cli:
+    needs: [published, release]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, macos-15-intel, windows-2022, ubuntu-24.04-arm]
+        include:
+          - os: ubuntu-latest
+            asset_name: linux-x86_64
+            gu_binary: gu
+            native_extra_args: -Dnative.build.xmx=10g -Dquarkus.native.native-image-xmx=10g
+          - os: macos-latest
+            asset_name: osx-aarch_64
+            gu_binary: gu
+            native_extra_args: -Dnative.build.xmx=5500m -Dquarkus.native.native-image-xmx=5500m
+          - os: macos-15-intel
+            asset_name: osx-x86_64
+            gu_binary: gu
+            native_extra_args: -Dnative.build.xmx=5500m -Dquarkus.native.native-image-xmx=5500m
+          - os: windows-2022
+            asset_name: windows-x86_64
+            gu_binary: gu.cmd
+            native_extra_args: -Dnative.build.xmx=10g -Dquarkus.native.native-image-xmx=10g
+          - os: ubuntu-24.04-arm
+            asset_name: linux-aarch_64
+            gu_binary: gu
+            native_extra_args: -Dnative.build.xmx=10g -Dquarkus.native.native-image-xmx=10g
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - if: ${{ matrix.os == 'windows-2022' }}
+        name: Add msbuild to PATH
+        uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57 # v3.0.0
+
+      - uses: graalvm/setup-graalvm@f70bc8032f90a104502824a54bcb94b6f01715bc # v1
+        with:
+          version: '25.0'
+          distribution: 'graalvm'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout Release Tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          ref: ${{ needs.release.outputs.version }}
+
+      - name: Detect CLI module path
+        id: detect-cli
+        shell: bash
+        run: |
+          if [ -f graalvm/cli/pom.xml ]; then
+            echo "module=graalvm/cli" >> $GITHUB_OUTPUT
+          else
+            echo "module=quarkus/cli" >> $GITHUB_OUTPUT
+          fi
+
+      - if: ${{ matrix.os == 'windows-2022' }}
+        name: Build native executable
+        run: |
+          call "C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x86_amd64
+          mvnw.cmd package -Pdistribution -Pwindows -Pnative -am -pl ${{ steps.detect-cli.outputs.module }} ${{ matrix.native_extra_args }}
+        shell: cmd
+
+      - if: ${{ matrix.os != 'windows-2022' }}
+        name: Build native executable
+        run: ./mvnw package -Pdistribution -Pnative -am -pl ${{ steps.detect-cli.outputs.module }} ${{ matrix.native_extra_args }}
+
+      - name: Upload CLI native executable
+        id: upload-cli-native-executable
+        run: |
+          gh release upload ${{ needs.release.outputs.version }} ${{ steps.detect-cli.outputs.module }}/target/infinispan-cli-${{ needs.release.outputs.version }}-${{ matrix.asset_name }}.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.INFINISPAN_RELEASE_TOKEN }}
+
+  images:
+    needs: [published, release]
+    if: startsWith(needs.release.outputs.version, '16.')
+    uses: ./.github/workflows/release_image.yml
+    secrets: inherit
+    with:
+      branch: ${{ inputs.branch }}
+      version: ${{ needs.release.outputs.version }}
+      type: ${{ inputs.type }}
+
+  images-legacy:
+    needs: [published, release]
+    if: startsWith(needs.release.outputs.version, '15.') || startsWith(needs.release.outputs.version, '14.') || startsWith(needs.release.outputs.version, '13.')
+    uses: infinispan/infinispan-images/.github/workflows/release.yml@fbfc22d69cec42331c552279d14502bc7032a009 # main
+    secrets: inherit
+    with:
+      branch: main
+      ispnVersion: ${{ needs.release.outputs.version }}
+      repository: infinispan/infinispan-images
+      type: ${{ inputs.type }}
+
+  operator-main:
+    needs: [images, release]
+    if: ${{ !contains(needs.release.outputs.version, '.Dev') }}
+    uses: infinispan/infinispan-operator/.github/workflows/add_operand.yml@40b3c0fbec83064b4a7173fafb68d053e56fe606 # main
+    secrets: inherit
+    with:
+      image: quay.io/infinispan/server:${{ needs.release.outputs.version }}
+      ref: main
+      repository: infinispan/infinispan-operator
+
+
+  cli-packages:
+    needs: [native-cli, release]
+    if: needs.native-cli.result == 'success'
+    uses: ./.github/workflows/release_cli_packages.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.release.outputs.version }}
+
+  update-website:
+    needs: [published, native-cli, release]
+    if: always() && needs.published.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update website release data
+        uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4
+        with:
+          token: ${{ secrets.API_TOKEN_GITHUB }}
+          repository: infinispan/infinispan.github.io
+          event-type: release_updated
+          client-payload: '{"project": "infinispan", "version": "${{ needs.release.outputs.version }}"}'
+
+  update-org-vars:
+    needs: [published, release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+        id: app-token
+        with:
+            client-id: ${{ secrets.GH_APP_ISPN_ID }}
+            private-key: ${{ secrets.GH_APP_ISPN_KEY }}
+
+      - name: Update GitHub Organization Variable to next release version
+        if: ${{ !contains(needs.release.outputs.version, '.Dev') }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh variable set "RELEASE_$(echo '${{ needs.release.outputs.version }}' | cut -f 1-2 -d '.' | tr . _)_VERSION" -b "$(echo ${{ needs.release.outputs.nextVersion }} | cut -f 1 -d '-')" --org infinispan --visibility all;
+
+      - name: Update RELEASE variable to the next main branch version if current release version matches
+        if: ${{ needs.release.outputs.version == vars.RELEASE }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh variable set RELEASE -b "$(echo ${{ needs.release.outputs.nextVersion }} | cut -f 1 -d '-')" --org infinispan  --visibility all;
+          gh variable set "RELEASE_$(echo '${{ needs.release.outputs.version }}' | cut -f 1-2 -d '.' | tr . _)_VERSION" -b "$(echo '${{ needs.release.outputs.version }}' | cut -f 1-2 -d '.').1" --org infinispan --visibility all;

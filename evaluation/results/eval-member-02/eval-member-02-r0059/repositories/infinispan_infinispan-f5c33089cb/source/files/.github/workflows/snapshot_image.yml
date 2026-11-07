@@ -1,0 +1,84 @@
+name: Snapshot Images
+
+on:
+  workflow_call:
+    inputs:
+      name:
+        description: 'The name of the image'
+        required: true
+        type: string
+      runId:
+        description: 'A workflow runId'
+        required: true
+        type: string
+      tag:
+        description: 'A tag to add to the snapshot image'
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      name:
+        description: 'The name of the image'
+        default: 'server'
+        type: string
+      runId:
+        description: 'A workflow runId'
+        required: true
+        type: string
+      tag:
+        description: 'A tag to add to the snapshot image'
+        required: true
+        type: string
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download Artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          run-id: '${{ inputs.runId }}'
+          name: infinispan-dist
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract artifact
+        id: extract_artifact
+        run: |
+          unzip -q infinispan-*-src.zip
+          SRCROOT=$(find . -maxdepth 1 -type d -name '*src')
+          echo "srcroot=$SRCROOT" >> $GITHUB_OUTPUT
+          mv infinispan-server-*.zip "$SRCROOT"/server/image/infinispan-server.zip
+
+      - name: Install qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
+
+      - name: Build image
+        id: build-image
+        uses: redhat-actions/buildah-build@719e3c40d8af9790c23eca13f7daa339f2867034 # v3
+        with:
+          build-args: |
+            BRAND_VERSION=${{ inputs.runId }}
+            BRAND_NAME=Infinispan
+            JDK_DIST=src/main/docker/adoptium
+            SERVER_DIST=infinispan-server.zip
+          containerfiles: ./${{ steps.extract_artifact.outputs.srcroot }}/server/image/src/main/docker/Dockerfile
+          context: ./${{ steps.extract_artifact.outputs.srcroot }}/server/image
+          image: ${{ inputs.name }}
+          platforms: linux/amd64, linux/arm64
+          tags: ${{ inputs.tag }}
+
+      - name: Log in to Quay.io
+        uses: redhat-actions/podman-login@50c2d9a331bb67c8fdab99b86455fad05e2e3252 # v2
+        with:
+          username: ${{ secrets.QUAY_USERNAME_TEST }}
+          password: ${{ secrets.QUAY_TOKEN_TEST }}
+          registry: quay.io
+
+      - name: Push to Quay.io
+        run: podman manifest push ${{ inputs.name }}:${{ inputs.tag }} quay.io/infinispan-test/server:${{ inputs.tag }} --all --tls-verify=true
+
+      - name: Print Quay.io image url
+        run: echo "Image pushed to quay.io/infinispan-test/server:${{ inputs.tag }}"

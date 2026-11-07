@@ -1,0 +1,98 @@
+name: Pull Request Open
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  targetlabel:
+    if: contains(github.event.pull_request.base.ref, '.')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add target label
+        run: |
+          TARGET="target/${{ github.event.pull_request.base.ref }}"
+          if gh api "repos/${GH_REPO}/labels" -q '.[].name' --paginate | grep -qxF "$TARGET"; then
+            gh pr edit ${{ github.event.pull_request.number }} --add-label "$TARGET"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+
+  issuelabels:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Copy labels from referenced issues
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          BASE_REF="${{ github.event.pull_request.base.ref }}"
+          BODY=$(gh pr view "$PR_NUMBER" --json body -q '.body // ""')
+
+          # Extract issue numbers from [#N] in title, and Fixes/Closes/Resolves #N in body
+          ISSUES=$(echo "$PR_TITLE" | grep -oP '\[#\K[0-9]+' || true)
+          ISSUES="$ISSUES $(echo "$BODY" | grep -oiP '(fix(es|ed)?|close[sd]?|resolve[sd]?)\s+#\K[0-9]+' || true)"
+          ISSUES=$(echo "$ISSUES" | tr ' ' '\n' | sort -un | xargs)
+
+          if [ -z "$ISSUES" ]; then
+            echo "No issue references found"
+            exit 0
+          fi
+
+          # Collect all repo labels for validation
+          REPO_LABELS=$(gh api "repos/${GH_REPO}/labels" -q '.[].name' --paginate)
+          
+          # Get all branches for release label filtering
+          ALL_BRANCHES=$(gh api "repos/${GH_REPO}/branches" --paginate -q '.[].name')
+
+          for ISSUE in $ISSUES; do
+            echo "Processing issue #$ISSUE"
+            LABELS=$(gh api "repos/${GH_REPO}/issues/${ISSUE}/labels" -q '.[].name' 2>/dev/null || true)
+            if [ -z "$LABELS" ]; then
+              echo "  No labels found or issue does not exist"
+              continue
+            fi
+            while IFS= read -r LABEL; do
+              # Skip target/* labels - they should only be applied by targetlabel job
+              if [[ "$LABEL" == target/* ]]; then
+                echo "  Skipping $LABEL: target labels are managed by targetlabel job"
+                continue
+              fi
+
+              # Filter release/* labels based on target branch
+              if [[ "$LABEL" == release/* ]]; then
+                # Extract version from label (e.g., release/15.1.0 -> 15.1.0)
+                VERSION="${LABEL#release/}"
+                MAJ_MIN=$(echo "$VERSION" | cut -d. -f1,2)
+
+                if [[ "$BASE_REF" == "main" ]]; then
+                  # For main branch: only apply if no branch matches maj.min.x pattern
+                  if echo "$ALL_BRANCHES" | grep -qE "^${MAJ_MIN}\.x$"; then
+                    echo "  Skipping $LABEL: branch ${MAJ_MIN}.x exists (not for main)"
+                    continue
+                  fi
+                elif [[ "$BASE_REF" =~ ^([0-9]+)\.([0-9]+)\.x$ ]]; then
+                  # For version branches (e.g., 15.1.x): only apply if maj.min matches
+                  BRANCH_MAJ_MIN="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+                  if [[ "$MAJ_MIN" != "$BRANCH_MAJ_MIN" ]]; then
+                    echo "  Skipping $LABEL: version mismatch (branch $BRANCH_MAJ_MIN != label $MAJ_MIN)"
+                    continue
+                  fi
+                fi
+              fi
+
+              if echo "$REPO_LABELS" | grep -qxF "$LABEL"; then
+                echo "  Adding label: $LABEL"
+                gh pr edit "$PR_NUMBER" --add-label "$LABEL"
+              fi
+            done <<< "$LABELS"
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_TITLE: ${{ github.event.pull_request.title }}

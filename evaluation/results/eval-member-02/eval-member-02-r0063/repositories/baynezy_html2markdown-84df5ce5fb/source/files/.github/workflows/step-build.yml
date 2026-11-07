@@ -1,0 +1,60 @@
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'The version number to use for the build'
+        required: true
+        type: string
+      checkout-ref:
+        description: 'The commit SHA to checkout'
+        required: true
+        type: string
+  
+jobs:
+  build-libraries:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Log Branch
+      run: |
+        echo "Branch: ${{ inputs.checkout-ref }}"
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
+      with:
+        ref: ${{ inputs.checkout-ref }}
+    - name: Setup .NET Core
+      uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v5
+      with:
+        dotnet-version: 10.0.x
+    - name: Restore
+      uses: cake-build/cake-action@d218f1133bb74a1df0b08c89cfd8fc100c09e1a0 # v3
+      with:
+        target: Restore
+    - name: Build
+      uses: cake-build/cake-action@d218f1133bb74a1df0b08c89cfd8fc100c09e1a0 # v3
+      with:
+        target: Build
+        arguments: |
+          versionNumber: ${{inputs.version}}
+    - name: Run tests
+      uses: cake-build/cake-action@d218f1133bb74a1df0b08c89cfd8fc100c09e1a0 # v3
+      env: 
+        TestPath: /home/runner/work/Html2Markdown/Html2Markdown/test/Html2Markdown.Test/Files/
+      with:
+        target: Test
+    - name: Publish Unit Test Results
+      if: ${{ github.actor != 'dependabot[bot]' }}
+      uses: EnricoMi/publish-unit-test-result-action/linux@7622c5bf3d112a72ab4fa3951c2aa5723d8ab92d # v2
+      with:
+        files: "**/TestResults/*.xml"
+    - name: Build NuGet Package
+      uses: cake-build/cake-action@d218f1133bb74a1df0b08c89cfd8fc100c09e1a0 # v3
+      with:
+        target: Pack
+        arguments: |
+          versionNumber: ${{inputs.version}}
+    - name: Upload Package
+      if: ${{ github.actor != 'dependabot[bot]' }}
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v5
+      with:
+        name: Html2Markdown
+        path: ./src/Html2Markdown/bin/Release/*.nupkg
