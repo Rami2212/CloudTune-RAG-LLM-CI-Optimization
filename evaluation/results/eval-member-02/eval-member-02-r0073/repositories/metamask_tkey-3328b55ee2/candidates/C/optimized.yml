@@ -1,0 +1,67 @@
+name: BrowserTests
+
+on:
+  create: #[push]
+  workflow_dispatch:
+
+env:
+  PLAYWRIGHT_BROWSERS_PATH: 0
+  NODE_VERSION: 24
+  FORCE_COLOR: 3
+
+jobs:
+  test:
+    strategy:
+      max-parallel: 1
+      matrix:
+        browser: [chromium, firefox]
+        # browser: [chromium, firefox, webkit]
+        # os: [macos-latest, windows-latest, ubuntu-latest]
+        os: [macos-latest]
+        exclude:
+          - browser: webkit
+            os: windows-latest
+          # - browser: webkit
+          #   os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      - name: Run Build
+        run: npm run build && npx playwright install
+
+      - name: Browser Test Development Chrome (Mocked)
+        if: startsWith(matrix.browser, 'chromium')
+        run: npm run browser-tests:local-mocked-chrome
+
+      - name: Browser Test Development Firefox (Mocked)
+        if: startsWith(matrix.browser, 'firefox')
+        run: npm run browser-tests:local-mocked-firefox
+
+      # - name: Browser Test Development webkit (Mocked)
+      #   if: startsWith(matrix.browser, 'webkit')
+      #   run: npm run browser-tests:local-mocked-webkit
+
+      - name: Browser Test Production Chrome (Prod)
+        if: startsWith(matrix.browser, 'chromium')
+        run: npm run browser-tests:local-prod-chrome
+
+      # - name: Browser Test Production Firefox (prod)
+      #   if: startsWith(matrix.browser, 'firefox')
+      #   run: npm run browser-tests:local-prod-firefox
+
+      # - name: Browser Test Production webkit (prod)
+      #   if: startsWith(matrix.browser, 'webkit')
+      #   run: npm run browser-tests:local-prod-webkit
