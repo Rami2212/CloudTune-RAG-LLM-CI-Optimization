@@ -1,0 +1,70 @@
+name: Build and Test 🚀✅
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ dev ]
+    paths:
+    - 'src/sdk/PnP.Core/**'
+    - 'src/sdk/PnP.Core.Auth/**'
+    - 'src/sdk/PnP.Core.Admin/**'
+    - 'src/sdk/PnP.Core.Provisioning/**'
+    - 'src/sdk/PnP.Core.Test/**'
+    - 'src/sdk/PnP.Core.Auth.Test/**'
+    - 'src/sdk/PnP.Core.Admin.Test/**'
+    - 'src/sdk/PnP.Core.Provisioning.Test/**'
+  pull_request:
+    branches: [ dev ]
+    paths:
+    - 'src/sdk/PnP.Core/**'
+    - 'src/sdk/PnP.Core.Auth/**'
+    - 'src/sdk/PnP.Core.Admin/**'
+    - 'src/sdk/PnP.Core.Provisioning/**'
+    - 'src/sdk/PnP.Core.Test/**'
+    - 'src/sdk/PnP.Core.Auth.Test/**'
+    - 'src/sdk/PnP.Core.Admin.Test/**'
+    - 'src/sdk/PnP.Core.Provisioning.Test/**'
+
+jobs:
+  build:
+    if: github.repository_owner == 'pnp'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+    - name: Wait for actions to finish
+      uses: softprops/turnstyle@3805450be63b8c80577dc253e8c17e9132036df4 # v3.3.3
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}              
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - name: Setup .NET Core
+      uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+      with:
+        dotnet-version: '10.0.x'
+    - name: Install dependencies
+      run: dotnet restore
+      working-directory: src/sdk
+    - name: Build ⚙
+      run:  dotnet build --configuration debug --no-restore --verbosity normal 
+      working-directory: src/sdk   
+    - name: Test 🧪
+      env:
+        pnpcoresdktestsite: ${{ secrets.PNPCORESDKTESTSITE }}
+        pnpcoresdktestuser: ${{ secrets.PNPCORESDKTESTUSER }}
+        pnpcoresdktestuserpassword: ${{ secrets.PNPCORESDKTESTUSERPASSWORD }}
+        pnpcoresdktestclientid: ${{ secrets.PNPCORESDKTESTCLIENTID }}
+      run: |
+        dotnet test ./PnP.Core.Test/PnP.Core.Test.csproj --no-restore --verbosity normal --collect:"XPlat Code Coverage"
+        dotnet test ./PnP.Core.Auth.Test/PnP.Core.Auth.Test.csproj --no-restore --verbosity normal --collect:"XPlat Code Coverage"
+        dotnet test ./PnP.Core.Admin.Test/PnP.Core.Admin.Test.csproj --no-restore --verbosity normal --collect:"XPlat Code Coverage"
+        dotnet test ./PnP.Core.Provisioning.Test/PnP.Core.Provisioning.Test.csproj --no-restore --verbosity normal --filter TestCategory=Offline --collect:"XPlat Code Coverage"
+      working-directory: src/sdk
+    - name: Upload coverage to Codecov 📝
+      uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        files: src/sdk/**/coverage.cobertura.xml        

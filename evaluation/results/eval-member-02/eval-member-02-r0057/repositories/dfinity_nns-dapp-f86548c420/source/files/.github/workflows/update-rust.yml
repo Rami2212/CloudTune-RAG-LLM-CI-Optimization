@@ -1,0 +1,97 @@
+# A GitHub Actions workflow that regularly checks for new Rust toolchain release
+# and creates a PR on new versions.
+name: Update rust
+permissions:
+  contents: read
+on:
+  schedule:
+    # check for new rust versions weekly
+    - cron: "30 3 * * FRI"
+  workflow_dispatch:
+  push:
+    branches:
+      # The development branch for this workflow:
+      - "update-rust"
+jobs:
+  rust-update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create GitHub App Token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: app-token
+        with:
+          app-id: ${{ vars.PR_AUTOMATION_BOT_PUBLIC_APP_ID }}
+          private-key: ${{ secrets.PR_AUTOMATION_BOT_PUBLIC_PRIVATE_KEY }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # First, check rust GitHub releases for a new version. We assume that the
+        # latest version's tag name is the version.
+      - name: Install yq
+        uses: ./.github/actions/install_yq
+      - name: Check new rust version
+        id: update
+        run: |
+          current_rust_version=$(cat ./rust-toolchain.toml | sed -n 's/^channel[[:space:]]*=[[:space:]]"\(.*\)"/\1/p')
+          echo "current rust version '$current_rust_version'"
+          latest_rust_version=$(curl -sSL https://static.rust-lang.org/dist/channel-rust-stable.toml | yq -p toml -oy .pkg.rust.version | awk '{print $1}')
+
+          # The GitHub API has some hiccups, so we check the value before going further
+          if [ -z "$latest_rust_version" ] || [ "$latest_rust_version" = "null" ]
+          then
+            echo "expected a rust version, got '$latest_rust_version'"
+            echo "data received from API:"
+            echo "$release_data"
+            exit 1
+          fi
+
+          echo "latest rust version '$latest_rust_version'"
+          echo "version=$latest_rust_version" >> "$GITHUB_OUTPUT"
+
+          if [ "$current_rust_version" != "$latest_rust_version" ]
+          then
+            echo rust toolchain needs an update
+            sed -i -e "/^channel *=/{s/$current_rust_version/$latest_rust_version/g}" ./rust-toolchain.toml
+            echo "updated=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "updated=0" >> "$GITHUB_OUTPUT"
+          fi
+
+          cat ./rust-toolchain.toml
+          # Show changes
+          echo "Git status:"
+          git status
+          echo "Git diff:"
+          git diff
+        # If the rust-toolchain was updated, create a PR.
+      - name: Create Pull Request
+        if: ${{ steps.update.outputs.updated == '1' }}
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          base: main
+          # Note: Please be careful when updating the add-paths field.  We have had the snsdemo committed by accident, with a pattern that matches nothing seemingly committing everything.
+          add-paths: ./rust-toolchain.toml
+          commit-message: Update rust version
+          committer: GitHub <noreply@github.com>
+          author: gix-bot <gix-bot@users.noreply.github.com>
+          branch: bot-rust-update
+          branch-suffix: timestamp
+          delete-branch: true
+          title: "bot: Update rust version to ${{ steps.update.outputs.version }}"
+          body: |
+            # Motivation
+            A new verion of Rust is available.
+
+            # Automated changes
+            * Update Rust version.
+
+            # Manual changes
+            If manual changes are required, please make a separate PR.
+            PRs created by bots should only contain automated changes to avoid any confusion.
+      - name: Notify Slack on failure
+        # Since the this is a scheduled job, a failure won't be shown on any
+        # PR status. To notify the team, we send a message to our Slack channel on failure.
+        uses: dfinity/internet-identity/.github/actions/slack@b278eab440b6adfcb561f18fe24bdea66c1987c3 # release-2023-08-28
+        if: ${{ failure() }}
+        with:
+          WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          MESSAGE: "Rust update failed"

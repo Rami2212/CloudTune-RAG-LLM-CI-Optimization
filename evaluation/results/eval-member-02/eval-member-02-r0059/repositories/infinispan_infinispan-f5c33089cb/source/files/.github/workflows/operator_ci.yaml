@@ -1,0 +1,84 @@
+name: Operator CI
+
+on:
+  push:
+    branches:
+      - main
+      - '*.0.x'
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE*'
+      - '.gitignore'
+      - '.gitattributes'
+      - '.editorconfig'
+      - 'CODEOWNERS'
+      - 'documentation/**'
+  pull_request:
+    branches:
+      - main
+      - '*.0.x'
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE*'
+      - '.gitignore'
+      - '.gitattributes'
+      - '.editorconfig'
+      - 'CODEOWNERS'
+      - 'documentation/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  # Cancel jobs same head_branch same repo, works
+  # both for pull_request and push
+  group: >
+      ${{ github.workflow }}-${{ github.repository }}-
+      ${{ github.event.pull_request.head.ref || github.event.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+
+    outputs:
+      image: ${{ steps.infinispan.outputs.image }}
+      version: ${{ steps.infinispan.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Setup Java
+        uses: ./.github/actions/setup-java
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4
+
+      - name: Build Image
+        id: infinispan
+        run: |
+          SERVER_VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+          OPERAND_VERSION=$(echo "${SERVER_VERSION}" | cut -d '-' -f 1)
+          IMAGE="localhost:5001/server:${SERVER_VERSION}"
+
+          ./mvnw install -DskipTests -am -pl server/runtime,server/image -Pimage -Dimage.name="${IMAGE}"
+          docker save "${IMAGE}" > /tmp/operand-image.tar
+
+          echo "image=${IMAGE}" >> "${GITHUB_OUTPUT}"
+          echo "version=${OPERAND_VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: operand-image
+          path: /tmp/operand-image.tar
+
+  tests:
+    needs: image
+    uses: infinispan/infinispan-operator/.github/workflows/ci.yml@40b3c0fbec83064b4a7173fafb68d053e56fe606 # main
+    with:
+      operand: ${{ needs.image.outputs.image }}
+      operandArtifact: operand-image
+      operandVersion: ${{ needs.image.outputs.version }}
+      ref: main
+      repository: infinispan/infinispan-operator

@@ -1,0 +1,64 @@
+name: Synchronize changes to the website
+
+on:
+  push:
+    branches:
+      - 'main'
+      - '*.x'
+    paths:
+      - 'documentation/**'
+
+permissions:
+  contents: read #  to fetch code (actions/checkout)
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      with:
+        persist-credentials: false
+
+    - name: Setup Java
+      uses: ./.github/actions/setup-java
+
+    - name: Build docs with Maven
+      run: ./mvnw install -Pdistribution -pl documentation -am
+
+    - name: Clone infinispan.github.io
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      with:
+        repository: infinispan/infinispan.github.io
+        ref: master
+        path: infinispan.github.io
+        persist-credentials: false
+
+    - if: github.ref != 'refs/heads/main'
+      name: Copy docs to version
+      run: |
+        cp -r documentation/target/generated/1*/html/* infinispan.github.io/docs/${{ github.ref_name }}
+
+    - if: github.ref == 'refs/heads/main'
+      name: Copy docs to dev
+      run: |
+        cp -r documentation/target/generated/1*/html/* infinispan.github.io/docs/dev/
+
+    - name: Commit files
+      run: |
+        cd infinispan.github.io
+        git config --global user.email "infinispan@infinispan.org"
+        git config --global user.name "Infinispan"
+        git add . --all
+        git commit -m "Synchronized core docs from ${{ github.ref }}"
+
+    - name: Push to the community site
+      uses: cpina/github-action-push-to-another-repository@55306faa4ed53b815ae49e564af8cfb359d32ae2 # main
+      env:
+        API_TOKEN_GITHUB: ${{ secrets.API_TOKEN_GITHUB }}
+      with:
+        source-directory: 'infinispan.github.io'
+        destination-github-username: 'infinispan'
+        destination-repository-name: 'infinispan.github.io'
+        user-email: infinispan@infinispan.org
+        target-branch: master

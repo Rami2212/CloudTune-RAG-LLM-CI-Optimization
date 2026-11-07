@@ -1,0 +1,357 @@
+name: Unit Tests
+permissions:
+  contents: read
+on:
+  push:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+defaults:
+  run:
+    shell: bash -euxlo pipefail {0}
+jobs:
+  formatting:
+    runs-on: ubuntu-24.04
+    env:
+      DFX_NETWORK: mainnet
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Get cargo sort version
+        run: jq -r '"CARGO_SORT_VERSION=\(.defaults.build.config.CARGO_SORT_VERSION)"' config.json >> $GITHUB_ENV
+      - name: Get node version
+        run: jq -r '"NODE_VERSION=\(.volta.node)"' frontend/package.json >> $GITHUB_ENV
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Install shfmt
+        uses: ./.github/actions/install_shfmt
+      - name: Install yq
+        uses: ./.github/actions/install_yq
+      - name: Install cargo dependency sorter
+        run: cargo install cargo-sort@${{ env.CARGO_SORT_VERSION }}
+      - name: Format
+        run: ./scripts/fmt
+      - name: Check formatted
+        run: |
+          test -z "$(git status --porcelain)" || {
+                  echo "FIX: Please run ./scripts/fmt"
+                  git diff
+                  exit 1
+          }
+  relative-imports:
+    runs-on: ubuntu-24.04
+    env:
+      DFX_NETWORK: mainnet
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Checks for the presence of relative imports
+        run: ./scripts/check-relative-imports
+  spelling:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install spellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -yy hunspell hunspell-en-gb hunspell-en-us clang libclang-dev
+          cargo install --locked --target x86_64-unknown-linux-gnu cargo-spellcheck@0.13.1
+      - name: Spellcheck Rust
+        run: cargo spellcheck -- --code 1
+      - name: Spellcheck changelog
+        run: scripts/spellcheck-changelog
+  cargo-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-1
+      - name: Lint rust code
+        run: ./scripts/lint-rs
+      - name: Run Unit Tests
+        shell: bash
+        run: |
+          RUSTFLAGS="-D warnings" cargo test --lib --bins --benches --examples --all-features
+        env:
+          RUST_BACKTRACE: 1
+  vitest-shard-1-of-2:
+    runs-on: ubuntu-latest-m
+    steps:
+      - name: Checkout nns-dapp
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run vitest shard 1/2
+        uses: ./.github/actions/vitest
+        with:
+          shard_number: 1
+          shard_count: 2
+  vitest-shard-2-of-2:
+    runs-on: ubuntu-latest-m
+    steps:
+      - name: Checkout nns-dapp
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run vitest shard 2/2
+        uses: ./.github/actions/vitest
+        with:
+          shard_number: 2
+          shard_count: 2
+  svelte-lint:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    env:
+      DFX_NETWORK: mainnet
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Get node version
+        run: jq -r '"NODE_VERSION=\(.volta.node)"' frontend/package.json >> $GITHUB_ENV
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Install dependencies
+        run: npm ci
+        working-directory: ./frontend
+      - name: Prepare
+        shell: bash
+        run: npm run prepare
+        working-directory: ./frontend
+      - name: Run linter
+        run: npm run check
+        working-directory: ./frontend
+  shell-checks:
+    name: ShellCheck
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -yy shellcheck
+          ./scripts/lint-sh
+  ic-commit-consistency:
+    name: IC Commit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install didc
+        run: scripts/install-didc
+      - name: Check didc
+        run: command -v didc
+      - name: Run the ic_commit code generator for sns_aggregator
+        run: |
+          ./scripts/update_ic_commit --crate sns_aggregator --ic_commit "$(jq -re .defaults.build.config.IC_COMMIT_FOR_SNS_AGGREGATOR config.json)"
+          ./scripts/sns/aggregator/mk_nns_patch.sh
+      - name: Verify that there are no code changes
+        run: |
+          if git diff | grep . ; then
+                  echo "ERROR: The code is not consistent with the IC_COMMIT in config.json"
+                  echo "Note:  didc version: $(didc --version)"
+                  exit 1
+          fi
+  release-templating-works:
+    name: Release template
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Install didc
+        run: scripts/install-didc
+      - name: Check didc
+        run: command -v didc
+      - name: Install dfx
+        uses: dfinity/setup-dfx@e50c04f104ee4285ec010f10609483cf41e4d365 # main
+      - name: Verify template creation
+        run: |
+          echo Create a fake wasm
+          mkdir -p release/ci
+          touch release/ci/nns-dapp.wasm.gz
+          echo Create a proposal template
+          scripts/nns-dapp/release-template
+          echo Check the proposal
+          ./scripts/nns-dapp/release-check
+  config-check:
+    name: Config is as expected
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install cargo binstall
+        uses: ./.github/actions/install_binstall
+      - name: Install tools
+        run: |
+          cargo binstall --no-confirm "idl2json_cli@$(jq -r .defaults.build.config.IDL2JSON_VERSION config.json)"
+      - name: Check mainnet config
+        run: bash -x config.test
+  migration-test-utils-work:
+    name: Migration test utilities work
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install cargo binstall
+        uses: ./.github/actions/install_binstall
+      - name: Install idl2json
+        run: cargo binstall --no-confirm "idl2json_cli@$(jq -r .defaults.build.config.IDL2JSON_VERSION config.json)" && idl2json --version
+      - name: Test migration utilities
+        run: |
+          set +x
+          scripts/nns-dapp/migration-test.on-exit.test
+  minor-version-bump-works:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install yq
+        uses: ./.github/actions/install_yq
+      - name: Install sponge
+        run: sudo apt-get update -yy && sudo apt-get install -yy moreutils && command -v sponge
+      - name: Get node version
+        run: jq -r '"NODE_VERSION=\(.volta.node)"' frontend/package.json >> $GITHUB_ENV
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Bumping the package versions works
+        run: ./scripts/nns-dapp/bump-patch.test
+      - name: Set git user
+        run: |
+          git config --global user.email "gix-bot@users.noreply.github.com"
+          git config --global user.name "GIX bot"
+      - name: Command creates commits
+        run: |
+          original_commit="$(git rev-parse HEAD)"
+          git checkout .
+          ./scripts/nns-dapp/bump-patch --commit
+          num_commits="$(git log --oneline "$original_commit..HEAD" | wc -l)"
+          (( num_commits == 2 )) || {
+                  echo "Expected two commits.  Got:"
+                  git log --oneline "$original_commit..HEAD"
+                  exit 1
+          } >&2
+          # TODO: Verify that the commits contain the expected changes.
+  version-match:
+    name: The nns-dapp npm and cargo versions should match
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Backend and frontend have the same version
+        run: |
+          backend_version="$(cargo metadata | jq -r '.packages[] | select(.name == "nns-dapp").version')"
+          frontend_version="$(jq -r .version frontend/package.json)"
+          [[ "${backend_version}" == "${frontend_version}" ]] || {
+                  echo "ERROR: The nns-dapp frontend and backend should have the same version but:"
+                  echo "Backend:  $backend_version"
+                  echo "Frontend: $frontend_version"
+                  exit 1
+          } >&2
+  small-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      # download-ci-wasm.test reads the Actions API.
+      actions: read
+    env:
+      # Used by download-ci-wasm.test
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install tools on Linux
+        run: |
+          if command -v apt-get; then
+            # libarchive-zip-perl is needed for crc32, used by convert-id.test
+            sudo apt-get update -yy && sudo apt-get install -yy moreutils libarchive-zip-perl && command -v sponge
+          fi
+      - name: Install tools on Mac
+        run: |
+          if command -v brew ; then
+            # coreutils is needed for
+            #   base32, used by convert-id.test, and
+            #   sha256sum, used download-ci-wasm.test
+            # moreutils is needed for sponge, used by network-config.test
+            brew install bash coreutils moreutils
+          fi
+      - name: Install dfx
+        uses: dfinity/setup-dfx@e50c04f104ee4285ec010f10609483cf41e4d365 # main
+      - name: Install didc
+        run: |
+          scripts/install-didc
+          # `didc` is installed in $HOME/.local/bin, which is in the path by
+          # default on Linux but not on Mac.
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+      - name: Ensure required didc version
+        run: ./scripts/ensure-required-didc-version.test
+      - name: docker-build prints help
+        run: ./scripts/docker-build --help | grep -i usage
+      - name: Download NNS-dapp CI wasm
+        run: |
+          git fetch --depth=1 origin main
+          MAIN_COMMIT="$(git rev-parse origin/main)"
+          LAST_COMMIT_TIMESTAMP="$(git log -1 --format=%ct "$MAIN_COMMIT")"
+          AGE_OF_LAST_COMMIT="$(( $(date +%s) - LAST_COMMIT_TIMESTAMP ))"
+          if [[ "$AGE_OF_LAST_COMMIT" -gt "$((3 * 24 * 60 * 60))" ]]; then
+            echo "The last commit to the main branch is over 3 days old so the build artifact may have expired, which means we can't download it."
+            echo "We'll test again after the next commit."
+          else
+            scripts/nns-dapp/download-ci-wasm.test --commit "$MAIN_COMMIT"
+          fi
+      - name: Test canister_ids tool
+        run: scripts/canister_ids.test
+      - name: Test release-sop script
+        run: scripts/nns-dapp/release-sop.test
+      - name: Test split-changelog script
+        run: scripts/nns-dapp/split-changelog.test
+      - name: Find unused i18n messages
+        run: scripts/unused-i18n
+      - name: Test the ID conversion script
+        run: scripts/convert-id.test
+      - name: Test the transaction search script
+        run: scripts/find-transaction-from-timestamp.test
+      - name: Test the transaction listing script
+        run: scripts/get-transactions.test
+      - name: Getting network config works
+        run: scripts/network-config.test
+      - name: Get SNS tool
+        run: |
+          diff -w <(scripts/sns/aggregator/get-sns Phasma) <(echo -n "Name:   PHASMA
+          Symbol: PHASMA
+          Aggregator URL:         https://3r4gx-wqaaa-aaaaq-aaaia-cai.icp0.io/v1/sns/root/nb7he-piaaa-aaaaq-aadqq-cai/slow.json
+          Root canister ID:       nb7he-piaaa-aaaaq-aadqq-cai
+          Governance canister ID: ni4my-zaaaa-aaaaq-aadra-cai
+          Ledger canister ID:     np5km-uyaaa-aaaaq-aadrq-cai
+          Index canister ID:      n535v-yiaaa-aaaaq-aadsq-cai
+          Swap canister ID:       n223b-vqaaa-aaaaq-aadsa-cai
+          Transaction fee:      50
+          Minimum neuron stake: 500000
+          Proposal fee:         5000000")
+  checks-pass:
+    needs:
+      - formatting
+      - spelling
+      - cargo-tests
+      - svelte-lint
+      - vitest-shard-1-of-2
+      - vitest-shard-2-of-2
+      - shell-checks
+      - ic-commit-consistency
+      - release-templating-works
+      - config-check
+      - minor-version-bump-works
+      - migration-test-utils-work
+      - version-match
+      - small-tests
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/needs_success
+        with:
+          needs: "${{ toJson(needs) }}"

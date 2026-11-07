@@ -1,0 +1,63 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: "${{ matrix.workspace }} (Node ${{ matrix.version }}, ${{ matrix.os }})"
+    strategy:
+      fail-fast: false
+      matrix:
+        version: [22, 24, 26]
+        os: [ubuntu-24.04, windows-2025, macos-15]
+        workspace:
+          - "@ui5/builder"
+          - "@ui5/cli"
+          - "@ui5/fs"
+          - "@ui5/logger"
+          - "@ui5/project"
+          - "@ui5/server"
+    runs-on: ${{ matrix.os }}
+    steps:
+
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Setup Node.js
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: ${{ matrix.version }}
+
+    # This is needed as npm 11 has issues with running "npm ci" on projects that use "overrides"
+    - name: Install recent npm version (Node 24 only)
+      if: matrix.version == 24
+      run: npm install -g npm@11 && npm --version
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Run unit tests
+      run: npm run unit --workspace=${{ matrix.workspace }}
+
+  # Aggregator so branch protection can require a single "Tests" check
+  # instead of every matrix combination.
+  tests:
+    name: Tests
+    needs: unit
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Check matrix result
+      run: |
+        if [ "${{ needs.unit.result }}" != "success" ]; then
+          echo "Unit test matrix result: ${{ needs.unit.result }}"
+          exit 1
+        fi

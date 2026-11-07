@@ -1,0 +1,99 @@
+# Sample workflow for building and deploying a VitePress site to GitHub Pages
+name: Deploy VitePress site to gh-pages
+
+on:
+    push:
+        branches: [main]
+    workflow_dispatch:
+
+# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
+permissions:
+    contents: write
+    pages: write
+    id-token: write
+
+# Allow only one concurrent deployment, skipping runs queued between the run in-progress and latest queued.
+# However, do NOT cancel in-progress runs as we want to allow these production deployments to complete.
+concurrency:
+    group: pages
+    cancel-in-progress: false
+
+jobs:
+    # Build job
+    deploy-docs:
+        runs-on: ubuntu-24.04
+        env:
+            DOC_VERSION: v5 # The directory in gh-pages where the documentation would be deployed
+            DOC_ALIAS: next # Change this to update the alias route. Note: Check the old alias when changing this!
+            GIT_COMMITTER_NAME: "OpenUI5 Bot"
+            GIT_COMMITTER_EMAIL: "openui5@sap.com"
+            GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            REPO_NAME: ${{ github.event.repository.name }}
+        steps:
+            - name: Checkout
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  fetch-depth: 0
+                  persist-credentials: false
+            - name: Setup Node
+              uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+              with:
+                node-version: 22.22.3
+                cache: npm
+            - name: Setup Pages
+              uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+            - name: Install dependencies
+              run: npm ci
+            - name: Fetch gh-pages branch
+              run: git fetch origin gh-pages --depth=1
+            - name: generate CLI doc
+              working-directory: internal/documentation
+              run: npm run generate-cli-doc
+            - name: Download UI5 CLI packages
+              working-directory: internal/documentation
+              run: npm run download-packages
+            - name: Build jsdoc
+              working-directory: internal/documentation
+              run: npm run jsdoc-generate-gh-pages
+            - name: Build vitepress build
+              working-directory: internal/documentation
+              run: |
+                # The base output
+                npm run build:vitepress -- --base="/${REPO_NAME}/${DOC_VERSION}/"
+                npm run build:assets -- ./dist
+                # The alias output
+                npm run build:vitepress -- --base="/${REPO_NAME}/${DOC_ALIAS}/" --outDir="dist-${DOC_ALIAS}"
+                npm run build:assets -- ./dist-${DOC_ALIAS}
+            - name: Build Schema
+              working-directory: internal/documentation
+              run: npm run schema-generate-gh-pages
+            - name: Checkout gh-pages
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  ref: gh-pages
+                  path: gh-pages
+            - name: Copy the additional resources to gh-pages
+              run: |
+                  # TODO: Skip for now deployment of the schema until we do a Schema Version 5 release
+                  # rm -rf ./gh-pages/schema
+                  # cp -R internal/documentation/schema ./gh-pages/schema/
+                  rm -rf ./gh-pages/${DOC_VERSION}
+                  rm -rf ./gh-pages/${DOC_ALIAS}
+
+                  # Main version route
+                  cp -R internal/documentation/dist ./gh-pages/${DOC_VERSION}/
+
+                  # Alias route. E.g., next, latest, stable, etc.
+                  # For vitepress must be a copy with different config, not a symlink
+                  cp -R internal/documentation/dist-${DOC_ALIAS} ./gh-pages/${DOC_ALIAS}/
+
+                  # Custom 404 page
+                  cp internal/documentation/scripts/resources/custom404.html ./gh-pages/404.html
+            - name: Publish Docs
+              run: |
+                  cd ./gh-pages
+                  git config --local user.email $GIT_COMMITTER_EMAIL
+                  git config --local user.name $GIT_COMMITTER_NAME
+                  git add .
+                  git commit -m "Updating supplemental resources for ${DOC_VERSION} documentation deployment"
+                  git push

@@ -1,0 +1,123 @@
+name: Check spec vectors
+
+# Replays the consensus-specs reference test vectors through the state
+# transition.
+#
+# On changes to the state transition and to the chain spec it reads, the
+# vectors of the release the state transition was updated to (SpecVersion in
+# indexer/beacon/statetransition) are replayed, so a failure there is a
+# divergence from the specs the package claims to implement.
+#
+# On schedule, the vectors of the newest release are replayed instead, so a
+# failure there is a spec change to catch up with. Both results are shown as
+# badges in indexer/beacon/statetransition/README.md - the badge of a workflow
+# can be filtered by the event that triggered the run.
+
+on:
+  pull_request:
+    branches: [ "master" ]
+    paths:
+      - 'indexer/beacon/statetransition/**'
+      - 'clients/consensus/chainspec.go'
+      - 'clients/consensus/chainstate.go'
+      - '.github/scripts/fetch-spec-tests.sh'
+      - '.github/workflows/test-spec-vectors.yml'
+  push:
+    branches: [ "master" ]
+    paths:
+      - 'indexer/beacon/statetransition/**'
+      - 'clients/consensus/chainspec.go'
+      - 'clients/consensus/chainstate.go'
+      - '.github/scripts/fetch-spec-tests.sh'
+      - '.github/workflows/test-spec-vectors.yml'
+  schedule:
+    # Spec releases are cut every week or two.
+    - cron: '30 5 * * 1,4'
+  workflow_dispatch:
+    inputs:
+      spec_version:
+        description: 'consensus-specs release to take the vectors from: pinned, latest or a tag'
+        required: false
+        default: 'pinned'
+        type: string
+      preset:
+        description: 'Preset to run'
+        required: false
+        default: 'minimal'
+        type: choice
+        options:
+          - minimal
+          - mainnet
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'schedule' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  spec_vectors:
+    name: "Replay the consensus-specs vectors"
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Set up go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: 1.26.x
+        check-latest: true
+
+    # The release has to be resolved before the cache step, which keys on it.
+    - name: Resolve the spec release
+      id: params
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        preset="${{ inputs.preset }}"
+        if [ -z "$preset" ]; then preset="minimal"; fi
+
+        version="${{ inputs.spec_version }}"
+        if [ -z "$version" ]; then
+          if [ "${{ github.event_name }}" = "schedule" ]; then version="latest"; else version="pinned"; fi
+        fi
+        case "$version" in
+          pinned) version="$(./.github/scripts/fetch-spec-tests.sh --pinned-version "$preset")" ;;
+          latest) version="$(./.github/scripts/fetch-spec-tests.sh --latest-version "$preset")" ;;
+        esac
+
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+        echo "preset=$preset" >> "$GITHUB_OUTPUT"
+        echo "Running the $preset vectors of $version"
+        echo "### Spec vectors: $version ($preset)" >> "$GITHUB_STEP_SUMMARY"
+
+    # The vector tarballs are hundreds of megabytes and a release never changes,
+    # so the extracted tree is cached per release and preset.
+    - name: Cache spec vectors
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: .spec-tests/${{ steps.params.outputs.version }}
+        key: spec-tests-${{ steps.params.outputs.version }}-${{ steps.params.outputs.preset }}
+
+    - name: Fetch spec vectors
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      run: ./.github/scripts/fetch-spec-tests.sh "${{ steps.params.outputs.version }}" "${{ steps.params.outputs.preset }}"
+
+    - name: Prepare test environment
+      run: mkdir -p ui-package/dist && touch ui-package/dist/dummy
+
+    - name: Replay the vectors
+      env:
+        # go test runs a package with its own directory as the working directory,
+        # so this has to be absolute.
+        SPEC_TESTS_DIR: ${{ github.workspace }}/.spec-tests/${{ steps.params.outputs.version }}
+        SPEC_TESTS_PRESET: ${{ steps.params.outputs.preset }}
+      run: |
+        set -o pipefail
+        status=0
+        go test -vet=off -timeout 60m ./indexer/beacon/statetransition/ -run TestSpecVectors -v 2>&1 | tee spec-vectors.log || status=$?
+        # The totals line names what the run covered, also when it failed.
+        grep -E 'spec vectors: [0-9]+ passed' spec-vectors.log | sed 's/^ *[a-z_]*\.go:[0-9]*: //' >> "$GITHUB_STEP_SUMMARY" || true
+        exit $status

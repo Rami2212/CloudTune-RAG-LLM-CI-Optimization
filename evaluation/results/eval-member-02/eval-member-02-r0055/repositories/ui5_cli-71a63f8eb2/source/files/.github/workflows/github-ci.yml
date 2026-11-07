@@ -1,0 +1,87 @@
+name: GitHub CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+
+  test:
+    name: General checks and tests
+    runs-on: ubuntu-24.04
+    steps:
+
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 0
+
+    - name: Use Node.js LTS 22
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: 22
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Check Node.js engine compatibility
+      run: npm run check-engine
+
+    - name: Check package.json workspace consistency
+      run: npm run check-workspaces
+
+    - name: Perform ESLint check
+      run: npm run lint
+
+    - name: Validate current commit (last commit) with commitlint
+      if: github.event_name == 'push'
+      run: npm run lint:commit -- --last --verbose
+
+    - name: Validate PR commits with commitlint
+      if: github.event_name == 'pull_request'
+      run: npm run lint:commit -- --from ${{ github.event.pull_request.base.sha }} --to ${{ github.event.pull_request.head.sha }} --verbose
+
+    - name: Perform Licenses check
+      run: npm run check-licenses
+
+    - name: Perform dependency check
+      run: npm run knip
+
+    - name: Run unit tests
+      run: npm run coverage
+
+    - name: Generate JSDoc documentation (workspace)
+      working-directory: internal/documentation
+      run: npm run jsdoc-generate
+
+    - name: Generate merged JSON schema (workspace)
+      working-directory: internal/documentation
+      run: npm run schema-generate
+
+    - name: Download UI5 CLI packages
+      working-directory: internal/documentation
+      run: npm run download-packages
+
+    - name: Generate JSDoc documentation (gh-pages)
+      working-directory: internal/documentation
+      run: npm run jsdoc-generate-gh-pages
+
+    - name: Generate merged JSON schema (gh-pages)
+      working-directory: internal/documentation
+      run: npm run schema-generate-gh-pages
+
+    - name: Generate CLI documentation
+      working-directory: internal/documentation
+      run: npm run generate-cli-doc
+
+    - name: Vitepress build
+      working-directory: internal/documentation
+      run: |
+        npm run build:vitepress
+        npm run build:assets

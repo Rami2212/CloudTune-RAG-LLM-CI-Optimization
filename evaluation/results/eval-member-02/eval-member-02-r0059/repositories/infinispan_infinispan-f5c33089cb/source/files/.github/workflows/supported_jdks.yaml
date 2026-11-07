@@ -1,0 +1,76 @@
+name: JDK Compatibility
+
+on:
+  push:
+    branches:
+      - main
+      - '*.*.x'
+
+  pull_request:
+    branches:
+      - main
+      - '*.*.x'
+
+permissions:
+  contents: read
+
+concurrency:
+  # Cancel jobs same head_branch same repo, works
+  # both for pull_request and push
+  group: >
+      ${{ github.workflow }}-${{ github.repository }}-
+      ${{ github.event.pull_request.head.ref || github.event.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  resolve-ea-jdk:
+    name: Resolve latest EA JDK
+    runs-on: ubuntu-latest
+    outputs:
+      ea-version: ${{ steps.resolve.outputs.ea-version }}
+    steps:
+      - name: Query Adoptium API for latest EA version
+        id: resolve
+        run: |
+          RELEASES=$(curl -s https://api.adoptium.net/v3/info/available_releases)
+          LATEST_GA=$(echo "$RELEASES" | jq '.most_recent_feature_release')
+          LATEST_VERSION=$(echo "$RELEASES" | jq '.most_recent_feature_version')
+
+          if [ "$LATEST_VERSION" -gt "$LATEST_GA" ]; then
+            echo "ea-version=${LATEST_VERSION}-ea" >> "$GITHUB_OUTPUT"
+            echo "Latest EA JDK: ${LATEST_VERSION}-ea"
+          else
+            echo "No EA version available (latest GA: $LATEST_GA)"
+            echo "ea-version=" >> "$GITHUB_OUTPUT"
+          fi
+
+  jdk-build:
+    needs: resolve-ea-jdk
+    if: needs.resolve-ea-jdk.outputs.ea-version != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Setup Java
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          java-version: ${{ needs.resolve-ea-jdk.outputs.ea-version }}
+          distribution: 'temurin'
+
+      - name: Build Infinispan
+        run: ./mvnw -B install -DskipTests
+
+  jdk-build-summary:
+    name: JDK Build Summary
+    runs-on: ubuntu-latest
+    needs: jdk-build
+    if: always()
+    steps:
+      - name: Check all matrix jobs
+        run: |
+          echo "Test job result: ${{ needs.jdk-build.result }}"
+          if [[ "${{ needs.jdk-build.result }}" != "success" && "${{ needs.jdk-build.result }}" != "skipped" ]]; then
+            echo "JDK EA build failed"
+            exit 1
+          fi
+          echo "JDK EA build passed successfully"

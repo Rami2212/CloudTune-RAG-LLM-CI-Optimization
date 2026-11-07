@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
+# SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
+
+---
+# tests for arrow_flight crate
+name: arrow_flight
+
+# Triggered by ci.yml, which owns event routing and concurrency.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-test:
+    name: Test
+    runs-on: ubuntu-latest
+    container:
+      image: amd64/rust
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          submodules: true
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-builder
+      - name: Test
+        run: |
+          cargo test -p arrow-flight
+      - name: Test --all-features
+        run: |
+          cargo test -p arrow-flight --all-features
+      - name: Test --examples
+        run: |
+          cargo test -p arrow-flight  --features=flight-sql,tls-ring --examples
+
+  vendor:
+    name: Verify Vendored Code
+    runs-on: ubuntu-latest
+    container:
+      image: amd64/rust
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-builder
+      - name: Run gen
+        run: ./arrow-flight/regen.sh
+      - name: Verify workspace clean (if this fails, run ./arrow-flight/regen.sh and check in results)
+        run: git diff --exit-code
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    container:
+      image: amd64/rust
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-builder
+      - name: Setup Clippy
+        run: rustup component add clippy
+      - name: Run clippy
+        run: cargo clippy -p arrow-flight --all-targets --all-features -- -D warnings

@@ -1,0 +1,56 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [MEDIUM] Switch "build-windows" from Windows to ubuntu runner
+# Estimated savings: ~0 min/run
+#
+name: Run regression tests in TeX Live
+
+on: [push, pull_request]
+
+jobs:
+  build-ubuntu:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install TeX Live
+      uses: TeX-Live/setup-texlive-action@v4
+      with:
+        package-file: .github/workflows/texlive-package.txt
+        packages: ppmcheckpdf
+        update-all-packages: true
+    - name: Test tabularray with l3build
+      run: |
+        l3build check --debug --halt-on-error --show-log-on-error
+    - name: Install pdftoppm
+      run: |
+        sudo apt-get update
+        sudo apt-get install poppler-utils
+    - name: Test tabularray with ppmcheckpdf
+      run: |
+        ppmcheckpdf check
+  build-windows:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install TeX Live
+      uses: TeX-Live/setup-texlive-action@v4
+      with:
+        package-file: .github/workflows/texlive-package.txt
+        packages: ppmcheckpdf
+        update-all-packages: true
+    - name: Test tabularray with l3build
+      run: |
+        l3build check --debug --halt-on-error --show-log-on-error
+    - name: Install pdftoppm
+      run: |
+        tlmgr install wintools.windows
+    - name: Test tabularray with ppmcheckpdf
+      run: |
+        ppmcheckpdf check
+    - name: Upload png and md5
+      uses: actions/upload-artifact@v7
+      with:
+        name: png-and-md5
+        path: |
+          testfiles/*.png
+          testfiles/*.md5

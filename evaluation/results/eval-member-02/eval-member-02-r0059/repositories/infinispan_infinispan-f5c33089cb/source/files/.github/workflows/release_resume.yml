@@ -1,0 +1,154 @@
+name: Resume Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "The Infinispan branch to checkout when cutting the release."
+        required: true
+        default: "main"
+      version:
+        description: "Release version"
+        required: true
+      type:
+        type: choice
+        description: The type of release
+        required: true
+        default: "default"
+        options:
+          - default
+          - latest
+          - prerelease
+
+permissions:
+  contents: read
+
+jobs:
+  published:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: GOSCHEN/http-status-code@944938ed534b092b9f7e1e5c6b08c5d9bbc35162 # v1.1.0
+        with:
+          url: https://repo1.maven.org/maven2/org/infinispan/infinispan-distribution/${{ inputs.version }}/infinispan-distribution-${{ inputs.version }}.pom
+          code: 200
+          timeout: 10800000
+          interval: 1200
+
+  native-cli:
+    needs: published
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, macos-15-intel, windows-2022, ubuntu-24.04-arm]
+        include:
+          - os: ubuntu-latest
+            asset_name: linux-x86_64
+            gu_binary: gu
+          - os: macos-latest
+            asset_name: osx-aarch_64
+            gu_binary: gu
+          - os: macos-15-intel
+            asset_name: osx-x86_64
+            gu_binary: gu
+          - os: windows-2022
+            asset_name: windows-x86_64
+            gu_binary: gu.cmd
+          - os: ubuntu-24.04-arm
+            asset_name: linux-aarch_64
+            gu_binary: gu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - if: ${{ matrix.os == 'windows-2022' }}
+        name: Add msbuild to PATH
+        uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57 # v3.0.0
+
+      - uses: graalvm/setup-graalvm@f70bc8032f90a104502824a54bcb94b6f01715bc # v1
+        with:
+          version: '25.0'
+          distribution: 'graalvm'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout Release Tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          ref: ${{ github.event.inputs.version }}
+
+      - name: Detect CLI module path
+        id: detect-cli
+        shell: bash
+        run: |
+          if [ -f graalvm/cli/pom.xml ]; then
+            echo "module=graalvm/cli" >> $GITHUB_OUTPUT
+          else
+            echo "module=quarkus/cli" >> $GITHUB_OUTPUT
+          fi
+
+      - if: ${{ matrix.os == 'windows-2022' }}
+        name: Build native executable
+        run: |
+          call "C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x86_amd64
+          mvnw.cmd package -Pdistribution -Pwindows -Pnative -am -pl ${{ steps.detect-cli.outputs.module }}
+        shell: cmd
+
+      - if: ${{ matrix.os != 'windows-2022' }}
+        name: Build native executable
+        run: ./mvnw package -Pdistribution -Pnative -am -pl ${{ steps.detect-cli.outputs.module }}
+
+      - name: Upload CLI native executable
+        id: upload-cli-native-executable
+        run: |
+          gh release upload ${{ github.event.inputs.version }} ${{ steps.detect-cli.outputs.module }}/target/infinispan-cli-${{ github.event.inputs.version }}-${{ matrix.asset_name }}.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.INFINISPAN_RELEASE_TOKEN }}
+
+  images:
+    needs: published
+    uses: ./.github/workflows/release_image.yml
+    secrets: inherit
+    with:
+      branch: ${{ inputs.branch }}
+      version: ${{ inputs.version }}
+      type: ${{ inputs.type }}
+
+  operator:
+    needs: images
+    if: contains(github.event.inputs.version, '.Final')
+    uses: infinispan/infinispan-operator/.github/workflows/add_operand.yml@40b3c0fbec83064b4a7173fafb68d053e56fe606 # main
+    secrets: inherit
+    with:
+      image: quay.io/infinispan/server:${{ github.ref_name }}
+      ref: main
+      repository: infinispan/infinispan-operator
+
+  update-website:
+    needs: [published, native-cli]
+    if: always() && needs.published.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update website release data
+        uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4
+        with:
+          token: ${{ secrets.API_TOKEN_GITHUB }}
+          repository: infinispan/infinispan.github.io
+          event-type: release_updated
+          client-payload: '{"project": "infinispan", "version": "${{ inputs.version }}"}'
+
+  update-org-vars:
+    needs: published
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+        id: app-token
+        with:
+            client-id: ${{ secrets.GH_APP_ISPN_ID }}
+            private-key: ${{ secrets.GH_APP_ISPN_KEY }}
+
+      - name: Update GitHub Organization Variable to next release version
+        if: ${{ !contains(inputs.version, '.Dev') }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh variable set "RELEASE_$(echo '${{ inputs.version }}' | cut -f 1-2 -d '.' | tr . _)_VERSION" -b "$(echo ${{ inputs.version }} | cut -f 1 -d '-')" --org infinispan --visibility all;

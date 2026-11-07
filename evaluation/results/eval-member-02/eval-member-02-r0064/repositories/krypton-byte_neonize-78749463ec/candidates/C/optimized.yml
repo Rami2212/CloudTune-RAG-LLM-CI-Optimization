@@ -1,0 +1,114 @@
+name: Automated Maintenance
+
+# Weekly automated dependency & proto updates delivered as reviewable PRs.
+#
+# - Commit messages use conventional "chore(...)"/"build(...)" prefixes so
+#   Python Semantic Release never treats these PRs as releasable.
+# - Every job is gated by a real build; formatting churn is intentionally NOT
+#   applied here (formatting belongs to local hooks + CI checks).
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * 1" # every Monday 00:00 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  golang-deps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: goneonize/go.mod
+          cache-dependency-path: goneonize/go.sum
+      - name: Update Go dependencies
+        run: |
+          cd goneonize
+          go get -u ./...
+          go mod tidy
+      - name: Verify build still passes
+        run: |
+          cd goneonize
+          go build ./...
+          go vet ./...
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v8.1.1
+        with:
+          base: dev
+          commit-message: "build(deps): update goneonize golang dependencies"
+          branch: chore/golang-deps
+          delete-branch: true
+          title: "build(deps): update goneonize golang dependencies"
+          body: |
+            Automated weekly update of goneonize Go dependencies.
+
+            - `go get -u ./...` + `go mod tidy`
+            - Verified with `go build ./...` and `go vet ./...`
+
+            > Merging this PR will **not** trigger a release (`build(...)` commits
+            > are ignored by Python Semantic Release). The next release that
+            > touches `goneonize/` will embed the updated dependencies.
+          labels: |
+            dependencies
+            goneonize
+            automated pr
+          assignees: krypton-byte
+
+  whatsmeow-proto:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '^1.26'
+          cache-dependency-path: goneonize/go.sum
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "34.1"
+          repo-token: ${{ secrets.PAT }}
+      - run: go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.12
+      - uses: astral-sh/setup-uv@v10
+      - name: Cache uv dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-uv-${{ hashFiles('uv.lock', 'pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-
+      - name: Sync proto definitions from whatsmeow main
+        run: |
+          uv sync --dev
+          export PATH="$HOME/go/bin:$PATH"
+          uv run task proto
+          uv run task build proto
+      - name: Verify build still passes
+        run: cd goneonize && go build ./...
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v8.1.1
+        with:
+          base: dev
+          commit-message: "chore(proto): sync whatsapp proto definitions from whatsmeow main"
+          branch: chore/whatsmeow-proto
+          delete-branch: true
+          title: "chore(proto): sync whatsapp proto definitions from whatsmeow main"
+          body: |
+            Automated weekly sync of WhatsApp protocol definitions from
+            [whatsmeow/main](https://github.com/tulir/whatsmeow/tree/main/proto).
+
+            - Regenerated via `uv run task proto && uv run task build proto`
+            - Verified with `go build ./...`
+
+            > Merging this PR will **not** trigger a release. Proto changes mark
+            > `goneonize/` as changed, so the next release will rebuild the
+            > shared libraries automatically.
+          labels: |
+            proto
+            whatsmeow
+            goneonize
+            automated pr
+          assignees: krypton-byte

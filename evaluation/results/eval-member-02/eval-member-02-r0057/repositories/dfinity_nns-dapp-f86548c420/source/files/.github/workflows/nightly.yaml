@@ -1,0 +1,63 @@
+name: Nightly Publication
+permissions:
+  contents: read
+on:
+  schedule:
+    - cron: "10 * * * *"
+  push:
+    branches:
+      # Commit to the nightly branch and push to test.
+      - nightly
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  tag-main:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Preflight checks
+        id: preflight
+        run: |
+          tag_name="$(date +nightly-%Y-%m-%d)"
+          echo "tag_name=${tag_name}" >> "$GITHUB_OUTPUT"
+          if gh release view "${tag_name}"
+          then echo "Skipping as the release already exists"
+          elif git tag --points-at HEAD | grep -E '\<nightly-'
+          then echo "Skipping as there is already a nightly tag on commit $(git rev-parse HEAD)"
+          else echo "need_release=true" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Build nns-dapp repo
+        if: steps.preflight.outputs.need_release == 'true'
+        uses: ./.github/actions/build_nns_dapp
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tag commit
+        if: steps.preflight.outputs.need_release == 'true'
+        id: tag
+        run: |
+          git tag "${{steps.preflight.outputs.tag_name}}"
+          if git push origin "refs/tags/${{steps.preflight.outputs.tag_name}}"
+          then echo "success=true" >> "$GITHUB_OUTPUT"
+          else echo "Abort: Failed to push tag '${{steps.preflight.outputs.tag_name}}'.  It probably already exists, possibly on a different commit."
+          fi
+      - name: Release
+        if: (steps.preflight.outputs.need_release == 'true') && (steps.tag.outputs.success == 'true')
+        uses: ./.github/actions/release_nns_dapp
+        with:
+          assets_dir: 'out'
+          token: ${{ secrets.GITHUB_TOKEN }}
+  nightly-passes:
+    needs: ["tag-main"]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/needs_success
+        with:
+          needs: '${{ toJson(needs) }}'
