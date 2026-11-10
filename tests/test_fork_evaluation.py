@@ -235,6 +235,22 @@ class HostedProtocolTests(unittest.TestCase):
                                          source.split(b"jobs:", 1)[1])
                         self.assertEqual(ensure_dispatch(result), result)
 
+    def test_dispatch_harness_preserves_comments_and_blank_lines_after_on(self):
+        for newline in ("\n", "\r\n"):
+            for prefix in ("  # Trigger on push\n", "\n  # Trigger on push\n  \n"):
+                with self.subTest(newline=repr(newline), prefix=prefix):
+                    source = ("name: CI\non:\n" + prefix +
+                              "  push:\n    branches: [master]\n"
+                              "  pull_request:\njobs:\n  test:\n"
+                              "    runs-on: ubuntu-latest\n"
+                              "    steps:\n      - run: echo ok\n").replace("\n", newline).encode()
+                    expected = source.replace(b"on:" + newline.encode(),
+                                              b"on:" + newline.encode() +
+                                              b"  workflow_dispatch:" + newline.encode(), 1)
+                    self.assertEqual(ensure_dispatch(source), expected)
+                    self.assertEqual(ensure_dispatch(expected), expected)
+
+
     def test_github_no_job_start_is_platform_inconclusive(self):
         github = FakeRunnerGitHub()
         github.all = lambda path, key: []

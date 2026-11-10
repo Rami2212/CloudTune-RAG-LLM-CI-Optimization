@@ -214,7 +214,9 @@ def ensure_dispatch(raw: bytes) -> bytes:
         raise ValueError("Workflow has no safe plain on: mapping for dispatch harness")
     match = matches[0]
     first = text[match.end():]
-    child = re.match(r"(\r?\n)( +)[A-Za-z_]", first)
+    # Comments and blank lines may precede the first event. Infer indentation
+    # from that event, preserving the original text when adding our trigger.
+    child = re.match(r"(\r?\n)(?:[ \t]*(?:#[^\r\n]*)?\r?\n)*( +)[A-Za-z_]", first)
     if not child:
         raise ValueError("Workflow on: block is not an ordinary mapping")
     amended = (text[:match.end()] + child[1] + child[2] + "workflow_dispatch:" +
