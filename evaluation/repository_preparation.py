@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import csv
 import hashlib
+from http.client import IncompleteRead
 import json
 import os
 import re
@@ -219,7 +220,7 @@ class GitHubReader:
                     raise PreparationError(f"GitHub API HTTP {error.code}: {api_path}", "api_error") from error
                 last_error = error
                 error.close()
-            except (urllib.error.URLError, TimeoutError) as error:
+            except (urllib.error.URLError, TimeoutError, IncompleteRead) as error:
                 if attempt == 2:
                     raise PreparationError(f"GitHub API connection failed for {api_path}", "api_error") from error
                 last_error = error
