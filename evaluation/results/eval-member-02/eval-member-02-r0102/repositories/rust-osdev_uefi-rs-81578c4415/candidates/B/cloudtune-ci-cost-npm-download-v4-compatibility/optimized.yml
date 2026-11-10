@@ -1,0 +1,215 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 4 optimizations:
+# - [HIGH] Add cargo dependency cache to "build_msrv" job
+# - [HIGH] Add cargo dependency cache to "build_msrv_raw" job
+# - [HIGH] Add cargo dependency cache to "build_standard_uefi_binary" job
+# - [MEDIUM] Switch "test_x86_64_windows" from Windows to ubuntu runner
+# Estimated savings: ~24 min/run
+#
+name: Rust
+on:
+  merge_group:
+  push:
+    branches:
+      - main
+      - version-*
+  pull_request:
+    branches:
+      - main
+      - version-*
+  schedule:
+    - cron: '0 0 * * 0-6'
+env:
+  RUSTFLAGS: -D warnings
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  test_aarch64:
+    name: Integration Test (AArch64)
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - name: Install qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install qemu-system-arm -y
+      - name: Run VM tests
+        run: cargo xtask run --target aarch64 --headless --ci
+        timeout-minutes: 4
+  test_x86_64:
+    name: Integration Test (x86_64)
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - name: Install qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install qemu-system-x86 swtpm -y
+      - name: Run VM tests
+        run: cargo xtask run --target x86_64 --headless --ci --tpm=v1
+        timeout-minutes: 4
+  test_ia32:
+    name: Integration Test (IA-32)
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - name: Install qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install qemu-system-x86 swtpm -y
+      - name: Run VM tests
+        run: cargo xtask run --target ia32 --headless --ci --tpm=v2
+        timeout-minutes: 4
+  # Ensure that developers can build and use this crate on Windows.
+  test_x86_64_windows:
+    name: Integration Test (x86_64 Windows)
+    runs-on: windows-latest
+    steps:
+      - name: Install QEMU
+        run: choco install qemu --version 2026.5.1 --no-progress --no-color
+      - name: Checkout sources
+        uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - name: Run VM tests
+        run: cargo xtask run --target x86_64 --headless --ci
+        timeout-minutes: 10
+  test:
+    name: Unit + Doc Tests
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - name: Run cargo test (without unstable)
+        run: cargo xtask test
+  # Run the build with our current stable MSRV (specified in
+  # ./msrv_toolchain.toml). This serves to check that we don't
+  # accidentally start relying on a new feature without intending
+  # to. Having a test for this makes it easier for us to be intentional
+  # about making changes that require a newer version.
+  build_msrv:
+    name: Build (stable MSRV)
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+      - name: Set toolchain
+        run: |
+          # Extract the MSRV using cargo.
+          msrv=$(cargo metadata --no-deps --format-version=1 | jq --raw-output '.packages[] | select(.name == "uefi") | .rust_version')
+          echo "MSRV: ${msrv}"
+          # Set the MSRV in the toolchain config.
+          sed -i "s:stable:${msrv}:" rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        # Build uefi-test-runner since its dependency tree includes all the
+        # library packages. Note that xtask isn't used or built here; since it's
+        # just a dev tool we don't care about the MSRV for that package.
+        run: |
+          cargo --version
+          cargo build --target x86_64-unknown-uefi -p uefi-test-runner
+  # The uefi-raw crate has its own MSRV. Check that the crate builds correctly
+  # with that version of the toolchain.
+  build_msrv_raw:
+    name: Build (uefi-raw MSRV)
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+      - name: Set toolchain
+        run: |
+          # Extract the MSRV using cargo.
+          msrv=$(cargo metadata --no-deps --format-version=1 | jq --raw-output '.packages[] | select(.name == "uefi-raw") | .rust_version')
+          echo "MSRV: ${msrv}"
+          # Set the MSRV in the toolchain config.
+          sed -i "s:stable:${msrv}:" rust-toolchain.toml
+      - name: Build
+        run: |
+          cargo --version
+          cargo build -p uefi-raw
+  # This job requires the nightly channel, but keep it as a separate job from
+  # `nightly_channel` because it takes a while to run.
+  build_feature_permutations:
+    name: Build (feature permutations)
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+      - name: Set nightly toolchain so that `unstable` can be included
+        run: cp .github/workflows/nightly_toolchain.toml rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo xtask build --feature-permutations
+  # Nightly + unstable feature
+  nightly_channel:
+    name: Nightly (build, test, doc)
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+      - name: Install qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install qemu-system-x86 -y
+      - name: Enable nightly toolchain
+        run: cp .github/workflows/nightly_toolchain.toml rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Run VM tests with the `unstable` feature
+        run: cargo xtask run --target x86_64 --headless --ci --unstable
+        timeout-minutes: 4
+      - name: Run cargo doc with the `unstable` feature
+        run: cargo xtask doc --warnings-as-errors --document-private-items --unstable
+      - name: Run test with the `unstable` feature
+        # Skip testing uefi-macros on nightly because the tests that check the
+        # compiler error output produce different output on stable vs nightly.
+        run: cargo xtask test --unstable --skip-macro-tests
+  miri:
+    name: Unit + Doc Tests (Miri)
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+      - name: Enable nightly toolchain
+        run: cp .github/workflows/nightly_toolchain.toml rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Run unit tests and doctests under Miri
+        run: |
+          rustup component add miri
+          cargo xtask miri
+  # Builds a Rust standard binary using the `std` impl for UEFI, rather than
+  # creating a `no_std` + `no_main` binary.
+  build_standard_uefi_binary:
+    name: Build Standard Binary (nightly)
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+      - name: Set toolchain
+        run: cp .github/workflows/nightly_toolchain.toml rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --target x86_64-unknown-uefi --verbose -p uefi-std-example
+  coverage:
+    name: Test Coverage
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Generate code coverage
+        run: cargo xtask cov --lcov
+      - name: Upload code coverage
+        uses: codecov/codecov-action@v7.1.1
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        with:
+          files: target/lcov

@@ -1,0 +1,105 @@
+import org.apache.tools.ant.filters.*
+
+buildscript { scriptHandler ->
+    apply from: rootProject.file('buildSrc/shared.gradle'), to: scriptHandler
+}
+
+plugins {
+    alias(libs.plugins.jmh)
+    id 'jacoco'
+}
+
+dependencies {
+    implementation libs.slf4j
+    implementation libs.slf4j.simple
+    implementation libs.jctools
+    implementation libs.asm
+    implementation libs.asm.util
+
+    jmh libs.jmh
+    jmh libs.jmh.annprocess
+
+    testImplementation platform(libs.junit)
+    testImplementation libs.junit.jupiter
+}
+
+jmh {
+    warmupIterations = 3
+    iterations = 5
+    fork = 2
+    threads = 1
+    timeUnit = 'ms'
+    def jmhIncludeProp = project.findProperty('jmhInclude')
+    includes = jmhIncludeProp ? [jmhIncludeProp] : ['.*BinaryProtocol.*']
+    benchmarkMode = ['avgt', 'thrpt']
+}
+
+processResources {
+    filter ReplaceTokens, tokens: [
+        "btrace.version": project.version,
+        "hash"          : getGitCommit()
+    ]
+}
+
+jacoco {
+    toolVersion = "0.8.16"
+}
+
+jacocoTestReport {
+    dependsOn test
+    reports {
+        xml.required = true
+        html.required = true
+        csv.required = false
+    }
+
+    // Focus on v2 protocol package
+    afterEvaluate {
+        classDirectories.setFrom(files(classDirectories.files.collect {
+            fileTree(dir: it, include: [
+                '**/io/btrace/core/comm/**/*.class'
+            ])
+        }))
+    }
+}
+
+def testJavaVersion = project.findProperty('testJavaVersion')
+if (testJavaVersion) {
+    // Gradle itself requires JVM 17+ to run, but this project still wants to verify
+    // wire protocol compatibility against older JDKs. Compile and run the test sources
+    // with the requested toolchain instead of the JVM hosting the Gradle daemon.
+    compileTestJava {
+        javaCompiler = javaToolchains.compilerFor {
+            languageVersion = JavaLanguageVersion.of(testJavaVersion as int)
+        }
+    }
+    if ((testJavaVersion as int) < 17) {
+        // junit-jupiter 6.x requires JDK 17+ to resolve/compile against; downgrade to the
+        // last JDK 8-compatible release for pre-17 toolchain runs. The testImplementation
+        // platform(libs.junit) BOM above pins every org.junit.jupiter/org.junit.platform
+        // artifact (including transitive ones like junit-platform-commons) to 6.x, so a
+        // blanket eachDependency rule is needed rather than forcing individual coordinates.
+        def downgradeJunit5 = {
+            resolutionStrategy.eachDependency { details ->
+                if (details.requested.group == 'org.junit.jupiter') {
+                    details.useVersion '5.14.4'
+                } else if (details.requested.group == 'org.junit.platform') {
+                    details.useVersion '1.14.4'
+                }
+            }
+        }
+        configurations.testCompileClasspath(downgradeJunit5)
+        configurations.testRuntimeClasspath(downgradeJunit5)
+    }
+}
+
+test {
+    useJUnitPlatform()
+    finalizedBy jacocoTestReport
+
+    if (testJavaVersion) {
+        javaLauncher = javaToolchains.launcherFor {
+            languageVersion = JavaLanguageVersion.of(testJavaVersion as int)
+        }
+    }
+}

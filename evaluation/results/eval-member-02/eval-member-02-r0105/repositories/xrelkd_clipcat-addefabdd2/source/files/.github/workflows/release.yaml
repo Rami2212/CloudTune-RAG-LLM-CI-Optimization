@@ -1,0 +1,104 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - hotfix/*
+      - release/*
+    tags:
+      - "v*"
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  MAINTAINER: "xrelkd <46590321+xrelkd@users.noreply.github.com>"
+  PACKAGE_NAME: "clipcat"
+  PACKAGE_DESCRIPTION: "Clipboard manager written in Rust Programming Language"
+  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y --fix-missing --no-install-recommends musl-tools protobuf-compiler libprotobuf-dev
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v23
+
+      - name: Build release assets
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          nix build .#tarball-x86_64 --no-link
+          nix build .#tarball-aarch64 --no-link
+          nix build .#deb-x86_64 --no-link
+          nix build .#deb-aarch64 --no-link
+          nix build .#rpm-x86_64 --no-link
+          nix build .#rpm-aarch64 --no-link
+          nix build .#apk-x86_64 --no-link
+          nix build .#apk-aarch64 --no-link
+
+      - name: Build tarballs (non-tag)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          nix build .#tarball-x86_64 --no-link
+          nix build .#tarball-aarch64 --no-link
+
+      - name: Collect release assets
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          mkdir -p dist
+
+          TARBALL_X86=$(nix build .#tarball-x86_64 --no-link --print-out-paths)
+          cp "$TARBALL_X86"/*.tar.gz dist/
+
+          TARBALL_A64=$(nix build .#tarball-aarch64 --no-link --print-out-paths)
+          cp "$TARBALL_A64"/*.tar.gz dist/
+
+          DEB_X86=$(nix build .#deb-x86_64 --no-link --print-out-paths)
+          cp "$DEB_X86"/*.deb dist/
+
+          DEB_A64=$(nix build .#deb-aarch64 --no-link --print-out-paths)
+          cp "$DEB_A64"/*.deb dist/
+
+          RPM_X86=$(nix build .#rpm-x86_64 --no-link --print-out-paths)
+          cp "$RPM_X86"/*.rpm dist/
+
+          RPM_A64=$(nix build .#rpm-aarch64 --no-link --print-out-paths)
+          cp "$RPM_A64"/*.rpm dist/
+
+          APK_X86=$(nix build .#apk-x86_64 --no-link --print-out-paths)
+          cp "$APK_X86"/*.apk dist/
+
+          APK_A64=$(nix build .#apk-aarch64 --no-link --print-out-paths)
+          cp "$APK_A64"/*.apk dist/
+
+      - name: Collect tarballs (non-tag)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          mkdir -p dist
+
+          TARBALL_X86=$(nix build .#tarball-x86_64 --no-link --print-out-paths)
+          cp "$TARBALL_X86"/*.tar.gz dist/
+
+          TARBALL_A64=$(nix build .#tarball-aarch64 --no-link --print-out-paths)
+          cp "$TARBALL_A64"/*.tar.gz dist/
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v3
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        with:
+          draft: false
+          files: dist/*
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

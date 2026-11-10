@@ -1,0 +1,152 @@
+# Replaces the old db_bench-avx512.yml (compile+run monolith).
+# Builds ToplingDB (avx512) + upstream RocksDB v8.10 + RocksDB master for comparison.
+# ToplingDB and the two RocksDB versions compile in parallel and each upload
+# an independent tarball. Run workflows download the three artifacts themselves.
+name: "db_bench-avx512-build"
+
+on:
+  workflow_dispatch:
+    inputs:
+      use_clang:
+        type: boolean
+        required: false
+        default: false
+        description: use clang
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{github.token}}
+    permissions:
+      contents: read
+      actions: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Prerequisites
+        run: |
+          set -xe
+          sudo apt-get update -y && sudo apt-get install -y \
+            libjemalloc-dev libaio-dev libgflags-dev zlib1g-dev \
+            libbz2-dev libcurl4-openssl-dev liburing-dev \
+            libsnappy-dev libbz2-dev liblz4-dev libzstd-dev
+
+      - name: Init submodule & Setup ssh
+        run: |
+          git submodule update --init --recursive
+          mkdir -p ~/.ssh && mkdir -p /opt/lib
+          ssh-keyscan -t rsa github.com >> ~/.ssh/known_hosts
+          echo nproc = `nproc`
+
+      - name: Git clone SidePlugin(s)
+        run: |
+          make clean
+
+      - name: Compile ToplingDB db_bench
+        run: |
+          set -xe
+          if ${{inputs.use_clang}}; then
+            export CXX=clang++
+            export CC=clang
+          fi
+          export CPU=-march=skylake-avx512
+          make db_bench memtablerep_bench -j`nproc` DEBUG_LEVEL=0 UPDATE_REPO=0
+
+      - name: Stage ToplingDB prefix
+        run: |
+          set -xe
+          BUNDLE="$PWD/_bench_bundle"
+          STAGE="$PWD/_bench_stage"
+          PREFIX="/usr/local"
+          rm -rf "$BUNDLE" "$STAGE"
+          mkdir -p "$BUNDLE"
+          make install DESTDIR="$STAGE" PREFIX="$PREFIX" DEBUG_LEVEL=0 UPDATE_REPO=0
+          mkdir -p "$STAGE$PREFIX/bin" "$STAGE$PREFIX/toplingdb-conf" "$STAGE$PREFIX/site"
+          cp -a db_bench memtablerep_bench "$STAGE$PREFIX/bin/"
+          # Same yaml as plain CI (incl. write_buffer_size); avx512 only changes CPU flags.
+          cp -a .github/bench-conf/db_bench_enterprise_zipkeyonly.yaml \
+                .github/bench-conf/db_bench_enterprise_zipkeyvalue.yaml \
+                "$STAGE$PREFIX/toplingdb-conf/"
+          cp -a sideplugin/rockside/src/topling/web/index.html \
+                sideplugin/rockside/src/topling/web/style.css \
+                "$STAGE$PREFIX/site/"
+          test -x "$STAGE$PREFIX/bin/db_bench"
+          test -f "$STAGE$PREFIX/toplingdb-conf/db_bench_enterprise_zipkeyonly.yaml"
+          test -f "$STAGE$PREFIX/toplingdb-conf/db_bench_enterprise_zipkeyvalue.yaml"
+          mv "$STAGE$PREFIX" "$BUNDLE/topling"
+          rm -rf "$STAGE"
+
+      - name: Pack ToplingDB tarball
+        run: |
+          set -xe
+          tar -C _bench_bundle -czf topling.tgz topling
+          tar -tzf topling.tgz | head -40
+
+      - name: Upload ToplingDB tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: db_bench-avx512-topling
+          path: topling.tgz
+          retention-days: 14
+
+  build-rocksdb:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ref: v8.10.2
+            dest: rocksdb-v8.10
+          - ref: master
+            dest: rocksdb-master
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Prerequisites
+        run: |
+          set -xe
+          sudo apt-get update -y && sudo apt-get install -y \
+            libjemalloc-dev libaio-dev libgflags-dev zlib1g-dev \
+            libbz2-dev libcurl4-openssl-dev liburing-dev \
+            libsnappy-dev libbz2-dev liblz4-dev libzstd-dev
+
+      - name: Build upstream RocksDB
+        run: |
+          set -xe
+          chmod +x .github/scripts/build_upstream_rocksdb.sh
+          if ${{inputs.use_clang}}; then
+            export CXX=clang++
+            export CC=clang
+          fi
+          # Match Topling avx512 (-march=skylake-avx512); overrides script default haswell.
+          export PORTABLE=skylake-avx512
+          BUNDLE="$PWD/_bench_bundle"
+          rm -rf "$BUNDLE"
+          mkdir -p "$BUNDLE"
+          .github/scripts/build_upstream_rocksdb.sh "${{ matrix.ref }}" \
+            "$BUNDLE/${{ matrix.dest }}"
+          test -x "$BUNDLE/${{ matrix.dest }}/bin/db_bench"
+
+      - name: Pack RocksDB tarball
+        run: |
+          set -xe
+          tar -C _bench_bundle -czf "${{ matrix.dest }}.tgz" "${{ matrix.dest }}"
+          tar -tzf "${{ matrix.dest }}.tgz" | head -20
+
+      - name: Upload RocksDB tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: db_bench-avx512-${{ matrix.dest }}
+          path: ${{ matrix.dest }}.tgz
+          retention-days: 14
