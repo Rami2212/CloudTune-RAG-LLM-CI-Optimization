@@ -1,0 +1,145 @@
+name: Tests & Publishes to PyPI
+
+on:
+  release:
+    types: [published]
+
+  push:
+    branches:
+      - master
+
+  pull_request:
+
+env:
+  PROJECT_NAME: mealpy
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 9
+          submodules: false
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: setup.py
+
+      - name: Install package and development dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+
+      - name: Run tests
+        run: |
+          pytest \
+            --doctest-modules \
+            --junitxml=junit/pytest-results-${{ matrix.python-version }}.xml \
+            --cov=$PROJECT_NAME \
+            --cov-report=xml \
+            tests/
+
+      - name: Run Flake8
+        run: |
+          flake8 tests/
+
+      - name: Upload pytest results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pytest-results-${{ matrix.python-version }}
+          path: junit/pytest-results-${{ matrix.python-version }}.xml
+          if-no-files-found: warn
+
+      # ============================================================
+      # Documentation validation
+      # Run only once with Python 3.11
+      # ============================================================
+
+      - name: Install documentation dependencies
+        if: matrix.python-version == '3.11'
+        run: |
+          python -m pip install -r docs/requirements.txt
+
+      - name: Generate optimizer classification table
+        if: matrix.python-version == '3.11'
+        run: |
+          python scripts/generate_optimizer_table.py --strict
+
+      - name: Build documentation
+        if: matrix.python-version == '3.11'
+        run: |
+          python -m sphinx \
+            -E \
+            -a \
+            --keep-going \
+            -b html \
+            docs/source \
+            docs/_build/html
+
+      # ============================================================
+      # Distribution package
+      # ============================================================
+
+      - name: Install package builder
+        if: matrix.python-version == '3.11'
+        run: |
+          python -m pip install --upgrade build twine
+
+      - name: Build distribution package
+        if: matrix.python-version == '3.11'
+        run: |
+          python -m build
+          python -m twine check --strict dist/*
+
+      - name: Upload distribution package
+        if: matrix.python-version == '3.11'
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist-package-3.11
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: build
+
+    if: github.event_name == 'release'
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Download distribution package
+        uses: actions/download-artifact@v7
+        with:
+          name: dist-package-3.11
+          path: dist
+
+      - name: Publish distribution to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+          attestations: false
+
+      - name: Publish distribution to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+          attestations: true

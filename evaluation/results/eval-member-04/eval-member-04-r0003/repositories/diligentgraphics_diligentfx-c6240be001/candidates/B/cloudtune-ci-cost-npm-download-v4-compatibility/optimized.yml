@@ -1,0 +1,209 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [MEDIUM] Switch "build" from Windows to ubuntu runner
+# - [LOW] Explicitly set fail-fast for large matrix job "build" (20 combinations)
+# Estimated savings: ~2 min/run
+#
+name: Win32/UWP build
+
+on: [push, pull_request]
+
+jobs:
+  precheks:
+    name:    Win10 -> Pre-checks
+    runs-on: windows-2025
+
+    steps:
+    - name: Clone DiligentCore
+      uses: actions/checkout@v6
+      with:
+        repository: DiligentGraphics/DiligentCore
+        path:       DiligentCore
+
+    - name: Clone DiligentFX
+      uses: actions/checkout@v6
+      with:
+        path: DiligentFX
+
+    - name: Format validation
+      shell: cmd
+      working-directory: ${{github.workspace}}/DiligentFX/BuildTools/FormatValidation
+      run: validate_format_win.bat
+
+
+  build:
+    needs:   precheks
+    runs-on: windows-2025
+
+    strategy:
+      fail-fast: false
+      matrix:
+        name:            ["Win10"]
+        toolset:         ["Win32", "x64"]
+        build_type:      ["Debug", "Release"]
+        cmake_generator: ["Visual Studio 18 2026"]
+        cmake_args:      ["-DDILIGENT_BUILD_FX_INCLUDE_TEST=ON -DDILIGENT_BUILD_FX_TESTS=ON -DDILIGENT_NO_WEBGPU=OFF"]
+        platform:        ["Win32"]
+
+        include:
+          - name:            "Win10-Dev"
+            platform:        "Win32"
+            toolset:         "x64"
+            build_type:      "RelWithDebInfo"
+            cmake_generator: "Visual Studio 18 2026"
+            cmake_args:      "-DDILIGENT_NO_GLSLANG=ON -DDILIGENT_NO_HLSL=ON -DDILIGENT_DEVELOPMENT=ON -DDILIGENT_BUILD_FX_TESTS=ON"
+
+          - name:            "Win10-Ninja"
+            platform:        "Win32"
+            toolset:         "x64"
+            build_type:      "Debug"
+            cmake_generator: "Ninja"
+            cmake_args:      "-DDILIGENT_NO_GLSLANG=ON -DDILIGENT_NO_HLSL=ON -DDILIGENT_BUILD_FX_TESTS=ON"
+
+          - name:            "MinGW"
+            platform:        "Win32"
+            toolset:         "x64"
+            build_type:      "Release"
+            cmake_generator: "MinGW Makefiles"
+            cmake_args:      "-DDILIGENT_NO_GLSLANG=ON -DDILIGENT_NO_HLSL=ON -DDILIGENT_BUILD_FX_TESTS=ON -DDILIGENT_BUILD_FX_TESTS=ON"
+
+          - name:            "UWP"
+            platform:        "UWP"
+            toolset:         "x64"
+            build_type:      "Debug"
+            cmake_generator: "Visual Studio 18 2026"
+            cmake_args:      "-DCMAKE_SYSTEM_NAME=WindowsStore -DCMAKE_SYSTEM_VERSION=10.0"
+
+          - name:            "UWP"
+            platform:        "UWP"
+            toolset:         "x64"
+            build_type:      "Release"
+            cmake_generator: "Visual Studio 18 2026"
+            cmake_args:      "-DCMAKE_SYSTEM_NAME=WindowsStore -DCMAKE_SYSTEM_VERSION=10.0"
+
+    name: Win10 -> ${{ matrix.name }}-${{ matrix.toolset }}, ${{ matrix.build_type }}
+
+    steps:
+    - name: Checkout
+      uses: DiligentGraphics/github-action/checkout@v28
+
+    - name: Set up build environment
+      if: success()
+      uses: DiligentGraphics/github-action/setup-build-env@v28
+      with:
+        platform:        ${{ matrix.platform }}
+        cmake-generator: ${{ matrix.cmake_generator }}
+        ninja-vs-arch:   ${{ matrix.toolset }}
+
+    - name: Configure CMake
+      if: success()
+      uses: DiligentGraphics/github-action/configure-cmake@v28
+      with:
+        generator:  ${{ matrix.cmake_generator }}
+        vs-arch:    ${{ matrix.toolset }}
+        build-type: ${{ matrix.build_type }}
+        cmake-args: ${{ matrix.cmake_args }}
+
+    - name: Build
+      id:   build
+      if: success()
+      uses: DiligentGraphics/github-action/build@v28
+
+    - name: RadientTest
+      if:   ${{ success() && matrix.name != 'UWP'}}
+      uses: DiligentGraphics/github-action/run-radient-tests@v28
+
+    - name: DiligentFXGPUTest D3D11
+      if:   ${{ (success() || failure() && steps.build.outcome == 'success') && matrix.name == 'Win10' }}
+      uses: DiligentGraphics/github-action/run-fx-gpu-tests@v28
+      with:
+        mode: d3d11_sw
+
+    - name: DiligentFXGPUTest D3D12
+      if:   ${{ (success() || failure() && steps.build.outcome == 'success') && matrix.name == 'Win10' }}
+      uses: DiligentGraphics/github-action/run-fx-gpu-tests@v28
+      with:
+        mode: d3d12_sw
+
+    - name: DiligentFXGPUTest WebGPU
+      if:   ${{ (success() || failure() && steps.build.outcome == 'success') && matrix.name == 'Win10' }}
+      uses: DiligentGraphics/github-action/run-fx-gpu-tests@v28
+      with:
+        mode: wgpu
+
+    - name: RadientGPUTest D3D11
+      # NB: it is essential to include failure() to override the default status check of success()
+      #     that is automatically applied to if conditions that don't contain a status check function.
+      if:   ${{ (success() || failure() && steps.build.outcome == 'success') && matrix.name == 'Win10' }}
+      uses: DiligentGraphics/github-action/run-radient-gpu-tests@v28
+      with:
+        mode: d3d11_sw
+
+    - name: RadientGPUTest D3D12
+      if:   ${{ (success() || failure() && steps.build.outcome == 'success') && matrix.name == 'Win10' }}
+      uses: DiligentGraphics/github-action/run-radient-gpu-tests@v28
+      with:
+        mode: d3d12_sw
+
+    - name: RadientGPUTest WebGPU
+      if:   ${{ (success() || failure() && steps.build.outcome == 'success') && matrix.name == 'Win10' }}
+      uses: DiligentGraphics/github-action/run-radient-gpu-tests@v28
+      with:
+        mode: wgpu
+
+    - name: Clone Radient Test Data
+      id: radient_test_data
+      if: ${{ (success() || failure()) && steps.build.outcome == 'success' && matrix.name == 'Win10' }}
+      uses: actions/checkout@v6
+      with:
+        repository: DiligentGraphics/DiligentTestData
+        ref:        radient
+        path:       RadientTestData
+
+    - name: Clone glTF Sample Assets
+      id: gltf_sample_assets
+      if: ${{ (success() || failure()) && steps.build.outcome == 'success' && matrix.name == 'Win10' }}
+      uses: actions/checkout@v6
+      with:
+        repository: KhronosGroup/glTF-Sample-Assets
+        ref:        ${{env.DILIGENT_GLTF_SAMPLE_ASSETS_COMMIT}}
+        path:       glTF-Sample-Assets
+
+    - name: RadientRenderTest D3D11
+      if: ${{ (success() || failure()) && steps.build.outcome == 'success' && steps.radient_test_data.outcome == 'success' && steps.gltf_sample_assets.outcome == 'success' && matrix.name == 'Win10' }}
+      uses: DiligentGraphics/github-action/run-radient-render-tests@v28
+      with:
+        mode:                 d3d11_sw
+        models-path:          ${{github.workspace}}/glTF-Sample-Assets
+        assets-path:          ${{github.workspace}}/RadientTestData
+        update-golden-images: true
+
+    - name: RadientRenderTest D3D12
+      if: ${{ (success() || failure()) && steps.build.outcome == 'success' && steps.radient_test_data.outcome == 'success' && steps.gltf_sample_assets.outcome == 'success' && matrix.name == 'Win10' }}
+      uses: DiligentGraphics/github-action/run-radient-render-tests@v28
+      with:
+        mode:                 d3d12_sw
+        models-path:          ${{github.workspace}}/glTF-Sample-Assets
+        assets-path:          ${{github.workspace}}/RadientTestData
+        update-golden-images: true
+
+    - name: RadientRenderTest WebGPU
+      if: ${{ (success() || failure()) && steps.build.outcome == 'success' && steps.radient_test_data.outcome == 'success' && steps.gltf_sample_assets.outcome == 'success' && matrix.name == 'Win10' }}
+      uses: DiligentGraphics/github-action/run-radient-render-tests@v28
+      with:
+        mode:                 wgpu
+        models-path:          ${{github.workspace}}/glTF-Sample-Assets
+        assets-path:          ${{github.workspace}}/RadientTestData
+        update-golden-images: true
+
+    - name: Upload Radient Render Images
+      if: ${{ always() && !cancelled() && steps.build.outcome == 'success' && steps.radient_test_data.outcome == 'success' && steps.gltf_sample_assets.outcome == 'success' && matrix.name == 'Win10' }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: RadientRenderImages-Windows-${{matrix.toolset}}-${{matrix.build_type}}
+        path: |
+          RadientTestData/GoldenImages/**/*_d3d11.png
+          RadientTestData/GoldenImages/**/*_d3d12.png
+          RadientTestData/GoldenImages/**/*_wgpu.png
+          RadientTestData/GoldenImagesDifferences
+        if-no-files-found: error

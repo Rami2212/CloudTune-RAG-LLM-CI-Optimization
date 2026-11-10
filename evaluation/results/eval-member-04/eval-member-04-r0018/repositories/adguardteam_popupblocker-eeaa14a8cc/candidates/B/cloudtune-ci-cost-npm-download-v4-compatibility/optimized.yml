@@ -1,0 +1,38 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [MEDIUM] Add concurrency group to "ci.yml"
+# Estimated savings: ~2 min/run
+#
+name: CI
+
+description: Lints, tests, and builds on pull requests and pushes to master.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    name: Lint, test, build
+    runs-on: team-extensions
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Build, lint, and test via Docker
+        run: DOCKER_BUILDKIT=1 docker build --progress plain --target test-output --output ./artifacts .
+
+      - name: Upload userscript build
+        uses: actions/upload-artifact@v7
+        with:
+          name: userscript
+          path: |
+            artifacts/popupblocker.user.js
+            artifacts/popupblocker.meta.js
+            artifacts/assets

@@ -1,0 +1,156 @@
+name: Emscripten build
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os:         ["windows-2025", "ubuntu-26.04", "macos-26"]
+        build_type: ["Debug", "Release"]
+
+        exclude:
+          # Exclude MacOS-Release
+          - os:         "macos-26"
+            build_type: "Release"
+
+        include:
+          - os:         "windows-2025"
+            host_name:  "Win10"
+            cmake_args: "-DDILIGENT_NO_WEBGPU=ON"
+
+          - os:         "ubuntu-26.04"
+            host_name:  "Linux"
+            cmake_args: "-DDILIGENT_NO_WEBGPU=OFF"
+
+          - os:         "macos-26"
+            host_name:  "MacOS"
+            cmake_args: "-DDILIGENT_NO_WEBGPU=ON"
+
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.host_name }} -> Emscripten, ${{ matrix.build_type }}
+
+    steps:
+    - name: Checkout
+      uses: DiligentGraphics/github-action/checkout@v28
+
+    - name: Set up build environment
+      if:   success()
+      uses: DiligentGraphics/github-action/setup-build-env@v28
+      with:
+        platform: Web
+
+    # These tests always target Wasm32; Linux Debug and Release
+    # cover marshalling without repeating it on every host platform.
+    - name: Set up binding test dependencies
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        # Ubuntu 26.04 already provides LLVM 22, Python venv, Ninja, and Chrome.
+        # Keep the parser on LLVM 22 to match the pinned Python bindings.
+        python3 -m venv "$RUNNER_TEMP/bindings-venv"
+        "$RUNNER_TEMP/bindings-venv/bin/python" -m pip install -r DiligentFX/BuildTools/Bindings/requirements.txt
+        binding_args=(
+          -DRADIENT_GENERATE_BINDINGS=ON
+          "-DRADIENT_BINDINGS_PYTHON_EXECUTABLE=$RUNNER_TEMP/bindings-venv/bin/python"
+          -DRADIENT_BINDINGS_LIBCLANG=/usr/lib/llvm-22/lib/libclang-22.so.1
+          "-DRADIENT_BINDINGS_NODE_EXECUTABLE=$(command -v node)"
+        )
+        echo "RADIENT_BINDINGS_CMAKE_ARGS=${binding_args[*]}" >> "$GITHUB_ENV"
+
+    - name: Build JavaScript binding tests
+      if: runner.os == 'Linux'
+      shell: bash
+      env:
+        BUILD_TYPE: ${{ matrix.build_type }}
+      run: |
+        emcmake cmake -S DiligentFX/BuildTools/Bindings/javascript -B "$RUNNER_TEMP/binding-js" -G Ninja \
+          -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
+          -DBINDINGS_PYTHON_EXECUTABLE="$RUNNER_TEMP/bindings-venv/bin/python" \
+          -DBINDINGS_LIBCLANG=/usr/lib/llvm-22/lib/libclang-22.so.1 \
+          -DBINDINGS_NODE_EXECUTABLE="$(command -v node)"
+        cmake --build "$RUNNER_TEMP/binding-js" --target BindingTestsWasm --parallel "$(nproc)"
+
+    - name: Test JavaScript bindings
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        export BINDINGS_TEST_BROWSER_EXECUTABLE="$(command -v google-chrome)"
+        ctest --test-dir "$RUNNER_TEMP/binding-js" --verbose --output-on-failure --no-tests=error
+
+    - name: Configure CMake
+      if:   success()
+      uses: DiligentGraphics/github-action/configure-cmake@v28
+      with:
+        build-type: ${{ matrix.build_type }}
+        cmake-args: ${{ matrix.cmake_args }} ${{ env.RADIENT_BINDINGS_CMAKE_ARGS }}
+
+    - name: Build
+      if:   success()
+      uses: DiligentGraphics/github-action/build@v28
+
+    - name: Build Radient bindings
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        # Reuse the Radient library and dependencies from the main build.
+        cmake --build "$DILIGENT_BUILD_DIR" --config "$DILIGENT_BUILD_TYPE" \
+          --target RadientWasm RadientBrowserRenderTest --parallel "$(nproc)"
+
+    - name: Test Radient bindings
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        ctest --test-dir "$DILIGENT_BUILD_DIR/DiligentFX/Radient/bindings" \
+          -C "$DILIGENT_BUILD_TYPE" -LE Browser --verbose --output-on-failure --no-tests=error
+
+    - name: Clone Radient test data
+      if: runner.os == 'Linux'
+      uses: actions/checkout@v6
+      with:
+        repository: DiligentGraphics/DiligentTestData
+        ref: radient
+        path: DiligentTestData
+
+    - name: Clone glTF Sample Assets
+      if: runner.os == 'Linux'
+      uses: actions/checkout@v6
+      with:
+        repository: KhronosGroup/glTF-Sample-Assets
+        ref: ${{env.DILIGENT_GLTF_SAMPLE_ASSETS_COMMIT}}
+        path: glTF-Sample-Assets
+
+    - name: Test Radient bindings in Chrome
+      if: runner.os == 'Linux'
+      shell: bash
+      env:
+        RADIENT_BROWSER_TEST_MODELS: ${{github.workspace}}/glTF-Sample-Assets
+        RADIENT_BROWSER_TEST_ASSETS: ${{github.workspace}}/DiligentTestData
+        RADIENT_BROWSER_TEST_OUTPUT: ${{github.workspace}}/BrowserRenderResults
+      run: |
+        # Use software rendering on hosted runners. Canvas presentation needs
+        # the Vulkan compositor as well as a SwiftShader WebGPU adapter.
+        cat > "$RUNNER_TEMP/chrome-webgpu" <<'EOF'
+        #!/usr/bin/env bash
+        exec google-chrome \
+          --use-angle=swiftshader \
+          --enable-features=Vulkan \
+          --use-vulkan=swiftshader \
+          --disable-vulkan-surface \
+          --enable-unsafe-webgpu \
+          --enable-unsafe-swiftshader \
+          --use-webgpu-adapter=swiftshader \
+          "$@"
+        EOF
+        chmod +x "$RUNNER_TEMP/chrome-webgpu"
+        export BINDINGS_TEST_BROWSER_EXECUTABLE="$RUNNER_TEMP/chrome-webgpu"
+        ctest --test-dir "$DILIGENT_BUILD_DIR/DiligentFX/Radient/bindings" \
+          -C "$DILIGENT_BUILD_TYPE" -L Browser --verbose --output-on-failure --no-tests=error
+
+    - name: Upload Radient browser render images
+      if: ${{ always() && runner.os == 'Linux' }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: RadientBrowserRenderImages-${{matrix.build_type}}
+        path: BrowserRenderResults
+        if-no-files-found: warn

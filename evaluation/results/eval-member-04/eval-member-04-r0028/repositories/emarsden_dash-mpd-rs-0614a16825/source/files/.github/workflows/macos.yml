@@ -1,0 +1,63 @@
+on: [push]
+
+name: macos
+
+env:
+  # This is currently needed to build the http3 functionality in the reqwest crate
+  RUSTFLAGS: '--cfg reqwest_unstable'
+  RUST_LOG: 'info'
+
+jobs:
+  check-macos:
+    name: dash-mpd-rs check/macos
+    runs-on: macos-latest
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+           fetch-depth: 0
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: taiki-e/install-action@cargo-hack
+      - run: cargo hack check --feature-powerset --exclude-features libav,socks,http3,xee-xslt --no-dev-deps
+
+    
+  build-macos:
+    name: dash-mpd-rs build/macos
+    runs-on: macos-latest
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+           fetch-depth: 0
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: cargo build
+
+
+  # Not using actions-rust-lang/setup-rust-toolchain because for some incomprehensible reason it
+  # does not work ("cargo not found")
+  test-macos:
+    name: dash-mpd-rs test/macos
+    runs-on: macos-latest
+    timeout-minutes: 100
+    needs: check-macos
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+           fetch-depth: 0
+      - run: |
+          brew update
+          brew upgrade || true
+          HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 brew install gpac
+          MP4Box -version
+          brew install ffmpeg
+          brew install mkvtoolnix
+          brew install media-info
+          brew install libxslt libxml2
+          wget -q -O /tmp/bento4.zip https://www.bok.net/Bento4/binaries/Bento4-SDK-1-6-0-641.universal-apple-macosx.zip
+          unzip /tmp/bento4.zip "Bento4-SDK-*/bin/mp4decrypt" -d /tmp
+          sudo mv /tmp/Bento4-SDK*/bin/mp4decrypt /usr/local/bin
+          wget -q -O /tmp/shaka-packager https://github.com/shaka-project/shaka-packager/releases/latest/download/packager-osx-x64
+          mv /tmp/shaka-packager /usr/local/bin
+          chmod +x /usr/local/bin/shaka-packager
+          brew install rust
+          cargo test --features http3 --jobs 1 --verbose -- --show-output --test-threads=1 --skip container

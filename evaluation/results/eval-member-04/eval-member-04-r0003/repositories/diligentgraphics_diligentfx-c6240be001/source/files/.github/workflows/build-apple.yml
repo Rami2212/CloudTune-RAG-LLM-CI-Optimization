@@ -1,0 +1,83 @@
+name: MacOS/iOS/tvOS build
+
+on: [push, pull_request]
+
+jobs:
+  precheks:
+    name:    MacOS -> Pre-Checks
+    runs-on: macos-26
+
+    steps:
+    - name: Clone DiligentCore
+      uses: actions/checkout@v6
+      with:
+        repository: DiligentGraphics/DiligentCore
+        path:       DiligentCore
+
+    - name: Clone DiligentFX
+      uses: actions/checkout@v6
+      with:
+        path: DiligentFX
+
+    - name: Format validation
+      shell: bash
+      working-directory: ${{github.workspace}}/DiligentFX/BuildTools/FormatValidation
+      run: ./validate_format_mac.sh
+      
+
+  build:
+    needs:   precheks
+    runs-on: macos-26
+
+    strategy:
+      matrix:
+        platform:   ["MacOS", "iOS", "tvOS"]
+        build_type: ["Debug", "Release"]
+
+        include:
+          - platform:   "MacOS"
+            build_type: "Debug"
+            cmake_args: "-DDILIGENT_NO_GLSLANG=ON -DDILIGENT_NO_HLSL=ON -DDILIGENT_BUILD_FX_INCLUDE_TEST=ON -DDILIGENT_BUILD_FX_TESTS=ON"
+
+          - platform:   "MacOS"
+            build_type: "Release"
+            # For some reason AVX2 causes invalid instruction exception on CI, so disable it
+            cmake_args: "-DDILIGENT_BUILD_TOOLS_TESTS=ON -DDILIGENT_BUILD_FX_TESTS=ON -DDILIGENT_CLANG_RELEASE_COMPILE_OPTIONS=\"\""
+
+          - platform:  "iOS"
+            cmake_args: "-DDILIGENT_NO_GLSLANG=ON -DDILIGENT_NO_HLSL=ON"
+
+          - platform:   "tvOS"
+            cmake_args: "-DDILIGENT_NO_GLSLANG=ON -DDILIGENT_NO_HLSL=ON"
+
+        exclude:
+          # Exclude tvOS-Release
+          - platform:   "tvOS"
+            build_type: "Release"
+
+    name: MacOS -> ${{ matrix.platform }}-${{ matrix.build_type }}
+
+    steps:
+    - name: Checkout
+      uses: DiligentGraphics/github-action/checkout@v28
+
+    - name: Set up build environment
+      if:   success()
+      uses: DiligentGraphics/github-action/setup-build-env@v28
+      with:
+        platform: ${{ matrix.platform }}
+
+    - name: Configure CMake
+      if:   success()
+      uses: DiligentGraphics/github-action/configure-cmake@v28
+      with:
+        build-type: ${{ matrix.build_type }}
+        cmake-args: ${{ matrix.cmake_args }}
+
+    - name: Build
+      if:   success()
+      uses: DiligentGraphics/github-action/build@v28
+
+    - name: RadientTest
+      if:   ${{ success() && matrix.platform == 'MacOS' }}
+      uses: DiligentGraphics/github-action/run-radient-tests@v28

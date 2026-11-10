@@ -1,0 +1,55 @@
+name: "E2E Pipeline for CDK Observability Accelerator"
+on:
+  issue_comment:
+    types: [created]
+jobs:
+  e2ePipeline:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    if: >
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '/do-e2e-test') &&
+      contains(fromJSON('["OWNER", "MEMBER"]'), github.event.comment.author_association)
+    steps:
+    - name: Dump GitHub context
+      env:
+        GITHUB_CONTEXT: ${{ toJson(github) }}
+      run: |
+        echo "$GITHUB_CONTEXT"
+    - name: Get PR branch
+      uses: xt0rted/pull-request-comment-branch@v1
+      id: comment-branch 
+    - name: Set latest commit status as pending
+      uses: myrotvorets/set-commit-status-action@master
+      with:
+        sha: ${{ steps.comment-branch.outputs.head_sha }}
+        token: ${{ secrets.CI_TOKEN }}
+        status: pending
+    - name: Configure AWS credentials from Test account
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        role-to-assume: ${{ secrets.ROLE_TO_ASSUME }}
+        aws-region: us-west-2
+        role-duration-seconds: 3600
+        role-session-name: GithubActions-Session
+    - name: Run CodeBuild
+      uses: aws-actions/aws-codebuild-run-build@v1
+      with:
+        project-name: cdk-pattern-test
+        env-vars-for-codebuild: |
+          PR_NUMBER,
+          COMMIT_ID,
+          PATTERN_NAME
+      env:
+        PR_NUMBER: ${{ github.event.issue.number }}
+        COMMIT_ID: ${{ steps.comment-branch.outputs.head_sha }}
+        PATTERN_NAME: ${{ github.event.comment.body }}
+    - name: Set latest commit status as ${{ job.status }}
+      uses: myrotvorets/set-commit-status-action@master
+      if: always()
+      with:
+        sha: ${{ steps.comment-branch.outputs.head_sha }}
+        token: ${{ secrets.CI_TOKEN }}
+        status: ${{ job.status }}
