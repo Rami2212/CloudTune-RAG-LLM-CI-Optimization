@@ -1,0 +1,63 @@
+name: Node.js CI
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "packages/mq-nodejs/**"
+      - "crates/mq-wasm/**"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "packages/mq-nodejs/**"
+      - "crates/mq-wasm/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test:
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v2.0.0
+        with:
+          cache: false
+      - uses: extractions/setup-just@v4.0.0
+        with:
+          just-version: 1.58.0
+      - uses: Swatinem/rust-cache@v2.9.3
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2.88.1
+        with:
+          tool: wasm-pack
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6.1.0
+        with:
+          package_json_file: packages/mq-nodejs/package.json
+      - name: Setup Node.js
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version-file: .tool-versions
+          package-manager-cache: false
+      - name: Install dependencies
+        working-directory: packages/mq-nodejs
+        run: pnpm install --frozen-lockfile
+      - name: Build
+        run: just build-node
+      - name: Type check
+        working-directory: packages/mq-nodejs
+        run: pnpm run type-check
+      - name: Lint
+        working-directory: packages/mq-nodejs
+        run: pnpm run lint
+      - name: Test
+        working-directory: packages/mq-nodejs
+        run: pnpm run test

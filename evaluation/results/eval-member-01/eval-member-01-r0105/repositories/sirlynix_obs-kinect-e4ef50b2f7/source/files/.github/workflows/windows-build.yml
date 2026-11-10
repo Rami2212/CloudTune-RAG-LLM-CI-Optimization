@@ -1,0 +1,148 @@
+name: Windows-Build
+
+on:
+  pull_request:
+  push:
+    paths-ignore:
+      - '.github/workflows/linux-build.yml'
+      - '.gitignore'
+      - 'LICENSE'
+      - 'README.md'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [windows-latest]
+        arch: [x64]
+        mode: [debug, releasedbg]
+
+    runs-on: ${{ matrix.os }}
+    if: "!contains(github.event.head_commit.message, 'ci skip')"
+
+    env:
+      OBS_VERSION: '33.0.0'
+      CMAKE_PRESET: 'windows-x64'
+
+    steps:
+    - name: Get current date as package key
+      id: pkg_key
+      run: echo "key=$(date +'%W')" >> $env:GITHUB_OUTPUT
+
+    - name: Checkout repository
+      uses: actions/checkout@v7
+
+    - name: Checkout Kinect SDKs
+      uses: actions/checkout@v7
+      continue-on-error: true
+      with:
+        repository: SirLynix/kinect-sdks
+        token: ${{ secrets.KINECT_SDKS_PAT }}
+        path: ${{ github.workspace }}/kinect-sdks
+
+    - name: Add msbuild to PATH
+      uses: microsoft/setup-msbuild@v3.0.0
+
+    - name: Enable longpath in git for Windows
+      run: git config --system core.longpaths true
+
+    # Select OBS runtime
+    - name: Choose OBS Debug or Release build
+      id: cmake_target
+      run: echo "value=${{ matrix.mode == 'debug' && 'Debug' || 'RelWithDebInfo' }}" >> $env:GITHUB_OUTPUT
+
+    # Cache OBS Studio
+    - name: Retrieve OBS Studio cache
+      uses: actions/cache@v6
+      id: obs-cache
+      with:
+        path: ${{ github.workspace }}/obs-studio
+        key: Windows-OBS-Studio-${{ steps.cmake_target.outputs.value }}-${{ env.OBS_VERSION }}
+
+    # Build obs-studio
+    - name: Clone OBS
+      if: steps.obs-cache.outputs.cache-hit != 'true'
+      uses: actions/checkout@v7
+      with:
+        repository: obsproject/obs-studio
+        path: ${{ github.workspace }}/obs-studio
+        submodules: 'recursive'
+        fetch-depth: 0 # for tags
+
+    # Checkout OBS to the wanted version
+    - name: Checkout OBS-Studio release (${{ env.OBS_VERSION }})
+      if: steps.obs-cache.outputs.cache-hit != 'true'
+      working-directory: ${{ github.workspace }}/obs-studio
+      run: |
+        git checkout ${{ env.OBS_VERSION }}
+        git submodule update
+
+    # Configure and build obs
+    - name: Build OBS-Studio
+      if: steps.obs-cache.outputs.cache-hit != 'true'
+      working-directory: ${{ github.workspace }}/obs-studio
+      run: |
+        cmake --preset "${{ env.CMAKE_PRESET }}" -DENABLE_FRONTEND=OFF -DENABLE_SCRIPTING=OFF -DENABLE_CORE_MODULES=OFF
+        cmake --build build_x64 -t libobs --config "${{ steps.cmake_target.outputs.value }}"
+
+    # Prepare environment
+    - name: Configure build
+      run:
+        echo "LibObs = {   Include = [[${{ github.workspace }}\obs-studio\libobs]],   Build64 = [[${{ github.workspace }}\obs-studio\build_x64]] }  ObsPlugins={}" > config.lua
+
+    # Force xmake to a specific folder (for cache)
+    - name: Set xmake env
+      run: echo "XMAKE_GLOBALDIR=${{ runner.workspace }}/xmake-global" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+    # Install xmake
+    - name: Setup xmake
+      uses: xmake-io/github-action-setup-xmake@v1
+
+    # Update xmake repository (in order to have the file that will be cached)
+    - name: Update xmake repository
+      run: xmake repo --update
+
+    # Fetch xmake dephash
+    - name: Retrieve dependencies hash
+      id: dep_hash
+      run: echo "hash=$(xmake l utils.ci.packageskey)" >> $env:GITHUB_OUTPUT
+
+    # Cache xmake dependencies
+    - name: Retrieve cached xmake dependencies
+      uses: actions/cache@v6
+      with:
+        path: ${{ env.XMAKE_GLOBALDIR }}\.xmake\packages
+        key: MSVC-${{ matrix.arch }}-${{ matrix.mode }}-${{ steps.dep_hash.outputs.hash }}-W${{ steps.pkg_key.outputs.key }}
+
+    # Setup compilation mode and install project dependencies
+    - name: Configure xmake and install dependencies
+      run: xmake config --arch=${{ matrix.arch }} --mode=${{ matrix.mode }} --ccache=n --yes --verbose
+      env:
+        KINECTSDKAZUREBT_DIR: ${{ github.workspace }}/kinect-sdks/k4abt
+        KINECTSDK10_DIR: ${{ github.workspace }}/kinect-sdks/sdk1
+        KINECT_TOOLKIT_DIR: ${{ github.workspace }}/kinect-sdks/sdk1-toolkit
+        KINECTSDK20_DIR: ${{ github.workspace }}/kinect-sdks/sdk2
+
+    # Build the plugin
+    - name: Build obs-kinect
+      run: xmake --verbose
+      env:
+        KINECTSDKAZUREBT_DIR: ${{ github.workspace }}/kinect-sdks/k4abt
+        KINECTSDK10_DIR: ${{ github.workspace }}/kinect-sdks/sdk1
+        KINECT_TOOLKIT_DIR: ${{ github.workspace }}/kinect-sdks/sdk1-toolkit
+        KINECTSDK20_DIR: ${{ github.workspace }}/kinect-sdks/sdk2
+
+    # Install the result files
+    - name: Package obs-kinect
+      run: xmake pack --verbose -y -f nsis,zip -o packaged
+      env:
+        KINECTSDKAZUREBT_DIR: ${{ github.workspace }}/kinect-sdks/k4abt
+        KINECTSDK10_DIR: ${{ github.workspace }}/kinect-sdks/sdk1
+        KINECT_TOOLKIT_DIR: ${{ github.workspace }}/kinect-sdks/sdk1-toolkit
+        KINECTSDK20_DIR: ${{ github.workspace }}/kinect-sdks/sdk2
+
+    # Upload artifacts
+    - uses: actions/upload-artifact@v7
+      with:
+        name: obs-kinect-windows-${{ matrix.arch }}-${{ matrix.mode }}
+        path: packaged

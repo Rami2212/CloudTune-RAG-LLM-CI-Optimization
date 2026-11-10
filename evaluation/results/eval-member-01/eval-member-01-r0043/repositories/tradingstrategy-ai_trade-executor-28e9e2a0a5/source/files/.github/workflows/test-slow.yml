@@ -1,0 +1,122 @@
+name: Slow test group
+on:
+  push:
+    branches: [ master ]
+    tags: [ v* ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  slow-test-suite:
+    timeout-minutes: 40
+    runs-on:
+      group: Beefy runners
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: 'recursive'
+
+      - name: Verify recursive submodules
+        run: |
+          git submodule sync --recursive
+          git submodule update --init --recursive
+          test -f spec/trade-executor-api.yaml
+          test -f deps/web3-ethereum-defi/contracts/lagoon-v0/src/protocol-v2/ProtocolRegistry.sol
+          test -f deps/web3-ethereum-defi/contracts/guard/lib/openzeppelin-contracts/contracts/access/Ownable.sol
+      - name: Set up Python 3.14
+        # The id exposes the resolved patch version to the venv cache key below,
+        # so a runner Python upgrade cannot restore a venv with a dangling interpreter.
+        id: setup-python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxml2-dev libxslt1-dev
+      - name: Install Poetry
+        uses: snok/install-poetry@v1.4.2
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          installer-parallel: true
+      - name: Load cached venv
+        id: cached-poetry-dependencies
+        uses: actions/cache@v6
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('**/poetry.lock') }}
+      # Match eth_defi's Foundry version: Anvil 1.8 changed the fork cache layout and receipts.
+      - name: Cache Foundry toolchain
+        uses: actions/cache@v6
+        with:
+          path: ~/.foundry/bin
+          key: foundry-toolchain-v1.8.6-${{ runner.os }}
+          restore-keys: |
+            foundry-toolchain-v1.8.6-
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1.9.1
+        with:
+          # Keep in step with deps/web3-ethereum-defi/.github/workflows/test.yml
+          version: "v1.8.6"
+      - name: Install dependencies
+        if: steps.cached-poetry-dependencies.outputs.cache-hit != 'true'
+        # We don't install -E qstrader and run legacy tests on CI as they
+        # download too much data
+        run: |
+          poetry install -E execution -E web-server -E qstrader -E demeter
+
+      # Prepare .sol files for deploy_contract_with_forge() tests.
+      # Legacy in-house ABIs are already shipped by eth-defi. Its in-house
+      # target depends on the removed Enzyme build; only rebuild guard sources.
+      - name: Prepare .sol source files
+        run: |
+            (cd deps/web3-ethereum-defi && make guard)
+
+      # Speed up testing by not downloading integration test data from the production server
+      # https://github.com/actions/cache
+      # See conftest.persistent_test_client
+      - name: Cache datasetes
+        id: cache-datasets-load
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/trading-strategy-tests
+          key: cache-datasets
+
+      # Run tests parallel by module
+      - name: Run test scripts
+        run: |
+          # Run tests marked with slow_test_group, print durations of slowest 20
+          poetry run pytest -v --tb=native -m "slow_test_group and not warm_rpc_test_group and not warm_rpc_high_value_group" --durations=20 -n 4 --dist loadscope
+          poetry run pytest -v --tb=native -m "slow_test_group and warm_rpc_test_group" --durations=20 -n 4 --dist loadgroup
+          poetry run pytest -v --tb=native -m "slow_test_group and warm_rpc_high_value_group" --durations=20 -n 4 --dist loadgroup
+        env:
+          # Cap each Anvil fork's upstream request rate (Anvil's default is 330) so
+          # parallel workers queue cold reads instead of drawing HTTP 429s, as eth_defi does.
+          ANVIL_COMPUTE_UNITS_PER_SECOND: "150"
+          TRADING_STRATEGY_API_KEY: ${{ secrets.TRADING_STRATEGY_API_KEY }}
+          # Creem licence key for the paid vault datasets: vault metadata and vault
+          # share price history, downloaded by tradingstrategy.vault_data_client.
+          # Format is five dash separated groups, emailed to the subscriber on purchase
+          # from https://tradingstrategy.ai/vaults/datasets
+          # Not interchangeable with TRADING_STRATEGY_API_KEY above: the oracle key is
+          # secret-token: prefixed and the dataset API answers it with 403 Invalid API key.
+          # When unset, the vault tests skip themselves rather than fail, so a green run
+          # does not mean the live dataset paths were exercised.
+          VAULT_PRO_API_KEY: ${{ secrets.VAULT_PRO_API_KEY }}
+          JSON_RPC_BINANCE: ${{ secrets.JSON_RPC_BINANCE }}
+          # https://stackoverflow.com/a/75274358/315168
+          PYDEVD_DISABLE_FILE_VALIDATION: 1
+          JSON_RPC_POLYGON: ${{ secrets.JSON_RPC_POLYGON }}
+          JSON_RPC_POLYGON_ARCHIVE: ${{ secrets.JSON_RPC_POLYGON_ARCHIVE }}
+          JSON_RPC_ARBITRUM: ${{ secrets.JSON_RPC_ARBITRUM }}
+          JSON_RPC_BASE: ${{ secrets.JSON_RPC_BASE }}
+          JSON_RPC_ETHEREUM: ${{ secrets.JSON_RPC_ETHEREUM }}
+
+      - name: Save datasets
+        id: cache-datasets-save
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/trading-strategy-tests
+          key: cache-datasets

@@ -1,0 +1,133 @@
+name: Windows Build
+
+on:
+    push:
+      branches:
+         - 'master'
+         - 'windows-build'
+         - 'heimdal-7-1-branch'
+      paths:
+         - '!docs/**'
+         - '!**.md'
+         - '!**.[1-9]'
+         - '**.[chly]'
+         - '**.hin'
+         - '**.in'
+         - '**.pl'
+         - '**.py'
+         - '**.asn1'
+         - '**.opt'
+         - '**.w32'
+         - '**.def'
+         - '**/NTMakefile*'
+         - '**/COPYING'
+         - '**/INSTALL'
+         - '**/README*'
+         - '.github/workflows/windows.yml'
+
+    pull_request:
+      paths:
+         - '!docs/**'
+         - '!**.md'
+         - '!**.[1-9]'
+         - '**.[chly]'
+         - '**.hin'
+         - '**.in'
+         - '**.pl'
+         - '**.py'
+         - '**.asn1'
+         - '**.opt'
+         - '**.w32'
+         - '**/NTMakefile'
+         - '**/COPYING'
+         - '**/INSTALL'
+         - '**/README*'
+         - '.github/workflows/windows.yml'
+
+jobs:
+    windows:
+        # Run if no [only X] tag, or if [only windows] is present (check both push commits and PR titles)
+        if: >-
+            (!contains(github.event.head_commit.message, '[only ') &&
+             !contains(github.event.pull_request.title, '[only ')) ||
+            contains(github.event.head_commit.message, '[only windows]') ||
+            contains(github.event.pull_request.title, '[only windows]')
+        runs-on: windows-latest
+        strategy:
+            fail-fast: false
+            matrix:
+                # clang-cl disabled due to LLVM 19 bug with MMX intrinsics in VS 2022 headers
+                compiler: [msvc]
+        env:
+            APPVER: '10.0'
+            CODESIGN_PKT: 0000000000000000
+            INSTALL_DIR: C:\heimdal
+            WINSDKVER: '10.0.22000.0'
+            WIXDIR: 'c:\Program Files (x86)\Windows Installer XML v3.5'
+        steps:
+            - name: Clone repository
+              uses: actions/checkout@v4
+
+            - name: Find MSVC and run vcvarsall.bat
+              uses: ilammy/msvc-dev-cmd@v1
+              with:
+                arch: amd64
+
+            - name: Setup OpenSSL
+              shell: pwsh
+              run: |
+                # OpenSSL 3.x is pre-installed on windows-latest at C:\Program Files\OpenSSL
+                $opensslDir = "C:\Program Files\OpenSSL"
+                if (Test-Path $opensslDir) {
+                    Write-Host "OpenSSL found at $opensslDir"
+                    Get-ChildItem $opensslDir
+                    # Show version
+                    & "$opensslDir\bin\openssl.exe" version
+                } else {
+                    Write-Host "OpenSSL not found, installing via chocolatey..."
+                    choco install openssl -y
+                    $opensslDir = "C:\Program Files\OpenSSL"
+                }
+                # Set environment variables for the build
+                echo "OPENSSL_DIR=$opensslDir" >> $env:GITHUB_ENV
+                echo "INCLUDE_openssl_crypto=$opensslDir\include" >> $env:GITHUB_ENV
+                echo "LIB_openssl_crypto=$opensslDir\lib\VC\x64\MD\libcrypto.lib" >> $env:GITHUB_ENV
+
+            - name: Install MSYS2 packages
+              shell: cmd
+              run: |
+                C:\msys64\usr\bin\pacman.exe --noconfirm -Sy
+                C:\msys64\usr\bin\pacman.exe --noconfirm -S zstd autoconf automake flex bison perl perl-JSON texinfo
+
+            - name: Build
+              shell: cmd
+              run: |
+                set "PATH=%PATH%;C:\msys64\usr\bin"
+                set "PATH=%PATH%;C:\Program Files (x86)\HTML Help Workshop"
+                set "PATH=%PATH%;C:\Program Files\OpenSSL\bin"
+                set CODESIGN_PKT=0000000000000000
+                mkdir %INSTALL_DIR%
+                echo PATH=%PATH%
+                echo INCLUDE_openssl_crypto=%INCLUDE_openssl_crypto%
+                echo LIB_openssl_crypto=%LIB_openssl_crypto%
+                echo Compiler: ${{ matrix.compiler }}
+                if "${{ matrix.compiler }}"=="clang-cl" (
+                    clang-cl --version
+                    nmake /f NTMakefile CC=clang-cl GHA=1 NO_INSTALLERS=1 INCLUDE_openssl_crypto="%INCLUDE_openssl_crypto%" LIB_openssl_crypto="%LIB_openssl_crypto%" CFLAGS="-msse2"
+                ) else (
+                    nmake /f NTMakefile GHA=1 NO_INSTALLERS=1 INCLUDE_openssl_crypto="%INCLUDE_openssl_crypto%" LIB_openssl_crypto="%LIB_openssl_crypto%"
+                )
+
+            - name: Test
+              timeout-minutes: 20
+              shell: cmd
+              run: |
+                set "PATH=%PATH%;C:\msys64\usr\bin"
+                set "PATH=%PATH%;C:\Program Files\OpenSSL\bin"
+                nmake /f NTMakefile GHA=1 NO_INSTALLERS=1 test
+
+            - name: Upload Artifacts
+              uses: actions/upload-artifact@v4
+              with:
+                name: Objects-${{ matrix.compiler }}
+                path: 'D:/a/heimdal/heimdal/out/'

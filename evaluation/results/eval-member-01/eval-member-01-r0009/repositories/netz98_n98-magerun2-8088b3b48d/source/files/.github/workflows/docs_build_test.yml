@@ -1,0 +1,63 @@
+---
+name: Docs Build Test
+
+on:
+  push:
+    branches:
+      - "master"
+      - "develop"
+      - "bugfix/*"
+      - "feature/*"
+      - "release/*"
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs_build_test.yml"
+  pull_request:
+    branches:
+      - "master"
+      - "develop"
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs_build_test.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+    working-directory: ./docs
+
+jobs:
+  build-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Report checked-out revision
+        run: git log -1 --format=%H
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: docs/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Report installed Docusaurus and test configuration
+        run: |
+          node -p "'Docusaurus core: ' + require('@docusaurus/core/package.json').version"
+          node -p "'Docusaurus Faster: ' + require('@docusaurus/faster/package.json').version"
+          node --test tests/*.test.cjs
+
+      - name: Build documentation
+        run: npm run build

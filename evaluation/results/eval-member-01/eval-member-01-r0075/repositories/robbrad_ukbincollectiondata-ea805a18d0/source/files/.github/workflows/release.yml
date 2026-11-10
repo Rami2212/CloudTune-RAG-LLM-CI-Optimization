@@ -1,0 +1,131 @@
+name: Release - Publish to PyPI
+
+on:
+  push:
+    tags:
+      - '*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Poetry
+        uses: abatilo/actions-poetry@v4.0.0
+        with:
+          poetry-version: '1.8.4'
+
+      - name: Cache Poetry dependencies
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/pypoetry
+          key: ${{ runner.os }}-poetry-${{ hashFiles('**/poetry.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-poetry-
+
+      - name: Set release version
+        run: echo "RELEASE_VERSION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
+
+      - name: Verify version matches tag
+        run: |
+          POETRY_VERSION=$(poetry version -s)
+          if [ "$POETRY_VERSION" != "${{ env.RELEASE_VERSION }}" ]; then
+            echo "Error: Poetry version ($POETRY_VERSION) doesn't match tag (${{ env.RELEASE_VERSION }})"
+            exit 1
+          fi
+
+      - name: Build package
+        run: poetry build
+
+      - name: Create GitHub release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ env.RELEASE_VERSION }}
+          generateReleaseNotes: true
+          artifacts: "dist/*"
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish to PyPI
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 5
+          max_attempts: 3
+          retry_wait_seconds: 30
+          command: |
+            poetry config pypi-token.pypi "${{ secrets.PYPI_API_KEY }}"
+            poetry publish
+
+      - name: Create workflow summary
+        if: always()
+        run: |
+          echo "## Release Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: ${{ env.RELEASE_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "- **PyPI**: https://pypi.org/project/uk-bin-collection/${{ env.RELEASE_VERSION }}/" >> $GITHUB_STEP_SUMMARY
+            echo "- **GitHub Release**: https://github.com/${{ github.repository }}/releases/tag/${{ env.RELEASE_VERSION }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ Release published successfully!" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "❌ Release failed - check logs above" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  docker:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4.6.0
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_API_KEY }}
+
+      # The release job's "Publish to PyPI" step can report success before
+      # the new version is actually pip-installable - PyPI's index takes a
+      # few seconds to catch up. The Docker build below pip-installs
+      # uk-bin-collection>=<this tag> from requirements.txt, so without this
+      # wait it can race the index and fail even though the release itself
+      # succeeded.
+      #
+      # Ask pip itself rather than PyPI's JSON API. The JSON API updates
+      # before the "simple" index pip actually reads, so polling it reports
+      # the version live while pip still can't find it - which is exactly how
+      # 0.173.2 shipped to PyPI but failed to build a Docker image, twice.
+      - name: Wait for PyPI to index the new version
+        run: |
+          for i in $(seq 1 24); do
+            if python3 -m pip download "uk-bin-collection==${{ github.ref_name }}" \
+                 --no-deps --no-cache-dir --dest /tmp/pypi-propagation-check \
+                 --quiet > /dev/null 2>&1; then
+              echo "uk-bin-collection ${{ github.ref_name }} is installable from PyPI"
+              exit 0
+            fi
+            echo "Not installable yet, waiting 15s (attempt $i/24)..."
+            sleep 15
+          done
+          echo "::error::uk-bin-collection ${{ github.ref_name }} still isn't installable from PyPI after 6 minutes"
+          exit 1
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./uk_bin_collection_api_server
+          push: true
+          tags: |
+            robbrad182/uk-bin-collection:${{ github.ref_name }}
+            robbrad182/uk-bin-collection:latest

@@ -1,0 +1,128 @@
+---
+name: Mage-OS Nightly Compatibility Test
+
+on:
+  schedule:
+    - cron: '0 6 * * *' # run at 6 AM UTC
+  workflow_dispatch:
+
+jobs:
+  test_develop_nightly:
+    name: Deploy nightly
+    runs-on: ubuntu-22.04
+
+    services:
+      opensearch:
+        image: opensearchproject/opensearch:2.19.1
+        ports:
+          - 9200
+          - 9600
+        options: >-
+          --env discovery.type=single-node
+          --env plugins.security.disabled=true
+          --env bootstrap.memory_lock=true
+          --env OPENSEARCH_JAVA_OPTS="-Xms512m -Xmx512m"
+          --env OPENSEARCH_INITIAL_ADMIN_PASSWORD=admin123Secure!
+          --health-cmd="curl -fsSL http://localhost:9200 || exit 1"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+      mariadb:
+        image: "mariadb:10.6"
+        env:
+          MARIADB_ROOT_PASSWORD: root
+          MARIADB_DATABASE: magento
+        ports:
+          - 3306 # Standard MariaDB/MySQL port
+        # Use authenticated TCP ping to avoid false negatives on CI runners
+        options: >-
+          --health-cmd="mariadb-admin ping -h 127.0.0.1 --protocol=tcp -uroot -proot || exit 1"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=20
+          --health-start-period=40s
+
+    steps:
+      - name: Checkout develop branch
+        uses: actions/checkout@v7
+        with:
+          ref: develop
+
+      - name: Linux Setup
+        run: ./.github/scripts/linux-setup.sh
+
+      - name: Dump GitHub context
+        run: echo "Register Github context"
+        env:
+          GITHUB_CONTEXT: ${{ toJSON(github) }}
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          tools: composer:2.8.8
+          php-version: '8.3'
+          extensions: mbstring, intl, zip
+          coverage: none
+
+      - name: Install Mage-OS Nightly
+        run: |
+          DB_PORT="${{ job.services.mariadb.ports['3306'] }}"
+          OS_PORT="${{ job.services.opensearch.ports['9200'] }}"
+          DB_HOST="127.0.0.1:${DB_PORT}"
+
+          composer create-project --stability alpha --repository-url=https://repo.mage-os.org mage-os/project-community-edition mage-os
+
+          cd mage-os
+
+          bin/magento setup:install \
+            --db-host="$DB_HOST" \
+            --db-user=root \
+            --db-password=root \
+            --db-name=magento \
+            --cleanup-database \
+            --session-save=db \
+            --backend-frontname=admin \
+            --timezone="Europe/Berlin" \
+            --currency="EUR" \
+            --base-url="http://github.magerun.test/" \
+            --use-rewrites=1 \
+            --use-secure=1 \
+            --use-secure-admin=1 \
+            --admin-user=admin \
+            --admin-password=Password123 \
+            --admin-firstname=Armin \
+            --admin-lastname=Admin \
+            --admin-email="admin@example.com" \
+            --search-engine="opensearch" \
+            --opensearch-host="127.0.0.1" \
+            --opensearch-port="$OS_PORT" \
+            --opensearch-index-prefix="magento2" \
+            --opensearch-timeout=15
+
+      - name: build.sh dataset refresh tests
+        run: bats tests/bats/build_dataset.bats
+
+      - name: Build phar file
+        run: |
+          composer --version
+          bash ./build.sh
+          composer self-update --rollback &> /dev/null || true
+
+      - name: Phar functional tests (Magerun)
+        run: bats tests/bats/functional_magerun_commands.bats
+        env:
+          N98_MAGERUN2_TEST_MAGENTO_ROOT: "${{ github.workspace }}/mage-os"
+          N98_MAGERUN2_BIN: "${{ github.workspace }}/n98-magerun2.phar"
+
+      - name: Phar functional tests (Magento Core)
+        run: bats tests/bats/functional_core_commands.bats
+        env:
+          N98_MAGERUN2_TEST_MAGENTO_ROOT: "${{ github.workspace }}/mage-os"
+          N98_MAGERUN2_BIN: "${{ github.workspace }}/n98-magerun2.phar"
+
+      - name: Phar functional tests (MCP server)
+        run: bats tests/bats/functional_mcp_commands.bats
+        env:
+          N98_MAGERUN2_TEST_MAGENTO_ROOT: "${{ github.workspace }}/mage-os"
+          N98_MAGERUN2_BIN: "${{ github.workspace }}/n98-magerun2.phar"

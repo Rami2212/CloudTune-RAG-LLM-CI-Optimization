@@ -1,0 +1,137 @@
+name: Building native images
+
+on:
+  push:
+    branches:
+      - main
+    # NOT bb/**: bb/src/tools/build.clj is the native build itself -- it is
+    # what invokes javac and native-image. Ignoring it meant a change to how
+    # we build the image could not trigger a build of the image, which is
+    # exactly backwards. #1010 fixed three Windows bugs in that file and
+    # touched nothing else, so it merged without a single native build running.
+    paths-ignore:
+      - '**/README.md'
+      - 'doc/**'
+      - '.circleci/**'
+      - 'dev/**'
+      - 'examples/**'
+      - 'test/**'
+
+jobs:
+  native:
+    if: "!contains(github.event.head_commit.message, 'skip ci')"
+    strategy:
+      # One platform's failure must not cancel the others, and must not
+      # withhold their artifacts. Matters as soon as this matrix grows.
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            name: macos
+            platform: macos
+            arch: amd64
+          - os: macos-15          # Apple Silicon
+            name: macos
+            platform: macos
+            arch: aarch64
+          # The .dll builds and ships. Only its C++ harness is skipped: that
+          # script exports LD_LIBRARY_PATH/DYLD_LIBRARY_PATH, which mean nothing
+          # on Windows, and drives compile-cpp through a gcc/clang toolchain.
+          - os: windows-latest
+            name: windows
+            platform: windows
+            arch: amd64
+            skip-libdatahike-test: true
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GRAALVM_VERSION: 25.0.0
+      # Per matrix entry, not per job: bb/src/tools/release.clj reads these to
+      # render {{lib}}-{{version}}-{{platform}}-{{arch}}.zip, so hardcoding them
+      # here is what limited this workflow to one architecture.
+      DTHK_PLATFORM: ${{ matrix.platform }}
+      DTHK_ARCH: ${{ matrix.arch }}
+    steps:
+      - name: Git checkout
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+          submodules: 'true'
+
+      - name: Restore cache
+        uses: actions/cache/restore@v4
+        id: restore-cache
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('deps.edn') }}
+
+      - name: Setup GraalVM
+        uses: graalvm/setup-graalvm@v1
+        with:
+          java-version: '25'
+          distribution: 'graalvm-community'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          set-java-home: true
+
+      - name: Install clojure tools
+        uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          cli: 1.12.2.1565
+          bb: 1.12.208
+
+      - name: Test scratch lifecycle
+        run: bb --config bb/scratch.edn -m tools.scratch-test
+
+      - name: Build native image
+        run: bb --config bb/scratch.edn -m tools.scratch run -- bb ni-cli
+
+      - name: Build libdatahike
+        run: bb --config bb/scratch.edn -m tools.scratch run -- bb ni-compile
+
+      # Tests gate this platform's upload and nothing else. `continue-on-error`
+      # records the outcome without ending the job, so a red test here cannot
+      # withhold another platform's binaries.
+      - name: Test native image
+        id: test-native-image
+        continue-on-error: true
+        run: bb --config bb/scratch.edn -m tools.scratch run -- bb test native-image
+
+      - name: Test babashka pod
+        id: test-bb-pod
+        continue-on-error: true
+        run: bb --config bb/scratch.edn -m tools.scratch run -- bb test bb-pod
+
+      - name: Test libdatahike
+        if: '!matrix.skip-libdatahike-test'
+        id: test-libdatahike
+        continue-on-error: true
+        run: bb --config bb/scratch.edn -m tools.scratch run -- bb test libdatahike
+
+      - name: Release native-image
+        if: steps.test-native-image.outcome == 'success' && steps.test-bb-pod.outcome == 'success'
+        run: bb --config bb/scratch.edn -m tools.scratch run -- bb release native-image
+
+      - name: Release libdatahike
+        if: "matrix.skip-libdatahike-test || steps.test-libdatahike.outcome == 'success'"
+        run: bb --config bb/scratch.edn -m tools.scratch run -- bb release libdatahike
+
+      # The job still fails if anything above did, so the red X is not lost —
+      # it just no longer pre-empts the uploads that did pass.
+      - name: Fail the job if any test failed
+        if: |
+          steps.test-native-image.outcome != 'success' ||
+          steps.test-bb-pod.outcome != 'success' ||
+          (!matrix.skip-libdatahike-test && steps.test-libdatahike.outcome != 'success')
+        run: |
+          echo "native-image: ${{ steps.test-native-image.outcome }}"
+          echo "bb-pod:       ${{ steps.test-bb-pod.outcome }}"
+          echo "libdatahike:  ${{ steps.test-libdatahike.outcome }}"
+          exit 1
+
+      - name: Save cache
+        uses: actions/cache/save@v4
+        id: save-cache
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('deps.edn') }}

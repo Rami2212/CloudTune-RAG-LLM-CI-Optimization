@@ -1,0 +1,110 @@
+name: Release GH+MR+CF
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      releaseType:
+        type: choice
+        description: Release Type
+        options:
+          - stable
+          - beta
+          - alpha
+      platform:
+        type: choice
+        description: Platform
+        options:
+          - both
+          - fabric
+          - neoforge
+      publishSite:
+        type: choice
+        description: Publishing Site
+        options:
+          - both
+          - modrinth
+          - curseforge
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment: Publishing
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+
+      - name: Setup JDK 25
+        uses: actions/setup-java@v5
+        with:
+          distribution: adopt
+          java-version: 25
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v5
+        with:
+          gradle-home-cache-cleanup: true
+          cache-read-only: true
+
+      - name: Validate Gradle Wrapper Integrity
+        uses: gradle/actions/wrapper-validation@v5
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Gradle Release Build
+        env:
+          RELEASE_WORKFLOW: true
+          PLATFORM: ${{ inputs.platform }}
+        run: ./gradlew build
+
+      - name: Set environment variables for the script below
+        run: |
+          echo "MINECRAFT_COMPILE_VERSION=$(./gradlew -q printMinecraftVersion)" >> $GITHUB_ENV
+          echo "MINECRAFT_DISPLAY_VERSION=$(./gradlew -q printMinecraftDisplayVersion)" >> $GITHUB_ENV
+          echo "MOD_VERSION=$(./gradlew -q printModVersion)" >> $GITHUB_ENV
+
+      - name: Set Release Name
+        id: set_release_name
+        run: |
+          if [ "${{ inputs.platform }}" == "both" ]; then
+            echo "RELEASE_NAME=Lithium $MOD_VERSION for Minecraft $MINECRAFT_DISPLAY_VERSION Fabric and Neoforge" >> $GITHUB_ENV
+          elif [ "${{ inputs.platform }}" == "fabric" ]; then
+            echo "RELEASE_NAME=Lithium $MOD_VERSION for Minecraft $MINECRAFT_DISPLAY_VERSION Fabric" >> $GITHUB_ENV
+          elif [ "${{ inputs.platform }}" == "neoforge" ]; then
+            echo "RELEASE_NAME=Lithium $MOD_VERSION for Minecraft $MINECRAFT_DISPLAY_VERSION Neoforge" >> $GITHUB_ENV
+          fi
+
+      - name: Replace placeholders in CHANGELOG.md
+        run: |
+          sed -i 's/_ReleaseTag_/mc${{ env.MINECRAFT_COMPILE_VERSION }}-${{ env.MOD_VERSION }}/g' CHANGELOG.md
+          sed -i 's/_MCVersion_/${{ env.MINECRAFT_DISPLAY_VERSION }}/g' CHANGELOG.md
+          sed -i 's/_LithiumVersion_/${{ env.MOD_VERSION }}/g' CHANGELOG.md     
+
+      - name: Trim CHANGELOG.md
+        run: |
+          trimmed_changelog=$(awk '/----------/{flag=1;next}flag' CHANGELOG.md)
+          echo "$trimmed_changelog" > CHANGELOG.md
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create mc${{ env.MINECRAFT_COMPILE_VERSION }}-${{ env.MOD_VERSION }} \
+            --title="${{ env.RELEASE_NAME }}" \
+            --notes-file=CHANGELOG.md \
+            --target=${{ github.ref_name }} \
+            --draft=false \
+            --prerelease=${{ inputs.releaseType != 'stable' }} \
+            build/libs/*.jar LICENSE.md
+
+      - name: Publish to Modrinth and Curseforge
+        env:
+          RELEASE_WORKFLOW: true
+          RELEASE_TYPE: ${{ inputs.releaseType }}
+          PLATFORM: ${{ inputs.platform }}
+          PUBLISH_SITE: ${{ inputs.publishSite }}
+          MODRINTH_API_KEY: ${{ secrets.MODRINTH_API_KEY }}
+          CURSEFORGE_API_KEY: ${{ secrets.CURSEFORGE_API_KEY }}
+        run: ./gradlew lithiumPublish

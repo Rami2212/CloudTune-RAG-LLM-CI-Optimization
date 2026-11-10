@@ -1,0 +1,64 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [HIGH] Add cargo dependency cache to "build-zenoh" job
+# - [MEDIUM] Add concurrency group to "tests-zenoh.yml"
+# Estimated savings: ~10 min/run
+#
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+name: CI / Zenoh backend
+
+permissions: read-all
+
+jobs:
+
+  build-zenoh:
+    name: build & test (zenoh feature)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # The Zenoh backend is built with the DDS default turned off.
+      - name: check (zenoh)
+        run: cargo check --no-default-features --features zenoh
+
+      - name: clippy (zenoh)
+        run: cargo clippy --no-default-features --features zenoh --lib --bins -- -D warnings
+
+      # The zenoh-backend example must compile (and lint clean). The DDS
+      # examples are gated on the `dds` feature (Cargo.toml `required-features`)
+      # and are skipped under this feature set.
+      - name: clippy examples (zenoh)
+        run: cargo clippy --no-default-features --features zenoh --examples -- -D warnings
+
+      # `--lib` only: the crate-level doctest exercises the DDS API and is not
+      # meant to compile under the zenoh backend. Serial to keep session ports
+      # from contending.
+      - name: test (zenoh, lib)
+        run: cargo test --no-default-features --features zenoh --lib -- --test-threads=1
+
+      # The DDS backend must also build when selected explicitly with default
+      # features off.
+      - name: check (dds, explicit)
+        run: cargo check --no-default-features --features dds
+
+      # Both backends may be enabled in the same build (ADR-0010 Phase 5):
+      # entity types are namespaced under `ros2_client::dds` /
+      # `ros2_client::zenoh`, so there is no more feature exclusivity to
+      # enforce. `--lib` only: examples/tests are written against a single
+      # backend's crate-root re-exports and are not meant to compile dual.
+      - name: check (dds + zenoh, lib)
+        run: cargo check --features dds,zenoh --lib
+
+      - name: clippy (dds + zenoh, lib)
+        run: cargo clippy --features dds,zenoh --lib -- -D warnings

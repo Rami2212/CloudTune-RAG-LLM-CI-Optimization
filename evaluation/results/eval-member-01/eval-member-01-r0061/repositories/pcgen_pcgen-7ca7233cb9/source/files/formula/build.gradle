@@ -1,0 +1,91 @@
+plugins {
+    id 'java-library'
+}
+
+group = 'net.sourceforge.pcgen'
+description = 'PCGen formula library - generic expression parser and solver system'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+    modularity.inferModulePath = true
+}
+
+def generatedJjtreeDir = layout.buildDirectory.dir('generated/sources/jjtree').get().asFile
+def generatedJavaccDir = layout.buildDirectory.dir('generated/sources/javacc').get().asFile
+
+sourceSets {
+    main {
+        java { srcDirs = ['code/src/java', generatedJjtreeDir, generatedJavaccDir] }
+    }
+    test {
+        java { srcDirs = ['code/src/test'] }
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+configurations {
+    javacc
+}
+
+dependencies {
+    api project(':base')
+
+    javacc libs.javacc
+
+    testImplementation platform(libs.junit.bom)
+    testImplementation libs.junit.jupiter.api
+    testImplementation libs.junit.jupiter.params
+    testRuntimeOnly libs.junit.jupiter.engine
+    testRuntimeOnly libs.junit.platform.launcher
+}
+
+// SimpleNode.java and Operator.java in code/src/java are hand-maintained; everything
+// else in pcgen/base/formula/parse is generated at build time. JJTree produces the AST
+// classes, the visitor interfaces, and an annotated .jj grammar; JavaCC then turns the
+// .jj into the parser and token classes.
+tasks.register('jjtree', JavaExec) {
+    def src = file('code/src/jjtree/pcgen/base/formula/parse/formula.jjt')
+    def outDir = new File(generatedJjtreeDir, 'pcgen/base/formula/parse')
+    inputs.file(src)
+    outputs.dir(generatedJjtreeDir)
+    classpath = configurations.javacc
+    mainClass = 'jjtree'
+    args "-OUTPUT_DIRECTORY=${outDir}", src.absolutePath
+    doFirst {
+        generatedJjtreeDir.deleteDir()
+        outDir.mkdirs()
+    }
+    doLast {
+        // SimpleNode is hand-maintained in code/src/java; drop JJTree's stub so the
+        // two don't collide on the source path.
+        new File(outDir, 'SimpleNode.java').delete()
+    }
+}
+
+tasks.register('javacc', JavaExec) {
+    dependsOn 'jjtree'
+    def jjFile = new File(generatedJjtreeDir, 'pcgen/base/formula/parse/formula.jj')
+    def outDir = new File(generatedJavaccDir, 'pcgen/base/formula/parse')
+    inputs.file(jjFile)
+    outputs.dir(generatedJavaccDir)
+    classpath = configurations.javacc
+    mainClass = 'javacc'
+    args "-OUTPUT_DIRECTORY=${outDir}", jjFile.absolutePath
+    doFirst {
+        generatedJavaccDir.deleteDir()
+        outDir.mkdirs()
+    }
+}
+
+tasks.named('compileJava') {
+    dependsOn 'javacc'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+}

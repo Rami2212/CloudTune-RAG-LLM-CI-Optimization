@@ -1,0 +1,309 @@
+name: 'Refresh Demos'
+on:
+  release:
+    types: published
+  push:
+    branches:
+      - main
+    paths:
+      - 'demos/**'
+      - '!demos/README.md'
+      - '!demos/*/README.md'
+      - '!demos/*/otlp.json'
+      - '!demos/*/output.*'
+jobs:
+  prepare:
+    if: ${{ github.event_name == 'push' || github.event_name == 'release' }}
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      dirs: ${{ steps.demos.outputs.dirs }}
+      should_run: ${{ steps.release.outputs.should_run }}
+    steps:
+      - uses: plengauer/opentelemetry-github/actions/instrument/job@5d34a21816f798c24f19857225b018a7f2af731f # v5.66.0
+        with:
+          secrets_to_redact: '["${{ github.token }}"]'
+        env:
+          OTEL_EXPORTER_OTLP_ENDPOINT: '${{ secrets.OTEL_EXPORTER_OTLP_ENDPOINT }}'
+          OTEL_EXPORTER_OTLP_HEADERS: '${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}'
+      - name: Check release is on default branch
+        id: release
+        if: ${{ github.event_name == 'release' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! response="$(curl --silent --show-error --fail-with-body --header "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/compare/${{ github.event.repository.default_branch }}...${{ github.sha }}")"; then
+            echo "Compare API call failed." >&2
+            printf '%s\n' "$response" >&2
+            exit 1
+          fi
+          status="$(printf '%s' "$response" | jq -r .status)"
+          case "$status" in
+            identical|behind) echo "should_run=true" >> "$GITHUB_OUTPUT" ;;
+            ahead|diverged)
+              echo "Release commit is not an ancestor of the default branch (status: $status). Skipping demo refresh."
+              echo "should_run=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Compare API returned unexpected status: $status" >&2
+              exit 1
+              ;;
+          esac
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - if: ${{ github.event_name == 'push' || steps.release.outputs.should_run == 'true' }}
+        run: |
+          cd demos && echo */ | tr ' ' '\n' | tr -d / | while read -r dir; do echo \""$dir"\"; done | jq -s | tr -d ' ' | tr -d '\n' | xargs -0 -I {} echo 'dirs={}' >> "$GITHUB_OUTPUT"
+        id: demos
+  generate:
+    if: ${{ !github.event.repository.fork && (github.event_name == 'push' || needs.prepare.outputs.should_run == 'true') }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        demo_directory: ${{ fromJSON(needs.prepare.outputs.dirs) }}
+    steps:
+      - run: |
+          { if [ "$GITHUB_EVENT_NAME" = release ]; then cat "$GITHUB_EVENT_PATH"; else curl --header "Authorization: Bearer ${{ github.token }}" https://api.github.com/repos/"$GITHUB_REPOSITORY"/releases/latest; fi; } | jq -r '.assets[] | select(.name | endswith("_amd64.deb")) | .url' | xargs wget --header "Authorization: Bearer ${{ github.token }}" --header "Accept: application/octet-stream" -O package.deb
+      - run: sudo apt-get -y install ./package.deb
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - id: demo
+        env:
+          GITHUB_TOKEN: ${{ secrets.ACTIONS_GITHUB_TOKEN }}
+        run: |
+          set +o pipefail
+          for name in $(printenv | cut -d = -f 1 | grep '^GITHUB_'); do unset "$name"; done
+          export GITHUB_TOKEN=${{ github.token }}
+          cd demos/${{ matrix.demo_directory }}
+          echo "
+          receivers:
+            otlp:
+              protocols:
+                grpc:
+                  endpoint: 0.0.0.0:4317
+                http:
+                  endpoint: 0.0.0.0:4318
+          processors:
+            batch:
+          exporters:
+            file:
+              path: /etc/otelcol/otlp.json
+          service:
+            pipelines:
+              metrics:
+                receivers: [otlp]
+                exporters: [file]
+                processors: [batch]
+              logs:
+                receivers: [otlp]
+                exporters: [file]
+                processors: [batch]
+              traces:
+                receivers: [otlp]
+                exporters: [file]
+                processors: [batch]
+          " > config.yaml
+          rm otlp.json || true
+          touch otlp.json && chmod 0666 otlp.json
+          sudo docker create --rm --mount "type=bind,source=$(pwd)/config.yaml,target=/etc/otelcol/config.yaml" --mount "type=bind,source=$(pwd)/otlp.json,target=/etc/otelcol/otlp.json" --network=host --name=collector otel/opentelemetry-collector:latest
+          sudo docker start collector
+          cat meta.json | jq -r .setup | (grep -v '^null$' || true) | sh
+          bash -e demo.sh 1> output.stdout 2> output.stderr || (cat output.stdout output.stderr && false)
+          while [ "$(pgrep -cf /opt/opentelemetry_shell/)" -gt 0 ]; do sleep 3; done
+          sudo docker stop collector
+          rm config.yaml
+          sed -i s/${{ github.token }}/***/g otlp.json
+      - env:
+          GITHUB_TOKEN: ${{ secrets.ACTIONS_GITHUB_TOKEN }}
+        run: |
+          set +o pipefail
+          cd demos/${{ matrix.demo_directory }}
+
+          spans() {
+            cat otlp.json | jq '. | select(.resourceSpans != null) | .resourceSpans[].scopeSpans[].spans[]'
+          }
+
+          convert_span_id_to_name() {
+            spans | jq -r '. | select(.spanId == "'"$1"'") | .name'
+          }
+
+          get_root_span_id() {
+            spans | jq -r '. | select(.name != null) | select(.parentSpanId == null or .parentSpanId == "") | .spanId'
+          }
+
+          get_child_span_ids() {
+            spans | jq '. | select(.name != null) | select(.parentSpanId == "'"$1"'") | .startTimeUnixNano |= .[0:-8]' | jq -r -s '. | sort_by(.endTimeUnixNano) | .[].spanId'
+          }
+
+          print_span_name_tree() {
+            local span_id="$1"
+            local indent="$2"
+            printf '%s' "$indent"; convert_span_id_to_name "$span_id"
+            get_child_span_ids "$span_id" | while read -r child_span_id; do
+              print_span_name_tree "$child_span_id" "$indent  "
+            done
+          }
+
+          pretty_print_attributes() {
+            attributes="$(jq .[] 2> /dev/null)"
+            if [ -z "$attributes" ]; then echo "{}"; return 0; fi
+            printf '%s' "$attributes" | jq -r .key | while read -r key; do
+              value="$(printf '%s' "$attributes" | jq 'select(.key == "'"$key"'")' | jq .value)"
+              if printf '%s' "$value" | grep -q arrayValue; then
+                if printf '%s' "$value" | grep -q stringValue; then
+                  value="$(printf '%s' "$value" | jq .arrayValue.values[].stringValue | tr '\n' ',')"
+                elif printf '%s' "$value" | grep -q intValue; then
+                  value="$(printf '%s', "$value" | jq -r .arrayValue.values[].intValue | tr '\n' ',')"
+                else
+                  value=","
+                fi
+                value="[${value::-1}]"
+              elif printf '%s' "$value" | grep -q stringValue; then
+                value="$(printf '%s' "$value" | jq .stringValue)"
+              elif printf '%s' "$value" | grep -q intValue; then
+                value="$(printf '%s' "$value" | jq -r .intValue)"
+              else
+                value=null
+              fi
+              jq -n --argjson "$key" "$value" '$ARGS.named'
+            done | jq -s add
+          }
+
+          pretty_print_events() {
+            events="$(cat)"
+            if [ -z "$events" ] || [ "$events" = null ]; then echo "[]"; return 0; fi
+            printf '%s' "$events" | jq .[].name | wc -l | xargs seq 1 | while read -r index; do echo "$((index-1))"; done | while read -r index; do
+              event="$(printf '%s' "$events" | jq ".[$index]")"
+              jq -n \
+                --argjson name "$(printf '%s' "$event" | jq .name)" \
+                --argjson time "$(printf '%s' "$event" | jq -r .timeUnixNano)" \
+                --argjson attributes "$(printf '%s' "$event" | jq .attributes | pretty_print_attributes)" \
+                 '$ARGS.named'
+            done | jq -s .
+          }
+
+          pretty_print_links() {
+            links="$(cat)"
+            if [ -z "$links" ] || [ "$links" = null ]; then echo "[]"; return 0; fi
+            printf '%s' "$links" | jq .[].traceId | wc -l | xargs seq 1 | while read -r index; do echo "$((index-1))"; done | while read -r index; do
+              link="$(printf '%s' "$links" | jq ".[$index]")"
+              jq -n \
+                --argjson trace_id "$(printf '%s' "$link" | jq .traceId)" \
+                --argjson span_id "$(printf '%s' "$link" | jq .spanId)" \
+                --argjson attributes "$(printf '%s' "$link" | jq .attributes | pretty_print_attributes)" \
+                 '$ARGS.named'
+            done | jq -s .
+          }
+
+          pretty_print_trace() {
+            cat otlp.json | jq -r '. | select(.resourceSpans != null) | .resourceSpans[].scopeSpans[].spans[]' | jq -r -s '. | sort_by(.startTimeUnixNano) | .[].spanId' | while read -r span_id; do
+              span="$(spans | jq --arg span_id "$span_id" 'select(.spanId == $span_id)')"
+              resource_attributes="$(jq --sort-keys --arg span_id "$span_id" '. | select(.resourceSpans != null) | .resourceSpans[] | select(.scopeSpans[].spans[].spanId == $span_id) | .resource.attributes' otlp.json)"
+              jq -n \
+                --argjson trace_id "$(printf '%s' "$span" | jq .traceId)" \
+                --argjson span_id "$(printf '%s' "$span" | jq .spanId)" \
+                --argjson parent_span_id "$(printf '%s' "$span" | jq .parentSpanId)" \
+                --argjson name "$(printf '%s' "$span" | jq .name)" \
+                --argjson kind "$(printf '%s' "$span" | jq .kind)" \
+                --argjson status "$(printf '%s' "$span" | jq -r .status.code)" \
+                --argjson time_start "$(printf '%s' "$span" | jq -r .startTimeUnixNano)" \
+                --argjson time_end "$(printf '%s' "$span" | jq -r .endTimeUnixNano)" \
+                --argjson attributes "$(printf '%s' "$span" | jq --sort-keys .attributes | pretty_print_attributes)" \
+                --argjson resource_attributes "$(printf '%s' "$resource_attributes" | pretty_print_attributes)" \
+                --argjson links "$(printf '%s' "$span" | jq .links | pretty_print_links)" \
+                --argjson events "$(printf '%s' "$span" | jq .events | pretty_print_events)" \
+                '$ARGS.named'
+            done \
+              | jq 'with_entries(if .key == "kind" and .value == 1 then .value = "INTERNAL" else . end)' \
+              | jq 'with_entries(if .key == "kind" and .value == 2 then .value = "SERVER" else . end)' \
+              | jq 'with_entries(if .key == "kind" and .value == 3 then .value = "CLIENT" else . end)' \
+              | jq 'with_entries(if .key == "kind" and .value == 4 then .value = "PRODUCER" else . end)' \
+              | jq 'with_entries(if .key == "kind" and .value == 5 then .value = "CONSUMER" else . end)' \
+              | jq 'with_entries(if .key == "status" and .value == null then .value = "UNSET" else . end)' \
+              | jq 'with_entries(if .key == "status" and .value == 0 then .value = "UNSET" else . end)' \
+              | jq 'with_entries(if .key == "status" and .value == 1 then .value = "OK" else . end)' \
+              | jq 'with_entries(if .key == "status" and .value == 2 then .value = "ERROR" else . end)' \
+              | jq -s '. | sort_by(.name) | .[]'
+          }
+
+          # Validate that at least one root span exists
+          root_span_count=$(get_root_span_id | grep -c . || true)
+          if [ "$root_span_count" -eq 0 ]; then
+            echo "Error: No root span found in trace data. At least one root span is required." >&2
+            exit 1
+          fi
+
+          {
+            echo '# Demo "'"$(cat ./meta.json | jq -r .title)"'"'
+            cat meta.json | jq -r .description
+            echo '## Script'
+            echo '```bash'
+            cat demo.sh
+            echo '```'
+            echo '## Trace Structure Overview'
+            echo '```bash'
+            get_root_span_id | while read -r root_span_id; do print_span_name_tree "$root_span_id" ""; done
+            echo '```'
+            echo '## Full Trace'
+            echo '```json'
+            pretty_print_trace
+            echo '```'
+          } > README.md
+          mv otlp.json otlp.json.minimized
+          jq . < otlp.json.minimized > otlp.json
+          rm otlp.json.minimized
+      - run: |
+          cd demos/${{ matrix.demo_directory }}
+          git add --intent-to-add README.md output.stdout output.stderr otlp.json
+          volatile_keys='"[^"]*[Ii]d"|[Tt]ime|timestamp|"vcs[.][^"]*"|"github[.][^"]*"|"[^"]*[.]version"|"[^"]*[.]ip"|"[^"]*[.]port"|"peer[.][^"]*"|"process[.]pid"|"process[.]parent_pid"|"process[.]owner"|"process[.]runtime[.]version"|"process[.]start_time"|"http[.]user_agent"|"user_agent[.]original"|"host[.]name"|"host[.]type"|"host[.]arch"|"cloud[.]region"|"cloud[.]account[.]id"|"cloud[.]availability_zone"|"azure[.][^"]*"|"os[.]build_id"|"os[.]description"|"network[.]local[.]address"|"network[.]local[.]port"|"network[.]peer[.]address"|"network[.]peer[.]port"|"client[.]address"|"client[.]port"|"server[.]port"|"code[.]lineno"|"code[.]filepath"|"code[.]column"|"code[.]stacktrace"|"http[.]request[.]header[.][^"]*"|"http[.]response[.]header[.][^"]*"|/tmp|"00-'
+          if git diff README.md | grep -v '^+++' | grep -v '^---' \
+            | awk -v pat="$volatile_keys" '
+                /^[+-]/ {
+                  line = substr($0, 2)
+                  if (depth > 0) {
+                    if (index(line, "[") > 0) depth++
+                    if (index(line, "]") > 0) depth--
+                    next
+                  }
+                  if (line ~ pat) {
+                    if (index(line, "[") > 0) depth=1
+                    next
+                  }
+                  print
+                  next
+                }
+                { print }
+              ' \
+            | grep -q '^+'; then echo dirty=true >> "$GITHUB_OUTPUT"; fi
+        id: diff
+      - name: "Open Pull Request"
+        if: steps.diff.outputs.dirty
+        id: open-pr
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ secrets.ACTIONS_GITHUB_TOKEN }}
+          commit-message: "Update demo"
+          base: main
+          branch: "demos/${{ matrix.demo_directory }}"
+          title: "Update Demo ${{ matrix.demo_directory }}"
+          body: |
+            (this PR is automatically generated)
+          delete-branch: true
+      - run: sleep 60 # make sure PR state is updated and API can catch up
+        if: steps.open-pr.outputs.pull-request-number != null
+      - uses: peter-evans/enable-pull-request-automerge@a660677d5469627102a1c1e11409dd063606628d # v3.0.0
+        if: steps.open-pr.outputs.pull-request-number != null
+        with:
+          token: ${{ secrets.ACTIONS_GITHUB_TOKEN }}
+          pull-request-number: ${{ steps.open-pr.outputs.pull-request-number }}
+          merge-method: squash

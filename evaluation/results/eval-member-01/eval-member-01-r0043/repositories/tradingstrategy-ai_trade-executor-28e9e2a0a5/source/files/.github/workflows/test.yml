@@ -1,0 +1,146 @@
+name: Automated test suite
+on:
+  push:
+    branches: [ master ]
+    tags: [ v* ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  automated-test-suite:
+
+    timeout-minutes: 40
+    # Use paid faster Github Actions runner
+    runs-on:
+      group: Beefy runners
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: 'recursive'
+
+      - name: Verify recursive submodules
+        run: |
+          git submodule sync --recursive
+          git submodule update --init --recursive
+          test -f spec/trade-executor-api.yaml
+          test -f deps/web3-ethereum-defi/contracts/lagoon-v0/src/protocol-v2/ProtocolRegistry.sol
+          test -f deps/web3-ethereum-defi/contracts/guard/lib/openzeppelin-contracts/contracts/access/Ownable.sol
+
+      - name: Set up Python 3.14
+        # The id exposes the resolved patch version to the venv cache key below,
+        # so a runner Python upgrade cannot restore a venv with a dangling interpreter.
+        id: setup-python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxml2-dev libxslt1-dev
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1.4.2
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          installer-parallel: true
+
+      # Do not let Poetry to install again if we do not detect a lock file change
+      - name: Load cached venv
+        id: cached-poetry-dependencies
+        uses: actions/cache@v6
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('**/poetry.lock') }}
+
+      # Speed up testing by not downloading integration test data from the production server
+      # https://github.com/actions/cache
+      # See conftest.persistent_test_client
+      - name: Cache datasetes
+        id: cache-datasets-load
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/trading-strategy-tests
+          key: cache-datasets
+
+      # Needed for Anvil / fork tests
+      # Match eth_defi's Foundry version: Anvil 1.8 changed the fork cache layout and receipts.
+      - name: Cache Foundry toolchain
+        uses: actions/cache@v6
+        with:
+          path: ~/.foundry/bin
+          key: foundry-toolchain-v1.8.6-${{ runner.os }}
+          restore-keys: |
+            foundry-toolchain-v1.8.6-
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1.9.1
+        with:
+          # Keep in step with deps/web3-ethereum-defi/.github/workflows/test.yml
+          version: "v1.8.6"
+
+      # Lagoon source deployment (use_forge=True) compiles contracts from source,
+      # which needs the soldeer-managed OpenZeppelin/forge-std dependencies.
+      # Without this step deploy_automated_lagoon_vault() forge builds fail with a
+      # soldeer dependency-resolution error (e.g. test_lagoon_ostium_v15_async_lifecycle).
+      - name: Cache Lagoon soldeer deps
+        uses: actions/cache@v6
+        with:
+          path: deps/web3-ethereum-defi/contracts/lagoon-v0/dependencies
+          key: soldeer-${{ hashFiles('deps/web3-ethereum-defi/contracts/lagoon-v0/soldeer.lock', 'deps/web3-ethereum-defi/contracts/lagoon-v0/foundry.toml') }}
+          restore-keys: |
+            soldeer-
+
+      - name: Install Lagoon soldeer dependencies
+        run: |
+          (cd deps/web3-ethereum-defi/contracts/lagoon-v0 && forge soldeer install)
+
+      - name: Install dependencies
+        if: steps.cached-poetry-dependencies.outputs.cache-hit != 'true'
+        run: |
+          poetry install --no-interaction -E execution -E web-server -E qstrader -E demeter
+
+      # Run testa parallel, do not run slow tests before Docker image build.
+      # Note that we limit concurrency to 2 workers as 4 workers crashed without an error message on Github CI.
+      # I suspect out of memory situation that is not reported to the user.
+      # Print 20 slowest tests when done.
+      # tests/**/test*.py -> workaround issues by scanning tests folder in git submodules and importing them (even if not running)
+      # More on Github Actions issues:
+      # https://github.com/pytest-dev/pytest/issues/3216#issuecomment-2572882817
+      - name: Run test scripts
+        run: |
+            poetry run pytest --tb=native --dist loadscope -n 5 --durations=10 -m "not slow_test_group and not warm_rpc_test_group and not warm_rpc_high_value_group" --timeout=390
+            poetry run pytest --tb=native --dist loadgroup -n 5 --durations=20 -m "not slow_test_group and warm_rpc_test_group" --timeout=390
+            poetry run pytest --tb=native --dist loadgroup -n 6 --durations=20 -m "not slow_test_group and warm_rpc_high_value_group" --timeout=390
+        env:
+          # Cap each Anvil fork's upstream request rate (Anvil's default is 330) so
+          # parallel workers queue cold reads instead of drawing HTTP 429s, as eth_defi does.
+          ANVIL_COMPUTE_UNITS_PER_SECOND: "150"
+          TRADING_STRATEGY_API_KEY: ${{ secrets.TRADING_STRATEGY_API_KEY }}
+          # Creem licence key for the paid vault datasets: vault metadata and vault
+          # share price history, downloaded by tradingstrategy.vault_data_client.
+          # Format is five dash separated groups, emailed to the subscriber on purchase
+          # from https://tradingstrategy.ai/vaults/datasets
+          # Not interchangeable with TRADING_STRATEGY_API_KEY above: the oracle key is
+          # secret-token: prefixed and the dataset API answers it with 403 Invalid API key.
+          # When unset, the vault tests skip themselves rather than fail, so a green run
+          # does not mean the live dataset paths were exercised.
+          VAULT_PRO_API_KEY: ${{ secrets.VAULT_PRO_API_KEY }}
+          JSON_RPC_BINANCE: ${{ secrets.JSON_RPC_BINANCE }}
+          # https://stackoverflow.com/a/75274358/315168
+          PYDEVD_DISABLE_FILE_VALIDATION: 1
+          JSON_RPC_POLYGON: ${{ secrets.JSON_RPC_POLYGON }}
+          JSON_RPC_POLYGON_ARCHIVE: ${{ secrets.JSON_RPC_POLYGON_ARCHIVE }}
+          JSON_RPC_ARBITRUM: ${{ secrets.JSON_RPC_ARBITRUM }}
+          JSON_RPC_BASE: ${{ secrets.JSON_RPC_BASE }}
+          JSON_RPC_ETHEREUM: ${{ secrets.JSON_RPC_ETHEREUM }}
+          # Special private key needed for Velvet integration tests
+          VELVET_VAULT_OWNER_PRIVATE_KEY: ${{ secrets.VELVET_VAULT_OWNER_PRIVATE_KEY }}
+
+      - name: Save datasets
+        id: cache-datasets-save
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/trading-strategy-tests
+          key: cache-datasets

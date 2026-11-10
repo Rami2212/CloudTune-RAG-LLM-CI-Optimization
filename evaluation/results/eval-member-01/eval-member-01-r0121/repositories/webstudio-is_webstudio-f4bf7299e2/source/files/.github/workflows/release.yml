@@ -1,0 +1,197 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const latestRelease = await github.rest.repos.getLatestRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            })
+            const commits = await github.rest.repos.compareCommitsWithBasehead({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              basehead: `refs/tags/${latestRelease.data.tag_name}...${context.ref}`,
+            })
+
+            const groups = {
+              feat: [`## Features\n`],
+              fix: [`## Fixes\n`],
+              docs: [`## Documentation\n`],
+              experimental: [`## Experimental\n`],
+              other: [`## Other changes\n`],
+            }
+            for (const commit of commits.data.commits) {
+              const match = commit.commit.message.match(/^(?<type>\w+)\s*:\s*(?<message>.+)\n*/)
+              const type = match?.groups?.type
+              const message = match?.groups?.message
+              if (type && message) {
+                const availableType = type in groups ? type : 'other'
+                const capitalized = message[0].toLocaleUpperCase() + message.slice(1)
+                groups[availableType].push(`- ${capitalized}`)
+              }
+            }
+
+            const tag_name = context.ref.slice('refs/tags/'.length)
+            const fullChangelog = `**Full Changelog**: https://github.com/${context.repo.owner}/${context.repo.repo}/compare/${latestRelease.data.tag_name}...${tag_name}`
+            const changelog = Object.values(groups)
+              .filter(lines => lines.length > 1)
+              .map(lines => lines.join('\n'))
+              .concat(fullChangelog)
+              .join('\n\n')
+            console.info(changelog)
+
+            await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name,
+              name: tag_name,
+              body: changelog,
+            })
+
+  publish:
+    runs-on: ubuntu-latest
+    outputs:
+      registry_baseline: ${{ steps.registry-baseline.outputs.value }}
+      version: ${{ steps.version.outputs.value }}
+    permissions:
+      contents: write
+    environment:
+      name: development
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }} # tag name
+      - uses: ./.github/actions/submodules-checkout
+        with:
+          submodules-ssh-key: ${{ secrets.PRIVATE_GITHUB_DEPLOY_TOKEN }}
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - id: version
+        run: echo "value=$(echo ${{ github.ref }} | sed 's/refs\/tags\///')" >> $GITHUB_OUTPUT
+      - id: registry-baseline
+        name: Resolve pre-publish CLI baseline
+        run: echo "value=$(npm view webstudio@latest version)" >> "$GITHUB_OUTPUT"
+      - name: bump version to ${{ steps.version.outputs.value }}
+        run: |
+          pnpx replace-in-files-cli \
+            --string="0.0.0-webstudio-version" \
+            --replacement="${{ steps.version.outputs.value }}" \
+            "**/package.json"
+
+      - name: pnpm instal
+        run: pnpm install --ignore-scripts
+      - run: pnpm --filter="webstudio..." build
+      - run: pnpm --filter="webstudio..." dts
+
+      - name: Creating .npmrc
+        run: |
+          cat << EOF > "$HOME/.npmrc"
+            //registry.npmjs.org/:_authToken=$NPM_TOKEN
+          EOF
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - run: pnpm -r publish --access public --no-git-checks
+
+      - name: Wait for exact CLI registry artifact
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          for attempt in $(seq 1 30); do
+            integrity=$(npm view "webstudio@$VERSION" dist.integrity --json 2>/dev/null || true)
+            if [ -n "$integrity" ] && [ "$integrity" != "null" ]; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Exact registry artifact webstudio@$VERSION was not observable with integrity metadata." >&2
+          exit 1
+
+  release-smoke:
+    needs: publish
+    timeout-minutes: 20
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    environment:
+      name: development
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }} # tag name
+      - uses: ./.github/actions/submodules-checkout
+        with:
+          submodules-ssh-key: ${{ secrets.PRIVATE_GITHUB_DEPLOY_TOKEN }}
+      - uses: ./.github/actions/ci-setup
+
+      - name: Verify exact published CLI against baseline
+        id: registry-smoke
+        env:
+          DATABASE_URL: postgres://
+          AUTH_SECRET: test
+          WEBSTUDIO_RELEASE_SMOKE_TOKEN_BUDGET: 6000
+          WEBSTUDIO_RELEASE_SMOKE_CANDIDATE: webstudio@${{ needs.publish.outputs.version }}
+          WEBSTUDIO_RELEASE_SMOKE_BASELINE: webstudio@${{ needs.publish.outputs.registry_baseline }}
+          WEBSTUDIO_RELEASE_SMOKE_EXPECT_REGISTRY_VERSION: ${{ needs.publish.outputs.version }}
+          WEBSTUDIO_RELEASE_SMOKE_REPORT: ${{ github.workspace }}/artifacts/cli-release-smoke.json
+        run: pnpm --filter webstudio test:release-smoke:registry
+
+      - name: Upload published CLI comparison report
+        if: ${{ always() && (steps.registry-smoke.outcome == 'success' || steps.registry-smoke.outcome == 'failure') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-release-smoke-${{ needs.publish.outputs.version }}
+          path: artifacts/cli-release-smoke.json
+          if-no-files-found: error
+
+  publish-docs:
+    needs: [release, publish]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: publish-docs
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: docs
+      - name: Publish released documentation snapshot
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          if git merge-base --is-ancestor "$RELEASE_SHA" HEAD; then
+            echo "The docs branch already contains release $RELEASE_VERSION or a newer revision."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge --no-edit "$RELEASE_SHA"
+          git checkout "$RELEASE_SHA" -- docs/university/mcp.md
+          CLI_VERSION_PLACEHOLDER="0.0.0-webstudio-version"
+          grep -Fq "$CLI_VERSION_PLACEHOLDER" docs/university/mcp.md
+          sed -i.bak "s/$CLI_VERSION_PLACEHOLDER/$RELEASE_VERSION/g" docs/university/mcp.md
+          rm docs/university/mcp.md.bak
+          ! grep -Fq "$CLI_VERSION_PLACEHOLDER" docs/university/mcp.md
+          grep -Fq "$RELEASE_VERSION" docs/university/mcp.md
+          git add docs/university/mcp.md
+          git commit -m "docs: publish Webstudio CLI $RELEASE_VERSION"
+          git push origin docs

@@ -1,0 +1,116 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: write  # required for actions/upload-artifact
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GIT_ACCESS_TOKEN }}
+
+      - name: Set up Java
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9  # v4
+        with:
+          java-version: 21
+          distribution: 'temurin'
+
+      - name: Cache Gradle
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: ~/.gradle/caches
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle') }}-${{ hashFiles('**/gradle.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Cache Gradle wrapper
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradlew-${{ hashFiles('**/gradlew') }}
+          restore-keys: ${{ runner.os }}-gradlew-
+
+      - name: Set up Git
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+      - name: Bump version in gradle.properties
+        id: bump
+        run: |
+          sed -i "s/^version\s*=.*/version = ${{ inputs.version }}/" gradle.properties
+          git add gradle.properties
+          git commit --allow-empty -m "release: Releasing version ${{ inputs.version }}"
+          git pull --rebase origin HEAD
+          git push origin HEAD
+
+      - name: Build
+        run: |
+          ./gradlew build test aggregateTestReport publish -S
+        env:
+          GRGIT_USER: ${{ secrets.GIT_USER }}
+          GRGIT_PASS: ${{ secrets.GIT_ACCESS_TOKEN }}
+
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: test-reports
+          path: |
+            build/reports/tests/aggregate/
+
+      - name: Assemble
+        uses: jreleaser/release-action@90ac653bb9c79d11179e65d81499f3f34527dcd5  # 2.5.0
+        with:
+          arguments: assemble
+        env:
+          JRELEASER_PROJECT_VERSION: ${{ inputs.version }}
+
+      - name: Release
+        uses: jreleaser/release-action@90ac653bb9c79d11179e65d81499f3f34527dcd5  # 2.5.0
+        with:
+          arguments: full-release
+        env:
+          JRELEASER_GITHUB_PASSWORD: ${{ secrets.GIT_ACCESS_TOKEN }}
+          JRELEASER_GITHUB_TOKEN: ${{ secrets.GIT_ACCESS_TOKEN }}
+          JRELEASER_GITHUB_USERNAME: ${{ secrets.GIT_USER }}
+          JRELEASER_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          JRELEASER_GPG_PUBLIC_KEY: ${{ secrets.GPG_PUBLIC_KEY }}
+          JRELEASER_GPG_SECRET_KEY: ${{ secrets.GPG_SECRET_KEY }}
+          JRELEASER_MAVENCENTRAL_USERNAME: ${{ secrets.SONATYPE_USERNAME }}
+          JRELEASER_MAVENCENTRAL_PASSWORD: ${{ secrets.SONATYPE_PASSWORD }}
+          JRELEASER_PROJECT_VERSION: ${{ inputs.version }}
+          JRELEASER_SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+
+      - name: JReleaser output
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: artifact
+          path: |
+            out/jreleaser/trace.log
+            out/jreleaser/output.properties
+
+      - name: Trigger documentation build
+        uses: peter-evans/repository-dispatch@bf47d102fdb849e755b0b0023ea3e81a44b6f570  # v2
+        with:
+          token: ${{ secrets.GIT_ACCESS_TOKEN }}
+          event-type: build-docs

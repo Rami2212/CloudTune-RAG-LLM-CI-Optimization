@@ -219,10 +219,21 @@ class HostedProtocolTests(unittest.TestCase):
                     self.assertEqual(ensure_dispatch(source), expected)
                     self.assertEqual(ensure_dispatch(expected), expected)
 
-    def test_dispatch_harness_rejects_quoted_sequence_events(self):
-        source = b"'on':\n  - push\njobs:\n  test:\n    steps:\n      - run: echo ok\n"
-        with self.assertRaises(ValueError):
-            ensure_dispatch(source)
+    def test_dispatch_harness_accepts_block_sequence_events(self):
+        from evaluation.repository_preparation import workflow_doc
+        for key in ("on", "'on'", '"on"'):
+            for indent in ("", "  "):
+                for newline in ("\n", "\r\n"):
+                    with self.subTest(key=key, indent=indent, newline=repr(newline)):
+                        source = (f"{key}: # events\n{indent}- push\n"
+                                  f"{indent}- pull_request\njobs:\n  test:\n"
+                                  "    steps:\n      - run: echo ok\n").replace("\n", newline).encode()
+                        result = ensure_dispatch(source)
+                        self.assertEqual(workflow_doc(result)["on"],
+                                         ["push", "pull_request", "workflow_dispatch"])
+                        self.assertEqual(result.split(b"jobs:", 1)[1],
+                                         source.split(b"jobs:", 1)[1])
+                        self.assertEqual(ensure_dispatch(result), result)
 
     def test_github_no_job_start_is_platform_inconclusive(self):
         github = FakeRunnerGitHub()

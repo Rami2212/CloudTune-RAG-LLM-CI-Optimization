@@ -1,0 +1,225 @@
+name: Main workflow
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_call:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.number || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read # to fetch code (actions/checkout)
+
+jobs:
+  ssg-artifact:
+    name: Packaged SSG Assets build
+    timeout-minutes: 7
+    runs-on: ubuntu-24.04-arm
+    environment:
+      name: development
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' && github.event.action == 'labeled' && github.event.label.name == 'safe-to-deploy' }}
+
+      - uses: ./.github/actions/submodules-checkout
+        with:
+          submodules-ssh-key: ${{ secrets.PRIVATE_GITHUB_DEPLOY_TOKEN }}
+
+      - uses: ./.github/actions/ci-setup
+
+      - name: Build packaged SSG fixture
+        run: pnpm --filter webstudio test:ssg-package
+
+  tests:
+    name: tests (${{ matrix.environment }}, ${{ matrix.suite.name }})
+    timeout-minutes: ${{ (matrix.suite.name == 'builder-app' || matrix.suite.name == 'packages') && 12 || 7 }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        environment:
+          - empty
+          - development
+        suite:
+          - name: packages
+            script: test:packages
+            browsers: chromium-firefox
+          - name: cli
+            script: test:cli
+            browsers: none
+          - name: builder-core
+            script: test:builder:core
+            browsers: chromium
+          - name: builder-app
+            script: test:builder:app
+            browsers: chromium
+    environment:
+      name: ${{ matrix.environment }}
+    env:
+      DATABASE_URL: postgres://
+      AUTH_SECRET: test
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' && github.event.action == 'labeled' && github.event.label.name == 'safe-to-deploy' }}
+
+      - uses: ./.github/actions/test-suite
+        with:
+          submodules-ssh-key: ${{ secrets.PRIVATE_GITHUB_DEPLOY_TOKEN }}
+          script: ${{ matrix.suite.script }}
+          browsers: ${{ matrix.suite.browsers }}
+
+  checks:
+    timeout-minutes: 7
+
+    environment:
+      name: empty
+
+    env:
+      DATABASE_URL: postgres://
+      AUTH_SECRET: test
+
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' && github.event.action == 'labeled' && github.event.label.name == 'safe-to-deploy' }}
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Pnpm install
+        run: |
+          pnpm install
+
+      - run: |
+          pnpm oxfmt --check
+
+      - name: Lint
+        run: |
+          pnpm lint
+
+      - name: Package boundaries
+        run: |
+          pnpm check:package-boundaries
+
+      - name: Generated API contracts
+        run: |
+          pnpm check:generated-api
+
+      - name: Generated CLI docs
+        run: |
+          pnpm check:generated-docs
+
+      - name: Typecheck
+        run: |
+          pnpm -r typecheck
+
+  check-size:
+    timeout-minutes: 7
+
+    runs-on: ubuntu-24.04-arm
+
+    environment:
+      name: development
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' && github.event.action == 'labeled' && github.event.label.name == 'safe-to-deploy' }}
+
+      - uses: ./.github/actions/submodules-checkout
+        with:
+          submodules-ssh-key: ${{ secrets.PRIVATE_GITHUB_DEPLOY_TOKEN }}
+
+      - uses: ./.github/actions/ci-setup
+
+      - run: pnpm --filter "{./fixtures/*}..." build
+
+      - run: pnpm check:fixture-sizes
+
+  builder-e2e-build:
+    name: builder-e2e build
+    timeout-minutes: 7
+
+    runs-on: ubuntu-24.04
+
+    environment:
+      name: development
+
+    outputs:
+      shards: ${{ steps.build.outputs.shards }}
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' && github.event.action == 'labeled' && github.event.label.name == 'safe-to-deploy' }}
+
+      - id: build
+        uses: ./.github/actions/builder-e2e-build
+        with:
+          submodules-ssh-key: ${{ secrets.PRIVATE_GITHUB_DEPLOY_TOKEN }}
+
+  supabase-migrations:
+    name: Supabase migrations
+    timeout-minutes: 7
+    runs-on: ubuntu-24.04
+    environment:
+      name: empty
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' && github.event.action == 'labeled' && github.event.label.name == 'safe-to-deploy' }}
+
+      - uses: ./.github/actions/ci-setup
+        with:
+          run-scripts: "true"
+
+      - name: Apply migrations to Supabase PostgreSQL
+        run: pnpm --filter @webstudio-is/builder e2e:supabase-migrations
+
+  builder-e2e:
+    name: builder-e2e (${{ matrix.shard }})
+    timeout-minutes: 12
+
+    needs: builder-e2e-build
+
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.builder-e2e-build.outputs.shards) }}
+
+    environment:
+      name: development
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' && github.event.action == 'labeled' && github.event.label.name == 'safe-to-deploy' }}
+
+      - uses: ./.github/actions/builder-e2e-shard
+        with:
+          submodules-ssh-key: ${{ secrets.PRIVATE_GITHUB_DEPLOY_TOKEN }}
+          shard: ${{ matrix.shard }}
+          partition: ${{ matrix.partition }}

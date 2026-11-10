@@ -177,7 +177,7 @@ def ensure_dispatch(raw: bytes) -> bytes:
                 line = lines[index].rstrip("\r\n")
                 if not line.strip() or line.lstrip().startswith("#"):
                     continue
-                if not line[0].isspace():
+                if not line[0].isspace() and not line.startswith("-"):
                     break
                 item = re.match(r"^( *)-\s+(.+?)\s*(?:#.*)?$", line)
                 if not item or (sequence_indent is not None and item.group(1) != sequence_indent):

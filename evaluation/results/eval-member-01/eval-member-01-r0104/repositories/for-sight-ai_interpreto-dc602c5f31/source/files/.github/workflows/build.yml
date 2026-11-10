@@ -1,0 +1,123 @@
+name: build
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10  # minutes
+    if: github.actor != 'dependabot[bot]' && github.actor != 'dependabot-preview[bot]'
+    strategy:
+      max-parallel: 1
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python ${{ matrix.python-version }}
+      id: setup-python
+      uses: actions/setup-python@v4.3.0
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install uv
+      run: |
+        make uv-download
+
+    - name: Set up cache
+      uses: actions/cache@v4.2.2
+      with:
+        path: .venv
+        key: venv-${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('pyproject.toml') }}
+
+    - name: Cache Hugging Face models
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/huggingface
+        key: hf-${{ runner.os }}-${{ hashFiles('.github/workflows/build.yml', 'pyproject.toml') }}
+
+    - name: Recreate virtual environment if cache is invalid
+      run: |
+        if [ ! -f .venv/bin/python ]; then
+          uv venv --clear --python=python${{ matrix.python-version }}
+        fi
+
+    - name: Install dependencies
+      run: |
+        source .venv/bin/activate
+        uv pip install ".[docs,lint,notebook]"
+
+
+    - name: Export HF_HUB_TOKEN
+      run: echo "HF_HUB_TOKEN=${{ secrets.HUGGINGFACE_TOKEN }}" >> $GITHUB_ENV
+
+    # Cache all tiny-random models in the github actions runner
+    - name: Pre-cache all tiny-random models
+      run: |
+        source .venv/bin/activate
+        python - <<'EOF'
+        from transformers import (
+            AutoModelForSequenceClassification,
+            AutoModelForCausalLM,
+            AutoModelForMaskedLM,
+            AutoTokenizer,
+        )
+
+        # A test also needs a real tokenizer
+        AutoTokenizer.from_pretrained("bert-base-uncased")
+
+        # List all of the hf-internal-testing model IDs that your tests need:
+        model_ids = [
+            "hf-internal-testing/tiny-random-bert",
+            "hf-internal-testing/tiny-random-gpt2",
+            "hf-internal-testing/tiny-random-LlamaForCausalLM",
+            "hf-internal-testing/tiny-random-roberta",
+            "hf-internal-testing/tiny-random-t5",
+            "textattack/bert-base-uncased-imdb",
+        ]
+
+        # We will call .from_pretrained(...) once per model_id,
+        # and also download its tokenizer.  Because HF_HUB_TOKEN
+        # is set in the environment, these calls are authenticated
+        # and will not exhaust the low unauthenticated rate limit.
+        for m in set(model_ids):
+            # Sequence classification or masked-LM vs causal-LM
+            # is determined by your conftest/test code.
+            # We can try all possible AutoModel types here, but
+            # since your conftest already splits them out, we just do:
+            try:
+                AutoModelForSequenceClassification.from_pretrained(m)
+            except Exception:
+                try:
+                    AutoModelForMaskedLM.from_pretrained(m)
+                except Exception:
+                    try:
+                        AutoModelForCausalLM.from_pretrained(m)
+                    except Exception as ee:
+                        print(f"‐‐ failed to load model {m}: {ee}")
+                        exit(1)
+            # In any case, also grab the tokenizer:
+            AutoTokenizer.from_pretrained(m)
+            print(f"✔ cached {m}")
+        print("All models cached successfully.")
+        EOF
+
+    - name: Check memory before fast tests
+      run: |
+        free -h
+        df -h /
+
+    - name: Run style checks
+      run: |
+        source .venv/bin/activate
+        make lint
+
+    - name: Run fast tests
+      run: |
+        make fast-test-ci

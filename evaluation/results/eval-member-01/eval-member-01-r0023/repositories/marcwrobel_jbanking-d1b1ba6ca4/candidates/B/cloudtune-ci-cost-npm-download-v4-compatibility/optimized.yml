@@ -1,0 +1,43 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [MEDIUM] Add concurrency group to "build.yml"
+# - [LOW] Explicitly set fail-fast for large matrix job "build" (5 combinations)
+# Estimated savings: ~4 min/run
+#
+# See https://help.github.com/en/actions/automating-your-workflow-with-github-actions/workflow-syntax-for-github-actions
+name: build
+
+on:
+  push:
+    branches: ['main', 'maintenance/*']
+  pull_request:
+    branches: ['main', 'maintenance/*']
+  schedule:
+    - cron: '0 0 * * 6'
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: 'read'
+
+jobs:
+  build:
+    runs-on: 'ubuntu-latest'
+    strategy:
+      matrix:
+        java: ['8', '11', '17', '21', '25']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Java ${{ matrix.java }}
+        uses: actions/setup-java@v5
+        with:
+          java-version: ${{ matrix.java }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Build
+        run: 'mvn -B formatter:validate verify javadoc:jar'

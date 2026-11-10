@@ -1,0 +1,90 @@
+name: Check SDK Version
+
+on:
+  schedule:
+    # Run daily at 9 AM UTC
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  check-sdk:
+    name: Check for new macOS SDK
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout electron-build-tools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # tag: v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # tag: v7.1.0
+        with:
+          node-version: lts/-1
+          check-latest: true
+
+      - name: Get Yarn cache directory
+        id: yarn-cache
+        run: echo "dir=$(yarn config get cacheFolder)" >> $GITHUB_OUTPUT
+
+      - name: Cache Yarn dependencies
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.yarn-cache.outputs.dir }}
+          key: ${{ runner.os }}-yarn-${{ hashFiles('yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Build
+        run: yarn build
+
+      - name: Fetch Chromium mac_toolchain.py
+        run: |
+          curl -sSL "https://chromium.googlesource.com/chromium/src/+/main/build/mac_toolchain.py?format=TEXT" | base64 -d > mac_toolchain.py
+
+      - name: Check for new SDK version
+        id: check-sdk
+        run: node .github/workflows/scripts/check-sdk-version.mjs mac_toolchain.py
+
+      - name: Create issue for new SDK
+        if: steps.check-sdk.outputs.new-sdk == 'true'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # tag: v9.0.0
+        with:
+          script: |
+            const newVersion = process.env.NEW_SDK_VERSION;
+            const title = `Add macOS SDK ${newVersion} to Azure`;
+
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'wg-infra'
+            });
+
+            const existingIssue = issues.data.find(issue => 
+              issue.title.includes(`macOS SDK ${newVersion}`)
+            );
+
+            if (existingIssue) {
+              console.log(`Issue already exists: ${existingIssue.html_url}`);
+              return;
+            }
+
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: `A new macOS SDK version **${newVersion}** has been detected in Chromium's \`build/mac_toolchain.py\` that is not present in \`src/utils/sdks.json\`.\n\nPlease add the macOS SDK ${newVersion} to Azure storage.\n\nFollow the [upgrade steps](https://github.com/electron/infra-private/blob/main/resources/updating-xcode-version.md) to add the new SDK version.`,
+              labels: ['wg-infra']
+            });
+
+            console.log(`Created issue: ${issue.data.html_url}`);
+        env:
+          NEW_SDK_VERSION: ${{ steps.check-sdk.outputs.sdk-version }}

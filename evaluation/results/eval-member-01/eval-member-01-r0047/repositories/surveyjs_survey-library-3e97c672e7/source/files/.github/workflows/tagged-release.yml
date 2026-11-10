@@ -1,0 +1,84 @@
+on:
+  push:
+    # Sequence of patterns matched against refs/tags
+    tags:
+      - 'v*' # Push events to matching v*, i.e. v1.0, v20.15.10
+  workflow_dispatch:
+
+name: Create Release
+
+jobs:
+  build:
+    name: Create Release
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20.x]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          
+      - name: Install shared dependencies
+        run: npm install --ignore-scripts
+
+      - name: Build Core
+        run: |
+          cd ./packages/survey-core
+          npm install
+          npm run build:all
+
+      - name: Zip Core Build
+        uses: montudor/action-zip@v1
+        with:
+          args: zip -qq -r survey-core-build.zip ./packages/survey-core/build
+        
+      - name: Build React UI
+        run: |
+          cd ./packages/survey-react-ui
+          npm install
+          npm run build
+          
+      - name: Zip React Build
+        uses: montudor/action-zip@v1
+        with:
+          args: zip -qq -r survey-react-ui-build.zip ./packages/survey-react-ui/build
+        
+      - name: Build Angular UI
+        run: |
+          cd ./packages/survey-angular-ui
+          npm install
+          npm run build
+          
+      - name: Zip Angular Build
+        uses: montudor/action-zip@v1
+        with:
+          args: zip -qq -r survey-angular-ui-build.zip ./packages/survey-angular-ui/build
+        
+      - name: Build Vue3 UI
+        run: |
+          cd ./packages/survey-vue3-ui
+          npm install
+          npm run build
+          
+      - name: Zip Vue3 Build
+        uses: montudor/action-zip@v1
+        with:
+          args: zip -qq -r survey-vue3-ui-build.zip ./packages/survey-vue3-ui/build
+        
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            survey-core-build.zip
+            survey-react-ui-build.zip
+            survey-angular-ui-build.zip
+            survey-vue3-ui-build.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+

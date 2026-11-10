@@ -1,0 +1,61 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [MEDIUM] Add concurrency group to "azwi-build.yaml"
+# - [LOW] Use shallow clone in "azwi_build" job
+# Estimated savings: ~2 min/run
+#
+name: Azure Workload Identity CI
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *' # nightly
+  pull_request:
+    branches:
+      - main
+      - release-**
+    paths-ignore:
+      - docs/**
+      - README.md
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+
+jobs:
+  azwi_build:
+    strategy:
+      fail-fast: false
+      matrix:
+        # TODO(aramase): add windows test env
+        env: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.env }}
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@eb238b55efaa70779f274895e782ed17c84f2895 # v2.6.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # v4.1.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5.0.0
+        with:
+          go-version: "1.27"
+          check-latest: true
+      - name: Build azwi
+        run: |
+          make bin/azwi
+      - name: Validate azwi commands
+        run: |
+          ./bin/azwi version
+          ./bin/azwi -h
+          ./bin/azwi serviceaccount -h
+          ./bin/azwi serviceaccount create -h
+          ./bin/azwi serviceaccount delete -h
+          ./bin/azwi jwks -h

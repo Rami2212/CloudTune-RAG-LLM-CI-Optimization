@@ -1,0 +1,275 @@
+---
+name: Deploy
+
+on:
+  push:
+    branches:
+      - 'develop'
+    paths:
+      - "bin/**"
+      - "config.yaml"
+      - "composer.json"
+      - "composer.lock"
+      - "res/**"
+      - "scoper.inc.php"
+      - "src/**"
+      - "version.txt"
+
+    tags:
+      # semver format and alpha/beta versions
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-alpha[0-9]*'
+      - '[0-9]+.[0-9]+.[0-9]+-beta[0-9]*'
+
+  workflow_dispatch:
+
+jobs:
+  create-signed-phar-file:
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write  # Required for GitHub OIDC
+      contents: read   # Access repository contents
+
+    steps:
+      - name: Checkout HEAD
+        uses: actions/checkout@v7
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          tools: composer:2
+          php-version: '8.3'
+
+      - name: Install dependencies
+        run: composer install --prefer-dist --no-progress --no-suggest
+
+      - name: Create phar
+        run: bash ./build.sh
+
+      - name: Run phar file
+        run: php n98-magerun2.phar --version
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.2
+
+      - name: Sign PHAR file using Cosign
+        run: |
+          cosign sign-blob \
+            --yes \
+            --output-signature n98-magerun2.phar.sig \
+            --bundle n98-magerun2.phar.bundle \
+            n98-magerun2.phar
+
+      - name: Ensure Cosign signature file
+        run: |
+          set -eo pipefail
+          jq -er '.messageSignature.signature' \
+            n98-magerun2.phar.bundle | \
+            base64 --decode > n98-magerun2.phar.sig
+
+      - name: Import GPG key
+        uses: crazy-max/ghaction-import-gpg@v7
+        with:
+          gpg_private_key: ${{secrets.GPG_PRIVATE_KEY}}
+          passphrase: ${{secrets.GPG_PASSPHRASE}}
+          trust_level: 5
+
+      - name: GPG sign phar file (detached)
+        run: |
+          echo "${{secrets.GPG_PASSPHRASE}}" | \
+            gpg --batch --yes --pinentry-mode loopback \
+            --passphrase-fd 0 --detach-sign -a \
+            -o n98-magerun2.phar.asc n98-magerun2.phar
+        env:
+          GPG_TTY: $(tty)
+
+      - name: GPG verify phar file
+        run: |-
+          gpg --verify n98-magerun2.phar.asc \
+            n98-magerun2.phar
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: n98-magerun2.phar
+          path: |
+            n98-magerun2.phar
+            n98-magerun2.phar.asc
+            n98-magerun2.phar.sig
+            n98-magerun2.phar.bundle
+
+  update-files-magerun-net:
+    runs-on: ubuntu-latest
+    needs: ["create-signed-phar-file"]
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: n98-magerun2.phar
+          path: .
+
+      - name: rename phar file (develop / unstable)
+        if: github.ref == 'refs/heads/develop'
+        run: |
+          mv n98-magerun2.phar n98-magerun2-dev.phar
+          mv n98-magerun2.phar.asc n98-magerun2-dev.phar.asc
+          mv n98-magerun2.phar.sig n98-magerun2-dev.phar.sig
+          mv n98-magerun2.phar.bundle n98-magerun2-dev.phar.bundle
+          ls -l
+
+      - name: rename phar file (tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          # Get tag part of github.ref
+          TAG=$(cut -d'/' -f3 <<< "$GITHUB_REF")
+          LATEST_VERSION=$( \
+            curl -s https://raw.githubusercontent.com/netz98/n98-magerun2/master/version.txt | \
+            tr -d '[:space:]' \
+          )
+
+          # Check if curl was successful
+          if [[ -z "$LATEST_VERSION" ]]; then
+            echo "Failed to fetch the latest version."
+            exit 1
+          fi
+
+          # Rename files - always create version-specific files
+          cp "n98-magerun2.phar" \
+            "n98-magerun2-${TAG}.phar"
+          cp "n98-magerun2.phar.asc" \
+            "n98-magerun2-${TAG}.phar.asc"
+          cp "n98-magerun2.phar.sig" \
+            "n98-magerun2-${TAG}.phar.sig"
+          cp "n98-magerun2.phar.bundle" \
+            "n98-magerun2-${TAG}.phar.bundle"
+
+          # Only mark as latest if it's a stable version
+          if [[ "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "This is a stable release. Marking as latest."
+            cp "n98-magerun2.phar" \
+              "n98-magerun2-latest.phar"
+            cp "n98-magerun2.phar.asc" \
+              "n98-magerun2-latest.phar.asc"
+            cp "n98-magerun2.phar.sig" \
+              "n98-magerun2-latest.phar.sig"
+            cp "n98-magerun2.phar.bundle" \
+              "n98-magerun2-latest.phar.bundle"
+          else
+            echo "This is an alpha/beta release. Not marking as latest."
+            # Remove only the original phar file since we don't need it anymore
+            # Keep the signature files (.asc and .sig) as they're needed for verification
+            rm "n98-magerun2.phar"
+            rm "n98-magerun2.phar.asc"
+            rm "n98-magerun2.phar.sig"
+            rm "n98-magerun2.phar.bundle"
+          fi
+
+          # List files to verify
+          ls -l
+
+      - name: Upload phar file to files.magerun.net
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{secrets.SSH_DEPLOY_HOST}}
+          username: ${{secrets.SSH_DEPLOY_USERNAME}}
+          key: ${{secrets.SSH_DEPLOY_PRIVATE_KEY}}
+          passphrase: >-
+            ${{secrets.SSH_DEPLOY_PASSPHRASE}}
+          source: >-
+            *.phar,*.phar.asc,*.phar.sig,*.phar.bundle
+          target: ${{secrets.SSH_DEPLOY_TARGET}}
+          rm: false
+          overwrite: true
+
+      - name: Run update tasks on files.magerun.net
+        uses: appleboy/ssh-action@v1.2.5
+        with:
+          host: ${{secrets.SSH_DEPLOY_HOST}}
+          username: ${{secrets.SSH_DEPLOY_USERNAME}}
+          key: ${{secrets.SSH_DEPLOY_PRIVATE_KEY}}
+          passphrase: >-
+            ${{secrets.SSH_DEPLOY_PASSPHRASE}}
+          script: |
+            ./site/build/build_phive.sh
+            php ./site/public/list.php > ./site/public/index.html
+
+      - name: Invalidate cloudflare
+        run: |
+          curl -X POST \
+            'https://api.cloudflare.com/client/v4/zones/${{secrets.CLOUDFLARE_ZONE}}/purge_cache' \
+            -H 'Content-Type:application/json' \
+            -H "Authorization: Bearer ${{secrets.CLOUDFLARE_TOKEN}}" \
+            --data-raw '{"purge_everything":true}'
+
+  update-dist-repo:
+    runs-on: ubuntu-latest
+    needs: [ "create-signed-phar-file" ]
+    steps:
+      - name: Checkout HEAD
+        uses: actions/checkout@v7
+      - uses: webfactory/ssh-agent@v0.10.0
+        with:
+          ssh-private-key: ${{secrets.DIST_REPO_DEPLOY_KEY}}
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: n98-magerun2.phar
+      - name: Update dist repo
+        env:
+          GIT_USER_EMAIL: ${{secrets.GIT_USER_EMAIL}}
+          GIT_USER_NAME: ${{secrets.GIT_USER_NAME}}
+        run: bash .github/scripts/update-dist-repo.sh
+
+  create-github-release:
+    runs-on: ubuntu-latest
+    needs: [ "create-signed-phar-file" ]
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Checkout HEAD
+        uses: actions/checkout@v7
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: n98-magerun2.phar
+      - name: 'Build Changelog'
+        uses: mikepenz/release-changelog-builder-action@v6
+        with:
+          owner: "netz98"
+          repo: "n98-magerun2"
+        id: build_changelog
+        env:
+          GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+      - run: echo "${{steps.build_changelog.outputs.changelog}}"
+      - name: Set release type
+        id: release_type
+        run: |
+          # Get tag part of github.ref
+          TAG=$(cut -d'/' -f3 <<< "$GITHUB_REF")
+
+          # Check if it's a stable version (x.y.z format without alpha/beta)
+          if [[ "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "This is a stable release."
+            echo "make_latest=true" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "This is a pre-release (alpha/beta)."
+            echo "make_latest=false" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Release
+        uses: softprops/action-gh-release@v3
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          body: |
+            ${{steps.build_changelog.outputs.changelog}}
+          make_latest: >-
+            ${{steps.release_type.outputs.make_latest}}
+          prerelease: >-
+            ${{steps.release_type.outputs.prerelease}}
+          files: |
+            n98-magerun2.phar
+            n98-magerun2.phar.asc
+            n98-magerun2.phar.sig
+            n98-magerun2.phar.bundle

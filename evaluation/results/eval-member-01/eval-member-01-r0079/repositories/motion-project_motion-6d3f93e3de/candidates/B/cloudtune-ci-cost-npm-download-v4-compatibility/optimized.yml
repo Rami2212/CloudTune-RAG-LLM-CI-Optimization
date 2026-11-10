@@ -1,0 +1,74 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [LOW] Explicitly set fail-fast for large matrix job "build" (6 combinations)
+# Estimated savings: ~2 min/run
+#
+name: CI
+
+on:
+  push:
+    paths-ignore:
+      - .github/ISSUE_TEMPLATE/**
+      - doc/**
+      - man/**
+      - '**/LICENCE'
+      - '**/.gitignore'
+      - '**.md'
+  pull_request:
+    paths-ignore:
+      - .github/ISSUE_TEMPLATE/**
+      - doc/**
+      - man/**
+      - '**/LICENCE'
+      - '**/.gitignore'
+      - '**.md'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [g++, clang++]
+        libc: [glibc]
+        include:
+          - cxx: g++
+            cc: gcc
+          - cxx: clang++
+            cc: clang
+          - libc: glibc
+            shell: bash
+
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+
+    steps:
+      - name: Set up Ubuntu
+        if: matrix.libc == 'glibc'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autopoint pkgconf gettext libcamera-dev libopencv-dev libavcodec-dev libavdevice-dev libavformat-dev libavutil-dev libswscale-dev libwebp-dev libmicrohttpd-dev libmariadb-dev libasound2-dev libpulse-dev libfftw3-dev
+
+      - name: Checkout source
+        uses: actions/checkout@main
+
+      - name: Configure build
+        run: |
+          autoreconf -fiv
+          ./configure CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
+
+      - name: Build target
+        run: |
+          ${{ matrix.CXX }} --version
+          make -j $(($(nproc)+1))
+
+      - name: Run artifact
+        run: |
+          file ./src/motion
+          ./src/motion -h || true

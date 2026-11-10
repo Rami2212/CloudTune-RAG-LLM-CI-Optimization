@@ -1,0 +1,892 @@
+/*
+ * PCGen build using the Gradle tool. This file specifies the core build tasks
+ * and refers to other files in the code/gradle directory for additional tasks
+ * for specific output.
+ *
+ * Show available tasks: gradle tasks
+ * Incremental dev build: gradle build
+ * Full build: gradle allTasks
+ * Build and run all tests: gradle clean build slowtest
+ * Run the data tests: gradle datatest
+ * Run the character integration tests: gradle inttest
+ */
+import java.nio.file.Files
+
+import org.apache.tools.ant.filters.FixCrLfFilter
+import org.apache.tools.ant.taskdefs.condition.Os
+
+import de.undercouch.gradle.tasks.download.Download
+import org.beryx.jlink.data.JdepsUsage
+
+/**
+ * Plugins without versions are ones that are bundled with Gradle at the version
+ * being used (should be through gradlew).
+ */
+plugins {
+    id 'application'                                    // Creating application bundles
+    id 'build-dashboard'                                // Produces a build report
+    id 'checkstyle'                                     // Checkstyle for Java, configured further below
+    alias(libs.plugins.spotbugs)                        // Spotbugs for Java
+    id 'maven-publish'                                  // Publishing to Maven Central
+    id 'pmd'                                            // PMD for Java, configured further below
+    alias(libs.plugins.download)                        // Shows download percentage
+    alias(libs.plugins.task.tree)                       // Prints the task dependency tree
+    alias(libs.plugins.jlink)                           // Creates custom runtimes with jlink
+    id 'jacoco'                                         // Code coverage
+}
+
+jacoco {
+    toolVersion = libs.versions.jacoco.get()
+}
+
+// Set the groupId as it helps with Maven
+group = 'net.sourceforge.pcgen'
+
+// Description of this project
+description = """PCGen"""
+
+// Define properties for the build (directories)
+ext {
+    // Folder where exe / jar files are placed.
+    outputDir = layout.projectDirectory.dir("output")
+
+    // Folder where the JDKs are downloaded for building releases
+    jdksDir = layout.projectDirectory.dir("jdks")
+
+    // Folder where the JavaFX mods are downloaded for building releases
+    modsDir = layout.projectDirectory.dir("mods")
+
+    // Installers are placed here
+    releaseDir = layout.projectDirectory.dir("build/release")
+
+    // Java major version. Drives the JDK toolchain and the JavaFX major (must match
+    // javafxVersion's major below). See README.md "Bumping Java / JavaFX versions".
+    javaVersion = providers.gradleProperty('javaVersion').get() as Integer
+
+    // Full JavaFX patch version (e.g. 25.0.3). Major must match javaVersion above.
+    javafxVersion = providers.gradleProperty('javafxVersion').get()
+
+    // Project version with -SNAPSHOT stripped. Shared between jpackage's
+    // appVersion (further sanitised below) and release.gradle's release-notes
+    // path so the two can't drift.
+    plainVerNum = version.replaceAll('-SNAPSHOT', '')
+}
+
+// Configure Java, in particular the version to test/compile/run with
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(javaVersion)
+    }
+}
+
+// Replace Gradle's opaque toolchain error with an actionable message.
+gradle.taskGraph.whenReady { graph ->
+    def needsCompile = graph.allTasks.any { it instanceof JavaCompile }
+    if (!needsCompile) return
+
+    try {
+        javaToolchains.launcherFor(java.toolchain).get()
+    } catch (Exception e) {
+        throw new GradleException("""
+
+            PCGen requires JDK ${javaVersion} to build, but Gradle could not
+            find one on this machine.
+
+            Currently running: Java ${System.getProperty('java.version')}
+                               at ${System.getProperty('java.home')}
+
+            Install JDK ${javaVersion} (or newer) and either:
+              - Set JAVA_HOME to it, or
+              - Run: ./gradlew -Porg.gradle.java.installations.paths=<path-to-jdk-${javaVersion}> <task>
+
+            Verify Gradle can see it:  ./gradlew -q javaToolchains
+
+            Downloads:
+              - Adoptium Temurin: https://adoptium.net/temurin/releases/?version=${javaVersion}
+              - Azul Zulu:        https://www.azul.com/downloads/?version=java-${javaVersion}-lts
+              - SapMachine:       https://sapmachine.io/
+            """.stripIndent(), e)
+    }
+}
+
+application {
+    mainClass.set('pcgen.system.Main')
+}
+
+repositories {
+    mavenCentral()
+}
+
+// Define the source sets for each task/module
+sourceSets {
+    // The main build
+    main {
+        java {
+            srcDirs 'code/src/java'
+        }
+        resources {
+            srcDirs = ['code/src/resources']
+        }
+    }
+    // Shared test utilities — compiled once, consumed by test/itest/slowtest.
+    testcommon {
+        java {
+            srcDirs = ['code/src/testcommon']
+        }
+        compileClasspath += sourceSets.main.output
+        runtimeClasspath += sourceSets.main.output
+    }
+    // Running regular tests
+    test {
+        java {
+            srcDirs = ['code/src/test']
+        }
+        compileClasspath += sourceSets.main.output + sourceSets.testcommon.output
+        runtimeClasspath += sourceSets.main.output + sourceSets.testcommon.output
+        resources {
+            srcDirs = ['code/src/testResources']
+        }
+    }
+    // Integration Tests
+    itest {
+        java {
+            srcDirs = ['code/src/itest']
+        }
+        resources {
+            srcDirs = ['code/src/testResources']
+        }
+        compileClasspath += sourceSets.test.output + sourceSets.test.compileClasspath
+        runtimeClasspath += sourceSets.test.output + sourceSets.test.runtimeClasspath
+    }
+    // Running Slow Tests
+    slowtest {
+        java {
+            srcDirs = ['code/src/slowtest']
+        }
+        resources {
+            srcDirs = ['code/src/testResources']
+        }
+        compileClasspath += sourceSets.test.output + sourceSets.test.compileClasspath
+        runtimeClasspath += sourceSets.test.output + sourceSets.test.runtimeClasspath
+    }
+}
+
+// Copy LICENSE onto the classpath for the About dialog (Windows symlink fallback).
+tasks.named("processResources") {
+    duplicatesStrategy = DuplicatesStrategy.INCLUDE
+    from(rootProject.layout.projectDirectory.file("LICENSE")) {
+        into "pcgen/gui3/dialog"
+    }
+}
+
+// Make the testcommon source set use the same dependency configurations as test.
+configurations {
+    testcommonImplementation.extendsFrom testImplementation
+    testcommonRuntimeOnly.extendsFrom testRuntimeOnly
+    testcommonCompileOnly.extendsFrom testCompileOnly
+}
+
+/* Copy 'master' outputsheets into different genre folders */
+tasks.register("copyMasterSheets", Copy) {
+    def filesToCopy = copySpec {
+        include 'eqsheet_fantasy_std.htm', 'psheet_fantasy_std.htm'
+        from 'outputsheets/d20/fantasy/htmlxml'
+    }
+
+    into(layout.projectDirectory.dir('outputsheets/d20'))
+
+    into('historical/htmlxml') { with filesToCopy }
+    into('horror/htmlxml') { with filesToCopy }
+    into('sciencefiction/htmlxml') { with filesToCopy }
+    into('western/htmlxml') { with filesToCopy }
+}
+
+/* Delete 'master' outputsheets from different genre folders */
+tasks.register("cleanMasterSheets", Delete) {
+    delete layout.projectDirectory.file("outputsheets/d20/historical/htmlxml/eqsheet_fantasy_std.htm"),
+            layout.projectDirectory.file("outputsheets/d20/historical/htmlxml/psheet_fantasy_std.htm"),
+            layout.projectDirectory.file("outputsheets/d20/horror/htmlxml/eqsheet_fantasy_std.htm"),
+            layout.projectDirectory.file("outputsheets/d20/horror/htmlxml/psheet_fantasy_std.htm"),
+            layout.projectDirectory.file("outputsheets/d20/sciencefiction/htmlxml/eqsheet_fantasy_std.htm"),
+            layout.projectDirectory.file("outputsheets/d20/sciencefiction/htmlxml/psheet_fantasy_std.htm"),
+            layout.projectDirectory.file("outputsheets/d20/western/htmlxml/eqsheet_fantasy_std.htm"),
+            layout.projectDirectory.file("outputsheets/d20/western/htmlxml/psheet_fantasy_std.htm")
+}
+
+/*
+ * Dependencies for this project.
+ *
+ * implementation means both compile and runtime
+ * testImplementation means both compile and runtime for test phase only
+ *
+ * For information on the exclude group items in this section, and why these are necessary to have Eclipse properly compile PCGen, please see the following items:
+ * https://bugs.openjdk.java.net/browse/JDK-8215739
+ * https://bugs.eclipse.org/bugs/show_bug.cgi?id=536928
+ * https://stackoverflow.com/questions/51094274/eclipse-cant-find-xml-related-classes-after-switching-build-path-to-jdk-10/53824670#53824670
+ * https://docs.gradle.org/current/userguide/dependency_downgrade_and_exclude.html
+ */
+dependencies {
+    implementation fileTree(dir: 'mods/lib', include: ['javafx.*.jar'])
+
+    implementation platform(libs.spring.bom)
+    implementation libs.bundles.spring
+    implementation libs.commons.lang3
+    implementation(libs.fop) {
+        exclude group: 'xml-apis', module: 'xml-apis'
+        exclude group: 'xalan', module: 'xalan'
+        exclude group: 'xalan', module: 'serializer'
+    }
+    implementation libs.saxon.he
+    implementation libs.jep
+    implementation libs.freemarker
+    implementation libs.argparse4j
+    implementation project(':base')
+    implementation project(':formula')
+
+    compileOnly libs.jetbrains.annotations
+    compileOnly libs.spotbugs.annotations
+
+    testImplementation platform(libs.junit.bom)
+    testImplementation libs.junit.platform.launcher
+    testImplementation libs.junit.jupiter.api
+    testImplementation libs.junit.jupiter.params
+    testRuntimeOnly libs.junit.jupiter.engine
+    testImplementation libs.hamcrest
+    testImplementation libs.testfx.junit5
+
+    // 21.0.2 is the latest version. As of Nov 2025, we have moved to OpenJFX 25 so this may cause issues
+    testImplementation libs.openjfx.monocle
+
+    testImplementation libs.bundles.xmlunit
+
+    spotbugsPlugins libs.findsecbugs.plugin
+}
+
+jar {
+    // Pick up some configuration to JAR up the plugins
+    it.dependsOn "jarAllPlugins"
+
+    // If we detect duplicate JARs ignore the subsequent ones
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+
+    // Create the manifest for the main JAR
+    manifest {
+        attributes 'Implementation-Title': 'PCGen',
+                'Implementation-Version': archiveVersion,
+                'Main-Class': 'pcgen.system.Main',
+                // Resolve the classpath lazily (Provider) so a toolchain miss fails at
+                // execution, not configuration, and can't be frozen into the config cache.
+                'Class-Path': configurations.runtimeClasspath.elements.map { files ->
+                    files.collect { " libs/${it.asFile.name} " }.join('')
+                }
+    }
+
+    exclude 'META-INF/*.SF', 'META-INF/*.DSA', 'META-INF/*.RSA', 'META-INF/*.EC'
+}
+
+/**
+ * Create a Java runtime built from Java modules using jlink
+ */
+// Host platform detection. jpackage shells out to native OS tooling and the
+// jlink mergedModule step invokes the target JDK's native javac, so cross-
+// platform images cannot be built from a single host. Compute host once and
+// reuse from jlink {}, jpackage {}, and the JDK/JFX download tasks below.
+def supportedHostOs = [
+        (Os.FAMILY_MAC)    : "mac",
+        (Os.FAMILY_UNIX)   : "linux",
+        (Os.FAMILY_WINDOWS): "windows",
+]
+def hostOs = supportedHostOs.find { Os.isFamily(it.key) }?.value
+if (hostOs == null) {
+    throw new GradleException("Unsupported host OS: '${System.getProperty("os.name")}'. Supported families: ${supportedHostOs.values().join(", ")}")
+}
+def supportedHostArch = ["x86_64": "x64", "amd64": "x64", "aarch64": "aarch64"]
+def rawHostArch = System.getProperty("os.arch")
+def hostArch = supportedHostArch[rawHostArch]
+if (hostArch == null) {
+    throw new GradleException("Unsupported host arch: '${rawHostArch}'. Supported: ${supportedHostArch.keySet().join(", ")}")
+}
+// Publish the host tokens so release.gradle (a separately-applied script) can
+// build installer filenames that match the portable zip
+// (pcgen-<version>-<hostOs>-<hostArch>.<ext>).
+project.ext.hostOs = hostOs
+project.ext.hostArch = hostArch
+def hostJdkExt = (hostOs == "windows") ? "zip" : "tar.gz"
+def hostJfxOsPackage = (hostOs == "mac") ? "osx" : hostOs
+def hostJfxArchSuffix = "-${hostArch}"
+
+// Assets staged here (dir named "app") are fed to jpackage via --app-content.
+def jpackageStageDir = layout.buildDirectory.dir("jpackageStage/app")
+
+jlink {
+    options = ['--strip-debug', '--no-header-files', '--no-man-pages']
+    addExtraDependencies('javafx')
+    forceMerge('jep', 'fop', 'Saxon-HE',
+               'commons-lang3', 'spring',
+               'freemarker', 'argparse4j', 'xmlresolver')
+
+    // Resolve packages → modules with the JDK's jdeps; the plugin's default
+    // resolver silently misses JDK modules on some distros (e.g. Temurin 25).
+    //
+    // Caveat: jdeps reads modules from `$javaHome/jmods`. JEP 493 JDKs
+    // (Temurin 25 on macOS aarch64, etc.) ship without those jmods, so jdeps
+    // sees only the JavaFX jmods we drop into that directory and silently
+    // omits JDK requires (java.logging, java.desktop, …) from the merged
+    // module-info. We compensate by listing every JDK module the merged
+    // jars need below.
+    useJdeps.set(JdepsUsage.exclusively)
+
+    mergedModule {
+        additive = true
+        // Listed manually because jdeps cannot see them on JEP 493 JDKs that
+        // omit the JDK jmods (see comment above). On JDKs that DO ship jmods
+        // jdeps would derive the same set, but the plugin appends our list
+        // verbatim — which would produce duplicate-requires errors. The build
+        // pulls Temurin (no JDK jmods) via `:extractJdk`, so duplicates are
+        // not produced in practice.
+        requires 'java.compiler'
+        requires 'java.desktop'
+        requires 'java.logging'
+        requires 'java.management'
+        requires 'java.naming'
+        requires 'java.prefs'
+        requires 'java.rmi'
+        requires 'java.scripting'
+        requires 'java.sql'
+        requires 'java.xml'
+        requires 'jdk.httpserver'
+        requires 'jdk.jfr'
+        requires 'jdk.unsupported'
+        requires 'jdk.unsupported.desktop'
+        requires 'jdk.xml.dom'
+
+        // Exclude service providers that reference optional/missing dependencies
+        excludeProvides(servicePattern: 'reactor\\.blockhound\\..*')
+        excludeProvides(servicePattern: 'jakarta\\.servlet\\..*')
+        excludeProvides(servicePattern: 'io\\.micrometer\\..*')
+        // FOP service files list factory classes that don't directly implement the service interface
+        excludeProvides(service: 'org.apache.fop.render.intermediate.IFDocumentHandler')
+        excludeProvides(service: 'org.apache.fop.render.Renderer')
+        excludeProvides(service: 'org.apache.fop.fo.FOEventHandler')
+    }
+
+    def hostJdkPath = (hostOs == "mac")
+            ? jdksDir.dir("jdk_${hostOs}_${hostArch}/Contents/Home").asFile.absolutePath
+            : jdksDir.dir("jdk_${hostOs}_${hostArch}").asFile.absolutePath
+    targetPlatform("${hostOs}-${hostArch}", hostJdkPath)
+
+    // Pin the JDK used by jdeps/javac in :createMergedModule and friends to the
+    // downloaded Temurin so the build behaves identically regardless of which
+    // JDK Gradle's toolchain auto-discovers locally (SapMachine, Zulu, etc.).
+    // This only affects jlink/jpackage tasks; compileJava/test/run still use
+    // whatever the toolchain resolves.
+    javaHome.set(file(hostJdkPath))
+
+    // Use the jpackage tool that comes with Java to build native installers
+    jpackage {
+        def licenseFile = layout.projectDirectory.file("LICENSE")
+        targetPlatformName = "${hostOs}-${hostArch}"
+
+        def appVersionStr = plainVerNum.replaceAll(/[^0-9.].*/, '').replaceAll(/\.$/, '')
+        appVersion = appVersionStr
+        def opts = ["--license-file", licenseFile.asFile.absolutePath]
+
+        // Embed runtime assets via --app-content so jpackage builds and signs the whole image.
+        def imgOpts = ['--app-content', jpackageStageDir.get().asFile.absolutePath]
+
+        if (hostOs == "mac") {
+            opts += ["--mac-package-identifier", "PcGen", "--mac-package-name", "PcGen"]
+            // macOS takes its icon from PcGen.icns in resourceDir by app-name convention.
+            resourceDir = layout.projectDirectory.dir("installers/mac-installer").asFile
+            installerType = "dmg"
+        }
+        else if (hostOs == "linux") {
+            opts += ['--linux-shortcut']
+            // jpackage wants a .png icon on Linux; without it the launcher falls back to the Java default.
+            imgOpts += ['--icon', layout.projectDirectory.file("code/src/images/PCGenApp.png").asFile.absolutePath]
+            installerType = "deb"
+        }
+        else if (hostOs == "windows") {
+            opts += ['--win-shortcut', '--win-menu']
+            // Reuse the gold Vitruvian-man icon from the legacy Windows desktop shortcut.
+            imgOpts += ['--icon', layout.projectDirectory.file("installers/win-installer/Local/PCGen2.ico").asFile.absolutePath]
+            installerType = "exe"
+        }
+
+        installerOptions = opts
+        imageName = "PcGen"
+        imageOptions = imgOpts
+    }
+}
+
+// Package up other files with the main program after jpackage creates the image
+tasks.named("jpackageImage") {
+    dependsOn tasks.named("jlink")
+
+    // Finder lazily writes .DS_Store into directories it has previewed; if one
+    // appears under build/jpackage between the plugin listing the dir and
+    // recursively deleting it, the rmtree fails with "New files were found".
+    // Sweep them out first.
+    def jpackageDir = layout.buildDirectory.dir("jpackage")
+    doFirst {
+        def root = jpackageDir.get().asFile.toPath()
+        if (Files.exists(root)) {
+            Files.walk(root).withCloseable { stream ->
+                stream.filter { it.fileName.toString() == ".DS_Store" }
+                      .forEach { Files.deleteIfExists(it) }
+            }
+        }
+    }
+}
+
+tasks.named("jlink") {
+    dependsOn "extractJfxMods"
+}
+
+// jlink.javaHome points at the extracted Temurin, so every plugin task that
+// invokes its tools (jdeps/javac/jlink/jpackage) must wait for :extractJdk.
+['prepareMergedJarsDir', 'createMergedModule', 'createDelegatingModules',
+ 'prepareModulesDir', 'jlink', 'jpackageImage', 'jpackage',
+ 'suggestMergedModuleInfo'].each { taskName ->
+    tasks.named(taskName) { dependsOn "extractJdk" }
+}
+
+// Stage runtime assets into a PCGen-owned "app" dir; jpackage embeds them via --app-content.
+tasks.register("assembleJpackageImage", Copy) {
+    dependsOn tasks.named("installDist")
+    includeEmptyDirs = false
+    from layout.buildDirectory.dir("install/pcgen")
+    exclude "**/*.exe"
+    exclude "**/*.bat"
+    exclude "pcgen"
+    exclude "**/lib/**"
+    into jpackageStageDir
+}
+
+// jpackage reads --app-content at image build, so stage the assets first.
+tasks.named("jpackageImage") {
+    dependsOn tasks.named("assembleJpackageImage")
+}
+
+tasks.register("fullJpackage") {
+    dependsOn tasks.named("jpackage")
+    description = "Build the native application bundle with jpackage"
+}
+
+// Portable zip: same self-contained app the installer ships, but as an
+// unzip-and-run archive. Source folder is whatever fullJpackage produces.
+//
+// On macOS the bundle is packed with `ditto -c -k --keepParent` rather than
+// Gradle's Zip task: ditto preserves the 0755 exec bits on
+// Contents/MacOS/PcGen, plus symlinks, xattrs, and code signatures. Plain Zip
+// strips POSIX modes, leaving the .app non-launchable after unzip
+// ("application can't be opened").
+if (hostOs == "mac") {
+    tasks.register("portableZip", Exec) {
+        dependsOn tasks.named("fullJpackage")
+        def archive = layout.buildDirectory.file(
+                "jpackage/pcgen-${version}-${hostOs}-${hostArch}-portable.zip")
+        def appBundle = layout.buildDirectory.dir("jpackage/PcGen.app")
+        inputs.dir(appBundle)
+        outputs.file(archive)
+        // ditto -c -k overwrites an existing archive silently; no pre-delete needed.
+        commandLine "ditto", "-c", "-k", "--keepParent",
+                appBundle.get().asFile.absolutePath,
+                archive.get().asFile.absolutePath
+    }
+} else {
+    tasks.register("portableZip", Zip) {
+        dependsOn tasks.named("fullJpackage")
+        from(layout.buildDirectory.dir("jpackage/PcGen")) {
+            into "PcGen"
+        }
+        archiveFileName = "pcgen-${version}-${hostOs}-${hostArch}-portable.zip"
+        destinationDirectory = layout.buildDirectory.dir("jpackage")
+    }
+}
+
+// Create the Data Convertor JAR.
+// This is a thin jar containing only a manifest that points at pcgen.jar
+// (and the rest of the runtime classpath) via Class-Path.
+tasks.register("converterJar", Jar) {
+    dependsOn jar
+    manifest {
+        attributes 'Implementation-Title': 'PCGen Data Converter',
+                   'Implementation-Version': archiveVersion,
+                   'Main-Class': 'pcgen.gui2.converter.PCGenDataConvert',
+                   'Class-Path': configurations.runtimeClasspath.elements.map { files ->
+                       'pcgen.jar' + files.collect { " libs/${it.asFile.name} " }.join('')
+                   }
+    }
+
+    archiveClassifier.set('batch-convert')
+}
+
+tasks.named("assemble") {
+    dependsOn converterJar
+}
+
+tasks.register("copyToLibs", Copy) {
+    dependsOn startScripts, installDist
+
+    into layout.buildDirectory.dir("libs")
+    from configurations.runtimeClasspath
+}
+
+// distZip/distTar are unused: CI publishes the custom buildDist zips
+// (see code/gradle/distribution.gradle) and the jpackage native installers,
+// not the built-in distribution-plugin archives. Disable them so they don't
+// materialize ~150 runtime JARs into build/distributions/ on every build.
+tasks.named("distZip") { enabled = false }
+tasks.named("distTar") { enabled = false }
+// jlink's prepareMergedJarsDir reads from build/libs, which copyToLibs populates.
+tasks.named("prepareMergedJarsDir").configure {
+    dependsOn copyToLibs
+}
+
+tasks.register("copyToOutput", Copy) {
+    dependsOn copyToLibs, converterJar, jar
+
+    from layout.buildDirectory.file("libs/pcgen-${version}.jar"),
+        layout.buildDirectory.file("libs/pcgen-${version}-batch-convert.jar"),
+        layout.projectDirectory.file("code/pcgen.bat")
+    from(layout.projectDirectory.file("code/pcgen.sh")) {
+        filter(FixCrLfFilter, eol:FixCrLfFilter.CrLf.newInstance("lf"))
+        filePermissions {
+            unix(0755)
+        }
+    }
+    into outputDir
+
+    rename "(.+)-$version(.+)", '$1$2'
+}
+
+tasks.register("qbuild", Copy) {
+    dependsOn copyToOutput, jar
+    description = "Copy the executable file into 'output' to create a working environment"
+    from layout.buildDirectory.file("libs/pcgen-${version}.jar")
+
+    into outputDir
+
+    rename "(.+)-$version(.+)", '$1$2'
+    mustRunAfter clean
+}
+
+tasks.register("cleanOutput", Delete) {
+    description = "Clean up things copied to the output folder by the build"
+    delete outputDir
+}
+
+tasks.register("cleanJdks", Delete) {
+    description = "Clean up things copied to the jdks folder by the build"
+    delete jdksDir
+}
+
+tasks.register("cleanMods", Delete) {
+    description="Clean up things copied to the mods folder by the build"
+    delete modsDir
+}
+
+tasks.named("build") {
+    // Ensures clean runs before build (not after) when both are invoked,
+    // so it doesn't delete the freshly-built artifacts.
+    mustRunAfter clean
+}
+
+tasks.withType(Download).configureEach {
+    overwrite false
+    useETag true
+    tempAndMove true
+    mustRunAfter clean
+}
+
+// Strips the leading path segment (the archive's top-level directory) when
+// extracting a JDK or JavaFX archive, so contents land directly under the
+// `into` target instead of inside an extra wrapper folder.
+def stripLeadingSegment = { FileCopyDetails fcd ->
+    def segments = fcd.relativePath.segments
+    if (segments.length > 1) {
+        fcd.relativePath = new RelativePath(
+                !fcd.isDirectory(),
+                Arrays.copyOfRange(segments, 1, segments.length) as String[])
+    }
+}
+
+tasks.register("downloadJdk", Download) {
+    description = "Downloads JDK for the host platform (${hostOs} ${hostArch})"
+    src "https://api.adoptium.net/v3/binary/latest/${javaVersion}/ga/${hostOs}/${hostArch}/jdk/hotspot/normal/eclipse"
+    dest jdksDir.file("jdk_${hostOs}_${hostArch}.${hostJdkExt}")
+    onlyIfModified true
+}
+
+tasks.register("extractJdk", Copy) {
+    description = "Extracts the host-platform JDK archive"
+    dependsOn "downloadJdk"
+
+    def archiveFile = jdksDir.file("jdk_${hostOs}_${hostArch}.${hostJdkExt}")
+    def outDir = jdksDir.dir("jdk_${hostOs}_${hostArch}")
+
+    from(hostJdkExt == 'zip' ? zipTree(archiveFile) : tarTree(archiveFile))
+    into outDir
+
+    eachFile stripLeadingSegment
+    includeEmptyDirs = false
+
+    onlyIf { !outDir.asFile.directory }
+}
+
+tasks.register("downloadJfxMods", Download) {
+    description = "Downloads JavaFX jmods for the host platform"
+    dependsOn "extractJdk"
+    def fileName = "openjfx-${javafxVersion}_${hostJfxOsPackage}${hostJfxArchSuffix}_bin-jmods.zip"
+    src "https://download2.gluonhq.com/openjfx/${javafxVersion}/${fileName}"
+    dest jdksDir.file("jfx_jmods_${hostOs}_${hostArch}.zip")
+}
+
+tasks.register("extractJfxMods", Copy) {
+    description = "Extracts JavaFX jmods into the host-platform JDK"
+    dependsOn "downloadJfxMods"
+
+    def jmodsTarget = (hostOs == 'mac')
+            ? jdksDir.dir("jdk_${hostOs}_${hostArch}/Contents/Home/jmods")
+            : jdksDir.dir("jdk_${hostOs}_${hostArch}/jmods")
+
+    from zipTree(jdksDir.file("jfx_jmods_${hostOs}_${hostArch}.zip"))
+    into jmodsTarget
+    eachFile stripLeadingSegment
+    includeEmptyDirs = false
+
+    onlyIf { !jmodsTarget.asFile.directory || jmodsTarget.asFile.list()?.length == 0 }
+}
+
+tasks.register("downloadJavaFXLocal", Download) {
+    description = "Downloads the JavaFX modules for the current platform to the 'mods' directory for local testing"
+    def fileName = "openjfx-${project.ext.javafxVersion}_${hostJfxOsPackage}${hostJfxArchSuffix}_bin-sdk.zip"
+
+    src "https://download2.gluonhq.com/openjfx/${project.ext.javafxVersion}/${fileName}"
+    dest layout.projectDirectory.file("mods/${fileName}")
+}
+
+tasks.register("extractJavaFXLocal", Copy) {
+    description = "Extracts the JavaFX modules for the current platform to the 'mods' directory for local testing"
+    dependsOn downloadJavaFXLocal
+
+    from zipTree(downloadJavaFXLocal.dest)
+    into layout.projectDirectory.dir("mods")
+    eachFile stripLeadingSegment
+    includeEmptyDirs = false
+}
+
+tasks.named("compileJava") {
+    dependsOn copyMasterSheets
+}
+
+tasks.register("testCoverage", JacocoReport) {
+    dependsOn test
+    group = "Reporting"
+    description = "Generate Jacoco coverage reports for the test build."
+
+    reports {
+        html.required.set(true)
+        xml.required.set(true)
+    }
+
+    classDirectories.from = fileTree(dir: layout.buildDirectory.dir("classes/java/main"))
+
+    sourceDirectories.from = files([
+            "$project.projectDir/code/src/java"
+    ])
+
+    executionData.from = fileTree(dir: layout.buildDirectory.dir("jacoco")).include("*.exec")
+}
+
+// https://docs.gradle.org/current/userguide/performance.html#a_run_tests_in_parallel
+// Test parallelism is set in the `allprojects` block below so it applies
+// uniformly to root and subproject Test tasks.
+
+tasks.named("test", Test) {
+    exclude 'test/pcgen/testsupport/**'
+    useJUnitPlatform()
+    // TestFX/Monocle setup — only the unit test source set has TestFX-based tests.
+    // Other JavaFX/Monocle args (testfx.*, prism.order, --add-exports for
+    // com.sun.javafx.util / com.sun.javafx.logging, --add-opens for
+    // com.sun.glass.ui) are applied to every Test by the
+    // tasks.withType(Test).configureEach block below; only the
+    // com.sun.javafx.application open is unique here, since withType
+    // has --add-exports (not --add-opens) for that package.
+    jvmArgs += [
+            // Workaround for TestFX modularity issue. https://github.com/TestFX/TestFX/issues/638
+            // --add-opens (not --add-exports) is required: TestFX's @AfterEach cleanup
+            // does setAccessible(true) on a private field of ParametersImpl, which is
+            // deep reflection — exports alone aren't enough.
+            '--add-opens', 'javafx.graphics/com.sun.javafx.application=ALL-UNNAMED',
+    ]
+}
+
+tasks.register("itest", Test) {
+    dependsOn jar
+    useJUnitPlatform()
+    testClassesDirs = sourceSets.itest.output.classesDirs
+    classpath = sourceSets.itest.runtimeClasspath
+    systemProperties['jar.path'] = jar.getArchiveFile().get().getAsFile()
+}
+
+tasks.register("slowtest", Test) {
+    dependsOn jar, itest
+    useJUnitPlatform()
+    testClassesDirs = sourceSets.slowtest.output.classesDirs
+    classpath = sourceSets.slowtest.runtimeClasspath
+    systemProperties['jar.path'] = jar.getArchiveFile().get().getAsFile()
+    forkEvery = 1
+}
+
+tasks.register("datatest", Test) {
+    dependsOn jar
+    useJUnitPlatform()
+    testClassesDirs = sourceSets.slowtest.output.classesDirs
+    classpath = sourceSets.slowtest.runtimeClasspath
+    include 'pcgen/persistence/lst/DataTest.class'
+    include 'pcgen/persistence/lst/DataLoadTest.class'
+    include 'pcgen/persistence/lst/DataEncodingTest.class'
+}
+
+// Data-only changes must invalidate validation even when compiled tests are unchanged.
+def sourceDataFiles = files(['data', 'system'].collect { directory ->
+    fileTree(directory) { include '**/*.lst', '**/*.pcc' }
+})
+['datatest', 'slowtest'].each { taskName ->
+    tasks.named(taskName, Test) {
+        inputs.files(sourceDataFiles)
+                .withPropertyName('sourceDataFiles')
+                .withPathSensitivity(PathSensitivity.RELATIVE)
+    }
+}
+
+tasks.register("inttest", Test) {
+    dependsOn jar
+    useJUnitPlatform()
+    testClassesDirs = sourceSets.slowtest.output.classesDirs
+    classpath = sourceSets.slowtest.runtimeClasspath
+    forkEvery = 1
+    include 'pcgen/inttest/**/*Test.class'
+}
+
+// Per-game-mode inttest variants. Each runs only the inttest classes for one
+// game directory under code/src/slowtest/pcgen/inttest. CI references these names
+// (e.g. pfinttest) so the task names are stable.
+[
+        sfinttest  : 'game_starfinder',
+        pfinttest  : 'game_pathfinder',
+        rsrdinttest: 'game_35e',
+        srdinttest : 'game_3e',
+        msrdinttest: 'game_modern',
+].each { taskName, gameDir ->
+    tasks.register(taskName, Test) {
+        dependsOn jar
+        useJUnitPlatform()
+        testClassesDirs = sourceSets.slowtest.output.classesDirs
+        classpath = sourceSets.slowtest.runtimeClasspath
+        include "pcgen/inttest/${gameDir}/*Test.class"
+    }
+}
+
+allprojects {
+    tasks.withType(Javadoc).configureEach {
+        options.addBooleanOption('Xdoclint:none', true)
+    }
+
+    tasks.withType(Test).configureEach {
+        maxHeapSize = "1024m"
+        maxParallelForks = Runtime.runtime.availableProcessors().intdiv(2) ?: 1
+        enableAssertions = true
+        testLogging {
+            exceptionFormat = 'full'
+            events 'failed', 'skipped'
+        }
+    }
+
+    // https://youtrack.jetbrains.com/issue/KT-46165
+    tasks.withType(Jar).configureEach {
+        duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    }
+    tasks.withType(JavaExec).configureEach {
+        maxHeapSize = "2048m"
+    }
+}
+
+// Root-project tests need JavaFX on the module path. Subproject tests
+// (base, formula) don't, and don't have a mods/lib dir.
+tasks.withType(Test).configureEach {
+    jvmArgs += [
+            '-Djava.awt.headless=true',
+            '-Dtestfx.robot=glass',
+            '-Dtestfx.headless=true',
+            '-Dprism.order=sw',
+            '-Dprism.verbose=true',
+            '-Djavafx.macosx.embedded=true',
+            '-Djava.security.manager=disallow',
+
+            "--module-path", layout.projectDirectory.dir("mods/lib"),
+            "--add-modules", "javafx.controls,javafx.web,javafx.swing,javafx.fxml,javafx.graphics",
+
+            // Needed to fix issue with testfx test crashing due to issue with modularity of whole program. Slightly related issue. https://github.com/TestFX/TestFX/issues/638
+            '--add-exports', 'javafx.graphics/com.sun.javafx.application=ALL-UNNAMED',
+            // Next two needed to support monocle testing
+            '--add-exports', 'javafx.graphics/com.sun.javafx.util=ALL-UNNAMED',
+            '--add-exports', 'javafx.base/com.sun.javafx.logging=ALL-UNNAMED',
+            '--add-opens', 'javafx.graphics/com.sun.glass.ui=ALL-UNNAMED',
+            '--enable-native-access=javafx.graphics',
+    ]
+}
+
+tasks.withType(JavaCompile).configureEach {
+    dependsOn extractJavaFXLocal
+    options.fork = true
+    options.release = project.ext.javaVersion
+
+    def modsLibPath = layout.projectDirectory.dir("mods/lib").asFile.absolutePath
+    // Resolve lazily: an eager read here forces the toolchain lookup, whose failure would be frozen into the config cache.
+    def runtimeFiles = configurations.runtimeClasspath.incoming.files
+    def compileFiles = configurations.compileClasspath.incoming.files
+
+    doFirst {
+        def depJars = runtimeFiles.findAll {
+            !it.name.startsWith('javafx-')
+        }.collect { it.absolutePath }.join(File.pathSeparator)
+        def compileOnlyJars = compileFiles.findAll {
+            it.name.contains('annotations') || it.name.contains('spotbugs')
+        }.collect { it.absolutePath }.join(File.pathSeparator)
+
+        if (name.toLowerCase().contains("test")) {
+            options.compilerArgs << "--module-path" << modsLibPath
+            options.compilerArgs << "--add-modules" << "javafx.controls,javafx.web,javafx.swing,javafx.fxml,javafx.graphics"
+        } else if (name == "compileJava") {
+            def modulePath = [modsLibPath, depJars, compileOnlyJars].findAll { it }.join(File.pathSeparator)
+            options.compilerArgs << "--module-path" << modulePath
+        }
+        println "Args for $name are $options.allCompilerArgs"
+    }
+}
+
+// Use the gradle wrapper
+tasks.named("wrapper") {
+    distributionType = Wrapper.DistributionType.ALL
+}
+
+// Bring in the rest of the gradle build config
+apply from: 'code/gradle/distribution.gradle'
+apply from: 'code/gradle/autobuild.gradle'    // depends on distribution.gradle
+apply from: 'code/gradle/reporting.gradle'
+apply from: 'code/gradle/release.gradle'
+apply from: 'code/gradle/plugins.gradle'
+apply from: 'code/gradle/benchmark.gradle'
+
+tasks.register("allTasks") {
+    dependsOn build, slowtest, javadoc, allReports
+    description = "Runs tasks build, slowtest, javadoc and allReports"
+}
+
+// This task is in the end, because other scripts contribute to the building process
+tasks.named("clean") {
+    dependsOn cleanPlugins, cleanOutput, cleanJdks, cleanMods, cleanMasterSheets
+}
