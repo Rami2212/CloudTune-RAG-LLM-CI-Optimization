@@ -1,0 +1,43 @@
+name: Build - Docker Image
+
+on:
+  push:
+    # Trigger unless only the wiki directory changed
+    paths:
+      - "uk_bin_collection_api_server/**"
+      - ".github/workflows/docker-image.yml"
+    branches: [ "master" ]
+  pull_request:
+    # Trigger unless only the wiki directory changed
+    paths:
+      - "uk_bin_collection_api_server/**"
+    # The branches below must be a subset of the branches above
+    branches: [ "master" ]
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * 0' # This runs at 00:00 on Sunday every week
+
+jobs:
+
+  build:
+    runs-on: ubuntu-latest
+    # Skip the version-bump commit. `cz bump` rewrites
+    # uk_bin_collection_api_server/requirements.txt to pin the just-bumped
+    # `uk-bin-collection>=<new version>`, and pushing that commit to master
+    # triggers this workflow. Building here would `pip install` the new version
+    # before it exists on PyPI (published separately by release.yml on the tag),
+    # so it races and fails. The release.yml `docker` job (needs: release)
+    # builds and pushes the image correctly *after* the PyPI publish, so this
+    # bump-commit build is redundant as well as broken — skip it.
+    if: >-
+      github.event_name != 'push' ||
+      !startsWith(github.event.head_commit.message, 'bump:')
+    steps:
+    - uses: actions/checkout@v7
+    - name: Publish to Registry
+      uses: elgohr/Publish-Docker-Github-Action@v5
+      with:
+        name: robbrad182/uk-bin-collection
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_API_KEY }}
+        workdir: uk_bin_collection_api_server

@@ -1,0 +1,406 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [MEDIUM] Add concurrency group to "linux.yml"
+# - [MEDIUM] 3 jobs clone the repo — consider artifact sharing
+# Estimated savings: ~3 min/run
+#
+name: Linux Build
+
+on:
+    push:
+      branches:
+         - 'master'
+         - 'heimdal-7-1-branch'
+         - 'test-ILP32'
+      paths:
+         - '!docs/**'
+         - '!**.md'
+         - '!**.[1-9]'
+         - '**.[chly]'
+         - '**.hin'
+         - '**.in'
+         - '**.am'
+         - '**.m4'
+         - '**.ac'
+         - '**.pl'
+         - '**.py'
+         - '**.asn1'
+         - '**.opt'
+         - '**.map'
+         - 'cf/check-library-abi.sh'
+         - 'lib/*/abi/**'
+         - '**/COPYING'
+         - '**/INSTALL'
+         - '**/README*'
+         - '.github/workflows/linux.yml'
+
+    pull_request:
+      paths:
+         - '!docs/**'
+         - '!**.md'
+         - '!**.[1-9]'
+         - '**.[chly]'
+         - '**.hin'
+         - '**.in'
+         - '**.am'
+         - '**.m4'
+         - '**.ac'
+         - '**.pl'
+         - '**.py'
+         - '**.asn1'
+         - '**.opt'
+         - '**.map'
+         - 'cf/check-library-abi.sh'
+         - 'lib/*/abi/**'
+         - '**/COPYING'
+         - '**/INSTALL'
+         - '**/README*'
+         - '.github/workflows/linux.yml'
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+    unix:
+        # Run if no [only X] tag, or if [only linux] is present (check both push commits and PR titles)
+        if: >-
+            (!contains(github.event.head_commit.message, '[only ') &&
+             !contains(github.event.pull_request.title, '[only ')) ||
+            contains(github.event.head_commit.message, '[only linux]') ||
+            contains(github.event.pull_request.title, '[only linux]')
+        runs-on: ${{ matrix.os }}
+        strategy:
+            fail-fast: false
+            matrix:
+                name: [linux-gcc]
+                include:
+                    - name: linux-gcc
+                      os: ubuntu-22.04
+                      compiler: gcc
+                      cflags: '-g -Wnonnull'
+                      configureopts: '--with-readline=yes'
+                      abi_platform: x86_64-linux-gnu
+        steps:
+            - name: Clone repository
+              uses: actions/checkout@v4
+            - name: Install packages
+              if: startsWith(matrix.os, 'ubuntu')
+              run: |
+                sudo apt-get update -qq
+                sudo apt-get install -y abigail-tools bison comerr-dev flex doxygen
+                sudo apt-get install -y libcap-ng-dev libdb-dev libedit-dev libjson-perl
+                sudo apt-get install -y libldap2-dev libncurses5-dev libperl4-corelibs-perl
+                sudo apt-get install -y libsqlite3-dev libkeyutils-dev libreadline-dev pkg-config python3
+                sudo apt-get install -y ss-dev texinfo unzip netbase keyutils ldap-utils
+                sudo apt-get install -y gdb apport curl libmicrohttpd-dev jq valgrind
+                # Temporary workaround for:
+                # https://github.com/actions/virtual-environments/issues/3185
+                sudo hostname localhost
+            - name: Build
+              env:
+                CC: ${{ matrix.compiler }}
+                MAKEVARS: ${{ matrix.makevars }}
+                CONFIGURE_OPTS: ${{ matrix.configureopts }}
+              run: |
+                /bin/sh ./autogen.sh
+                mkdir build
+                cd build
+                ../configure --srcdir=`dirname "$PWD"` --enable-maintainer-mode --enable-developer --with-ldap $CONFIGURE_OPTS --prefix=$HOME/inst CFLAGS="${{ matrix.cflags }} -Wno-error=shadow -Wno-error=bad-function-cast -Wno-error=unused-function -Wno-error=unused-result -Wno-error=deprecated-declarations"
+                make -j4
+            - name: Test
+              timeout-minutes: 40
+              env:
+                CC: ${{ matrix.compiler }}
+                MAKEVARS: ${{ matrix.makevars }}
+              run: |
+                cd build
+                sudo sysctl kernel.core_pattern=core.%p || true
+                ulimit -c unlimited
+                make check
+            - name: ABI compatibility
+              if: matrix.abi_platform == 'x86_64-linux-gnu'
+              env:
+                ABI_PLATFORM: ${{ matrix.abi_platform }}
+                CC: ${{ matrix.compiler }}
+                MAKEVARS: ${{ matrix.makevars }}
+              run: |
+                cd build
+                make check-abi
+            - name: Make Install
+              env:
+                CC: ${{ matrix.compiler }}
+                MAKEVARS: ${{ matrix.makevars }}
+              run: |
+                cd build || true
+                make DESTDIR=/tmp/h5l install
+                cd /tmp/h5l
+                tar czf $HOME/heimdal-install-linux-${{ matrix.compiler }}.tgz .
+            - name: Interrupted/timed out test diagnostics
+              if: ${{ cancelled() || failure() }}
+              run: |
+                set -x
+                # Show any test-related processes still running
+                ps auxww | grep -E 'kdc|test_context|kinit|kadmin|check-' | grep -v grep || true
+                # Show who's on the test port
+                ss -tlnp sport = :49188 || true
+                # Show the newest .log file (the one likely interrupted)
+                newest=$(find build/tests -name '*.log' -newer build/tests/gss/Makefile -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+                if [ -n "$newest" ]; then
+                  echo "=== Newest test log: $newest ==="
+                  cat "$newest"
+                fi
+                # Also show KDC messages.log if any exist
+                for f in build/tests/gss/messages.log build/tests/kdc/messages.log; do
+                  if [ -f "$f" ]; then
+                    echo "=== $f ==="
+                    tail -100 "$f"
+                  fi
+                done
+            - name: Core dump stacks
+              if: ${{ always() }}
+              run: |
+                find . -name '*core*' -print
+                echo "thread apply all bt" > /tmp/x
+                find . -name core\* -print | while read core; do gdb -batch -x x `file "$core"|sed -e "s/^[^']*'//" -e "s/[ '].*$//"` "$core"; done
+                if [ "$(find . -name core -print | wc -l)" -gt 0 ]; then false; fi
+            - name: Test logs
+              if: ${{ always() }}
+              run: |
+                find build -depth -name \*.trs | xargs grep -lw FAIL | sed -e 's/trs$/log/' | tar -czf $HOME/logs-linux-${{ matrix.compiler }}.tgz --verbatim-files-from --files-from -
+                find build -name \*.trs | xargs grep -lw FAIL | sed -e 's/trs$/log/' | xargs cat
+            - name: Failed Test logs
+              if: ${{ failure() }}
+              run: |
+                find build -name \*.trs | xargs grep -lw FAIL | sed -e 's/trs$/log/' | xargs cat
+            - name: Make Dist
+              run: |
+                cd build
+                make dist
+                make distclean
+                if [ "$(git ls-files -o|grep -v ^build/ | wc -l)" -ne 0 ]; then
+                  echo "Files not removed by make distclean:"
+                  git ls-files -o|grep -v ^build/
+                fi
+            - name: Upload Install Tarball
+              uses: actions/upload-artifact@v4
+              with:
+                name: Install Tarball (${{ matrix.name }})
+                path: '~/heimdal-install-linux-${{ matrix.compiler }}.tgz'
+            - name: Upload Dist Tarball
+              uses: actions/upload-artifact@v4
+              with:
+                name: Dist Tarball (${{ matrix.name }})
+                path: 'build/heimdal-*.tar.gz'
+            - name: Upload Logs Tarball
+              uses: actions/upload-artifact@v4
+              with:
+                name: Test Logs (${{ matrix.name }})
+                path: '~/logs-linux-${{ matrix.compiler }}.tgz'
+
+    linux-aarch64-cross:
+        name: cross build amd64 to aarch64
+        # Run if no [only X] tag, or if [only linux] is present (check both push commits and PR titles)
+        if: >-
+            (!contains(github.event.head_commit.message, '[only ') &&
+             !contains(github.event.pull_request.title, '[only ')) ||
+            contains(github.event.head_commit.message, '[only linux]') ||
+            contains(github.event.pull_request.title, '[only linux]')
+        runs-on: ubuntu-22.04
+        container: debian:trixie
+        env:
+            DEBIAN_FRONTEND: noninteractive
+        steps:
+            - name: Clone repository
+              uses: actions/checkout@v4
+
+            - name: Install packages
+              run: |
+                dpkg --add-architecture arm64
+                apt-get update -qq
+                apt-get install -y --no-install-recommends \
+                    autoconf automake bison build-essential ca-certificates \
+                    crossbuild-essential-arm64 file flex libedit-dev \
+                    libjson-perl libmicrohttpd-dev libncurses-dev \
+                    libsqlite3-dev libssl-dev libtool make netbase perl \
+                    pkg-config python3 texinfo \
+                    libcrypt-dev:arm64 libdb-dev:arm64 libedit-dev:arm64 \
+                    libmicrohttpd-dev:arm64 libncurses-dev:arm64 \
+                    libperl-dev:arm64 libsqlite3-dev:arm64 libssl-dev:arm64
+
+            - name: Generate build system
+              run: /bin/sh ./autogen.sh
+
+            - name: Build native tools
+              run: |
+                mkdir build-tools
+                cd build-tools
+                ../configure --disable-dependency-tracking
+                make -j"$(nproc)"
+
+            - name: Prepare native tools
+              run: |
+                mkdir cross-tools
+                printf '#!/bin/sh\nexec %s/build-tools/lib/asn1/asn1_compile "$@"\n' \
+                    "$GITHUB_WORKSPACE" > cross-tools/asn1_compile
+                printf '#!/bin/sh\nexec %s/build-tools/lib/sl/slc "$@"\n' \
+                    "$GITHUB_WORKSPACE" > cross-tools/slc
+                printf '#!/bin/sh\nexec %s/build-tools/lib/com_err/compile_et "$@"\n' \
+                    "$GITHUB_WORKSPACE" > cross-tools/compile_et
+                chmod 755 cross-tools/*
+
+            - name: Cross build
+              run: |
+                mkdir build-aarch64
+                cd build-aarch64
+                PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig \
+                CC=aarch64-linux-gnu-gcc \
+                ../configure \
+                    --build="$(../config.guess)" \
+                    --host=aarch64-linux-gnu \
+                    --with-cross-tools="$GITHUB_WORKSPACE/cross-tools" \
+                    --disable-dependency-tracking \
+                    --prefix=/usr
+                make -j"$(nproc)"
+                make DESTDIR="$GITHUB_WORKSPACE/heimdal-aarch64-root" install
+
+            - name: Verify target architecture
+              run: |
+                file heimdal-aarch64-root/usr/bin/kinit
+                file heimdal-aarch64-root/usr/bin/kinit |
+                    grep -q 'ARM aarch64'
+
+            - name: Package cross build
+              run: |
+                tar --exclude=.git --exclude=build-tools --exclude=cross-tools \
+                    -czf /tmp/heimdal-aarch64-build.tar.gz .
+
+            - name: Upload cross build
+              uses: actions/upload-artifact@v4
+              with:
+                name: heimdal-aarch64-build
+                path: /tmp/heimdal-aarch64-build.tar.gz
+
+    linux-aarch64-test:
+        name: test on aarch64
+        needs: linux-aarch64-cross
+        runs-on: ubuntu-24.04-arm
+        container:
+            image: debian:trixie
+            options: --init
+        env:
+            DEBIAN_FRONTEND: noninteractive
+        steps:
+            - name: Install packages
+              run: |
+                apt-get update -qq
+                apt-get install -y --no-install-recommends \
+                    bison build-essential ca-certificates curl file flex gzip jq \
+                    libcrypt-dev libdb-dev libedit-dev libjson-perl \
+                    libmicrohttpd-dev \
+                    libncurses-dev libperl-dev libsqlite3-dev libssl-dev \
+                    libtool make netbase perl pkg-config procps python3 texinfo unzip
+
+            - name: Download cross build
+              uses: actions/download-artifact@v4
+              with:
+                name: heimdal-aarch64-build
+                path: /tmp
+
+            - name: Install cross-built Heimdal
+              run: |
+                tar -xzf /tmp/heimdal-aarch64-build.tar.gz \
+                    -C "$GITHUB_WORKSPACE"
+                cp -a heimdal-aarch64-root/. /
+                ldconfig
+
+            - name: Prepare native tools
+              run: |
+                mkdir cross-tools
+                printf '#!/bin/sh\nexec %s/build-aarch64/lib/asn1/asn1_compile "$@"\n' \
+                    "$GITHUB_WORKSPACE" > cross-tools/asn1_compile
+                printf '#!/bin/sh\nexec %s/build-aarch64/lib/sl/slc "$@"\n' \
+                    "$GITHUB_WORKSPACE" > cross-tools/slc
+                printf '#!/bin/sh\nexec %s/build-aarch64/lib/com_err/compile_et "$@"\n' \
+                    "$GITHUB_WORKSPACE" > cross-tools/compile_et
+                chmod 755 cross-tools/*
+
+            - name: Test cross build
+              run: |
+                test "$(uname -m)" = aarch64
+                file build-aarch64/kuser/.libs/kinit
+                /usr/bin/kinit --version
+                cd build-aarch64
+                make check
+
+    linux-i386:
+        name: linux-i386 (${{ matrix.name }})
+        # Run if no [only X] tag, or if [only linux] is present (check both push commits and PR titles)
+        if: >-
+            (!contains(github.event.head_commit.message, '[only ') &&
+             !contains(github.event.pull_request.title, '[only ')) ||
+            contains(github.event.head_commit.message, '[only linux]') ||
+            contains(github.event.pull_request.title, '[only linux]')
+        runs-on: ubuntu-22.04
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - name: time32
+                      image: i386/debian:bookworm
+                      year2038_configure: ""
+                      time_t_size: 4
+                    - name: year2038
+                      image: i386/debian:trixie
+                      year2038_configure: --enable-year2038
+                      time_t_size: 8
+        steps:
+            - name: Clone repository
+              uses: actions/checkout@v4
+            - name: Build and test on Debian i386
+              run: |
+                docker run --security-opt seccomp=unconfined --platform linux/386 --rm \
+                    -v "$PWD:/src:ro" \
+                    -e YEAR2038_CONFIGURE="${{ matrix.year2038_configure }}" \
+                    -e EXPECT_TIME_T_SIZE="${{ matrix.time_t_size }}" \
+                    ${{ matrix.image }} \
+                    /bin/bash -euxc '
+                        export DEBIAN_FRONTEND=noninteractive
+                        apt-get update -qq
+                        apt-get install -y --no-install-recommends \
+                            autoconf automake bison build-essential ca-certificates \
+                            comerr-dev curl doxygen flex gdb git iproute2 jq keyutils \
+                            ldap-utils libcap-ng-dev libdb-dev libedit-dev libjson-perl \
+                            libkeyutils-dev libldap2-dev liblmdb-dev libmicrohttpd-dev libncurses5-dev \
+                            libperl4-corelibs-perl libreadline-dev libsqlite3-dev libssl-dev \
+                            libtool make netbase pkg-config procps python3 ss-dev tar \
+                            texinfo unzip valgrind xz-utils
+
+                        cp -a /src /tmp/heimdal-src
+                        git config --global --add safe.directory /tmp/heimdal-src
+                        cd /tmp/heimdal-src
+                        /bin/sh ./autogen.sh
+                        mkdir build
+                        cd build
+                        ../configure --srcdir=`dirname "$PWD"` \
+                            --enable-maintainer-mode \
+                            --enable-developer \
+                            ${YEAR2038_CONFIGURE} \
+                            --with-ldap \
+                            --with-readline=yes \
+                            --with-db-type-preference=lmdb \
+                            --prefix=/tmp/heimdal-i386-inst \
+                            CFLAGS="-Wnonnull -Wno-error=shadow -Wno-error=bad-function-cast -Wno-error=unused-function -Wno-error=unused-result -Wno-error=deprecated-declarations"
+                        printf "%s\n" \
+                            "#include \"include/config.h\"" \
+                            "#include <stdio.h>" \
+                            "#include <time.h>" \
+                            "int main(void) { unsigned long s = sizeof(time_t); printf(\"sizeof(time_t)=%lu\n\", s); return s == EXPECT_TIME_T_SIZE ? 0 : 1; }" \
+                            > check-time-t.c
+                        cc -I. -I.. -DEXPECT_TIME_T_SIZE="$EXPECT_TIME_T_SIZE" -o check-time-t check-time-t.c
+                        ./check-time-t
+                        make -j4
+                        make -C lib/asn1 check
+                        make -C lib/hx509 check TESTS=test_cert_binary
+                        make DESTDIR=/tmp/heimdal-i386-root install
+                    '

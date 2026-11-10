@@ -1,0 +1,41 @@
+name: Markdown spec conformance
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gfm_roundtrip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v2.0.0
+      - uses: extractions/setup-just@v4.0.0
+        with:
+          just-version: 1.58.0
+      - uses: Swatinem/rust-cache@v2.9.3
+      - name: Render the spec examples
+        run: just test-spec
+        env:
+          SPEC_REPORT: ${{ runner.temp }}/spec-report.md
+      - name: Report the conformance
+        if: always()
+        env:
+          SPEC_REPORT: ${{ runner.temp }}/spec-report.md
+        run: |
+          {
+            echo "## Spec conformance"
+            echo
+            echo "| Spec | Features | Passed | Examples | Rate |"
+            echo "| :--- | :--- | ---: | ---: | ---: |"
+            sort "$SPEC_REPORT"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Run GFM spec round-trip check
+        run: just test-gfm-spec

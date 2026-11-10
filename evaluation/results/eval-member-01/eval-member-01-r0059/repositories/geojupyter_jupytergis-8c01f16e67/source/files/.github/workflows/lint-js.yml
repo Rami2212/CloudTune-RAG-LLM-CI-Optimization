@@ -1,0 +1,110 @@
+name: Lint JavaScript
+
+on:
+  push:
+    branches: main
+  pull_request:
+    branches: '*'
+
+permissions: {}
+
+jobs:
+  lint-js:
+    name: eslint & prettier
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          cache: true
+
+      - name: Install Conda environment with Micromamba
+        uses: mamba-org/setup-micromamba@f457c30a868e4760d3a6fcea5f25dc655b8edf39 # v3.2.1
+        with:
+          cache-environment: true
+          environment-name: gis
+          create-args: >-
+            pip
+            qgis
+            python=3.14
+
+      - name: Setup pip cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ matrix.python-version }}-${{ hashFiles('package.json') }}
+          restore-keys: |
+            pip-${{ matrix.python-version }}-
+            pip-
+
+      - name: Install Python build deps
+        shell: bash -l {0}
+        run: pip install --group build
+
+      - name: Install JS build deps
+        shell: bash -l {0}
+        run: |
+          set -e
+
+          pnpm install --frozen-lockfile
+          pnpm list --depth 0
+
+      # Unfortunately, we need to build to properly lint. If we don't build,
+      # the types for cross-package dependencies won't be available and we'll
+      # see false positives and negatives in our lint jobs.
+      - name: Build
+        shell: bash -l {0}
+        run: pnpm run build
+
+      - name: Lint
+        id: eslint
+        continue-on-error: true
+        shell: bash -l {0}
+        run: pnpm run eslint:check
+
+      - name: Check formatting
+        id: prettier
+        continue-on-error: true
+        shell: bash -l {0}
+        run: |
+          pnpm run prettier:check
+          rc=$?
+
+          if [ $rc -ne 0 ]; then
+            # Show what was changed -- useful if CI is reporting an error and
+            # local prettier run is not (╯°□°)╯︵ ┻━┻
+            pnpm run prettier
+            git diff
+            git restore .
+          fi
+
+          exit $rc
+
+      - name: Report
+        env:
+          ESLINT_OUTCOME: ${{ steps.eslint.outcome }}
+          PRETTIER_OUTCOME: ${{ steps.prettier.outcome }}
+        run: |
+          failed=0
+
+          if [ "${ESLINT_OUTCOME}" == "success" ]; then
+            echo "🎉 ESLint check passed"
+          else
+            echo "❌ ESLint check failed"
+            failed=1
+          fi
+
+          if [ "${PRETTIER_OUTCOME}" == "success" ]; then
+            echo "🎉 Prettier format check passed"
+          else
+            echo "❌ Prettier format check failed"
+            failed=1
+          fi
+
+          exit $failed

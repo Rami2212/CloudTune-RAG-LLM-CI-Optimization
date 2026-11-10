@@ -1,0 +1,37 @@
+name: Publish Docker image
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+env:
+  REGISTRY: "registry-1.docker.io"
+  REPO: "dnsmonster"
+
+jobs:
+  path-context:
+    runs-on: ubuntu-latest
+    steps:
+
+      - uses: actions/checkout@v7
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4.7.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Extract tag name
+        id: extract_tag
+        run: echo "tag=${GITHUB_REF##*/}" >> $GITHUB_OUTPUT
+
+      - name: Build and push ${{ env.REPO }}
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ secrets.DOCKER_USERNAME }}/${{ env.REPO }}:latest
+            ${{ env.REGISTRY }}/${{ secrets.DOCKER_USERNAME }}/${{ env.REPO }}:${{ steps.extract_tag.outputs.tag }}

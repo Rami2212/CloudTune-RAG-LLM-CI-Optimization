@@ -1,0 +1,152 @@
+name: Deploy Mezon FE Prod
+permissions:
+  contents: read
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: mezon-build-linux
+    name: Build Mezon FE
+    environment: prod
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.5.0'
+
+      - name: Install dependencies
+        run: |
+          echo "Environments"
+          echo "NODE_ENV: ${{ env.NODE_ENV }}"
+          export nv=$(node -v)
+          echo "Node version: $nv"
+          echo "Installing dependencies"
+          yarn config set nodedir ~/.cache/node-gyp/20.18.1/
+          echo "Node directory: ${nv:1}"
+          source ~/.bashrc
+          yarn
+
+      - name: Reset Nx cache
+        run: |
+          echo "Resetting Nx cache"
+          yarn nx reset
+
+      - name: Remove env
+        run: |
+          rm -rf apps/chat/.env
+
+      - name: Create ENV
+        uses: SpicyPizza/create-envfile@v2.0
+        with:
+          directory: apps/chat
+          envkey_NX_CHAT_APP_API_HOST: ${{ secrets.NX_CHAT_APP_API_HOST_PROD }}
+          envkey_NX_CHAT_APP_API_PORT: ${{ secrets.NX_CHAT_APP_API_PORT_PROD }}
+          envkey_NX_CHAT_APP_API_KEY: ${{ secrets.NX_CHAT_APP_API_KEY_PROD }}
+          envkey_NX_CHAT_APP_API_SECURE: ${{ secrets.NX_CHAT_APP_API_SECURE_PROD }}
+          envkey_NX_CHAT_APP_GOOGLE_CLIENT_ID: ${{ secrets.NX_CHAT_APP_GOOGLE_CLIENT_ID_PROD }}
+          envkey_NX_CHAT_APP_REDIRECT_URI: ${{ secrets.NX_CHAT_APP_REDIRECT_URI_PROD }}
+          envkey_NX_CHAT_APP_FCM_API_KEY: ${{ secrets.NX_CHAT_APP_FCM_API_KEY_PROD }}
+          envkey_NX_CHAT_APP_FCM_AUTH_DOMAIN: ${{ secrets.NX_CHAT_APP_FCM_AUTH_DOMAIN_PROD }}
+          envkey_NX_CHAT_APP_FCM_PROJECT_ID: ${{ secrets.NX_CHAT_APP_FCM_PROJECT_ID_PROD }}
+          envkey_NX_CHAT_APP_FCM_STORAGE_BUCKET: ${{ secrets.NX_CHAT_APP_FCM_STORAGE_BUCKET_PROD }}
+          envkey_NX_CHAT_APP_FCM_MESSAGING_SENDER_ID: ${{ secrets.NX_CHAT_APP_FCM_MESSAGING_SENDER_ID_PROD }}
+          envkey_NX_CHAT_APP_FCM_APP_ID: ${{ secrets.NX_CHAT_APP_FCM_APP_ID_PROD }}
+          envkey_NX_CHAT_APP_FCM_MEASUREMENT_ID: ${{ secrets.NX_CHAT_APP_FCM_MEASUREMENT_ID_PROD }}
+          envkey_NX_CHAT_APP_FCM_VAPID_KEY: ${{ secrets.NX_CHAT_APP_FCM_VAPID_KEY_PROD }}
+          envkey_NX_CHAT_APP_API_KLIPY_KEY: ${{ secrets.NX_CHAT_APP_API_KLIPY_KEY_PROD }}
+          envkey_NX_CHAT_APP_API_CLIENT_KEY_CUSTOM: ${{ secrets.NX_CHAT_APP_API_CLIENT_KEY_CUSTOM_PROD }}
+          envkey_NX_CHAT_SENTRY_DNS: ${{ secrets.NX_CHAT_SENTRY_DNS_PROD }}
+          envkey_NX_CHAT_APP_ANNONYMOUS_USER_ID: ${{ secrets.NX_CHAT_APP_ANNONYMOUS_USER_ID_PROD }}
+          envkey_NX_CHAT_APP_NOTIFICATION_WS_URL: ${{ secrets.NX_CHAT_APP_NOTIFICATION_WS_URL_PROD }}
+          envkey_NX_CHAT_SENTRY_DSN: ${{ secrets.NX_CHAT_SENTRY_DSN_PROD }}
+          envkey_NX_IMGPROXY_BASE_URL: ${{ secrets.NX_IMGPROXY_BASE_URL }}
+          envkey_NX_IMGPROXY_KEY: ${{ secrets.NX_IMGPROXY_KEY }}
+          envkey_NX_WEBRTC_ICESERVERS_URL: ${{ secrets.NX_WEBRTC_ICESERVERS_URL_PROD }}
+          envkey_NX_WEBRTC_ICESERVERS_USERNAME: ${{ secrets.NX_WEBRTC_ICESERVERS_USERNAME_PROD }}
+          envkey_NX_WEBRTC_ICESERVERS_CREDENTIAL: ${{ secrets.NX_WEBRTC_ICESERVERS_CREDENTIAL_PROD }}
+          envkey_NX_CHAT_APP_STREAM_WS_URL: ${{ secrets.NX_CHAT_APP_STREAM_WS_URL }}
+          envkey_NX_CHAT_APP_MEET_WS_URL: ${{ secrets.NX_CHAT_APP_MEET_WS_URL }}
+          envkey_NX_CHAT_APP_SFU_WS_URL: ${{ secrets.NX_CHAT_APP_SFU_WS_URL }}
+          envkey_NX_CHAT_APP_STREAMING_URL: ${{ secrets.NX_CHAT_APP_STREAMING_URL }}
+          envkey_NX_CHAT_APP_FILE_INGEST: cdn-api.mezon.ai=https://streaming.mezon.vn
+          envkey_NX_CHAT_APP_OAUTH2_AUTHORIZE_URL: ${{ secrets.NX_CHAT_APP_OAUTH2_AUTHORIZE_URL }}
+          envkey_NX_CHAT_APP_OAUTH2_CLIENT_ID: ${{ secrets.NX_CHAT_APP_OAUTH2_CLIENT_ID }}
+          envkey_NX_CHAT_APP_OAUTH2_REDIRECT_URI: ${{ secrets.NX_CHAT_APP_OAUTH2_REDIRECT_URI }}
+          envkey_NX_CHAT_APP_OAUTH2_RESPONSE_TYPE: ${{ secrets.NX_CHAT_APP_OAUTH2_RESPONSE_TYPE }}
+          envkey_NX_CHAT_APP_OAUTH2_SCOPE: ${{ secrets.NX_CHAT_APP_OAUTH2_SCOPE }}
+          envkey_NX_CHAT_APP_OAUTH2_CODE_CHALLENGE_METHOD: ${{ secrets.NX_CHAT_APP_OAUTH2_CODE_CHALLENGE_METHOD }}
+          envkey_NX_CHAT_APP_API_KLIPY_URL: https://api.klipy.com/api/v1
+          envkey_NX_MAX_LENGTH_NAME_ALLOWED: 64
+          envkey_NX_LOGO_MEZON: https://cdn.komu.vn/images/mezon_logo.png
+          envkey_NX_CLOUDFLARE_CDN_URL: https://cdn.komu.vn
+          envkey_NX_MEZON_CDN_URL: https://cdn.mezon.ai
+          envkey_NX_PROFILE_IMG_URL: https://profile.mezon.ai
+          envkey_NX_CDN_SIGNATURE_TTL_MS: 10800000
+          envkey_NX_CHAT_APP_OAUTH2_LOG_OUT_CALLBACK: https://mezon.ai/logout/callback
+          envkey_NX_CHAT_APP_OAUTH2_LOG_OUT: https://oauth2.mezon.ai/oauth2/sessions/logout
+          envkey_NX_CLI_SET: true
+          envkey_NX_LOAD_DOT_ENV_FILES: true
+          envkey_NX_TASK_TARGET_PROJECT: chat
+          envkey_NX_TASK_TARGET_TARGET: build
+          envkey_NX_TASK_TARGET_CONFIGURATION: production
+          envkey_NX_CHAT_APP_API_GW_HOST: ${{ secrets.NX_CHAT_APP_API_GW_HOST }}
+          envkey_NX_CHAT_APP_API_GW_PORT: ${{ secrets.NX_CHAT_APP_API_GW_PORT }}
+          envkey_NX_DOMAIN_URL: https://mezon.ai
+          envkey_NX_CHAT_APP_MMN_API_URL: https://dong.mezon.ai/mmn-api
+          envkey_NX_CHAT_APP_INDEXER_API_URL: https://dong.mezon.ai/indexer-api
+          envkey_NX_CHAT_APP_ZK_API_URL: https://dong.mezon.ai/zk-api
+          envkey_NX_OGP_URL: https://ogp.mezon.ai/ogp
+          envkey_NX_APP_INTERACTIVE: '2089273739668623360'
+          envkey_NX_APP_BLACKBOARD: '2089294331818020864'
+          envkey_NX_APP_QUIZ: '2089257413122199552'
+          envkey_NX_VOICE_AGENT_ID: '2037383744142184448'
+          envkey_NX_MODEL_ONNX: 'https://cdn.komu.vn/ns/model.onnx'
+          envkey_NX_MODEL_ACCENT_ONNX: https://cdn.komu.vn/ns/accent_model.onnx
+      - name: Build
+        env:
+          BABEL_ENV: 'remove-e2e'
+        run: |
+          echo "Build"
+          yarn build:chat
+
+      - name: Compress build artifact
+        run: |
+          echo "Compress Artifact"
+          cd ./dist/apps/chat/
+          zip -r mezon-fe-prod.zip *
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mezon-fe-prod
+          path: ./dist/apps/chat/mezon-fe-prod.zip
+          retention-days: 1
+
+  deploy:
+    runs-on: mezon-fe-prod
+    name: Deploy Mezon FE
+    environment: prod
+    needs:
+      - build
+    steps:
+      - name: Clear www folder
+        run: |
+          echo "Clearing /var/www/mezon-fe/"
+          rm -rf /var/www/mezon-fe/*
+
+      - name: Download Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: mezon-fe-prod
+          path: /var/www/mezon-fe/
+
+      - name: Extract and check files
+        run: |
+          cd /var/www/mezon-fe/
+          ls -la
+          unzip mezon-fe-prod.zip

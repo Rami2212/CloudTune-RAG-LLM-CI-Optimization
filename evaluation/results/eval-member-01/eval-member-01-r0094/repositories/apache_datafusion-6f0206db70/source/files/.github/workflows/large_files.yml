@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
+# SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
+
+name: Large files PR check
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.head_ref || github.sha }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  check-files:
+    runs-on: ubuntu-slim
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Check size of new Git objects
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "merge_group" ]; then
+            # For merge queue, compare against the base branch
+            base_sha="${{ github.event.merge_group.base_sha }}"
+            head_sha="${{ github.event.merge_group.head_sha }}"
+          else
+            # For pull requests
+            base_sha="${{ github.event.pull_request.base.sha }}"
+            head_sha="${{ github.event.pull_request.head.sha }}"
+          fi
+          ./ci/scripts/check_large_files.sh --base "${base_sha}" --head "${head_sha}"

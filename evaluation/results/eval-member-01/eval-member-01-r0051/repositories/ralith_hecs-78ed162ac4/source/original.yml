@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: ['master']
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rust:
+          - stable
+        features:
+          - --all-features
+          - --no-default-features
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - run: cargo build -p hecs --all-targets ${{ matrix.features }}
+
+      - run: cargo test -p hecs ${{ matrix.features }}
+
+  no-std-build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+
+      # Build the `test-no-std-macros` target with x86_64-unknown-none target
+      - run: cargo build -p test-no-std-macros --target x86_64-unknown-none
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - run: cargo fmt --all -- --check
+
+      - name: doc
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+
+      - run: cargo clippy --all-features -- -D warnings
+
+  miri:
+    runs-on: ubuntu-latest
+    env:
+      # We only use permissive provenance ops for creating aligned
+      # dangling pointers, and strict provenance is a big MSRV bump.
+      MIRIFLAGS: -Zmiri-permissive-provenance
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+
+      - run: cargo miri setup
+
+        # miri doesn't want to run doctests for some reason
+      - run: cargo miri test --all-features --lib --tests

@@ -1,0 +1,35 @@
+name: Lint
+
+on:
+  push:
+    branches:
+      - main
+  pull_request: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v7
+        with:
+          python-version: 3.9
+      - name: Install Lint Dependencies
+        run: |
+          pip install -r test-requirements.txt --no-cache-dir
+          sudo wget -O /usr/local/bin/buildifier https://github.com/bazelbuild/buildtools/releases/download/4.0.1/buildifier-linux-amd64
+          sudo chmod +x /usr/local/bin/buildifier
+      - name: Run PyFlakes
+        run: pyflakes larq_compute_engine
+      - name: Black code style
+        run: black larq_compute_engine --check --target-version py39
+      - name: clang-format lint
+        uses: DoozyX/clang-format-lint-action@v0.20
+        with:
+          clangFormatVersion: 12
+      - name: Lint bazel files
+        run: buildifier -mode=check -r ./
+      - name: Type check with PyType
+        run: pytype --jobs auto

@@ -1,0 +1,77 @@
+name: Lint
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+    - name: Set git global config (Windows)
+      if: ${{ matrix.os == 'windows-latest' }}
+      run: |
+        git config --global core.autocrlf false
+        git config --global core.eol lf
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # tag: v7.0.1
+      with:
+        persist-credentials: false
+    - name: Setup Node.js
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # tag: v7.1.0
+      with:
+        node-version: lts/-1
+        check-latest: true
+    - name: Cache node_modules
+      id: cache-node-modules
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # tag: v6.1.0
+      with:
+        path: node_modules
+        key: ${{ runner.os }}-${{ hashFiles('yarn.lock') }}-node-modules
+    - name: Install
+      if: steps.cache-node-modules.outputs.cache-hit != 'true'
+      run: yarn install --immutable
+    - name: Lint
+      run: yarn lint
+
+  schema:
+    name: Schema Up-To-Date
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # tag: v7.0.1
+      with:
+        persist-credentials: false
+    - name: Setup Node.js
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # tag: v7.1.0
+      with:
+        node-version: lts/-1
+        check-latest: true
+    - name: Cache node_modules
+      id: cache-node-modules
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # tag: v6.1.0
+      with:
+        path: node_modules
+        key: ${{ runner.os }}-${{ hashFiles('yarn.lock') }}-node-modules
+    - name: Install
+      if: steps.cache-node-modules.outputs.cache-hit != 'true'
+      run: yarn install --immutable
+    - name: Build
+      run: yarn build
+    - name: Regenerate schema
+      run: yarn build:schema
+    - name: Fail if evm-config.schema.json is stale
+      run: |
+        if ! git diff --exit-code evm-config.schema.json; then
+          echo "::error::evm-config.schema.json is out of date. Run 'yarn build:schema' locally and commit the result."
+          exit 1
+        fi

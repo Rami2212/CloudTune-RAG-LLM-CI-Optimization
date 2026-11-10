@@ -1,0 +1,142 @@
+name: Linux-Build
+
+on:
+  pull_request:
+  push:
+    paths-ignore:
+      - '.github/workflows/windows-build.yml'
+      - '.gitignore'
+      - 'LICENSE'
+      - 'README.md'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-26.04]
+        arch: [x86_64]
+        mode: [debug, releasedbg]
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    if: "!contains(github.event.head_commit.message, 'ci skip')"
+
+    env:
+      OBS_VERSION: '33.0.0'
+      CMAKE_PRESET: 'ubuntu'
+
+    steps:
+    - name: Get current date as package key
+      id: pkg_key
+      run: echo "key=$(date +'%W')" >> $GITHUB_OUTPUT
+
+    - name: Checkout repository
+      uses: actions/checkout@v7
+
+    - name: Checkout Kinect SDKs
+      uses: actions/checkout@v7
+      continue-on-error: true
+      with:
+        repository: SirLynix/kinect-sdks
+        token: ${{ secrets.KINECT_SDKS_PAT }}
+        path: ${{ github.workspace }}/kinect-sdks
+
+    # Install OBS studio & Kinect for Azure dependencies
+    - name: Install apt dependencies
+      run: | 
+          sudo apt-get -qq update
+          sudo apt-get install -y \
+          cmake extra-cmake-modules ninja-build pkg-config clang clang-format build-essential curl ccache git zsh \
+          libavcodec-dev libavdevice-dev libavfilter-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libx264-dev libcurl4-openssl-dev libmbedtls-dev libgl1-mesa-dev libjansson-dev libluajit-5.1-dev python3-dev libx11-dev libxcb-randr0-dev libxcb-shm0-dev libxcb-xinerama0-dev libxcb-composite0-dev libxcomposite-dev libxinerama-dev libxcb1-dev libx11-xcb-dev libxcb-xfixes0-dev swig libcmocka-dev libxss-dev libglvnd-dev libgles2-mesa-dev libwayland-dev librist-dev libsrt-openssl-dev libpci-dev libpipewire-0.3-dev libqrcodegencpp-dev uthash-dev libsimde-dev \
+          libdrm-dev uuid-dev
+
+    # Cache OBS Studio
+    - name: Retrieve OBS Studio cache
+      uses: actions/cache@v6
+      id: obs-cache
+      with:
+        path: ${{ github.workspace }}/obs-studio
+        key: Linux-OBS-Studio-${{ env.OBS_VERSION }}
+
+    # Build obs-studio
+    - name: Clone OBS
+      if: steps.obs-cache.outputs.cache-hit != 'true'
+      uses: actions/checkout@v7
+      with:
+        repository: obsproject/obs-studio
+        path: ${{ github.workspace }}/obs-studio
+        submodules: 'recursive'
+        fetch-depth: 0 # for tags
+
+    # Checkout OBS to the wanted version
+    - name: Checkout OBS-Studio release (${{ env.OBS_VERSION }})
+      if: steps.obs-cache.outputs.cache-hit != 'true'
+      shell: bash
+      working-directory: ${{ github.workspace }}/obs-studio
+      run: |
+        git checkout ${{ env.OBS_VERSION }}
+        git submodule update
+
+    # Configure and build obs
+    - name: Build OBS-Studio
+      if: steps.obs-cache.outputs.cache-hit != 'true'
+      working-directory: ${{ github.workspace }}/obs-studio
+      shell: bash
+      run: |
+        mkdir ./build64
+        cd ./build64
+        cmake -DENABLE_FRONTEND=OFF -DENABLE_SCRIPTING=OFF -DENABLE_CORE_MODULES=OFF -DENABLE_PULSEAUDIO=OFF -DENABLE_WAYLAND=OFF ..
+        make -j4 libobs
+
+    # Prepare environment
+    - name: Configure build
+      run:
+        printf "LibObs = {\n  Include = [[${{ github.workspace }}/obs-studio/libobs]],\n  Build64 = [[${{ github.workspace }}/obs-studio/build64]]\n}\n\nObsPlugins={}" > config.lua
+
+    # Force xmake to a specific folder (for cache)
+    - name: Set xmake env
+      run: echo "XMAKE_GLOBALDIR=${{ runner.workspace }}/xmake-global" >> $GITHUB_ENV
+
+    # Install xmake
+    - name: Setup xmake
+      uses: xmake-io/github-action-setup-xmake@v1
+
+    # Update xmake repository (in order to have the file that will be cached)
+    - name: Update xmake repository
+      run: xmake repo --update
+
+    # Fetch xmake dephash
+    - name: Retrieve dependencies hash
+      id: dep_hash
+      run: echo "hash=$(xmake l utils.ci.packageskey)" >> $GITHUB_OUTPUT
+
+    # Cache xmake dependencies
+    - name: Retrieve cached xmake dependencies
+      uses: actions/cache@v6
+      with:
+        path: ${{ env.XMAKE_GLOBALDIR }}/.xmake/packages
+        key: Linux-${{ matrix.arch }}-${{ matrix.mode }}-${{ steps.dep_hash.outputs.hash }}-W${{ steps.pkg_key.outputs.key }}
+
+    # Setup compilation mode and install project dependencies
+    - name: Configure xmake and install dependencies
+      run: xmake config --arch=${{ matrix.arch }} --mode=${{ matrix.mode }} --ccache=n --yes --verbose
+      env:
+        KINECTSDKAZUREBT_DIR: ${{ github.workspace }}/kinect-sdks/k4abt
+
+    # Build the plugin
+    - name: Build obs-kinect
+      run: xmake --verbose
+      env:
+        KINECTSDKAZUREBT_DIR: ${{ github.workspace }}/kinect-sdks/k4abt
+
+    # Install the result files
+    - name: Package obs-kinect
+      run: xmake pack --verbose -y -f targz -o packaged
+      env:
+        KINECTSDKAZUREBT_DIR: ${{ github.workspace }}/kinect-sdks/k4abt
+
+    # Upload artifacts
+    - uses: actions/upload-artifact@v7
+      with:
+        name: obs-kinect-linux-${{ matrix.arch }}-${{ matrix.mode }}
+        path: packaged

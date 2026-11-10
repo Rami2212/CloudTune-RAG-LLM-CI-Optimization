@@ -1,0 +1,88 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [HIGH] Switch "build" from macOS to ubuntu runner
+# Estimated savings: ~0 min/run
+#
+name: "Regular CI Build"
+on:
+  push:
+    branches:
+      - main
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Install Swift
+        uses: swift-actions/setup-swift@v3
+        with:
+          swift-version: "6.4.0"
+
+      - name: Cache Swift build
+        uses: actions/cache@v4
+        with:
+          path: vendor/SophonClientv3/.build
+          key: swift-${{ runner.os }}-${{ runner.arch }}-6.3.3-${{ hashFiles('build-sophon.sh', 'vendor/SophonClientv3/Package.swift', 'vendor/SophonClientv3/Package.resolved') }}
+
+      - name: Install Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 16
+
+      - uses: pnpm/action-setup@v2
+        name: Install pnpm
+        id: pnpm-install
+        with:
+          version: 7
+          run_install: false
+
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        shell: bash
+        run: |
+          echo "STORE_PATH=$(pnpm store path)" >> $GITHUB_OUTPUT
+
+      - uses: actions/cache@v3
+        name: Setup pnpm cache
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build app
+        run: |
+          ./configure.sh
+          pnpm run format-check
+          pnpm run lint
+          YAAGL_CHANNEL_CLIENT=hk4ecn node ./build-app.js
+          YAAGL_CHANNEL_CLIENT=hk4eos node ./build-app.js
+          YAAGL_CHANNEL_CLIENT=bh3glb node ./build-app.js
+          YAAGL_CHANNEL_CLIENT=hkrpgcn node ./build-app.js
+          YAAGL_CHANNEL_CLIENT=hkrpgos node ./build-app.js
+          YAAGL_CHANNEL_CLIENT=napcn node ./build-app.js
+          YAAGL_CHANNEL_CLIENT=napos node ./build-app.js
+
+      # - name: Tar app
+      #   run: |
+      #     tar -zcf Yaagl.tar.gz Yaagl.app
+      #     tar -zcf "Yaagl OS.tar.gz" "Yaagl OS.app"
+      #     tar -zcf "Yaagl Honkai Global.tar.gz" "Yaagl Honkai Global.app"
+      # - name: Upload artifact - app
+      #   uses: actions/upload-artifact@v3
+      #   with:
+      #     name: app
+      #     path: Yaagl.tar.gz
+      # - name: Upload artifact - app-os
+      #   uses: actions/upload-artifact@v3
+      #   with:
+      #     name: app-os
+      #     path: "Yaagl OS.tar.gz"

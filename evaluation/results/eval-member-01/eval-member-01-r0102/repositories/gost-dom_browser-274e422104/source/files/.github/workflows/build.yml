@@ -1,0 +1,60 @@
+# This workflow will build a golang project
+# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-go
+
+name: Build
+
+on:
+  workflow_call:
+  push:
+    branches: [ "main", "auto-merge", "next", "feature/*" ]
+  pull_request:
+    branches: [ "main" ]
+
+
+jobs:
+  build:
+    name: Tests on ${{ matrix.os }} ${{ matrix.arch }} with Go ${{ matrix.go-version }}
+    strategy:
+      matrix:
+        os: 
+          - darwin
+          - linux
+        arch: [amd64, arm64]
+        include:
+        - os: darwin
+          platform: macos-latest
+        - os: linux
+          platform: ubuntu-latest
+    runs-on: ${{ matrix.platform }}
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: 1.26
+        cache-dependency-path: |
+          go.sum
+          scripting/v8engine/go.sum
+          scripting/sobekengine/go.sum
+
+    - name: Add GOPATH to GITHUB_ENV
+      run: echo "GOPATH=$(go env GOPATH)" >>"$GITHUB_ENV"
+
+    - name: Build
+      run: |
+        make ci
+  web-platform-test:
+    name: Run Web Platform Tests
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: 'internal/test/wpt/go.mod'
+        cache-dependency-path: 'internal/test/wpt/go.sum'
+    - name: Run Web Platform Tests
+      run: |
+        cd internal/test/wpt 
+        ./ci

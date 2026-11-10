@@ -1,0 +1,39 @@
+# Create a "github" release based on new tags. The actual release is created by
+# the 'release' workflow, which creates a tag if successful
+name: Create github release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Create Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+      - name: Get latest version tag
+        id: latest_version
+        run: echo "VERSION=$(git tag --merged | sort -V | tail -1)" >> $GITHUB_OUTPUT
+      - name: Changelog
+        uses: Bullrich/generate-release-changelog@master
+        id: Changelog
+        env:
+          REPO: ${{ github.repository }}
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@latest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # This token is provided by Actions, you do not need to create your own token
+        with:
+          tag_name: ${{ steps.latest_version.outputs.VERSION }}
+          release_name: Release ${{ steps.latest_version.outputs.VERSION }}
+          body: |
+            ${{ steps.Changelog.outputs.changelog }}
+          draft: false
+          prerelease: false
