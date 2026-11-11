@@ -1,0 +1,72 @@
+name: 'iOS'
+
+on:
+  push:
+    branches:
+      - 'master'
+  pull_request:
+    types: [ opened, synchronize ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Build verification only: there is no Apple Developer account behind this workflow, so the device bundle is left
+# unsigned (a device refuses it) and the simulator bundle is for the runner's own architecture. Both compile and
+# link the whole game together with the dependencies built from source (SDL2, OpenAL Soft, Ogg/Vorbis, libcurl),
+# which is what a change to the shared code or to the iOS-specific arms is checked against here.
+jobs:
+  Build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - BuildType: Release
+          Target: Device
+          Rhi: Metal
+
+        - BuildType: Release
+          Target: Simulator
+          Rhi: OpenGL
+
+    runs-on: 'macos-latest'
+
+    steps:
+    - name: 'Checkout Repository'
+      uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+
+    - name: 'Configure CMake'
+      run: |
+        case "${{ matrix.Target }}" in
+          Device ) sysroot="iphoneos"
+                   architecture="arm64" ;;
+          Simulator ) sysroot="iphonesimulator"
+                      architecture="$(uname -m)" ;;
+          * ) exit 1 ;;
+        esac
+
+        rm -f ./Content/Translations/*.po
+
+        cmake -B ./_build/ -D CMAKE_BUILD_TYPE=${{ matrix.BuildType }} -D CMAKE_SYSTEM_NAME=iOS -D CMAKE_OSX_SYSROOT="$sysroot" -D CMAKE_OSX_ARCHITECTURES="$architecture" -D CMAKE_OSX_DEPLOYMENT_TARGET=14.0 -D NCINE_PREFERRED_RHI=${{ matrix.Rhi }} -D NCINE_STRIP_BINARIES=ON
+
+    - name: 'Build'
+      run: |
+        make -j 3 -C ./_build/
+
+    - name: 'Create Package'
+      run: |
+        # The bundle is assembled by the build itself (see cmake/ncine_ios_bundle.cmake), nothing is installed
+        mkdir ./_package/
+        cp -R ./_build/jazz2.app ./_package/
+        cp -f ./LICENSE ./_package/LICENSE
+        plutil -lint ./_package/jazz2.app/Info.plist
+        file ./_package/jazz2.app/jazz2
+
+    - name: 'Upload Package'
+      uses: actions/upload-artifact@v7
+      with:
+        name: Jazz2_iOS_${{ matrix.Target }}_${{ matrix.Rhi }}_Unsigned
+        path: ./_package/

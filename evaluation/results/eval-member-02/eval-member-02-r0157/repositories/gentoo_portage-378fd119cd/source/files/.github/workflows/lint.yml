@@ -1,0 +1,48 @@
+name: Lint
+
+on: [ push, pull_request ]
+
+jobs:
+  black:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: "Collect stragglers that Black misses"
+        id: stragglers
+        run: |
+          echo "missed=$(
+          find bin -type f -not -name '*.py' -not -name '*.sh' | \
+          xargs grep -l '#!/usr/bin/env python' | tr $'\n' ' ')" >> $GITHUB_OUTPUT
+      - uses: psf/black@26.5.1
+        with:
+            src: . ${{ steps.stragglers.outputs.missed }}
+
+  pylint:
+    runs-on: ubuntu-24.04
+    # See .github/ci/Dockerfile.
+    container: ${{ vars.CI_IMAGE || 'ghcr.io/gentoo/portage-ci:master' }}
+    timeout-minutes: 5
+    strategy:
+      matrix:
+        python-version:
+          - '3.9'
+          - '3.10'
+          - '3.11'
+          - '3.12'
+          - '3.13'
+          - '3.14'
+          # no pylint for py315 available
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install pylint for Python ${{ matrix.python-version }}
+        run: |
+          set -xe
+          /opt/uv/bin/uv venv --no-cache --python /opt/python/${{ matrix.python-version }}/bin/python /tmp/lint
+          /opt/uv/bin/uv pip install --no-cache --python /tmp/lint pylint pytest
+          echo /tmp/lint/bin >> "${GITHUB_PATH}"
+          /tmp/lint/bin/python -VV
+      - name: Run pylint for ${{ matrix.python-version }}
+        run: |
+          ./run-pylint

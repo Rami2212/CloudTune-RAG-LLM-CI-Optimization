@@ -1,0 +1,43 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [HIGH] Split "ci" into parallel jobs (lint + test + build)
+# - [MEDIUM] Add concurrency group to "ci.yml"
+# Estimated savings: ~8 min/run
+#
+name: Node.js CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - run: |
+        docker pull ghcr.io/osgeo/gdal:ubuntu-small-latest ;
+        docker run -i --rm -v `pwd`/test/data:/data ghcr.io/osgeo/gdal:ubuntu-small-latest bash -c "apt-get update && apt-get -y install imagemagick libtiff-tools wget && cd /data && ./setup_data.sh"
+    - name: Use Node.js ${{ matrix.node-version }}
+      uses: actions/setup-node@v6
+      with:
+        node-version: 24
+        cache: 'npm'
+    - run: npm ci --ignore-scripts
+    - run: npm rebuild
+    - run: npm run build
+    - run: npm test
+    - name: action-slack
+      uses: 8398a7/action-slack@v3.8.0
+      with:
+        status: ${{ job.status }}
+        fields: repo,message,commit,author,action,eventName,ref,workflow,job,took
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      if: ${{ github.event_name != 'pull_request'}}

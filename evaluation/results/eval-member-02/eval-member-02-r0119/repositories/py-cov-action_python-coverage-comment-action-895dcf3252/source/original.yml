@@ -1,0 +1,45 @@
+name: Release Action
+
+on: workflow_dispatch
+
+concurrency:
+  group: release
+
+permissions: {}
+
+jobs:
+  release:
+    name: Create new release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Create the release and its tag
+
+    steps:
+      - name: Create the release
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          import subprocess
+
+          current = subprocess.run(
+              ["gh", "release", "view", "--json", "tagName", "--jq", ".tagName"],
+              check=True,
+              text=True,
+              capture_output=True,
+          ).stdout.strip()
+
+          major, minor = current.split(".")[:2]
+
+          # Major releases will be released manually.
+          new_tag = f"{major}.{int(minor) + 1}"
+
+          subprocess.run(
+              [
+                  "gh", "release", "create", new_tag,
+                  "--generate-notes",
+                  "--notes-start-tag", current,
+              ],
+              check=True,
+          )

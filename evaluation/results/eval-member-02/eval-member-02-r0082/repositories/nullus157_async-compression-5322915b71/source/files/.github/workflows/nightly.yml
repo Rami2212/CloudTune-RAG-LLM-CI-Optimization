@@ -1,0 +1,53 @@
+name: nightly
+
+env:
+  RUST_BACKTRACE: 1
+  RUSTFLAGS: --cfg async_compression_unstable
+  RUSTDOCFLAGS: --cfg async_compression_unstable
+
+jobs:
+  test:
+    name: cargo +nightly test
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      with:
+        toolchain: nightly
+    - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+      with: { tool: cargo-nextest }
+    - run: cargo --locked nextest run --workspace --all-features
+    - run: cargo --locked test --workspace --doc --all-features
+
+  fmt:
+    name: cargo +nightly fmt --check
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      with:
+        toolchain: nightly
+        components: rustfmt
+    - run: cargo fmt --all -- --check
+
+  clippy:
+    name: cargo +nightly clippy
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      with:
+        toolchain: nightly
+        components: clippy
+    - run: cargo --locked clippy --no-deps --all --all-targets --all-features -- -D warnings
+
+on:
+  merge_group:
+    types: [checks_requested]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  schedule:
+  - cron: '0 2 * * *'

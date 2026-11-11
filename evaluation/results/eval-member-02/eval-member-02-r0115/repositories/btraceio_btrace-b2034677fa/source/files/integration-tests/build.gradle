@@ -1,0 +1,299 @@
+import java.nio.file.Files
+import java.nio.file.Paths
+
+apply plugin: 'java'
+
+dependencies {
+    implementation project(':btrace-compiler')
+    implementation project(':btrace-extensions:btrace-metrics')
+    implementation project(':btrace-extensions:btrace-ext-test')
+    testImplementation project(':btrace-client')
+    testImplementation project(':btrace-core')
+    testImplementation libs.testcontainers
+}
+
+compileTestJava {
+    sourceCompatibility = 8
+    targetCompatibility = 8
+}
+
+// Test classes target Java 8 bytecode so they stay loadable when the "test" task runs
+// under an actual JDK 8 launcher. junit-jupiter 6.x requires JDK 17+ to compile against,
+// so pin this module's test dependency to the last JDK 8-compatible release instead of
+// the repo-wide catalog version.
+configurations.testCompileClasspath {
+    resolutionStrategy.force 'org.junit.jupiter:junit-jupiter:5.14.4'
+}
+configurations.testRuntimeClasspath {
+    resolutionStrategy.force 'org.junit.jupiter:junit-jupiter:5.14.4'
+}
+
+task buildEventsJar(type: Jar) {
+    inputs.files compileJava
+    from files("${project.buildDir}/classes/java/main")
+    archiveBaseName = "events"
+    archiveVersion = ""
+    archiveClassifier = ""
+}
+
+def externalTypeClientHome = layout.buildDirectory.dir('external-type-client-home')
+def externalTypeClientLibs = externalTypeClientHome.map { it.dir('libs') }
+def externalTypeExtensions = externalTypeClientHome.map { it.dir('extensions') }
+def releaseBtraceJar = project(':btrace-dist').layout.buildDirectory.file("resources/main/v${project.version}/libs/btrace.jar")
+def externalTypeArchive = project(':btrace-extensions:btrace-ext-test').layout.buildDirectory.file("distributions/btrace-ext-test-${project.version}-extension.zip")
+
+task stageExternalTypeClientHome {
+    dependsOn ':btrace-dist:btraceJar', ':btrace-dist:copyDtraceLib', ':btrace-extensions:btrace-ext-test:packageExtension'
+    inputs.file releaseBtraceJar
+    inputs.file externalTypeArchive
+    outputs.dir externalTypeClientHome
+
+    doLast {
+        File clientHome = externalTypeClientHome.get().asFile
+        project.delete(clientHome)
+        project.copy {
+            from releaseBtraceJar
+            into new File(clientHome, 'libs')
+        }
+        project.copy {
+            from project.zipTree(externalTypeArchive.get().asFile)
+            into new File(clientHome, 'extensions/btrace-ext-test')
+        }
+    }
+}
+
+// Homes for the embedded-extension test. Each holds a single libs/btrace.jar and deliberately no
+// sibling extensions/ directory: the client derives the extension API classpath from btrace.libs'
+// parent, so staging next to the real distribution would let its extensions satisfy the probe and
+// the test would pass without ever exercising the embedded copies.
+def embeddedExtHome = layout.buildDirectory.dir('embedded-extension-home')
+def embeddedExtLibs = embeddedExtHome.map { it.dir('libs') }
+def leanEngineHome = layout.buildDirectory.dir('lean-engine-home')
+def leanEngineLibs = leanEngineHome.map { it.dir('libs') }
+def publishedFatAgent = project(':btrace-dist').layout.buildDirectory.file('fat-agent/btrace-agent-fat.jar')
+
+task stageEmbeddedExtensionHomes {
+    dependsOn ':btrace-dist:btraceJar', ':btrace-dist:fatAgentJar'
+    inputs.file releaseBtraceJar
+    inputs.file publishedFatAgent
+    outputs.dir embeddedExtHome
+    outputs.dir leanEngineHome
+
+    doLast {
+        // The published artifact is the fat agent; the client locates the engine by the
+        // btrace.jar name, so stage it under that name.
+        File withExtensions = embeddedExtHome.get().asFile
+        project.delete(withExtensions)
+        project.copy {
+            from publishedFatAgent
+            into new File(withExtensions, 'libs')
+            rename { 'btrace.jar' }
+        }
+
+        File withoutExtensions = leanEngineHome.get().asFile
+        project.delete(withoutExtensions)
+        project.copy {
+            from releaseBtraceJar
+            into new File(withoutExtensions, 'libs')
+        }
+    }
+}
+
+task compileTestProbes {
+    dependsOn compileTestJava, ':btrace-agent:jar', ':btrace-compiler:jar'
+    // Wire all extension buildApiJar tasks dynamically (parent aggregator dissolved)
+    gradle.projectsEvaluated {
+        rootProject.subprojects.each { sp ->
+            if (sp.plugins.hasPlugin('io.btrace.extension')) {
+                def apiTask = sp.tasks.findByName('buildApiJar')
+                if (apiTask != null) {
+                    compileTestProbes.dependsOn(apiTask)
+                }
+            }
+        }
+    }
+    doLast {
+        def path = project(':integration-tests').sourceSets.main.runtimeClasspath
+
+        def loader = new URLClassLoader(path.collect { f -> f.toURL() } as URL[])
+        def compiler = loader.loadClass('io.btrace.compiler.Compiler')
+        def rtCp = sourceSets.main.runtimeClasspath
+        // Ensure the BTrace extension API JAR(s) (with manifest attributes) are present on classpath
+        def extApiJars = []
+        rootProject.subprojects.each { sp ->
+            if (sp.plugins.hasPlugin('io.btrace.extension')) {
+                try {
+                    def apiJar = sp.tasks.named('buildApiJar').get().archiveFile.get().asFile
+                    extApiJars << apiJar
+                } catch (Throwable ignored) { }
+            }
+        }
+        if (extApiJars.isEmpty()) {
+            logger.lifecycle("[integration-tests] No extension API JARs found. If you renamed an extension module, ensure it applies id 'io.btrace.extension'.")
+        } else {
+            rtCp = rtCp.plus(files(extApiJars))
+            logger.lifecycle("[integration-tests] Using extension API JARs: ${extApiJars}")
+        }
+
+        def fullCp = rtCp.plus(files(buildDir.toPath().resolve("classes/java/test"), buildDir.toPath().resolve("classes/java/java11_dummy")))
+        def cpPath = fullCp.getAsPath()
+        def args = ["-cp", cpPath, "-d", buildDir.toPath().resolve("classes").toString()]
+
+        def files = fileTree(dir: "src/test/btrace", include: '**/*.java', exclude: 'verifier/**/*.java').findAll {
+            it != null
+        }.collect { it }
+
+        args.addAll(files)
+
+        // Ensure BTrace compiler and its Verifier use the same classloader for resource lookups
+        // and have access to extension API manifest metadata
+        def prev = Thread.currentThread().contextClassLoader
+        try {
+            Thread.currentThread().contextClassLoader = loader
+            System.setProperty('btrace.allow.undeclared.services', 'true')
+            System.setProperty('java.class.path', cpPath)
+            compiler.main(args as String[])
+        } finally {
+            Thread.currentThread().contextClassLoader = prev
+            System.clearProperty('btrace.allow.undeclared.services')
+        }
+    }
+}
+
+test {
+    onlyIf {
+        project.hasProperty("integration")
+    }
+    dependsOn cleanTest, buildEventsJar, compileTestProbes,
+             ':btrace-dist:btraceJar',
+             ':btrace-dist:explodeExtensions',
+             stageExternalTypeClientHome,
+             stageEmbeddedExtensionHomes
+    dependsOn gradle.includedBuild('btrace-gradle-plugin').task(':jar')
+
+    testLogging.showStandardStreams = true
+
+    // Where StallWatchdog writes a thread dump when a test stops making progress. Absolute, because
+    // a relative path would resolve against the test task's working directory (the project dir),
+    // and under build/reports because that is what the workflows' `if: always()` steps upload -- the
+    // sink that survives a job cancelled at its timeout.
+    systemProperty 'btrace.test.stallDumpDir',
+            layout.buildDirectory.dir('reports/stall-dumps').get().asFile.absolutePath
+
+    def dockerAvailable = false
+    if (project.hasProperty("integration")) {
+        String dockerHost = System.getenv("DOCKER_HOST")
+        try {
+            if (dockerHost == null || dockerHost.trim().isEmpty()) {
+                def defaultSocket = new File("/var/run/docker.sock")
+                if (defaultSocket.exists()) {
+                    dockerHost = "unix:///var/run/docker.sock"
+                }
+                def hostOutput = new ByteArrayOutputStream()
+                def hostResult = exec {
+                    commandLine 'docker', 'context', 'inspect', '--format', '{{.Endpoints.docker.Host}}'
+                    ignoreExitValue true
+                    standardOutput = hostOutput
+                    errorOutput = hostOutput
+                }
+                def hostText = hostOutput.toString().trim()
+                if (hostResult.exitValue == 0 && !hostText.isEmpty()) {
+                    dockerHost = hostText
+                } else {
+                    logger.warn("[integration-tests] Docker context host not available: ${hostText}.")
+                }
+            }
+
+            if (dockerHost != null && !dockerHost.trim().isEmpty()) {
+                def infoOutput = new ByteArrayOutputStream()
+                def infoResult = exec {
+                    commandLine 'docker', 'info', '--format', '{{.ServerVersion}}'
+                    ignoreExitValue true
+                    standardOutput = infoOutput
+                    errorOutput = infoOutput
+                    environment 'DOCKER_HOST', dockerHost
+                }
+                def infoText = infoOutput.toString().trim()
+                if (!(infoResult.exitValue == 0 && !infoText.isEmpty())) {
+                    logger.warn("[integration-tests] Docker not available (docker info returned: ${infoText}).")
+                }
+            } else {
+                logger.warn("[integration-tests] Docker host not configured.")
+            }
+        } catch (Exception e) {
+            logger.warn("[integration-tests] Docker not available (${e.getClass().getSimpleName()}: ${e.getMessage()}).")
+        }
+        dockerAvailable = dockerHost != null && !dockerHost.trim().isEmpty()
+        if (!dockerAvailable) {
+            logger.warn("[integration-tests] Docker not available; skipping tests tagged 'docker'.")
+        } else {
+            if (System.getenv("DOCKER_HOST") == null || System.getenv("DOCKER_HOST").trim().isEmpty()) {
+                environment 'DOCKER_HOST', dockerHost
+            }
+            if (dockerHost.startsWith("unix://")) {
+                environment 'TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE', dockerHost.replace("unix://", "")
+            }
+            systemProperty 'docker.host', dockerHost
+            if (dockerHost.startsWith("unix://")) {
+                systemProperty 'testcontainers.docker.socket.override', dockerHost.replace("unix://", "")
+                systemProperty 'testcontainers.dockerclient.strategy', 'org.testcontainers.dockerclient.UnixSocketClientProviderStrategy'
+            }
+            logger.lifecycle("[integration-tests] Using DOCKER_HOST=${dockerHost}")
+        }
+        systemProperty 'btrace.docker.available', String.valueOf(dockerAvailable)
+        useJUnitPlatform {
+            if (!dockerAvailable) {
+                excludeTags 'docker'
+            }
+        }
+    }
+
+    def props = new Properties()
+    def javaHome = System.getenv("JAVA_HOME") ?: System.getProperty("java.home")
+    def releaseFile = Paths.get(javaHome.replace("/jre", ""), "release")
+    if (Files.exists(releaseFile)) {
+        props.load(Files.newInputStream(releaseFile))
+    }
+    def libsPath = "${projectDir}/../btrace-dist/build/resources/main/v${project.version}/libs/"
+    systemProperty 'btrace.externalType.client.libs', externalTypeClientLibs.get().asFile.absolutePath
+    systemProperty 'btrace.externalType.extensions', externalTypeExtensions.get().asFile.absolutePath
+    systemProperty 'btrace.embedded.libs', embeddedExtLibs.get().asFile.absolutePath
+    systemProperty 'btrace.embedded.lean.libs', leanEngineLibs.get().asFile.absolutePath
+    def isJava8 = props.getProperty("JAVA_VERSION")?.contains("1.8")
+    if (isJava8) {
+        jvmArgs "-Dproject.dir=${projectDir}", "-Dproject.version=${project.version}", "-Dbtrace.libs=${libsPath}"
+    } else {
+        jvmArgs "-Dproject.dir=${projectDir}", "-Dbtrace.libs=${libsPath}", '-XX:+IgnoreUnrecognizedVMOptions', '--add-opens', 'java.base/jdk.internal.reflect=ALL-UNNAMED', '--add-exports', 'java.base/jdk.internal.reflect=ALL-UNNAMED', '--add-modules', 'jdk.attach', '--add-exports', 'jdk.attach/sun.tools.attach=ALL-UNNAMED', "-Dproject.version=${project.version}"
+    }
+    if (!isJava8) {
+        classpath = classpath.filter { it.name != 'tools.jar' }
+    }
+
+    // Optional test knob: when -Pbtrace.test.skipLibs=true, set a system property that instructs
+    // the agent to skip adding preconfigured btrace-libs (used to exercise manifest-libs path).
+    if (project.findProperty('btrace.test.skipLibs')?.toString()?.toBoolean()) {
+        systemProperty 'btrace.test.skipLibs', 'true'
+    }
+
+    // Canonical propagation: use Gradle project properties only (-P)
+    // -Pbtrace.debug=true will enable verbose logs in the tests (maps to btrace.test.debug)
+    // Any other -Pbtrace.* properties are forwarded verbatim to the test JVM and then to the traced app
+    project.properties.findAll { k, v -> k instanceof String && k.startsWith('btrace.') }.each { k, v ->
+        def key = (String) k
+        def val = String.valueOf(v)
+        systemProperty key, val
+        if (key == 'btrace.debug') {
+            systemProperty 'btrace.test.debug', val
+        }
+    }
+
+    // Expose CI flag to tests when passed as -PCI (or present in env)
+    // Treat presence of -PCI without value as 'true'
+    if (project.hasProperty('CI')) {
+        def ciVal = project.findProperty('CI')
+        def ci = (ciVal == null || ciVal.toString().trim().isEmpty()) ? 'true' : ciVal.toString()
+        systemProperty 'CI', ci
+    } else if (System.getenv('CI') != null) {
+        systemProperty 'CI', System.getenv('CI')
+    }
+}
