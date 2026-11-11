@@ -1,0 +1,164 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  detect-changes:
+    name: Detect changed packages
+    runs-on: ubuntu-latest
+    outputs:
+      core: ${{ steps.changes.outputs.core }}
+      cli: ${{ steps.changes.outputs.cli }}
+      any: ${{ steps.changes.outputs.core == 'true' || steps.changes.outputs.cli == 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
+        id: changes
+        with:
+          filters: |
+            core:
+              - 'packages/busylight-core/**'
+              - 'pyproject.toml'
+              - 'uv.lock'
+            cli:
+              - 'packages/busylight/**'
+              - 'pyproject.toml'
+              - 'uv.lock'
+
+  get-python-versions:
+    name: Get Python test versions
+    runs-on: ubuntu-latest
+    outputs:
+      python-versions: ${{ steps.extract.outputs.versions }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Extract Python test versions
+        id: extract
+        run: |
+          if versions=$(uv run toml get --toml-path packages/busylight-core/pyproject.toml tool.busylight_core.ci.test-python-versions 2>/dev/null); then
+            echo "versions=$versions" >> $GITHUB_OUTPUT
+          else
+            echo 'versions=["3.11", "3.12", "3.13"]' >> $GITHUB_OUTPUT
+          fi
+
+  test-core:
+    name: "Core: Tests (${{ matrix.python-version }}, ${{ matrix.os }})"
+    needs: [detect-changes, get-python-versions, lint, dependency-check]
+    if: |
+      always()
+      && needs.detect-changes.outputs.core == 'true'
+      && needs.lint.result == 'success'
+      && (needs.dependency-check.result == 'success' || needs.dependency-check.result == 'skipped')
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ${{ fromJSON(needs.get-python-versions.outputs.python-versions) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev libusb-1.0-0-dev
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Install workspace
+        run: uv sync --all-extras --all-packages
+
+      - name: Run core unit tests
+        run: uv run pytest packages/busylight-core/tests/
+
+      - name: Run core doc tests
+        run: uv run pytest --markdown-docs packages/busylight-core/docs/ --ignore=packages/busylight-core/docs/gen_ref_pages.py
+
+  test-cli:
+    name: "CLI: Tests (${{ matrix.python-version }}, ${{ matrix.os }})"
+    needs: [detect-changes, get-python-versions, lint, dependency-check]
+    if: |
+      always()
+      && (needs.detect-changes.outputs.cli == 'true' || needs.detect-changes.outputs.core == 'true')
+      && needs.lint.result == 'success'
+      && (needs.dependency-check.result == 'success' || needs.dependency-check.result == 'skipped')
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ${{ fromJSON(needs.get-python-versions.outputs.python-versions) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev libusb-1.0-0-dev
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Install workspace
+        run: uv sync --all-extras --all-packages
+
+      - name: Run CLI unit tests
+        run: uv run pytest packages/busylight/tests/
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install workspace packages
+        run: uv sync --all-extras --all-packages
+
+      - name: Run ruff check
+        run: uv run ruff check packages/
+
+      - name: Run ruff format check
+        run: uv run ruff format --check packages/
+
+  dependency-check:
+    name: Dependency check
+    needs: [detect-changes]
+    if: needs.detect-changes.outputs.any == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install workspace packages
+        run: uv sync --all-extras --all-packages
+
+      - name: Check core dependencies
+        if: needs.detect-changes.outputs.core == 'true'
+        run: uv run deptry packages/busylight-core/src --config packages/busylight-core/pyproject.toml
+
+      - name: Check CLI dependencies
+        if: needs.detect-changes.outputs.cli == 'true' || needs.detect-changes.outputs.core == 'true'
+        run: uv run deptry packages/busylight/src --config packages/busylight/pyproject.toml
