@@ -1,0 +1,159 @@
+[project]
+name = "econml"
+requires-python = ">=3.9"
+authors = [{ name = "PyWhy contributors" }]
+description = "This package contains several methods for calculating Conditional Average Treatment Effects"
+readme = "README.md"
+keywords = ["treatment-effect"]
+license = "MIT"
+dynamic = ["version"]
+
+classifiers = [
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux"
+]
+# Lower bounds are deliberately conservative: roughly the newest release available at the
+# end of 2024, capped so they never exceed the version actually exercised on our oldest
+# supported interpreter (Python 3.9) in lkg.txt. Beyond documenting what we actually test,
+# real lower bounds stop resolvers from silently back-tracking into ancient releases when a
+# newer conflict appears: an unbounded "scipy > 1.4.0" allowed a resolver to select scipy
+# 1.6.1, which has no wheels for modern Pythons and fails to build.
+dependencies = [
+    "numpy >= 2.0.2",
+    # numba is only a transitive dependency, so ideally we wouldn't need to specify it here,
+    # but to avoid issues with very old incompatible versions being installed with numpy 2.4.x
+    # we need to constrain it here (at least until package metadata directly supports constraints
+    # in addition to dependencies)
+    "numba >= 0.60.0",
+    "scipy >= 1.13.1",
+    "scikit-learn >= 1.6.0, < 1.10",
+    "sparse >= 0.15.4",
+    "joblib >= 1.4.2",
+    "statsmodels >= 0.14.4",
+    "pandas >= 2.2.3",
+    "shap >= 0.46.0",
+    "lightgbm >= 4.5.0",
+    "packaging >= 24.2"
+]
+
+[project.urls]
+"Homepage" = "https://github.com/py-why/EconML"
+"Bug Tracker" = "https://github.com/py-why/EconML/Issues"
+"Source Code" = "https://github.com/py-why/EconML" 
+"Documentation" = "https://www.pywhy.org/EconML/"
+
+[project.optional-dependencies]
+automl = [
+    # Disabled due to incompatibility with scikit-learn
+    # azureml-sdk[explain,automl] == 1.0.83
+    "azure-cli"
+]
+plt = [
+    "graphviz >= 0.20.3",
+    "matplotlib >= 3.9.4"
+]
+dowhy = [
+    # when updating this, also update the version check in dowhy.py
+    "dowhy >= 0.13, < 0.15"
+]
+ray = [
+    "ray >= 2.40.0"
+]
+all = [
+    # Disabled due to incompatibility with scikit-learn
+    # azureml-sdk[explain,automl] == 1.0.83
+    "azure-cli",
+    "graphviz >= 0.20.3",
+    "matplotlib >= 3.9.4",
+    "dowhy >= 0.13, < 0.15",
+    "ray >= 2.40.0"
+]
+
+[build-system]
+requires = [
+    "setuptools >= 75.6.0",
+    "wheel >= 0.45.1",
+    "numpy >=2, <3",
+    "scipy >= 1.13.1",
+    # Cython 3.3.0 generates native extensions that crash throughout the test suite.
+    "cython >= 3.0.11, < 3.3"
+]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["econml", "econml.*"]
+exclude = ["econml.tests"]
+
+[tool.setuptools.package-data]
+# include all CSV files as data
+"*" = ["*.csv", "*.jbl"]
+
+[tool.pytest.ini_options]
+testpaths = ["econml/tests"]
+addopts = "--junitxml=junit/test-results.xml -n auto --strict-markers --cov-config=pyproject.toml --cov --import-mode=importlib"
+markers = [    
+    "slow",
+    "notebook",
+    "automl",
+    "dml",
+    "serial",
+    "cate_api",
+    "treatment_featurization",
+    "ray"
+]
+
+[tool.coverage.run]
+branch = true
+# need to explicitly add support for multiprocessing for OrthoForest
+concurrency = [
+    "thread",
+    "multiprocessing"
+]
+source = ["econml"]
+omit = ["econml/tests/*"]
+relative_files = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "raise NotImplementedError\\(\"(Abstract method|Defer to inference)\"\\)"
+]
+
+[tool.ruff]
+line-length = 120
+extend-include = ["*.ipynb"]
+extend-exclude = ["prototypes", "monte_carlo_tests"]
+
+[tool.ruff.format]
+docstring-code-format = true
+quote-style = "preserve"
+
+[tool.ruff.lint]
+ignore = [
+    "D100", # Missing docstring in public module
+    "D101", # Missing docstring in public class
+    "D102", # Missing docstring in public method
+    "D103", # Missing docstring in public function
+    "D104", # Missing docstring in public package
+    "D105", # Missing docstring in magic method
+    "D301", # Use r""" if any backslashes in a docstring,
+    "SIM108", # Use ternary instead of if-else (looks ugly for some of our long expressions)
+    "SIM300", # Yoda condition detected (these are often easier to understand in array expressions) 
+]
+select = [
+    "D", # Docstring
+    "W", # Pycodestyle warnings
+    "E", # All Pycodestyle erros, not just the default ones
+    "F", # All pyflakes rules
+    "SIM", # Simplifification 
+]
+extend-per-file-ignores = { "econml/tests" = ["D"] } # ignore docstring rules for tests
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"

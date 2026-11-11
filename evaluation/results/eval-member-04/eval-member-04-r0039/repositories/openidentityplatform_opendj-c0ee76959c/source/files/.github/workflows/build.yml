@@ -1,0 +1,2232 @@
+# The contents of this file are subject to the terms of the Common Development and
+# Distribution License (the License). You may not use this file except in compliance with the
+# License.
+#
+# You can obtain a copy of the License at legal/CDDLv1.0.txt. See the License for the
+# specific language governing permission and limitations under the License.
+#
+# When distributing Covered Software, include this CDDL Header Notice in each file and include
+# the License file at legal/CDDLv1.0.txt. If applicable, add the following below the CDDL
+# Header, with the fields enclosed by brackets [] replaced by your own identifying
+# information: "Portions copyright [year] [name of copyright owner]".
+#
+# Copyright 2021-2026 3A Systems, LLC.
+
+name: Build
+
+on:
+  push:
+    branches: [ 'sustaining/4.10.x','master', 'issues/**', 'features/**' ]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Nothing in this workflow writes back to the repository: the docker jobs push to
+# the local registry service, not to a remote one, and the other jobs only
+# publish artifacts through the actions API. The docker jobs additionally get
+# security-events: write to upload Trivy scan results to code scanning.
+permissions:
+  contents: read
+
+jobs:
+  build-maven:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # The full Java sweep runs on ubuntu only; macOS and Windows build with the
+      # minimum supported (11) and the latest (26) Java.
+      matrix:
+        os: [ 'ubuntu-latest' ]
+        java: [ '11','17','21','25','27']
+        include:
+          - { os: 'macos-latest',   java: '11' }
+          - { os: 'macos-latest',   java: '27' }
+          - { os: 'windows-latest', java: '11' }
+          - { os: 'windows-latest', java: '27' }
+      fail-fast: false
+    steps:
+    - name:  Install rpm for distribution
+      if: runner.os == 'Linux'
+      shell: bash
+      run:   |
+        sudo apt-get update
+        sudo apt-get install -y rpm
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 0
+        submodules: recursive
+    # deploy.yml runs these two scripts only after a push build, so this is the check they
+    # get before merge. It needs the history above: it compares launchers committed on master.
+    - name: Check same-pe-code.py and refresh-launchers.sh against committed launchers
+      if: runner.os == 'Linux' && matrix.java == '11'
+      shell: bash
+      run: bash .github/scripts/test-refresh-launchers.sh
+    - name: Java ${{ matrix.Java }} (${{ matrix.os }})
+      uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+      with:
+        java-version: ${{ matrix.java }}
+        distribution: 'zulu'
+    - name: Cache Maven packages
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+         path: ~/.m2/repository
+         key: ${{ runner.os }}-m2-repository-${{ hashFiles('**/pom.xml') }}
+         restore-keys: ${{ runner.os }}-m2-repository
+    - name: Setup MSVC Developer Command Prompt (x86)
+      if: runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+      env:
+        # Opt in to Node.js 24 for this action, which still ships on Node.js 20.
+        # See https://github.com/ilammy/msvc-dev-cmd/issues/99
+        FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      with:
+        arch: x86
+    - name: Build Windows native executables
+      if: runner.os == 'Windows'
+      shell: cmd
+      run: |
+        cd opendj-server-legacy\src\build-tools\windows
+        nmake all || exit /b 1
+        xcopy /Y *.exe ..\..\..\lib\ || exit /b 1
+        git status
+    # Also the source of truth for the committed opendj-server-legacy/lib/*.exe: on a
+    # successful push build, deploy.yml downloads windows-exe-11 from this very run and
+    # commits each launcher that differs from the committed one in more than the toolchain
+    # stamp (.github/scripts/refresh-launchers.sh). Nothing here compares them with what
+    # is committed - an MSVC toolchain bump on the runner image changes the bytes on its
+    # own, so a byte-for-byte gate would fire without a source change.
+    - name: Upload Windows exe artifacts
+      if: runner.os == 'Windows'
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: windows-exe-${{ matrix.java }}
+        retention-days: 5
+        path: opendj-server-legacy/src/build-tools/windows/*.exe
+    - name: Set Integration Test Environment
+      id: failsafe
+      if: runner.os == 'Linux'
+      run:   |
+        echo "MAVEN_PROFILE_FLAG=-P precommit" >> $GITHUB_OUTPUT
+
+    - name: Setup WiX (.NET tool) for MSI
+      # Only the java 11 job's MSI is consumed downstream (test-msi*, deploy.yml); without
+      # wix installed the distribution-windows-msi profile stays inactive, so the other
+      # Windows jobs skip the MSI build entirely instead of producing an artifact nothing
+      # uses.
+      if: runner.os == 'Windows' && matrix.java == '11'
+      shell: bash
+      run: |
+        # The MSI builds on Windows only (WiX cannot author MSIs on Linux/macOS). WiX 5 ships as a
+        # net6.0 tool; allow it to run on the newer .NET runtime present on the runner.
+        echo "DOTNET_ROLL_FORWARD=Major" >> "$GITHUB_ENV"
+        export DOTNET_ROLL_FORWARD=Major
+        dotnet tool install --global wix --version 5.0.2 || dotnet tool update --global wix --version 5.0.2
+        echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+        export PATH="$HOME/.dotnet/tools:$PATH"
+        wix --version
+        wix extension add -g WixToolset.UI.wixext/5.0.2 || true
+
+    # The per-module javadoc:jar that runs during verify only ever sees one
+    # module's sources, so it cannot report a package declared by two modules
+    # at once. Only the aggregate on the root reactor can, and it used to run
+    # nowhere but deploy.yml, after the merge and under continue-on-error, so a
+    # broken aggregate blocked nothing and went unnoticed. This is the gate for
+    # it. Appending the goal to the same Maven invocation keeps it in the
+    # reactor that just built; one cell is enough, and this is the platform and
+    # Java version deploy.yml aggregates with.
+    - name: Set Aggregate Javadoc Goal
+      id: javadoc
+      if: runner.os == 'Linux' && matrix.java == '11'
+      run:   |
+        echo "MAVEN_JAVADOC_GOAL=javadoc:aggregate" >> $GITHUB_OUTPUT
+
+    - name: Build with Maven
+      timeout-minutes: 180
+      env:
+        MAVEN_OPTS: -Dhttps.protocols=TLSv1.2 -Dmaven.wagon.httpconnectionManager.ttlSeconds=120 -Dmaven.wagon.http.retryHandler.requestSentEnabled=true -Dmaven.wagon.http.retryHandler.count=10
+      run: mvn --batch-mode --errors --update-snapshots verify ${{ steps.javadoc.outputs.MAVEN_JAVADOC_GOAL }} --file pom.xml ${{ steps.failsafe.outputs.MAVEN_PROFILE_FLAG }}
+    - name: Validate the MSI (ICE)
+      # wix build runs no ICE validation (only MSBuild projects or an explicit validate
+      # do), so a green build alone proves the authoring compiles, not that it validates -
+      # e.g. the ICE63 rule about script-generating actions sequenced before
+      # RemoveExistingProducts would go unnoticed without this step.
+      if: runner.os == 'Windows' && matrix.java == '11'
+      shell: bash
+      run: |
+        msi=$(ls opendj-packages/opendj-msi/opendj-msi-standard/target/*.msi)
+        # ICE61 fires by design: AllowSameVersionUpgrades authors an UpgradeVersion row
+        # whose range includes the product's own version, which is exactly what makes a
+        # rebuilt hotfix at the same 3-part version upgrade rather than install alongside.
+        # Left unsuppressed it is permanent noise this step could not tell from a real
+        # regression.
+        wix msi validate -sice ICE61 "$msi"
+    - name: Test on Unix
+      if: runner.os == 'Linux'
+      run:   |
+        export OPENDJ_JAVA_ARGS="-server -Xmx512m"
+        opendj-server-legacy/target/package/opendj/setup -h localhost -p 1389 --ldapsPort 1636 --adminConnectorPort 4444 --enableStartTLS --generateSelfSignedCertificate --rootUserDN "cn=Directory Manager" --rootUserPassword password --baseDN dc=example,dc=com --sampleData 5000 --cli --acceptLicense --no-prompt
+        opendj-server-legacy/target/package/opendj/bin/status --hostname localhost --bindDN "cn=Directory Manager" --bindPassword password --trustAll
+        opendj-server-legacy/target/package/opendj/bin/ldapsearch --hostname localhost --port 1636 --bindDN "cn=Directory Manager" --bindPassword password --useSsl --trustAll --baseDN "dc=example,dc=com" --searchScope base "(objectClass=*)" 1.1
+        opendj-server-legacy/target/package/opendj/bin/ldapsearch --hostname localhost --port 1636 --bindDN "cn=Directory Manager" --bindPassword password --useSsl --trustAll --baseDN "ou=people,dc=example,dc=com" --searchScope sub "(uid=user.*)" dn | grep ^dn: | wc -l | grep -q 5000
+        # --- Load-testing tools smoke tests (server online, 5000 sample users) ---
+        echo "===== searchrate ====="
+        opendj-server-legacy/target/package/opendj/bin/searchrate --hostname localhost --port 1636 --useSSL --trustAll --bindDN "cn=Directory Manager" --bindPassword password --baseDN "ou=people,dc=example,dc=com" --searchScope sub -c 4 -t 1 -m 2000 -i 1 -g "rand(0,4999)" "(uid=user.%d)" 1.1
+        echo "===== authrate ====="
+        opendj-server-legacy/target/package/opendj/bin/authrate --hostname localhost --port 1636 --useSSL --trustAll -D "uid=user.%d,ou=people,dc=example,dc=com" -w password -c 4 -m 2000 -i 1 -g "rand(0,4999)"
+        echo "===== modrate ====="
+        opendj-server-legacy/target/package/opendj/bin/modrate --hostname localhost --port 1636 --useSSL --trustAll --bindDN "cn=Directory Manager" --bindPassword password -b "uid=user.%d,ou=people,dc=example,dc=com" -c 4 -t 1 -m 2000 -i 1 -g "rand(0,4999)" "description:modrate-load-test"
+        echo "===== addrate ====="
+        cat > /tmp/addrate.template <<'EOF'
+        define suffix=dc=example,dc=com
+
+        branch: ou=People,[suffix]
+        subordinateTemplate: person
+
+        template: person
+        rdnAttr: uid
+        objectClass: top
+        objectClass: person
+        objectClass: organizationalPerson
+        objectClass: inetOrgPerson
+        uid: addrate.<sequential:0>
+        cn: AddRate {uid}
+        sn: AddRate
+        userPassword: password
+        EOF
+        opendj-server-legacy/target/package/opendj/bin/addrate --hostname localhost --port 1636 --useSSL --trustAll --bindDN "cn=Directory Manager" --bindPassword password -c 4 -t 1 -m 2000 -i 1 -C fifo -s 100 /tmp/addrate.template
+        opendj-server-legacy/target/package/opendj/bin/dsconfig create-backend --hostname localhost --port 4444 --bindDN "cn=Directory Manager" --bindPassword password --backend-name=example2 --type je --set=base-dn:dc=example2,dc=com --set=enabled:true --no-prompt --trustAll
+        opendj-server-legacy/target/package/opendj/bin/makeldif -o /tmp/test.ldif -c suffix=dc=example2,dc=com opendj-server-legacy/target/package/opendj/config/MakeLDIF/example.template
+        opendj-server-legacy/target/package/opendj/bin/stop-ds
+        echo "4.9.9.0" > opendj-server-legacy/target/package/opendj/config/buildinfo
+        opendj-server-legacy/target/package/opendj/upgrade -n
+        opendj-server-legacy/target/package/opendj/bin/import-ldif --offline --ldifFile /tmp/test.ldif --backendID=example2
+        opendj-server-legacy/target/package/opendj/bin/rebuild-index --offline --bindDN "cn=Directory Manager" --bindPassword password  --baseDN "dc=example2,dc=com" --rebuildAll
+        opendj-server-legacy/target/package/opendj/bin/start-ds
+        opendj-server-legacy/target/package/opendj/bin/rebuild-index --bindDN "cn=Directory Manager" --bindPassword password --baseDN "dc=example2,dc=com" --rebuildAll --trustAll
+        opendj-server-legacy/target/package/opendj/bin/ldapsearch --hostname localhost --port 1636 --bindDN "cn=Directory Manager" --bindPassword password --useSsl --trustAll --baseDN "ou=people,dc=example2,dc=com" --searchScope sub "(uid=user.*)" dn | grep ^dn: | wc -l | grep -q 10000
+        opendj-server-legacy/target/package/opendj/bin/stop-ds
+        rm -rf opendj-server-legacy/target/package/opendj/{config,db,changelogDb,logs,tmp}
+
+    - name: Test on Unix FIPS
+      if: runner.os == 'Linux'
+      run: |
+        export OPENDJ_JAVA_ARGS="-server -Xmx512m" 
+        echo password > /tmp/opendj.keystore.pin
+        
+        keytool -genkey -alias server-cert -keyalg rsa \
+          -dname "CN=example.com,O=OpenDJ RSA Self-Signed Certificate" \
+          -keystore /tmp/opendj.bcfks -storetype BCFKS -validity 3650 -providername BCFIPS \
+          -provider org.bouncycastle.jcajce.provider.BouncyCastleFipsProvider \
+          -providerpath ./opendj-server-legacy/target/package/opendj/lib/org.bouncycastle.bc-fips.jar:./opendj-server-legacy/target/package/opendj/lib/org.bouncycastle.bcpkix-fips.jar \
+          -keypass:file /tmp/opendj.keystore.pin -storepass:file /tmp/opendj.keystore.pin -keysize 2048 -sigalg SHA256WITHRSA
+  
+        keytool -selfcert -alias server-cert -keystore /tmp/opendj.bcfks \
+          -storetype BCFKS -validity 3650 -providername BCFIPS \
+          -provider org.bouncycastle.jcajce.provider.BouncyCastleFipsProvider \
+          -providerpath ./opendj-server-legacy/target/package/opendj/lib/org.bouncycastle.bc-fips.jar:./opendj-server-legacy/target/package/opendj/lib/org.bouncycastle.bcpkix-fips.jar \
+          -storepass:file /tmp/opendj.keystore.pin
+        
+        keytool -genkey -alias admin-cert -keyalg rsa \
+          -dname "CN=example.com,O=Administration Connector RSA Self-Signed Certificate" \
+          -keystore /tmp/opendj.bcfks -storetype BCFKS -validity 3650 -providername BCFIPS \
+          -provider org.bouncycastle.jcajce.provider.BouncyCastleFipsProvider \
+          -providerpath ./opendj-server-legacy/target/package/opendj/lib/org.bouncycastle.bc-fips.jar:./opendj-server-legacy/target/package/opendj/lib/org.bouncycastle.bcpkix-fips.jar \
+          -keypass:file /tmp/opendj.keystore.pin -storepass:file /tmp/opendj.keystore.pin -keysize 2048 -sigalg SHA256WITHRSA
+        
+        keytool -selfcert -alias admin-cert -keystore /tmp/opendj.bcfks \
+          -storetype BCFKS -validity 3650 -providername BCFIPS \
+          -provider org.bouncycastle.jcajce.provider.BouncyCastleFipsProvider \
+          -providerpath ./opendj-server-legacy/target/package/opendj/lib/org.bouncycastle.bc-fips.jar:./opendj-server-legacy/target/package/opendj/lib/org.bouncycastle.bcpkix-fips.jar \
+          -storepass:file /tmp/opendj.keystore.pin
+        
+        echo "useBcfksKeystore=/tmp/opendj.bcfks
+        keyStorePasswordFile=/tmp/opendj.keystore.pin" > /tmp/opendj-setup.properties.bcfks
+        
+        opendj-server-legacy/target/package/opendj/setup -h localhost -p 1389 --ldapsPort 1636 --adminConnectorPort 4444 \
+          --enableStartTLS --certNickname admin-cert --rootUserDN "cn=Directory Manager" --rootUserPassword password \
+          --baseDN dc=example,dc=com --sampleData 5000 --cli --acceptLicense --no-prompt \
+          --propertiesFilePath /tmp/opendj-setup.properties.bcfks --doNotStart
+        
+        # start-ds sweeps the native libraries the BC FIPS loader leaves in tmp/ and nothing
+        # else: the rest of tmp/ belongs to tools that may still be running, setup among them
+        # (issue #1030). Without these two probes a sweep back to "tmp/*" passes every cell.
+        mkdir -p opendj-server-legacy/target/package/opendj/tmp/bc-fips-jni_123
+        touch opendj-server-legacy/target/package/opendj/tmp/keep.me
+        
+        opendj-server-legacy/target/package/opendj/bin/start-ds
+        
+        test ! -e opendj-server-legacy/target/package/opendj/tmp/bc-fips-jni_123
+        test -e opendj-server-legacy/target/package/opendj/tmp/keep.me
+        
+        opendj-server-legacy/target/package/opendj/bin/status --hostname localhost --bindDN "cn=Directory Manager" --bindPassword password --trustAll
+        opendj-server-legacy/target/package/opendj/bin/ldapsearch --hostname localhost --port 1636 --bindDN "cn=Directory Manager" --bindPassword password --useSsl --trustAll --baseDN "dc=example,dc=com" --searchScope base "(objectClass=*)" 1.1
+        opendj-server-legacy/target/package/opendj/bin/ldapsearch --hostname localhost --port 1636 --bindDN "cn=Directory Manager" --bindPassword password --useSsl --trustAll --baseDN "ou=people,dc=example,dc=com" --searchScope sub "(uid=user.*)" dn | grep ^dn: | wc -l | grep -q 5000
+        opendj-server-legacy/target/package/opendj/bin/dsconfig create-backend --hostname localhost --port 4444 --bindDN "cn=Directory Manager" --bindPassword password --backend-name=example2 --type je --set=base-dn:dc=example2,dc=com --set=enabled:true --no-prompt --trustAll
+        opendj-server-legacy/target/package/opendj/bin/makeldif -o /tmp/test.ldif -c suffix=dc=example2,dc=com opendj-server-legacy/target/package/opendj/config/MakeLDIF/example.template
+        opendj-server-legacy/target/package/opendj/bin/stop-ds
+        echo "4.9.9.0" > opendj-server-legacy/target/package/opendj/config/buildinfo
+        opendj-server-legacy/target/package/opendj/upgrade -n
+        opendj-server-legacy/target/package/opendj/bin/import-ldif --offline --ldifFile /tmp/test.ldif --backendID=example2
+        opendj-server-legacy/target/package/opendj/bin/rebuild-index --offline --bindDN "cn=Directory Manager" --bindPassword password  --baseDN "dc=example2,dc=com" --rebuildAll
+        opendj-server-legacy/target/package/opendj/bin/start-ds
+        opendj-server-legacy/target/package/opendj/bin/rebuild-index --bindDN "cn=Directory Manager" --bindPassword password --baseDN "dc=example2,dc=com" --rebuildAll --trustAll
+        opendj-server-legacy/target/package/opendj/bin/ldapsearch --hostname localhost --port 1636 --bindDN "cn=Directory Manager" --bindPassword password --useSsl --trustAll --baseDN "ou=people,dc=example2,dc=com" --searchScope sub "(uid=user.*)" dn | grep ^dn: | wc -l | grep -q 10000
+        opendj-server-legacy/target/package/opendj/bin/stop-ds
+        rm -rf opendj-server-legacy/target/package/opendj/{config,db,changelogDb,logs,tmp}
+    - name: Test LDAP in Cassandra
+      if: runner.os == 'Linux'
+      run:   |
+        docker run --rm -it -d -p 9042:9042 --name cassandra cassandra
+        timeout 5m bash -c 'until docker logs cassandra | grep -q "Created default superuser role"; do sleep 5; done'
+        export OPENDJ_JAVA_ARGS="-server -Xmx512m -Ddatastax-java-driver.basic.contact-points.0=localhost:9042 -Ddatastax-java-driver.basic.load-balancing-policy.local-datacenter=datacenter1"
+        opendj-server-legacy/target/package/opendj/setup -h localhost -p 1389 --ldapsPort 1636 --adminConnectorPort 4444 --enableStartTLS --generateSelfSignedCertificate --rootUserDN "cn=Directory Manager" --rootUserPassword password --cli --acceptLicense --no-prompt
+        opendj-server-legacy/target/package/opendj/bin/dsconfig create-backend -h localhost -p 4444 --bindDN "cn=Directory Manager" --bindPassword password --backend-name=userRoot --type cas --set base-dn:dc=example,dc=com --set db-directory:keyspace_name --set enabled:true --no-prompt --trustAll
+        opendj-server-legacy/target/package/opendj/bin/makeldif -o /tmp/test.ldif -c suffix=dc=example,dc=com opendj-server-legacy/target/package/opendj/config/MakeLDIF/example.template
+        opendj-server-legacy/target/package/opendj/bin/import-ldif --ldifFile /tmp/test.ldif --backendID=userRoot -h localhost -p 4444 --bindDN "cn=Directory Manager" --bindPassword password --trustAll
+        opendj-server-legacy/target/package/opendj/bin/status --hostname localhost --bindDN "cn=Directory Manager" --bindPassword password --trustAll
+        opendj-server-legacy/target/package/opendj/bin/ldapsearch --hostname localhost --port 1636 --bindDN "cn=Directory Manager" --bindPassword password --useSsl --trustAll --baseDN "dc=example,dc=com" --searchScope base "(objectClass=*)" 1.1
+        opendj-server-legacy/target/package/opendj/bin/ldapsearch --hostname localhost --port 1636 --bindDN "cn=Directory Manager" --bindPassword password --useSsl --trustAll --baseDN "ou=people,dc=example,dc=com" --searchScope sub "(uid=user.*)" dn | grep ^dn: | wc -l | grep -q 10000
+        opendj-server-legacy/target/package/opendj/bin/stop-ds
+        rm -rf opendj-server-legacy/target/package/opendj/{config,db,changelogDb,logs,tmp}
+    - name: Test LDAP in Postgres
+      if: runner.os == 'Linux'
+      run:   |
+        docker run --rm -it -d -p 5432:5432 -e POSTGRES_DB=database_name -e POSTGRES_PASSWORD=password --name postgres postgres
+        timeout 5m bash -c 'until docker logs postgres | grep -q "database system is ready to accept connections"; do sleep 5; done'
+        export OPENDJ_JAVA_ARGS="-server -Xmx512m"
+        opendj-server-legacy/target/package/opendj/setup -h localhost -p 1389 --ldapsPort 1636 --adminConnectorPort 4444 --enableStartTLS --generateSelfSignedCertificate --rootUserDN "cn=Directory Manager" --rootUserPassword password --cli --acceptLicense --no-prompt
+        opendj-server-legacy/target/package/opendj/bin/dsconfig create-backend -h localhost -p 4444 --bindDN "cn=Directory Manager" --bindPassword password --backend-name=userRoot --type jdbc --set base-dn:dc=example,dc=com --set db-directory:jdbc:postgresql://localhost:5432/database_name?user=postgres\&password=password --set enabled:true --no-prompt --trustAll
+        opendj-server-legacy/target/package/opendj/bin/makeldif -o /tmp/test.ldif -c suffix=dc=example,dc=com opendj-server-legacy/target/package/opendj/config/MakeLDIF/example.template
+        opendj-server-legacy/target/package/opendj/bin/ldapmodify --hostname localhost --port 1636 --bindDN "cn=Directory Manager" --bindPassword password --useSsl --trustAll -f /tmp/test.ldif -a 1> /dev/null
+        opendj-server-legacy/target/package/opendj/bin/status --hostname localhost --bindDN "cn=Directory Manager" --bindPassword password --trustAll
+        opendj-server-legacy/target/package/opendj/bin/ldapsearch --hostname localhost --port 1636 --bindDN "cn=Directory Manager" --bindPassword password --useSsl --trustAll --baseDN "dc=example,dc=com" --searchScope base "(objectClass=*)" 1.1
+        opendj-server-legacy/target/package/opendj/bin/ldapsearch --hostname localhost --port 1636 --bindDN "cn=Directory Manager" --bindPassword password --useSsl --trustAll --baseDN "ou=people,dc=example,dc=com" --searchScope sub "(uid=user.*)" dn | grep ^dn: | wc -l | grep -q 10000
+        opendj-server-legacy/target/package/opendj/bin/stop-ds
+        rm -rf opendj-server-legacy/target/package/opendj/{config,db,changelogDb,logs,tmp}
+    - name: Test replication
+      if: runner.os == 'Linux'
+      # dsreplication enable can hang indefinitely; without a timeout a hang
+      # holds the runner until the 6-hour job limit. Normal duration is ~4 min.
+      timeout-minutes: 30
+      # Every listen port stays below 32768: Linux hands out 32768-60999 as source ports
+      # for outgoing connections, and a server whose admin or replication port sits in
+      # that range loses it at random to whatever else is dialling out (#1031).
+      run: |
+        cp -r ./opendj-server-legacy/target/package/opendj ./opendj-server-legacy/target/package/opendj1
+        cp -r ./opendj-server-legacy/target/package/opendj ./opendj-server-legacy/target/package/opendj2
+        cp -r ./opendj-server-legacy/target/package/opendj ./opendj-server-legacy/target/package/opendj3
+        
+        echo "Setup OpenDJ-1"
+        
+        opendj-server-legacy/target/package/opendj1/setup -h localhost -p 1389 --ldapsPort 1636 --adminConnectorPort 4444 --enableStartTLS \
+        --generateSelfSignedCertificate --rootUserDN "cn=Directory Manager" --rootUserPassword password --baseDN dc=example,dc=com \
+        --sampleData 100000 --cli --acceptLicense --no-prompt
+        
+        echo "Setup OpenDJ-2 with replication"
+        
+        opendj-server-legacy/target/package/opendj2/setup -h localhost -p 2389 --ldapsPort 2636 --adminConnectorPort 4445 --enableStartTLS \
+        --generateSelfSignedCertificate --rootUserDN "cn=Directory Manager" --rootUserPassword password --baseDN dc=example,dc=com \
+        --addBaseEntry --cli --acceptLicense --no-prompt
+        
+        opendj-server-legacy/target/package/opendj2/bin/dsreplication enable --no-prompt --host1 localhost --port1 4444 --bindDN1 "cn=Directory Manager"  --bindPassword1 password --replicationPort1 8989 \
+        --host2 localhost --port2 4445 --bindDN2 "cn=Directory Manager" --bindPassword2 password --replicationPort2 8990 \
+        --adminUID admin --adminPassword password --baseDN dc=example,dc=com --trustAll --noPropertiesFile
+        
+        opendj-server-legacy/target/package/opendj2/bin/dsreplication initialize --baseDN dc=example,dc=com --adminUID admin --adminPassword password --hostSource localhost \
+        --portSource 4444 --hostDestination localhost --portDestination 4445 -X -n
+        
+        opendj-server-legacy/target/package/opendj2/bin/ldapsearch --port 2636 --hostname localhost --bindDN "cn=Directory Manager" --bindPassword password --useSsl --trustAll \
+        --baseDN "ou=people,dc=example,dc=com" --searchScope sub "(uid=user.*)" dn  | grep ^dn: | wc -l | grep -q 100000
+        
+        echo "Setup OpenDJ-3 with replication"
+        
+        opendj-server-legacy/target/package/opendj3/setup -h localhost -p 3389 --ldapsPort 3636 --adminConnectorPort 4446 --enableStartTLS \
+        --generateSelfSignedCertificate --rootUserDN "cn=Directory Manager" --rootUserPassword password --baseDN dc=example,dc=com \
+        --addBaseEntry --cli --acceptLicense --no-prompt
+        
+        opendj-server-legacy/target/package/opendj3/bin/dsreplication enable --no-prompt --host1 localhost --port1 4445 --bindDN1 "cn=Directory Manager"  --bindPassword1 password --replicationPort1 8990 \
+        --host2 localhost --port2 4446 --bindDN2 "cn=Directory Manager" --bindPassword2 password --replicationPort2 8991 \
+        --adminUID admin --adminPassword password --baseDN dc=example,dc=com --trustAll --noPropertiesFile
+        
+        opendj-server-legacy/target/package/opendj3/bin/dsreplication initialize --baseDN dc=example,dc=com --adminUID admin --adminPassword password --hostSource localhost \
+        --portSource 4445 --hostDestination localhost --portDestination 4446 -X -n
+        
+        opendj-server-legacy/target/package/opendj2/bin/ldapsearch --port 3636 --hostname localhost --bindDN "cn=Directory Manager" --bindPassword password --useSsl --trustAll \
+        --baseDN "ou=people,dc=example,dc=com" --searchScope sub "(uid=user.*)" dn  | grep ^dn: | wc -l | grep -q 100000
+        
+        echo "Stopping and removing OpenDJ instances"
+        
+        opendj-server-legacy/target/package/opendj1/bin/stop-ds
+        opendj-server-legacy/target/package/opendj2/bin/stop-ds
+        opendj-server-legacy/target/package/opendj3/bin/stop-ds
+        
+        rm -rf ./opendj-server-legacy/target/package/opendj1
+        rm -rf ./opendj-server-legacy/target/package/opendj2
+        rm -rf ./opendj-server-legacy/target/package/opendj3
+
+    - name: Test on Windows
+      if: runner.os == 'Windows'
+      run:   |
+        . .github\scripts\wait-server-stopped.ps1
+        set OPENDJ_JAVA_ARGS="-server -Xmx512m"
+        opendj-server-legacy\target\package\opendj\setup.bat -h localhost -p 1389 --ldapsPort 1636 --adminConnectorPort 4444 --enableStartTLS --generateSelfSignedCertificate --rootUserDN "cn=Directory Manager" --rootUserPassword password --baseDN dc=example,dc=com --sampleData 5000 --cli --acceptLicense --no-prompt
+        opendj-server-legacy\target\package\opendj\bat\status.bat --hostname localhost --bindDN "cn=Directory Manager" --bindPassword password --trustAll
+        opendj-server-legacy\target\package\opendj\bat\ldapsearch.bat --hostname localhost --port 1636 --bindDN "cn=Directory Manager" --bindPassword password --useSsl --trustAll --baseDN "dc=example,dc=com" --searchScope base "(objectClass=*)" 1.1
+        opendj-server-legacy\target\package\opendj\bat\ldapsearch.bat --hostname localhost --port 1636 --bindDN "cn=Directory Manager" --bindPassword password --useSsl --trustAll --baseDN "dc=example,dc=com" --searchScope sub "(uid=user.*)" dn | find /c '"dn:"' | findstr "5000"
+        # --- Load-testing tools smoke tests (server online, 5000 sample users) ---
+        Write-Host "===== searchrate ====="
+        opendj-server-legacy\target\package\opendj\bat\searchrate.bat --hostname localhost --port 1636 --useSSL --trustAll --bindDN "cn=Directory Manager" --bindPassword password --baseDN "ou=people,dc=example,dc=com" --searchScope sub -c 4 -t 1 -m 2000 -i 1 -g "rand(0,4999)" "(uid=user.%d)" 1.1
+        if ($LASTEXITCODE -ne 0) { throw "searchrate failed with exit code $LASTEXITCODE" }
+        Write-Host "===== authrate ====="
+        opendj-server-legacy\target\package\opendj\bat\authrate.bat --hostname localhost --port 1636 --useSSL --trustAll -D "uid=user.%d,ou=people,dc=example,dc=com" -w password -c 4 -m 2000 -i 1 -g "rand(0,4999)"
+        if ($LASTEXITCODE -ne 0) { throw "authrate failed with exit code $LASTEXITCODE" }
+        Write-Host "===== modrate ====="
+        opendj-server-legacy\target\package\opendj\bat\modrate.bat --hostname localhost --port 1636 --useSSL --trustAll --bindDN "cn=Directory Manager" --bindPassword password -b "uid=user.%d,ou=people,dc=example,dc=com" -c 4 -t 1 -m 2000 -i 1 -g "rand(0,4999)" "description:modrate-load-test"
+        if ($LASTEXITCODE -ne 0) { throw "modrate failed with exit code $LASTEXITCODE" }
+        Write-Host "===== addrate ====="
+        @'
+        define suffix=dc=example,dc=com
+
+        branch: ou=People,[suffix]
+        subordinateTemplate: person
+
+        template: person
+        rdnAttr: uid
+        objectClass: top
+        objectClass: person
+        objectClass: organizationalPerson
+        objectClass: inetOrgPerson
+        uid: addrate.<sequential:0>
+        cn: AddRate {uid}
+        sn: AddRate
+        userPassword: password
+        '@ | Set-Content -Encoding ascii addrate.template
+        opendj-server-legacy\target\package\opendj\bat\addrate.bat --hostname localhost --port 1636 --useSSL --trustAll --bindDN "cn=Directory Manager" --bindPassword password -c 4 -t 1 -m 2000 -i 1 -C fifo -s 100 addrate.template
+        if ($LASTEXITCODE -ne 0) { throw "addrate failed with exit code $LASTEXITCODE" }
+        opendj-server-legacy\target\package\opendj\bat\dsconfig.bat create-backend --hostname localhost --port 4444 --bindDN "cn=Directory Manager" --bindPassword password --backend-name=example2 --type je --set=base-dn:dc=example2,dc=com --set=enabled:true --no-prompt --trustAll
+        opendj-server-legacy\target\package\opendj\bat\makeldif.bat -o test.ldif -c suffix=dc=example2,dc=com opendj-server-legacy\target\package\opendj\config\MakeLDIF\example.template
+        opendj-server-legacy\target\package\opendj\bat\stop-ds.bat
+        if ($LASTEXITCODE -ne 0) { throw "stop-ds.bat failed with exit code $LASTEXITCODE" }
+        Wait-ServerStopped 'opendj-server-legacy\target\package\opendj\locks\server.lock'
+        echo "4.9.9.0" > opendj-server-legacy\target\package\opendj\config\buildinfo
+        opendj-server-legacy\target\package\opendj\upgrade.bat
+        opendj-server-legacy\target\package\opendj\bat\import-ldif.bat --offline --ldifFile test.ldif --backendID=example2
+        opendj-server-legacy\target\package\opendj\bat\rebuild-index.bat --offline --bindDN "cn=Directory Manager" --bindPassword password  --baseDN "dc=example2,dc=com" --rebuildAll
+        # The same probe as the Unix FIPS step, for start-ds.bat: the sweep takes the BC FIPS
+        # directories and leaves everything else in tmp\ alone (issue #1030). The runner's
+        # install path has no space in it, so this does not settle the quoting of the for /D line.
+        New-Item -ItemType Directory -Force opendj-server-legacy\target\package\opendj\tmp\bc-fips-jni_123 | Out-Null
+        New-Item -ItemType File -Force opendj-server-legacy\target\package\opendj\tmp\keep.me | Out-Null
+        opendj-server-legacy\target\package\opendj\bat\start-ds.bat
+        if (Test-Path opendj-server-legacy\target\package\opendj\tmp\bc-fips-jni_123) { throw "start-ds.bat left a bc-fips-jni_* directory behind" }
+        if (-not (Test-Path opendj-server-legacy\target\package\opendj\tmp\keep.me)) { throw "start-ds.bat removed a tmp file that is not its own" }
+        opendj-server-legacy\target\package\opendj\bat\rebuild-index.bat --bindDN "cn=Directory Manager" --bindPassword password --baseDN "dc=example2,dc=com" --rebuildAll --trustAll
+        opendj-server-legacy\target\package\opendj\bat\ldapsearch.bat --hostname localhost --port 1636 --bindDN "cn=Directory Manager" --bindPassword password --useSsl --trustAll --baseDN "dc=example2,dc=com" --searchScope sub "(uid=user.*)" dn | find /c '"dn:"' | findstr "10000"
+        opendj-server-legacy\target\package\opendj\bat\stop-ds.bat
+        if ($LASTEXITCODE -ne 0) { throw "stop-ds.bat failed with exit code $LASTEXITCODE" }
+        Wait-ServerStopped 'opendj-server-legacy\target\package\opendj\locks\server.lock'
+        opendj-server-legacy\target\package\opendj\bat\windows-service.bat --enableService
+        net start "OpenDJ Server"
+        if ($LASTEXITCODE -ne 0) { throw "net start 'OpenDJ Server' failed with exit code $LASTEXITCODE" }
+        for ($i=0; $i -lt 12; $i++) { try { $c = New-Object System.Net.Sockets.TcpClient('localhost', 1636); $c.Close(); break } catch { Start-Sleep -Seconds 5 } }
+        opendj-server-legacy\target\package\opendj\bat\ldapsearch.bat --hostname localhost --port 1636 --bindDN "cn=Directory Manager" --bindPassword password --useSsl --trustAll --baseDN "dc=example2,dc=com" --searchScope sub "(uid=user.*)" dn | find /c '"dn:"' | findstr "10000"
+        net stop "OpenDJ Server"
+        if ($LASTEXITCODE -ne 0) { throw "net stop 'OpenDJ Server' failed with exit code $LASTEXITCODE" }
+        opendj-server-legacy\target\package\opendj\bat\windows-service.bat --disableService
+
+    # A test step that fails leaves its instances behind. The server-side story of a
+    # failed start lives in logs/server.out and logs/errors, and nothing else prints it
+    # (setup only has the client-side view, see issue #1030). The quicksetup tests run
+    # their own instance under build/unit-tests/quicksetup (issue #1160).
+    - name: Dump the server logs of a failed test
+      if: failure()
+      shell: bash
+      run: |
+        for f in opendj-server-legacy/target/package/opendj*/logs/server.out opendj-server-legacy/target/package/opendj*/logs/errors \
+                 opendj-server-legacy/build/unit-tests/quicksetup/OpenDS/logs/server.out opendj-server-legacy/build/unit-tests/quicksetup/OpenDS/logs/errors; do
+          [ -f "$f" ] || continue
+          echo "===== $f"
+          cat "$f"
+        done
+
+    - name: Upload artifacts OpenDJ Server
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{ matrix.os }}-${{ matrix.java }}
+        retention-days: 5
+        path:  |
+            opendj-server-legacy/target/package/*.zip
+            opendj-ldap-toolkit/target/*.zip
+            opendj-packages/opendj-deb/opendj-deb-standard/target/*.deb
+            opendj-packages/opendj-rpm/opendj-rpm-standard/target/rpm/opendj/RPMS/noarch/*.rpm
+            opendj-packages/opendj-msi/opendj-msi-standard/target/*.msi
+            opendj-packages/opendj-docker/target/Dockerfile.zip
+            opendj-packages/opendj-openshift-template/*.yaml
+            opendj-doc-generated-ref/target/*.zip
+            opendj-dsml-servlet/target/*.war
+            opendj-rest2ldap-servlet/target/*.war
+  build-docker:
+    needs: build-maven
+    # builds the image for every platform and hands its linux/amd64 image to docker-test (and
+    # docker-convergence): the registry service below is gone with this job
+    outputs:
+      release_version: ${{ steps.version.outputs.release_version }}
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: read
+    services:
+      registry:
+        image: registry:3
+        ports:
+          - 5000:5000
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ubuntu-latest-11
+      - name: Get latest release version
+        id: version
+        shell: bash
+        env:
+          # An anonymous call shares the 60-an-hour budget of the runner's address with every
+          # other job there; once it is spent the API answers with no release, the version comes
+          # out empty and buildx refuses the untagged push (run 34854564649).
+          GH_TOKEN: ${{ github.token }}
+        run:   |
+          export git_version_last="$(curl -i -o - --silent -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/OpenIdentityPlatform/OpenDJ/releases/latest | grep -m1 "\"name\"" | cut -d\" -f4)" ; echo "last release: $git_version_last"
+          [ -n "$git_version_last" ] || { echo "::error::The latest release of OpenIdentityPlatform/OpenDJ could not be read, so there is no version to tag the image with"; exit 1; }
+          echo "release_version=$git_version_last" >> $GITHUB_ENV
+          echo "release_version=$git_version_last" >> $GITHUB_OUTPUT
+          echo "image_repository=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: |
+            localhost:5000/${{ github.repository }}
+          tags: |
+            type=raw,value=${{ env.release_version }}
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: network=host
+      - name: Prepare Dockerfile
+        shell: bash
+        run: |
+          unzip -d ./opendj-packages/opendj-docker ./opendj-packages/opendj-docker/target/Dockerfile.zip 
+          cp ./opendj-server-legacy/target/package/opendj-*.zip ./opendj-packages/opendj-docker
+          sed -i -E '/^#COPY opendj/s/^#//' ./opendj-packages/opendj-docker/Dockerfile
+      - name: Build image (default)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ./opendj-packages/opendj-docker
+          file: ./opendj-packages/opendj-docker/Dockerfile
+          build-args: |
+            VERSION=${{ env.release_version }}
+          platforms: linux/amd64, linux/arm64/8, linux/ppc64le, linux/s390x, linux/riscv64 #, linux/arm/v7
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+      - name: Save the linux/amd64 image for the test jobs
+        # the layers come from the build above, so this only exports them
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ./opendj-packages/opendj-docker
+          file: ./opendj-packages/opendj-docker/Dockerfile
+          build-args: |
+            VERSION=${{ env.release_version }}
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          outputs: type=docker,dest=${{ runner.temp }}/image.tar
+      - name: Upload the linux/amd64 image
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: docker-image-default
+          path: ${{ runner.temp }}/image.tar
+          # about 250 MB. "Re-run failed jobs" does not run this job again and downloads the
+          # image it uploaded: within 3 days of the run; later only "Re-run all jobs" works
+          retention-days: 3
+
+  build-docker-alpine:
+    needs: build-maven
+    # builds the image for every platform and hands its linux/amd64 image to docker-test (and
+    # docker-convergence): the registry service below is gone with this job
+    outputs:
+      release_version: ${{ steps.version.outputs.release_version }}
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: read
+    services:
+      registry:
+        image: registry:3
+        ports:
+          - 5000:5000
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ubuntu-latest-11
+      - name: Get latest release version
+        id: version
+        shell: bash
+        env:
+          # An anonymous call shares the 60-an-hour budget of the runner's address with every
+          # other job there; once it is spent the API answers with no release, the version comes
+          # out empty and buildx refuses the untagged push (run 34854564649).
+          GH_TOKEN: ${{ github.token }}
+        run:   |
+          export git_version_last="$(curl -i -o - --silent -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/OpenIdentityPlatform/OpenDJ/releases/latest | grep -m1 "\"name\"" | cut -d\" -f4)" ; echo "last release: $git_version_last"
+          [ -n "$git_version_last" ] || { echo "::error::The latest release of OpenIdentityPlatform/OpenDJ could not be read, so there is no version to tag the image with"; exit 1; }
+          echo "release_version=$git_version_last" >> $GITHUB_ENV
+          echo "release_version=$git_version_last" >> $GITHUB_OUTPUT
+          echo "image_repository=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+      - name: Docker meta 
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: |
+            localhost:5000/${{ github.repository }}
+          tags: |
+            type=raw,value=alpine
+            type=raw,value=${{ env.release_version }}-alpine
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: network=host
+      - name: Prepare Dockerfile
+        shell: bash
+        run: |
+          unzip -d ./opendj-packages/opendj-docker ./opendj-packages/opendj-docker/target/Dockerfile.zip 
+          cp ./opendj-server-legacy/target/package/opendj-*.zip ./opendj-packages/opendj-docker
+          sed -i -E '/^#COPY opendj/s/^#//' ./opendj-packages/opendj-docker/Dockerfile-alpine
+      - name: Build image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ./opendj-packages/opendj-docker
+          file: ./opendj-packages/opendj-docker/Dockerfile-alpine
+          build-args: |
+            VERSION=${{ env.release_version }}
+          platforms: linux/amd64, linux/arm64/8, linux/s390x, linux/ppc64le, linux/386, linux/riscv64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+      - name: Save the linux/amd64 image for the test jobs
+        # the layers come from the build above, so this only exports them
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ./opendj-packages/opendj-docker
+          file: ./opendj-packages/opendj-docker/Dockerfile-alpine
+          build-args: |
+            VERSION=${{ env.release_version }}
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          outputs: type=docker,dest=${{ runner.temp }}/image.tar
+      - name: Upload the linux/amd64 image
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: docker-image-alpine
+          path: ${{ runner.temp }}/image.tar
+          # see the image of build-docker: a re-run of the failed jobs within 3 days
+          retention-days: 3
+
+  docker-test:
+    # the tests of both images, each on the linux/amd64 image its build job saved
+    name: docker-test (${{ matrix.flavor }})
+    needs: [build-docker, build-docker-alpine]
+    # a matrix row cannot need its own build job only, and a job-level if cannot read the
+    # matrix: the tests of one image run when the build of the other failed, the row of the
+    # image that was not built fails at its download, and re-running that build re-runs both rows
+    if: ${{ !cancelled() && (needs.build-docker.result == 'success' || needs.build-docker-alpine.result == 'success') }}
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: default
+            suffix: ""
+            trivy_category: trivy-build-default
+            build_label: Build
+            release_label: Release
+            release_image: openidentityplatform/opendj:latest
+          - flavor: alpine
+            suffix: "-alpine"
+            trivy_category: trivy-build-alpine
+            build_label: Build-alpine
+            release_label: Release-alpine
+            release_image: openidentityplatform/opendj:alpine
+    env:
+      release_version: ${{ matrix.flavor == 'alpine' && needs.build-docker-alpine.outputs.release_version || needs.build-docker.outputs.release_version }}
+    steps:
+      # .github/scripts holds the replication test of both images
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            .github/benchmark
+            .github/scripts
+      - name: Download the image
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: docker-image-${{ matrix.flavor }}
+          path: ${{ runner.temp }}/image
+      - name: Load the image
+        # under the tag its build job pushed to its registry, which every step below names
+        shell: bash
+        run: |
+          docker load -i "$RUNNER_TEMP/image/image.tar"
+          echo "image_repository=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+      - name: Docker test
+        shell: bash
+        run: |
+          trap 'code=$?; echo "::group::container logs (test)"; docker logs test 2>&1 || true; echo "::endgroup::"; exit $code' ERR
+          # the image draws nothing: the OS carries none of what AWT needs to, freetype with brotli, X11 or ALSA.
+          # The temurin JRE of the default image keeps a freetype of its own in /opt/java, linking nothing but libc (#1238)
+          awt=$(docker run --rm --entrypoint sh localhost:5000/${GITHUB_REPOSITORY,,}:${{ env.release_version }}${{ matrix.suffix }} -c 'find / -xdev \( -name "libfreetype.so*" ! -path "/opt/java/*" -o -name "libbrotli*.so*" -o -name "libX11.so*" -o -name "libasound.so*" \) 2>/dev/null; true')
+          if [ -n "$awt" ]; then echo "::error::The image carries libraries only AWT needs:"; echo "$awt"; false; fi
+          docker run -it -d --memory="512m" --name=test localhost:5000/${GITHUB_REPOSITORY,,}:${{ env.release_version }}${{ matrix.suffix }}
+          # the bootstrap's server is down before the marker the health check waits for is
+          # written: the stop has logged its record by the time the marker is there
+          timeout 3m bash -c 'until docker exec test sh -c "test -f \"\$BOOTSTRAP_COMPLETE\"" 2>/dev/null; do sleep 0.2; done'
+          test "$(docker exec test grep -c "The Directory Server is now stopped" /opt/opendj/data/logs/errors)" -ge 1
+          timeout 3m bash -c 'until docker inspect --format="{{json .State.Health.Status}}" test | grep -q \"healthy\"; do sleep 10; done'
+          docker exec test 'sh' '-c' '/opt/opendj/bin/dsconfig create-backend --hostname localhost --port 4444 --bindDN "cn=Directory Manager" --bindPassword password --backend-name=example2 --type je --set=base-dn:dc=example2,dc=com --set=enabled:true --no-prompt --trustAll'
+          docker exec test 'sh' '-c' '/opt/opendj/bin/makeldif -o /tmp/test.ldif -c suffix=dc=example2,dc=com /opt/opendj/data/config/MakeLDIF/example.template'
+          docker exec test 'sh' '-c' '/opt/opendj/bin/import-ldif --hostname localhost --port 4444 --bindDN "cn=Directory Manager" --bindPassword password --ldifFile /tmp/test.ldif --backendID=example2 --trustAll'
+          # the server is PID 1 of the container, so stopping it stops the container; the
+          # container that bootstrapped the instance has to stop the server on SIGTERM, not
+          # sit out the timeout and be killed. The server run in the foreground reports its
+          # shutdown only in the error log, which is read once the container is back up
+          stopped=$(docker exec test grep -c "The Directory Server is now stopped" /opt/opendj/data/logs/errors || true)
+          start=$SECONDS
+          docker stop -t 60 test
+          echo "stopped in $((SECONDS - start)) s, exit code $(docker inspect --format='{{.State.ExitCode}}' test)"
+          test $((SECONDS - start)) -lt 50
+          test "$(docker inspect --format='{{.State.ExitCode}}' test)" -ne 137
+          # a restart runs the server of the instance already there
+          docker start test
+          timeout 3m bash -c 'until docker inspect --format="{{json .State.Health.Status}}" test | grep -q \"healthy\"; do sleep 10; done'
+          test "$(docker exec test grep -c "The Directory Server is now stopped" /opt/opendj/data/logs/errors)" -gt "$stopped"
+          docker exec test 'sh' '-c' '/opt/opendj/bin/rebuild-index --hostname localhost --port 4444 --bindDN "cn=Directory Manager" --bindPassword password --baseDN "dc=example2,dc=com" --rebuildAll --trustAll'
+          docker exec test 'sh' '-c' '/opt/opendj/bin/ldapsearch --hostname localhost --port 1636 --bindDN "cn=Directory Manager" --bindPassword password --useSsl --trustAll --baseDN "ou=people,dc=example2,dc=com" --searchScope sub "(uid=user.*)" dn | grep ^dn: | wc -l | grep -q 10000'
+          # upgrade looks for java before it narrows PATH to /bin:/usr/bin, as the other tools do:
+          # the java of the default image is on the PATH from /opt/java/openjdk/bin alone (alpine has
+          # /usr/bin/java, so only the default row can fail), and run.sh runs upgrade on every start of a volume (#1229)
+          docker exec test sh -c 'unset JAVA_HOME; sh /opt/opendj/upgrade -n --force'
+          # upgrade runs set_environment_vars twice: the module flags reach the JVM once
+          docker exec test sh -c 'OPENDJ_JAVA_BIN=$(command -v java) INSTALL_ROOT=/opt/opendj INSTANCE_ROOT=/opt/opendj SCRIPT_NAME=upgrade; export OPENDJ_JAVA_BIN INSTALL_ROOT INSTANCE_ROOT SCRIPT_NAME; SCRIPT_UTIL_CMD=set-environment-vars; . /opt/opendj/lib/_script-util.sh; . /opt/opendj/lib/_script-util.sh; test "$(echo " $OPENDJ_JAVA_ARGS " | tr " " "\n" | grep -c -- "^--add-opens$")" -eq 1'
+          # a java found nowhere is reported without a shell error about the empty lookup
+          out=$(docker exec test sh -c 'unset JAVA_HOME; PATH=/bin:/usr/bin /opt/opendj/bin/ldapsearch --version' 2>&1 || true)
+          if grep -F "unexpected operator" <<<"$out"; then echo "::error::The lookup of java on the PATH fails with a shell error where it finds no java"; false; fi
+          docker rm -f test
+      - name: Docker test custom password
+        shell: bash
+        run: |
+          trap 'code=$?; echo "::group::container logs (test_custom)"; docker logs test_custom 2>&1 || true; echo "::endgroup::"; exit $code' ERR
+          docker run --rm -it -d --memory="512m" -e ADD_BASE_ENTRY="--addBaseEntry" -e ROOT_PASSWORD=custom_password --name=test_custom localhost:5000/${GITHUB_REPOSITORY,,}:${{ env.release_version }}${{ matrix.suffix }}
+          timeout 3m bash -c 'until docker inspect --format="{{json .State.Health.Status}}" test_custom | grep -q \"healthy\"; do sleep 10; done'
+          docker exec test_custom 'sh' '-c' '/opt/opendj/bin/ldapsearch --hostname localhost --port 1636 --bindDN "cn=Directory Manager" --bindPassword custom_password --useSsl --trustAll --baseDN "dc=example,dc=com" --searchScope base "(objectClass=*)" 1.1'
+          docker kill test_custom
+      - name: Docker test base DN with a space
+        # the shell must hand the base DN to dsconfig as one value, or the bootstrap stops at
+        # "creating backend" (#1157)
+        shell: bash
+        run: |
+          trap 'code=$?; echo "::group::container logs (test_base_dn)"; docker logs test_base_dn 2>&1 || true; echo "::endgroup::"; exit $code' ERR
+          docker run --rm -it -d --memory="512m" -e ADD_BASE_ENTRY="--addBaseEntry" -e BASE_DN="o=My Company,c=US" --name=test_base_dn localhost:5000/${GITHUB_REPOSITORY,,}:${{ env.release_version }}${{ matrix.suffix }}
+          timeout 3m bash -c 'until docker inspect --format="{{json .State.Health.Status}}" test_base_dn | grep -q \"healthy\"; do sleep 10; done'
+          docker exec test_base_dn 'sh' '-c' '/opt/opendj/bin/ldapsearch --hostname localhost --port 1636 --bindDN "cn=Directory Manager" --bindPassword password --useSsl --trustAll --baseDN "o=My Company,c=US" --searchScope base "(objectClass=*)" 1.1 | grep -qx "dn: o=My Company,c=US"'
+          docker kill test_base_dn
+      - name: Docker test arbitrary uid
+        # OpenShift runs a container under an arbitrary uid that is only in group 0 (#1088)
+        shell: bash
+        run: |
+          trap 'code=$?; echo "::group::container logs (test_uid)"; docker logs test_uid 2>&1 || true; echo "::endgroup::"; exit $code' ERR
+          uid=$((1000000000 + RANDOM))
+          docker run --rm -it -d --memory="512m" --user $uid:0 -e ADD_BASE_ENTRY="--addBaseEntry" --name=test_uid localhost:5000/${GITHUB_REPOSITORY,,}:${{ env.release_version }}${{ matrix.suffix }}
+          timeout 3m bash -c 'until docker inspect --format="{{json .State.Health.Status}}" test_uid | grep -q \"healthy\"; do sleep 10; done'
+          docker exec test_uid 'sh' '-c' "test \"\$(stat -c %u /opt/opendj/instance.loc)\" = $uid"
+          docker exec test_uid 'sh' '-c' '/opt/opendj/bin/ldapsearch --hostname localhost --port 1636 --bindDN "cn=Directory Manager" --bindPassword password --useSsl --trustAll --baseDN "dc=example,dc=com" --searchScope base "(objectClass=*)" 1.1'
+          docker restart test_uid
+          timeout 3m bash -c 'until docker inspect --format="{{json .State.Health.Status}}" test_uid | grep -q \"healthy\"; do sleep 10; done'
+          docker exec test_uid 'sh' '-c' '/opt/opendj/bin/ldapsearch --hostname localhost --port 1636 --bindDN "cn=Directory Manager" --bindPassword password --useSsl --trustAll --baseDN "dc=example,dc=com" --searchScope base "(objectClass=*)" 1.1'
+          docker kill test_uid
+      - name: Docker test replication
+        # the background join of OPENDJ_REPLICATION_TYPE=simple and the one-shot sdsr path, the same
+        # scenarios for both images
+        shell: bash
+        run: .github/scripts/docker-test-replication.sh "localhost:5000/${GITHUB_REPOSITORY,,}:${{ env.release_version }}${{ matrix.suffix }}"
+      - name: Docker test secret volume
+        # a keystore mounted at SECRET_VOLUME is what LDAPS serves from the first start on, a
+        # renewed one - a new password included - is copied while the server runs and served
+        # without a restart, and the server is PID 1 of the container, stopping on SIGTERM
+        # (#1087, #1085); a start copies what was renewed while no container ran, over the
+        # instance already there, and SECRET_VOLUME_REFRESH=0 runs no watcher
+        shell: bash
+        env:
+          IMAGE: localhost:5000/${{ env.image_repository }}:${{ env.release_version }}${{ matrix.suffix }}
+        run: |
+          set -E
+          trap 'code=$?; echo "::group::container logs (test_secret)"; docker logs test_secret 2>&1 || true; echo "::endgroup::"; exit $code' ERR
+          SECRETS=$(mktemp -d)
+          chmod 777 "$SECRETS"
+          # a key under an alias other than setup's own, since setup binds no connection handler
+          # to an alias, and a truststore holding its certificate; the alias is kept by a
+          # renewal the server is to load while it runs, which takes a keystore only when it
+          # holds a key under an alias the one before it did
+          keystore() {
+            local pass=${2:-changeit} alias=${3:-$1}
+            docker run --rm --entrypoint keytool -v "$SECRETS":/secrets "$IMAGE" -genkeypair -alias "$alias" \
+              -keyalg RSA -keysize 2048 -validity 30 -dname "CN=$1" -storetype PKCS12 \
+              -keystore /secrets/keystore.new -storepass "$pass" -keypass "$pass"
+            docker run --rm --entrypoint keytool -v "$SECRETS":/secrets "$IMAGE" -exportcert -rfc -alias "$alias" \
+              -keystore /secrets/keystore.new -storepass "$pass" -file /secrets/cert.pem
+            rm -f "$SECRETS/truststore.new"
+            docker run --rm --entrypoint keytool -v "$SECRETS":/secrets "$IMAGE" -importcert -noprompt -alias "$1" \
+              -file /secrets/cert.pem -keystore /secrets/truststore.new -storetype JKS -storepass changeit
+            rm -f "$SECRETS/cert.pem"
+            printf %s "$pass" > "$SECRETS/keystore.pin"
+            printf changeit > "$SECRETS/truststore.pin"
+            mv -f "$SECRETS/truststore.new" "$SECRETS/truststore"
+            mv -f "$SECRETS/keystore.new" "$SECRETS/keystore"
+          }
+          served() { echo | openssl s_client -connect 127.0.0.1:1637 2>/dev/null | openssl x509 -noout -subject -nameopt RFC2253; }
+          healthy() { timeout 3m bash -c 'until docker inspect --format="{{json .State.Health.Status}}" test_secret | grep -q \"healthy\"; do sleep 10; done'; }
+          copies() { docker logs test_secret 2>&1 | grep -c "^Copied $1 from the secret volume$" || true; }
+          keystore secret-v1
+          docker run -d --memory="512m" -e SECRET_VOLUME_REFRESH=5 -p 127.0.0.1:1637:1636 --name=test_secret \
+            -v "$SECRETS":/var/secrets/opendj:ro -v test_secret_data:/opt/opendj/data "$IMAGE"
+          healthy
+          grep -q "CN=secret-v1" <<< "$(served)"
+          test "$(docker exec test_secret cat /proc/1/comm)" = java
+          test "$(docker exec test_secret stat -c %a /opt/opendj/data/config/keystore.pin)" = 600
+          docker exec test_secret cmp -s /var/secrets/opendj/truststore /opt/opendj/data/config/truststore
+          # the bootstrap's server is stopped before the instance is marked bootstrapped
+          test "$(docker logs test_secret 2>&1 | grep -e '^Stopping Server' -e '^The instance is bootstrapped' | paste -sd '|' -)" \
+            = "Stopping Server...|The instance is bootstrapped, the health check may probe it"
+          keystore secret-v2 changeit secret-v1
+          timeout 1m bash -c 'until docker exec test_secret cmp -s /var/secrets/opendj/keystore /opt/opendj/data/config/keystore; do sleep 5; done'
+          # the server loads the keystore the watcher copied on the next handshake
+          grep -q "CN=secret-v2" <<< "$(served)"
+          # the watcher has looked at the volume every 5 s since the start, and copied the
+          # keystore only when it changed: on the start and once more for v2
+          sleep 6
+          test "$(copies keystore)" = 2
+          # a new password is copied along with its keystore, and the server loads both
+          keystore secret-v3 changeit2 secret-v1
+          timeout 1m bash -c 'until docker exec test_secret sh -c "cmp -s /var/secrets/opendj/keystore /opt/opendj/data/config/keystore && cmp -s /var/secrets/opendj/keystore.pin /opt/opendj/data/config/keystore.pin"; do sleep 5; done'
+          grep -q "CN=secret-v3" <<< "$(served)"
+          test "$(copies keystore.pin)" = 2
+          start=$SECONDS
+          docker stop -t 60 test_secret
+          test $((SECONDS - start)) -lt 30
+          test "$(docker inspect --format='{{.State.ExitCode}}' test_secret)" = 143
+          docker start test_secret
+          healthy
+          grep -q "CN=secret-v3" <<< "$(served)"
+          docker stop -t 60 test_secret
+          docker rm test_secret
+          # renewed while no container runs, the keystore, its new password and its new alias
+          # are copied by the start, over the instance already there
+          keystore secret-v4 changeit3
+          docker run -d --memory="512m" -e SECRET_VOLUME_REFRESH=0 -p 127.0.0.1:1637:1636 --name=test_secret \
+            -v "$SECRETS":/var/secrets/opendj:ro -v test_secret_data:/opt/opendj/data "$IMAGE"
+          healthy
+          grep -q "CN=secret-v4" <<< "$(served)"
+          # no watcher, whose sleep is nearly always there, and nothing copied while the server runs
+          docker exec test_secret sh -c '! grep -sqx sleep /proc/[0-9]*/comm'
+          keystore secret-v5 changeit3
+          sleep 15
+          docker exec test_secret sh -c '! cmp -s /var/secrets/opendj/keystore /opt/opendj/data/config/keystore'
+          docker rm -f test_secret
+          docker volume rm test_secret_data
+      - name: Docker test bootstrap LDIFs
+        shell: bash
+        run: |
+          IMAGE=localhost:5000/${GITHUB_REPOSITORY,,}:${{ env.release_version }}${{ matrix.suffix }}
+          trap 'code=$?; for c in test_bootstrap_lf test_bootstrap_cr test_bootstrap; do echo "::group::container logs ($c)"; docker logs $c 2>&1 || true; echo "::endgroup::"; done; exit $code' ERR
+          # a root password with a line break is refused: the tools read only the first line of the password file
+          docker run -d --memory="512m" -e ROOT_PASSWORD=$'ab\ncd' --name=test_bootstrap_lf "$IMAGE"
+          docker run -d --memory="512m" -e ROOT_PASSWORD=$'ab\rcd' --name=test_bootstrap_cr "$IMAGE"
+          for c in test_bootstrap_lf test_bootstrap_cr; do
+            timeout 2m bash -c 'until docker logs $0 2>&1 | grep -qF "ROOT_PASSWORD must not contain a line break"; do sleep 2; done' $c
+          done
+          docker rm -f test_bootstrap_lf test_bootstrap_cr
+          # a password with a space and a pattern that matches files in /opt/opendj: every tool
+          # of the bootstrap must get it as one value (#1093); the LDIF names have a space as well
+          ROOT_PASSWORD='p@ss b*'
+          BOOTSTRAP_DIR=$(mktemp -d)
+          mkdir -p "$BOOTSTRAP_DIR/schema" "$BOOTSTRAP_DIR/data" "$BOOTSTRAP_DIR/config/schema"
+          printf "dn: cn=schema\nchangetype: modify\nadd: attributeTypes\nattributeTypes: ( 1.3.6.1.4.1.99999.1.1 NAME 'bootstrapProbe' SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )\n" > "$BOOTSTRAP_DIR/schema/10 schema.ldif"
+          # a schema file of bootstrap/config/schema is copied into the configuration of the instance before setup runs
+          printf "dn: cn=schema\nobjectClass: top\nobjectClass: ldapSubentry\nobjectClass: subschema\ncn: schema\nattributeTypes: ( 1.3.6.1.4.1.99999.1.2 NAME 'bootstrapConfigProbe' SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )\n" > "$BOOTSTRAP_DIR/config/schema/99 config.ldif"
+          # a pre-encoded password is accepted only once the bootstrap has allowed it on the admin
+          # port the server listens on, which is not the default one here
+          USER_PASSWORD=$(python3 -c 'import base64, hashlib, os; s = os.urandom(8); print("{SSHA}" + base64.b64encode(hashlib.sha1(b"userpw" + s).digest() + s).decode())')
+          printf 'dn: ou=probe,dc=example,dc=com\nobjectClass: organizationalUnit\nou: probe\n\ndn: uid=pre,ou=probe,dc=example,dc=com\nobjectClass: inetOrgPerson\nuid: pre\ncn: pre\nsn: pre\nuserPassword: %s\n' "$USER_PASSWORD" > "$BOOTSTRAP_DIR/data/10 probe.ldif"
+          chmod -R a+rX "$BOOTSTRAP_DIR"
+          # the containers of a Kubernetes pod share its /dev/shm, which outlives a restart of one of them: the holder stands in for the pod
+          docker run -d --no-healthcheck --ipc=shareable --entrypoint sleep --name=test_bootstrap_shm "$IMAGE" 3600
+          docker run -it -d --memory="512m" --ipc=container:test_bootstrap_shm -e ADD_BASE_ENTRY="--addBaseEntry" -e ROOT_PASSWORD="$ROOT_PASSWORD" -e ADMIN_PORT=5444 -v "$BOOTSTRAP_DIR/schema:/opt/opendj/bootstrap/schema:ro" -v "$BOOTSTRAP_DIR/data:/opt/opendj/bootstrap/data:ro" -v "$BOOTSTRAP_DIR/config/schema:/opt/opendj/bootstrap/config/schema:ro" --name=test_bootstrap "$IMAGE"
+          # while the bootstrap runs, the password file is on the tmpfs of /dev/shm rather than in the writable
+          # layer, and its name carries the admin port of the container
+          timeout 2m bash -c 'until docker exec test_bootstrap sh -c "ls /dev/shm/opendj-setup-password.5444.*" >/dev/null 2>&1; do sleep 1; done'
+          timeout 5m bash -c 'until docker inspect --format="{{json .State.Health.Status}}" test_bootstrap | grep -q \"healthy\"; do sleep 10; done'
+          # the schema and the data LDIFs were loaded: the user of the data LDIF binds with its pre-encoded password
+          docker exec test_bootstrap /opt/opendj/bin/ldapsearch --hostname localhost --port 1636 --bindDN "cn=Directory Manager" --bindPassword "$ROOT_PASSWORD" --useSsl --trustAll --baseDN "cn=schema" --searchScope base "(objectClass=*)" attributeTypes > "$BOOTSTRAP_DIR/schema.out"
+          grep -q bootstrapProbe "$BOOTSTRAP_DIR/schema.out"
+          grep -q bootstrapConfigProbe "$BOOTSTRAP_DIR/schema.out"
+          docker exec test_bootstrap /opt/opendj/bin/ldapsearch --hostname localhost --port 1636 --bindDN "uid=pre,ou=probe,dc=example,dc=com" --bindPassword userpw --useSsl --trustAll --baseDN "" --searchScope base "(objectClass=*)" 1.1
+          if docker logs test_bootstrap 2>&1 | grep -F "$ROOT_PASSWORD"; then echo "::error::The root password is in the container log"; false; fi
+          # the password file of setup.sh is gone once the bootstrap is over; the perf data of the
+          # JVM of the HEALTHCHECK's ldapsearch holds the password too while it runs (#1092)
+          left=$(docker exec test_bootstrap grep -rlsF -- "$ROOT_PASSWORD" /tmp /dev/shm | grep -v '^/tmp/hsperfdata_' || true)
+          if [ -n "$left" ]; then echo "::error::The root password is left in $left"; false; fi
+          # no tool of the bootstrap gets the password on its command line, which only a sample taken
+          # while that tool runs would show; grep exits with 1 only when it has read the file and found nothing
+          rc=0; docker exec test_bootstrap grep -nE -- '(^|[[:space:]])(-w|--(bindPassword|rootUserPassword))([[:space:]=]|$)' /opt/opendj/bootstrap/setup.sh || rc=$?
+          if [ $rc -ne 1 ]; then echo "::error::setup.sh passes the root password on a command line, or grep could not read it"; false; fi
+          # run.sh removes the password file that a bootstrap killed before its EXIT trap leaves behind, in /tmp
+          # and in /dev/shm, but not the one of another container of the pod, which listens on another admin port
+          left=$(docker exec test_bootstrap mktemp /tmp/opendj-setup-password.5444.XXXXXX)
+          shm_left=$(docker exec test_bootstrap mktemp -p /dev/shm opendj-setup-password.5444.XXXXXX)
+          shm_other=$(docker exec test_bootstrap mktemp -p /dev/shm opendj-setup-password.4444.XXXXXX)
+          docker restart test_bootstrap
+          timeout 5m bash -c 'until docker inspect --format="{{json .State.Health.Status}}" test_bootstrap | grep -q \"healthy\"; do sleep 10; done'
+          for f in "$left" "$shm_left"; do
+            docker exec test_bootstrap test ! -e "$f" || { echo "::error::$f is still there after a restart"; false; }
+          done
+          docker exec test_bootstrap test -e "$shm_other" || { echo "::error::run.sh removed $shm_other, the password file of another container"; false; }
+          docker kill test_bootstrap test_bootstrap_shm
+      - name: Docker test health check
+        shell: bash
+        run: |
+          # the ERR trap below has to fire for a check failing inside stays_healthy too
+          set -o errtrace
+          # the containers are run without --rm, so that one whose bootstrap failed is still there for the trap to print
+          trap 'code=$?; for c in test_health test_health_bind; do echo "::group::container logs ($c)"; docker logs $c 2>&1 || true; docker inspect --format="{{json .State.Health}}" $c 2>&1 || true; echo "::endgroup::"; done; docker rm -f test_health test_health_bind >/dev/null 2>&1 || true; exit $code' ERR
+          IMAGE=localhost:5000/${GITHUB_REPOSITORY,,}:${{ env.release_version }}${{ matrix.suffix }}
+          # a failed probe leaves a failing streak until the next probe passes, 5 s later at the
+          # earliest, so a container found "healthy 0" every 2 s for 45 s passed every probe since
+          stays_healthy() {
+            local end=$((SECONDS + 45))
+            while [ $SECONDS -lt $end ]; do
+              test "$(docker inspect --format='{{.State.Health.Status}} {{.State.Health.FailingStreak}}' "$1")" = "healthy 0"
+              sleep 2
+            done
+          }
+          # ROOT_PASSWORD is only the initial root password: changing it must not turn the container unhealthy
+          docker run -it -d --memory="512m" --health-interval=5s -e ROOT_PASSWORD=initial_password --name=test_health $IMAGE
+          timeout 3m bash -c 'until docker inspect --format="{{json .State.Health.Status}}" test_health | grep -q \"healthy\"; do sleep 10; done'
+          docker exec test_health /opt/opendj/bin/ldappasswordmodify --hostname localhost --port 1636 --useSsl --trustAll --bindDN "cn=Directory Manager" --bindPassword initial_password --currentPassword initial_password --newPassword rotated_password
+          # bind settings kept for the CLI in the home of the image user must not reach the probe
+          docker exec test_health sh -c 'mkdir -p /home/opendj/.opendj && printf "bindDN=cn=Directory Manager\nbindPassword=wrong_password\n" > /home/opendj/.opendj/tools.properties'
+          stays_healthy test_health
+          docker rm -f test_health
+          # an instance rejecting unauthenticated requests is probed with the account it is given, whose password is read from a file
+          # a password of its own, so the command lines below can be searched for it
+          printf hc_secret_1092 > "$RUNNER_TEMP/healthcheck_password"
+          chmod 644 "$RUNNER_TEMP/healthcheck_password"
+          docker run -it -d --memory="512m" --health-interval=5s -v "$RUNNER_TEMP/healthcheck_password:/tmp/healthcheck_password:ro" -e ROOT_PASSWORD=hc_secret_1092 -e HEALTHCHECK_BIND_DN="cn=Directory Manager" -e HEALTHCHECK_BIND_PASSWORD_FILE=/tmp/healthcheck_password --name=test_health_bind $IMAGE
+          timeout 3m bash -c 'until docker inspect --format="{{json .State.Health.Status}}" test_health_bind | grep -q \"healthy\"; do sleep 10; done'
+          docker exec test_health_bind /opt/opendj/bin/dsconfig set-global-configuration-prop --hostname localhost --port 4444 --bindDN "cn=Directory Manager" --bindPasswordFile /tmp/healthcheck_password --set reject-unauthenticated-requests:true --no-prompt --trustAll
+          # the setting has taken: the anonymous probe would now be refused
+          rc=0
+          docker exec test_health_bind /opt/opendj/bin/ldapsearch --hostname localhost --port 1636 --useSsl --trustAll --baseDN "" --searchScope base "(objectClass=*)" 1.1 || rc=$?
+          test "$rc" = 53
+          # and the probe reports that refusal when it has no account to bind with
+          rc=0
+          docker exec -e HEALTHCHECK_BIND_DN= test_health_bind /opt/opendj/healthcheck.sh || rc=$?
+          test "$rc" = 1
+          # a password file it cannot read is reported as such, whether it is missing or there but not
+          # readable: the image runs as its own user, not root, so mode 000 keeps the probe out
+          docker exec test_health_bind sh -c 'touch /tmp/unreadable_password && chmod 000 /tmp/unreadable_password'
+          for f in /nonexistent /tmp/unreadable_password; do
+            rc=0
+            out=$(docker exec -e HEALTHCHECK_BIND_PASSWORD_FILE=$f test_health_bind /opt/opendj/healthcheck.sh) || rc=$?
+            test "$rc" = 1
+            grep -q 'is not a readable file' <<< "$out"
+          done
+          stays_healthy test_health_bind
+          # the password never shows on a command line: sample every process's for two probe intervals
+          docker exec test_health_bind sh -c 'end=$(($(date +%s) + 12)); while [ "$(date +%s)" -lt "$end" ]; do for f in /proc/[0-9]*/cmdline; do tr "\0" " " < "$f" 2>/dev/null; echo; done | grep -q "[h]c_secret_1092" && exit 1; sleep 0.2; done; exit 0'
+          docker rm -f test_health_bind
+      - name: Docker test failed bootstrap
+        # a start over a volume whose bootstrap failed once setup had written its
+        # configuration must not report healthy either (#1182)
+        shell: bash
+        run: |
+          IMAGE=localhost:5000/${GITHUB_REPOSITORY,,}:${{ env.release_version }}${{ matrix.suffix }}
+          MEMORY=512m
+          trap 'code=$?; echo "::group::container logs (test_failed)"; docker logs test_failed 2>&1 || true; docker inspect --format="{{json .State.Health}}" test_failed 2>&1 || true; echo "::endgroup::"; docker rm -f test_failed >/dev/null 2>&1 || true; docker volume rm test_failed_data >/dev/null 2>&1 || true; exit $code' ERR
+          # an unknown backend type fails create-backend once setup has written data/config
+          docker run -d --memory="$MEMORY" --health-interval=5s -e ADD_BASE_ENTRY="--addBaseEntry" -e BACKEND_TYPE=bogus -v test_failed_data:/opt/opendj/data --name=test_failed "$IMAGE"
+          timeout 3m bash -c 'until docker logs test_failed 2>&1 | grep -qF "failed, this container will not report itself healthy"; do sleep 2; done'
+          docker restart -t 60 test_failed
+          timeout 3m bash -c 'until docker logs test_failed 2>&1 | grep -qF "The bootstrap of this volume did not complete"; do sleep 2; done'
+          # the server is up to be looked at, and no probe passes over 45 s of probes every 5 s
+          timeout 3m bash -c 'until docker exec test_failed /opt/opendj/bin/ldapsearch --hostname localhost --port 1636 --useSsl --trustAll --bindDN "cn=Directory Manager" --bindPassword password --baseDN "" --searchScope base "(objectClass=*)" 1.1 >/dev/null 2>&1; do sleep 5; done'
+          end=$((SECONDS + 45))
+          while [ $SECONDS -lt $end ]; do
+            test "$(docker inspect --format='{{.State.Health.Status}}' test_failed)" != healthy
+            sleep 2
+          done
+          # the setup finished by hand and the mark removed, the next start reports healthy
+          docker exec test_failed /opt/opendj/bin/dsconfig create-backend --hostname localhost --port 4444 --bindDN "cn=Directory Manager" --bindPassword password --backend-name=userRoot --type je --set=base-dn:dc=example,dc=com --set=enabled:true --no-prompt --trustAll
+          docker exec test_failed rm /opt/opendj/data/.bootstrap-pending
+          docker restart -t 60 test_failed
+          timeout 3m bash -c 'until docker inspect --format="{{json .State.Health.Status}}" test_failed | grep -q \"healthy\"; do sleep 5; done'
+          docker rm -f test_failed
+          docker volume rm test_failed_data
+      - name: Docker test upgrade from a released image
+        # the build image started over a volume that the latest release bootstrapped
+        # upgrades it on start, the road the Installation Guide documents (#1183), and an
+        # upgrade that did not complete keeps it unhealthy on later starts too (#1185)
+        shell: bash
+        run: |
+          IMAGE=localhost:5000/${GITHUB_REPOSITORY,,}:${{ env.release_version }}${{ matrix.suffix }}
+          RELEASED=openidentityplatform/opendj:${{ env.release_version }}${{ matrix.suffix }}
+          MEMORY=512m
+          trap 'code=$?; echo "::group::container logs (test_upgrade)"; docker logs test_upgrade 2>&1 || true; docker inspect --format="{{json .State.Health}}" test_upgrade 2>&1 || true; echo "::endgroup::"; docker rm -f test_upgrade >/dev/null 2>&1 || true; docker volume rm test_upgrade_data >/dev/null 2>&1 || true; exit $code' ERR
+          search() { docker exec test_upgrade /opt/opendj/bin/ldapsearch --hostname localhost --port 1636 --useSsl --trustAll --bindDN "cn=Directory Manager" --bindPassword password "$@"; }
+          # release.yml publishes the GitHub release before it pushes the images of it: in between,
+          # and while a failed push stays unfixed, the latest release has no image to start from.
+          # Only that skips the test - a tag the registry does not have, which the classic image
+          # store reports as "manifest unknown" and the containerd one as a reference it could not
+          # resolve, "not found"; a pull that failed otherwise - a rate limit, the registry or the
+          # network down - fails it rather than passing it untested
+          if ! out=$(docker pull "$RELEASED" 2>&1); then
+            echo "$out"
+            case $out in
+              *"manifest unknown"*|*"failed to resolve reference"*": not found"*) echo "::warning::$RELEASED is not on Docker Hub yet, the upgrade test is skipped"; exit 0 ;;
+              *) exit 1 ;;
+            esac
+          fi
+          docker run -d --memory="$MEMORY" -e ADD_BASE_ENTRY="--addBaseEntry" -e SAMPLE_DATA=10 -v test_upgrade_data:/opt/opendj/data --name=test_upgrade "$RELEASED"
+          # the entries, not the health status: the health check of 5.1.2 turned healthy before
+          # import-ldif had finished
+          export -f search
+          timeout 5m bash -c 'until search --baseDN "ou=People,dc=example,dc=com" --searchScope one "(uid=user.9)" 1.1 2>/dev/null | grep -q "^dn:"; do sleep 5; done'
+          docker stop -t 60 test_upgrade
+          docker rm test_upgrade
+          docker run -d --memory="$MEMORY" -v test_upgrade_data:/opt/opendj/data --name=test_upgrade "$IMAGE"
+          timeout 10m bash -c 'until docker inspect --format="{{json .State.Health.Status}}" test_upgrade | grep -q \"healthy\"; do sleep 5; done'
+          # the upgrade ran its tasks: on equal versions it would be a no-op
+          if docker logs test_upgrade 2>&1 | grep -F "has already been upgraded"; then echo "::error::The build image found nothing to upgrade on the volume of $RELEASED"; false; fi
+          test "$(search --baseDN "ou=People,dc=example,dc=com" --searchScope one "(uid=user.*)" 1.1 | grep -c "^dn:")" = 10
+          # a successful upgrade leaves no mark behind (#1185)
+          docker exec test_upgrade test ! -e /opt/opendj/data/.upgrade-pending
+          # an upgrade that recorded the new version but did not complete its post-upgrade tasks:
+          # the next run of upgrade finds nothing to do, and the mark keeps the container unhealthy
+          # until the operator removes it
+          docker stop -t 60 test_upgrade
+          docker rm test_upgrade
+          docker run --rm --entrypoint sh -v test_upgrade_data:/opt/opendj/data "$IMAGE" -c 'echo "an earlier version to this one" >/opt/opendj/data/.upgrade-pending'
+          docker run -d --memory="$MEMORY" --health-interval=5s -v test_upgrade_data:/opt/opendj/data --name=test_upgrade "$IMAGE"
+          timeout 3m bash -c 'until docker logs test_upgrade 2>&1 | grep -qF "did not complete on an earlier start"; do sleep 2; done'
+          # the server is up to be looked at, and no probe passes over 45 s of probes every 5 s
+          timeout 3m bash -c 'until search --baseDN "" --searchScope base "(objectClass=*)" 1.1 >/dev/null 2>&1; do sleep 5; done'
+          end=$((SECONDS + 45))
+          while [ $SECONDS -lt $end ]; do
+            test "$(docker inspect --format='{{.State.Health.Status}}' test_upgrade)" != healthy
+            sleep 2
+          done
+          docker exec test_upgrade rm /opt/opendj/data/.upgrade-pending
+          docker restart -t 60 test_upgrade
+          timeout 3m bash -c 'until docker inspect --format="{{json .State.Health.Status}}" test_upgrade | grep -q \"healthy\"; do sleep 5; done'
+          docker rm -f test_upgrade
+          docker volume rm test_upgrade_data
+          # the mark goes on before the upgrade and stays when it fails: a read-only buildinfo
+          # fails it where it records the new version, after its upgrade tasks
+          docker run -d --memory="$MEMORY" -e ADD_BASE_ENTRY="--addBaseEntry" -v test_upgrade_data:/opt/opendj/data --name=test_upgrade "$RELEASED"
+          timeout 5m bash -c 'until search --baseDN "dc=example,dc=com" --searchScope base "(objectClass=*)" 1.1 2>/dev/null | grep -q "^dn:"; do sleep 5; done'
+          docker stop -t 60 test_upgrade
+          docker rm test_upgrade
+          docker run --rm --user root --entrypoint chmod -v test_upgrade_data:/opt/opendj/data "$IMAGE" 444 /opt/opendj/data/config/buildinfo
+          docker run -d --memory="$MEMORY" -v test_upgrade_data:/opt/opendj/data --name=test_upgrade "$IMAGE"
+          timeout 5m bash -c 'until docker logs test_upgrade 2>&1 | grep -qF "The upgrade did not complete, this container will not report itself healthy"; do sleep 2; done'
+          docker run --rm --entrypoint test -v test_upgrade_data:/opt/opendj/data "$IMAGE" -s /opt/opendj/data/.upgrade-pending
+          docker rm -f test_upgrade
+          docker volume rm test_upgrade_data
+      - name: Scan image for vulnerabilities (Trivy)
+        # trivy resolves the image from the local Docker daemon, so only the runner's
+        # linux/amd64 manifest is scanned; cache: false keeps the ~1GB trivy DBs from
+        # evicting the m2-repository caches out of the repo's 10GB actions-cache quota
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: localhost:5000/${{ env.image_repository }}:${{ env.release_version }}${{ matrix.suffix }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          limit-severities-for-sarif: true
+          ignore-unfixed: true
+          scanners: vuln
+          cache: false
+      - name: Upload Trivy report to GitHub Security
+        uses: github/codeql-action/upload-sarif@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
+        # upload even if a preceding step failed, but not without a report to upload
+        if: ${{ always() && hashFiles('trivy-results.sarif') != '' }}
+        with:
+          sarif_file: trivy-results.sarif
+          # distinct from the docker-scan.yml categories, which track the published images
+          category: ${{ matrix.trivy_category }}
+      - name: Cache JMeter
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/jmeter
+          key: jmeter-5.6.3
+      - name: Benchmark PDB vs JE
+        # the default image only, as before
+        if: matrix.flavor == 'default'
+        shell: bash
+        run: |
+          A_BACKEND=je B_BACKEND=pdb THREADS=200 DURATION=150 bash .github/benchmark/compare-opendj.sh \
+            "JE"  localhost:5000/${GITHUB_REPOSITORY,,}:${{ env.release_version }}${{ matrix.suffix }} \
+            "PDB" localhost:5000/${GITHUB_REPOSITORY,,}:${{ env.release_version }}${{ matrix.suffix }}
+      - name: Upload benchmark artifacts (PDB vs JE)
+        if: always() && matrix.flavor == 'default'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: benchmark-pdb-vs-je
+          path: |
+            a/
+            b/
+            *.jtl
+            *.docker.log
+            *.jmeter.out
+          if-no-files-found: warn
+          retention-days: 5
+      - name: Benchmark ${{ matrix.build_label }} vs ${{ matrix.release_label }}
+        shell: bash
+        run: |
+          THREADS=200 DURATION=150 bash .github/benchmark/compare-opendj.sh \
+            "${{ matrix.build_label }}"   localhost:5000/${GITHUB_REPOSITORY,,}:${{ env.release_version }}${{ matrix.suffix }} \
+            "${{ matrix.release_label }}" ${{ matrix.release_image }}
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: benchmark-build-vs-release${{ matrix.suffix }}
+          path: |
+            a/
+            b/
+            *.jtl
+            *.docker.log
+            *.jmeter.out
+          if-no-files-found: warn
+          retention-days: 5
+
+  docker-convergence:
+    # #1090: writes to every directory server of a replication topology at once, then checks
+    # that the replicas hold the same data; next to docker-test, on the image of build-docker.
+    # Each row but the base one disturbs the topology during the load in one way (#1208)
+    needs: build-docker
+    # a red row turns the Build run red, and deploy.yml then skips the snapshot deploy and the
+    # publishing of the docs of a push to master
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        topology: [rs534, combined]
+        # none: the base run; restart-ds and kill-ds: a directory server restarts or crashes;
+        # kill-rs and restart-rs: one RS is killed or gracefully restarted per fresh topology
+        # while every DS writes. Only rs534 has replication servers apart from directory servers.
+        disturbance: [none, restart-ds, kill-ds, kill-rs, restart-rs]
+        exclude:
+          - topology: combined
+            disturbance: kill-rs
+          - topology: combined
+            disturbance: restart-rs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            .github/scripts/replication
+      # what a green row does not show: what a disturbance window of the errors log check
+      # expects - nothing it expects is logged outside the window there, and a base row has
+      # none - and where each disturbance opens and closes its windows
+      - name: Self-tests of the errors log check, disturbances and summary
+        shell: bash
+        run: |
+          .github/scripts/replication/selftest-replication-errors.sh
+          .github/scripts/replication/selftest-disturb-restart-ds.sh
+          .github/scripts/replication/selftest-disturb-kill-ds.sh
+          .github/scripts/replication/selftest-disturb-rs.sh
+          .github/scripts/replication/selftest-summary.sh
+      - name: Download the image
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: docker-image-default
+          path: ${{ runner.temp }}/image
+      - name: Load the image
+        shell: bash
+        run: docker load -i "$RUNNER_TEMP/image/image.tar"
+      - name: Convergence run (${{ matrix.topology }}, ${{ matrix.disturbance }})
+        shell: bash
+        env:
+          TOPOLOGY: ${{ matrix.topology }}
+          DISTURBANCE: ${{ matrix.disturbance }}
+          # Every row runs 900 s of load; disturbed rows act a third of the way in.
+          DURATION: "900"
+          # the replicas fall behind during the load and catch up after it: 900 s at 325 and 65
+          # a second converged in 396 s (run 38944365728), 1800 s at 423 and 85 in 2489 s (run
+          # 39043600905), the backlog growing faster than the load above the replay capacity; a
+          # run that does not converge in time skips the checks of the data
+          QUIESCE_TIMEOUT: "4500"
+          SAMPLE_DATA: "10000"
+          OUT: ${{ runner.temp }}/replication-out
+        run: .github/scripts/replication/run.sh "localhost:5000/${GITHUB_REPOSITORY,,}:${{ needs.build-docker.outputs.release_version }}"
+      - name: Upload the convergence run
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          # the base rows keep the names they had before the disturbed ones came
+          name: convergence-${{ matrix.topology }}${{ matrix.disturbance != 'none' && format('-{0}', matrix.disturbance) || '' }}
+          path: ${{ runner.temp }}/replication-out
+          if-no-files-found: warn
+          retention-days: 5
+
+  test-deb:
+    needs: build-maven
+    runs-on: 'ubuntu-latest'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ubuntu-latest-11
+      - name: Clean-room install + SysV start/stop (debian:12 container)
+        shell: bash
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work debian:12 bash -c '
+            set -e
+            export DEBIAN_FRONTEND=noninteractive
+            DEB=$(ls opendj-packages/opendj-deb/opendj-deb-standard/target/*.deb | head -1)
+            echo "Found $DEB"
+            apt-get update
+            apt-get install -y lintian
+            lintian --info --no-tag-display-limit "$DEB" || true
+            dpkg-deb -I "$DEB"
+            # Both service files must be present (two greps: a single alternation
+            # would pass with either one missing).
+            dpkg-deb -c "$DEB" | grep "lib/systemd/system/opendj.service"
+            dpkg-deb -c "$DEB" | grep "etc/init.d/opendj"
+            # /etc/default/opendj must be a real conffile, so admin edits survive
+            # upgrades and the file survives "apt remove".
+            dpkg-deb -e "$DEB" /tmp/ctrl
+            grep -qx "/etc/default/opendj" /tmp/ctrl/conffiles
+            apt-get install -y "./$DEB"
+            id opendj
+            test "$(stat -c %U /opt/opendj)" = opendj
+            # No JAVA_HOME in this clean container: Java resolves from the PATH
+            # java that the package JRE dependency pulled in.
+            runuser -u opendj -- /opt/opendj/setup --cli --no-prompt --acceptLicense --doNotStart \
+              --rootUserDN "cn=Directory Manager" --rootUserPassword password \
+              --hostname localhost --ldapPort 1389 --adminConnectorPort 4444 \
+              --baseDN dc=example,dc=com --addBaseEntry
+            /etc/init.d/opendj start
+            bash .github/scripts/wait-for-ldap.sh 1389
+            /etc/init.d/opendj status
+            /etc/init.d/opendj stop
+            apt-get purge -y opendj
+          '
+      - name: Live systemd install + start/stop (runner)
+        shell: bash
+        run: |
+          DEB=$(ls opendj-packages/opendj-deb/opendj-deb-standard/target/*.deb | head -1)
+          sudo apt-get update
+          sudo apt-get install -y "$PWD/$DEB"
+          test "$(stat -c '%U' /opt/opendj)" = opendj
+          # postinst must have enabled the unit; do not enable by hand here or
+          # the postinst registration would go untested.
+          sudo systemctl is-enabled --quiet opendj
+          # Before setup the unit's start condition must keep it from
+          # start-bursting: "start" succeeds but no process may appear.
+          sudo systemctl start opendj
+          sleep 2
+          if sudo systemctl is-failed --quiet opendj; then echo "unit failed before setup"; exit 1; fi
+          # sudo/runuser/systemd strip JAVA_HOME -> the service uses the PATH java.
+          # Privileged port 389: only AmbientCapabilities=CAP_NET_BIND_SERVICE lets
+          # the non-root service bind it - the very reason it can drop root. setup
+          # itself runs via runuser WITHOUT that capability, so it must skip its
+          # own bind probe; the systemd start below performs the real 389 bind.
+          sudo runuser -u opendj -- /opt/opendj/setup --cli --no-prompt --acceptLicense --doNotStart \
+            --rootUserDN "cn=Directory Manager" --rootUserPassword password \
+            --hostname localhost --ldapPort 389 --adminConnectorPort 4444 \
+            --baseDN dc=example,dc=com --addBaseEntry --skipPortCheck
+          sudo systemctl start opendj
+          bash .github/scripts/wait-for-ldap.sh 389
+          sudo systemctl is-active --quiet opendj
+          echo "OpenDJ is active under systemd"
+          sudo systemctl stop opendj
+          sleep 3
+          if sudo systemctl is-active --quiet opendj; then echo "still active"; exit 1; fi
+          sudo apt-get purge -y opendj
+
+  # Known coverage limit: the container has no booted systemd (/run/systemd/system
+  # is absent), so only the SysV/chkconfig path of the scriptlets is exercised
+  # here; start/stop through systemd is covered by the deb live-systemd jobs on
+  # the runner. The enable registration IS asserted below - systemctl enable is
+  # a pure symlink operation and works without a booted systemd.
+  test-rpm:
+    needs: build-maven
+    runs-on: 'ubuntu-latest'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ubuntu-latest-11
+      - name: Install and start/stop in Rocky Linux 9
+        shell: bash
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work rockylinux:9 bash -c '
+            set -e
+            RPM=$(ls opendj-packages/opendj-rpm/opendj-rpm-standard/target/rpm/opendj/RPMS/noarch/*.rpm | head -1)
+            echo "Found $RPM"
+            # Both service files must be shipped.
+            rpm -qlp "$RPM" | grep "^/usr/lib/systemd/system/opendj.service$"
+            rpm -qlp "$RPM" | grep "^/etc/init.d/opendj$"
+            # The %pre user-creation dependency must be declared for minimal images.
+            rpm -qp --requires "$RPM" | grep "shadow-utils"
+            # A real EL9 host always has systemd, but the container image ships no
+            # systemctl at all - %post then (correctly) skips the enable in silence.
+            # Preinstall it as host infrastructure, deliberately NOT a package
+            # Requires, so the is-enabled assertion below tests the enable path.
+            dnf install -y systemd
+            # No further manual dependencies: the package must pull everything else
+            # itself (Requires).
+            dnf install -y "$RPM"
+            id opendj
+            test "$(stat -c %U /opt/opendj)" = opendj
+            # %post must have enabled the unit on initial install.
+            systemctl is-enabled opendj.service
+            # No JAVA_HOME here: Java resolves from the PATH java pulled in by
+            # the java-headless dependency.
+            runuser -u opendj -- /opt/opendj/setup --cli --no-prompt --acceptLicense --doNotStart \
+              --rootUserDN "cn=Directory Manager" --rootUserPassword password \
+              --hostname localhost --ldapPort 1389 --adminConnectorPort 4444 \
+              --baseDN dc=example,dc=com --addBaseEntry
+            /etc/init.d/opendj start
+            bash .github/scripts/wait-for-ldap.sh 1389
+            /etc/init.d/opendj status
+            /etc/init.d/opendj stop
+            rpm -e opendj
+          '
+
+  # Upgrade path: released 5.1.2 deb (root-owned, SysV) -> this build's deb, on the
+  # runner's LIVE systemd. The new package must stop the running server, create the
+  # opendj user, migrate ownership, run the upgrade tool and restart the server with
+  # the old data - through deb-systemd-invoke and the native unit, the path a real
+  # systemd host takes (docs: chap-upgrade).
+  test-deb-upgrade:
+    needs: build-maven
+    runs-on: 'ubuntu-latest'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ubuntu-latest-11
+      - name: Download released 5.1.2 deb
+        shell: bash
+        run: |
+          curl -fsSL -o opendj-5.1.2.deb https://github.com/OpenIdentityPlatform/OpenDJ/releases/download/5.1.2/opendj_5.1.2-1_all.deb
+          # Pin the upgrade source: a retagged release asset must fail loudly here,
+          # not surface as an unrelated upgrade-job failure.
+          echo "8f7f8bdd526b2d63eaef0621545be6aa55749cb60200d3bc2a2849d9ab69eb59  opendj-5.1.2.deb" | sha256sum -c -
+      - name: Upgrade 5.1.2 -> new deb (live systemd on the runner)
+        shell: bash
+        run: |
+          NEW=$(ls opendj-packages/opendj-deb/opendj-deb-standard/target/*.deb | head -1)
+          echo "New deb: $NEW"
+          sudo apt-get update
+          # No manual dependencies: even the released 5.1.2 deb declares a JRE dependency.
+          sudo apt-get install -y "$PWD/opendj-5.1.2.deb"
+          # 5.1.2 model: no dedicated user, root-owned tree, SysV only - on this
+          # booted host its unit comes from the systemd-sysv-generator.
+          sudo /opt/opendj/setup --cli --no-prompt --acceptLicense --doNotStart \
+            --rootUserDN "cn=Directory Manager" --rootUserPassword password \
+            --hostname localhost --ldapPort 1389 --adminConnectorPort 4444 \
+            --baseDN dc=example,dc=com --addBaseEntry
+          sudo systemctl daemon-reload
+          sudo /etc/init.d/opendj start
+          bash .github/scripts/wait-for-ldap.sh 1389
+          # Leave the server RUNNING: the new package must stop it, upgrade and
+          # restart it - through deb-systemd-invoke and the native unit this time.
+          sudo apt-get install -y "$PWD/$NEW"
+          id opendj
+          test "$(stat -c %U /opt/opendj)" = opendj
+          test -f /opt/opendj/config/config.ldif
+          # The systemd-hosted upgrade must leave the unit enabled and active.
+          sudo systemctl is-enabled --quiet opendj
+          sudo systemctl is-active --quiet opendj
+          # The pre-upgrade data must be served again, now by the dedicated user.
+          bash .github/scripts/wait-for-ldap.sh 1389
+          test "$(stat -c %U /proc/$(cat /opt/opendj/logs/server.pid))" = opendj
+          sudo systemctl stop opendj
+          sleep 3
+          if sudo systemctl is-active --quiet opendj; then echo "still active"; exit 1; fi
+          sudo apt-get purge -y opendj
+
+  test-rpm-upgrade:
+    needs: build-maven
+    runs-on: 'ubuntu-latest'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ubuntu-latest-11
+      - name: Download released 5.1.2 rpm
+        shell: bash
+        run: |
+          curl -fsSL -o opendj-5.1.2.rpm https://github.com/OpenIdentityPlatform/OpenDJ/releases/download/5.1.2/opendj-5.1.2-1.noarch.rpm
+          # Pin the upgrade source: a retagged release asset must fail loudly here,
+          # not surface as an unrelated upgrade-job failure.
+          echo "9622ef7c3292f0c156c96029a647ca704064aa93b567e5608734fe07d224ec58  opendj-5.1.2.rpm" | sha256sum -c -
+      - name: Upgrade 5.1.2 -> new rpm (Rocky Linux 9 container)
+        shell: bash
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work rockylinux:9 bash -c '
+            set -e
+            NEW=$(ls opendj-packages/opendj-rpm/opendj-rpm-standard/target/rpm/opendj/RPMS/noarch/*.rpm | head -1)
+            echo "New rpm: $NEW"
+            # No manual dependencies: the released 5.1.2 rpm already declares its runtime
+            # requirements (#677), and everything the NEW package needs must come from its
+            # own Requires.
+            dnf install -y ./opendj-5.1.2.rpm
+            # 5.1.2 model: no dedicated user, root-owned tree, SysV only
+            /opt/opendj/setup --cli --no-prompt --acceptLicense --doNotStart \
+              --rootUserDN "cn=Directory Manager" --rootUserPassword password \
+              --hostname localhost --ldapPort 1389 --adminConnectorPort 4444 \
+              --baseDN dc=example,dc=com --addBaseEntry
+            /etc/init.d/opendj start
+            bash .github/scripts/wait-for-ldap.sh 1389
+            # Leave the server RUNNING: the new package must stop it, upgrade and restart it.
+            dnf install -y "./$NEW"
+            id opendj
+            test "$(stat -c %U /opt/opendj)" = opendj
+            test -f /opt/opendj/config/config.ldif
+            # 5.1.2 was chkconfig-enabled and the native unit now shadows the
+            # sysv-generator unit: %post must have migrated that enable state
+            # (a pure symlink operation, asserted fine without booted systemd).
+            systemctl is-enabled opendj.service
+            # The package restarted the server; the pre-upgrade data must be served again,
+            # now by the dedicated user.
+            bash .github/scripts/wait-for-ldap.sh 1389
+            test "$(stat -c %U /proc/$(cat /opt/opendj/logs/server.pid))" = opendj
+            /etc/init.d/opendj stop
+            rpm -e opendj
+          '
+
+  # The gate both MSI jobs wait on. Deliberately not "needs: build-maven": that waits for
+  # the whole matrix, whose ubuntu legs run for about two hours, so any push landing inside
+  # that window cancels the run before those two-minute jobs have started - which is how the
+  # MSI work reached its eighth review round with no completed run behind it. The only input
+  # they have is the windows-latest-11 artifact, so wait for exactly that.
+  #
+  # On ubuntu, and in a job of its own, for two reasons. A waiter on windows-latest holds a
+  # Windows runner from t=0 for the whole wait, competing for the capacity the leg it is
+  # waiting for needs - in run 31578978374 the windows-latest-11 leg sat in the queue for 38
+  # minutes while windows-latest-26 started within one. And the wait was duplicated
+  # verbatim in both jobs, with a 45-minute budget measured from t=0 that covered the leg's
+  # runtime but not its queue time: in that same run the artifact appeared at +52 minutes,
+  # so both jobs would have failed a perfectly healthy build.
+  wait-msi-artifact:
+    runs-on: 'ubuntu-latest'
+    # The queue is not this run's to bound: it is a property of the account's runner
+    # capacity, which GitHub shares across every OS, and the leg has been seen sitting in it
+    # for three hours. So the wall clock here is only the six-hour ceiling GitHub puts on a
+    # job, less a margin; what gets a budget is the leg's own runtime, which is the part a
+    # change under test can actually break.
+    timeout-minutes: 350
+    permissions:
+      contents: read
+      # Listing the run's artifacts and jobs, which the wait below polls.
+      actions: read
+    steps:
+      - name: Wait for the Windows build artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Four times the longest the leg has taken to publish, and counted only from the
+          # moment it has a runner. The budget this replaces ran from t=0 and so was spent on
+          # the queue instead: in run 34318105667 the leg waited 178 minutes for a Windows
+          # runner and published 14 minutes later, an hour after a 120-minute budget had
+          # failed a build that was entirely healthy.
+          budget=$(( 60 * 60 ))
+          deadline=''
+          while true; do
+            # A transient API error is a reason to poll again, not to read "not published
+            # yet" out of a listing that never arrived: the leg may already have published,
+            # and the completion check below would then call a healthy build one that
+            # finished without publishing.
+            if ! artifacts=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" \
+                 --jq '.artifacts[].name'); then
+              sleep 30
+              continue
+            fi
+            if grep -qx 'windows-latest-11' <<<"$artifacts"; then
+              echo 'windows-latest-11 is available'
+              exit 0
+            fi
+            if ! leg=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" \
+                 --jq '.jobs[] | select(.name | startswith("build-maven (windows-latest, 11)")) | "\(.status) \(.conclusion)"'); then
+              sleep 30
+              continue
+            fi
+            case "$leg" in
+              # Stop waiting the moment the leg that would publish it has finished without
+              # doing so, instead of sitting out the deadline.
+              completed*)
+                echo "the Windows build leg finished as '${leg#* }' without publishing windows-latest-11" >&2
+                exit 1
+                ;;
+              # It has a runner, so from here on the wait is on the build rather than on the
+              # queue. A queued leg is listed too, and with a started_at holding the time it
+              # was queued - which is why this reads the status and not that.
+              in_progress*)
+                [ -n "$deadline" ] || deadline=$(( $(date +%s) + budget ))
+                ;;
+            esac
+            if [ -n "$deadline" ] && [ "$(date +%s)" -ge "$deadline" ]; then
+              echo 'the Windows build leg has been running for 60 minutes without publishing windows-latest-11' >&2
+              exit 1
+            fi
+            sleep 30
+          done
+
+  test-msi:
+    needs: wait-msi-artifact
+    runs-on: 'windows-latest'
+    permissions:
+      contents: read
+    steps:
+      # Only for .github/scripts/wait-server-stopped.ps1 and the MSI authoring the guard
+      # step below reads, and it has to come first: checkout cleans the workspace the
+      # artifact is unpacked into. Sparse because those two are the entire reason for it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            .github/scripts
+            opendj-packages/opendj-msi/opendj-msi-standard/resources/msi
+      - name: Download artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-latest-11
+      - name: Set up Java
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          java-version: '25'
+          distribution: 'zulu'
+      - name: The upgrade guards must hold up on their own
+        shell: pwsh
+        run: |
+          # Two things no install scenario can see, both of which have already gone wrong here.
+          # The first is what a guard is allowed to READ: the execute sequence is processed in
+          # the installer service, so a private property set in the UI sequence is empty by the
+          # time the guard evaluates - which inverts it in exactly the full-UI sessions that no
+          # /qn scenario runs. The second is the inline PowerShell itself: the scenarios reach
+          # it only through a ten-minute install and can then only look at msiexec's exit code,
+          # so a guard that always exits 0 looks the same as one that never has to refuse.
+          # Read from the authoring rather than from the built MSI's tables: wix copies both
+          # the sequence conditions and ExeCommand across verbatim, and it is test-msi-upgrade
+          # that judges the artifact - those scenarios now assert the refusal's own 1603 and
+          # "Return value 3" rather than any non-zero exit code.
+          $wxs = Get-Content -Raw opendj-packages/opendj-msi/opendj-msi-standard/resources/msi/package.wxs
+          $sequence = [regex]::Match($wxs, '(?s)<InstallExecuteSequence>(.*?)</InstallExecuteSequence>')
+          if (-not $sequence.Success) { throw "package.wxs has no InstallExecuteSequence" }
+          foreach ($action in @('RequireDirOnCustomUpgrade', 'RefuseRelocatingUpgrade')) {
+            $scheduled = [regex]::Match($sequence.Groups[1].Value, '(?s)<Custom Action="' + $action + '"(.*?)/>')
+            if (-not $scheduled.Success) { throw "$action is not scheduled in InstallExecuteSequence" }
+            $found = [regex]::Match($scheduled.Groups[1].Value, '(?s)Condition="([^"]*)"')
+            if (-not $found.Success) { throw "$action is scheduled without a condition" }
+            $condition = [System.Net.WebUtility]::HtmlDecode($found.Groups[1].Value)
+            # Property names in these conditions are upper case, and so are AND/NOT: a
+            # lower-case letter is a private property, which reads as empty in the service.
+            if ($condition -cmatch '[a-z]') { throw "$action reads a private property, which never reaches the installer service: $condition" }
+            Write-Host "$action : $condition"
+          }
+          foreach ($property in @('OPENDJ', 'OPENDJ_GIVEN')) {
+            if ($wxs -notmatch ('<Property Id="' + $property + '"[^>]*Secure="yes"')) { throw "$property must be Secure: the guards read it in the service, where a non-administrator's value is dropped otherwise" }
+          }
+          # Sequence="first" is what keeps OPENDJ_GIVEN meaning "the directory was named":
+          # without it the action re-runs in the execute sequence of a full-UI install, where
+          # OPENDJ has long been resolved, and the guards' prefix test would be comparing a
+          # value with itself. Every msiexec call in this workflow is /qn, which runs no UI
+          # sequence, so nothing else here would notice it going.
+          if ($wxs -notmatch '<SetProperty Id="OPENDJ_GIVEN"[^>]*Sequence="first"') { throw 'OPENDJ_GIVEN must be captured with Sequence="first", or it stops meaning "named" in a full-UI install' }
+          # CheckServerNotRunning, run exactly as msiexec runs it: the Formatted field
+          # resolved - [\[] and [\]] are its escapes for literal brackets, [property]
+          # references become their values - and handed to cmd.exe. Windows PowerShell 5.1 is
+          # what the command names, so that is what this exercises.
+          $found = [regex]::Match($wxs, '(?s)<CustomAction Id="CheckServerNotRunning".*?ExeCommand="([^"]*)"')
+          if (-not $found.Success) { throw "CheckServerNotRunning has no ExeCommand" }
+          $target = [System.Net.WebUtility]::HtmlDecode($found.Groups[1].Value)
+          $probeRoot = Join-Path $PWD 'guard-probe'
+          New-Item -ItemType Directory -Force (Join-Path $probeRoot 'locks') | Out-Null
+          $command = $target.Replace('[\[]', '[').Replace('[\]]', ']').Replace('[System64Folder]', "$env:SystemRoot\System32\").Replace('[OPENDJ]', "$probeRoot\")
+          Set-Content -Encoding Ascii -Path guard-probe.cmd -Value $command
+          Write-Host $command
+          function Invoke-Guard { (Start-Process cmd.exe -Wait -PassThru -ArgumentList '/c', 'guard-probe.cmd' -WorkingDirectory $PWD).ExitCode }
+          $lock = Join-Path $probeRoot 'locks\server.lock'
+          Remove-Item $lock -Force -ErrorAction SilentlyContinue
+          $rc = Invoke-Guard
+          if ($rc -ne 0) { throw "no lock file at all must let the upgrade proceed, got $rc" }
+          Set-Content -Path $lock -Value ''
+          $rc = Invoke-Guard
+          if ($rc -ne 0) { throw "an unlocked server.lock must let the upgrade proceed, got $rc" }
+          # A running server holds a mandatory byte-range lock over the whole file
+          # (LockFileManager: RandomAccessFile "rw" plus tryLock) and opens it shared, so the
+          # open succeeds by design and only the Lock call raises IOException - the exception
+          # PowerShell hands to the catch wrapped in a MethodInvocationException.
+          Set-Content -Path guard-holder.ps1 -Value @(
+            '$fs = [System.IO.File]::Open($env:GUARD_PROBE_LOCK, ''Open'', ''ReadWrite'', ''ReadWrite'')',
+            '$fs.Lock(0, [Int64]::MaxValue)',
+            'New-Item -ItemType File -Force -Path "$env:GUARD_PROBE_LOCK.held" | Out-Null',
+            'Start-Sleep -Seconds 300'
+          )
+          $env:GUARD_PROBE_LOCK = $lock
+          Remove-Item "$lock.held" -Force -ErrorAction SilentlyContinue
+          $holder = Start-Process pwsh -PassThru -ArgumentList '-NoProfile', '-File', 'guard-holder.ps1' -WorkingDirectory $PWD
+          for ($i = 0; $i -lt 30 -and -not (Test-Path "$lock.held"); $i++) { Start-Sleep -Seconds 1 }
+          if (-not (Test-Path "$lock.held")) { throw "the holder process never took the lock" }
+          $started = Get-Date
+          $rc = Invoke-Guard
+          $elapsed = [int]((Get-Date) - $started).TotalSeconds
+          Stop-Process -Id $holder.Id -Force -ErrorAction SilentlyContinue
+          if ($rc -ne 1) { throw "a held server.lock must refuse the upgrade (exit 1), got $rc after ${elapsed}s" }
+          # Refusing before the grace is up would mean the loop exited for some other reason.
+          if ($elapsed -lt 55) { throw "the refusal came after ${elapsed}s, so the 60 s grace was not polled through" }
+          Write-Host "CheckServerNotRunning: 0 with no lock file, 0 unlocked, 1 while held (after ${elapsed}s)"
+          Remove-Item -Recurse -Force $probeRoot, guard-probe.cmd, guard-holder.ps1 -ErrorAction SilentlyContinue
+      - name: Install MSI (silent)
+        shell: pwsh
+        run: |
+          $msi = (Get-ChildItem -Recurse -Filter *.msi -Path opendj-packages/opendj-msi | Select-Object -First 1).FullName
+          if (-not $msi) { throw "MSI not found in the windows-latest-11 artifact" }
+          Write-Host "MSI: $msi"
+          # No OPENDJ property: exercise the x64 default C:\Program Files\OpenDJ (a path with
+          # spaces, which the server scripts must handle).
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i `"$msi`" /quiet /qn /norestart /l*v install.log"
+          if ($p.ExitCode -ne 0) { Get-Content install.log -Tail 80; throw "msiexec /i failed: $($p.ExitCode)" }
+          $root = "C:\Program Files\OpenDJ"
+          if (-not (Test-Path "$root\setup.bat")) { Get-Content install.log -Tail 80; throw "OpenDJ not installed into the x64 default $root" }
+          Write-Host "Installed to $root"
+          # The package lays the files down and registers no service: enabling one stays
+          # the administrator's explicit step (windows-service.bat / setup), exactly as
+          # for the zip distribution, so start-ds.bat keeps starting the server directly.
+          if (Get-Service OpenDJ -ErrorAction SilentlyContinue) { throw "the package must not register a service of its own" }
+          if (Get-Service "OpenDJ Server" -ErrorAction SilentlyContinue) { throw "the package must not register a service of its own" }
+          # The SCM wrapper is harvested with the rest of lib; windows-service.bat needs it.
+          if (-not (Test-Path "$root\lib\opendj_service.exe")) { throw "lib\opendj_service.exe missing from the MSI install" }
+          # Custom extension jars go into lib\extensions; the server warns on startup
+          # (WARN_ADMIN_NO_EXTENSIONS_DIR) when it is missing.
+          if (-not (Test-Path "$root\lib\extensions")) { throw "lib\extensions missing from the MSI install" }
+          "OPENDJ_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Setup, then start and stop the server without a service
+        shell: pwsh
+        run: |
+          # An MSI install that was never asked for service mode must behave exactly like
+          # a zip one: start-ds.bat starts the server in this very session rather than
+          # dispatching to the SCM, and needs no elevation to do it.
+          $root = $env:OPENDJ_ROOT
+          $env:OPENDJ_JAVA_ARGS = "-server -Xmx512m"
+          & "$root\setup.bat" -h localhost -p 1389 --ldapsPort 1636 --adminConnectorPort 4444 --enableStartTLS --generateSelfSignedCertificate --rootUserDN "cn=Directory Manager" --rootUserPassword password --baseDN dc=example,dc=com --addBaseEntry --cli --acceptLicense --no-prompt --doNotStart
+          if ($LASTEXITCODE -ne 0) { throw "setup.bat failed: $LASTEXITCODE" }
+          & "$root\bat\start-ds.bat"
+          if ($LASTEXITCODE -ne 0) { throw "start-ds.bat failed: $LASTEXITCODE" }
+          for ($i=0; $i -lt 12; $i++) { try { $c = New-Object System.Net.Sockets.TcpClient('localhost', 1636); $c.Close(); break } catch { Start-Sleep -Seconds 5 } }
+          & "$root\bat\ldapsearch.bat" --hostname localhost --port 1636 --bindDN "cn=Directory Manager" --bindPassword password --useSsl --trustAll --baseDN "dc=example,dc=com" --searchScope base "(objectClass=*)" 1.1
+          if ($LASTEXITCODE -ne 0) { throw "ldapsearch failed: $LASTEXITCODE" }
+          & "$root\bat\stop-ds.bat"
+          if ($LASTEXITCODE -ne 0) { throw "stop-ds.bat failed: $LASTEXITCODE" }
+          # A zero exit code from stop-ds does not mean the JVM let go of the lock (#768),
+          # and the next step registers and starts the service against this same instance.
+          . .github\scripts\wait-server-stopped.ps1
+          Wait-ServerStopped "$root\locks\server.lock"
+      - name: Enable, start, stop and disable the Windows service
+        shell: pwsh
+        run: |
+          # Service mode is opt-in and driven entirely by windows-service.bat, the same
+          # command the zip distribution uses. The service it registers takes the display
+          # name "OpenDJ Server" for the first instance on the host.
+          $root = $env:OPENDJ_ROOT
+          & "$root\bat\windows-service.bat" --enableService
+          if ($LASTEXITCODE -ne 0) { throw "--enableService failed: $LASTEXITCODE" }
+          if (-not (Get-Service -DisplayName "OpenDJ Server" -ErrorAction SilentlyContinue)) { sc.exe query; throw "--enableService did not register the service" }
+          net start "OpenDJ Server"
+          if ($LASTEXITCODE -ne 0) { throw "net start failed: $LASTEXITCODE" }
+          for ($i=0; $i -lt 12; $i++) { try { $c = New-Object System.Net.Sockets.TcpClient('localhost', 1636); $c.Close(); break } catch { Start-Sleep -Seconds 5 } }
+          & "$root\bat\ldapsearch.bat" --hostname localhost --port 1636 --bindDN "cn=Directory Manager" --bindPassword password --useSsl --trustAll --baseDN "dc=example,dc=com" --searchScope base "(objectClass=*)" 1.1
+          if ($LASTEXITCODE -ne 0) { throw "ldapsearch (as a service) failed: $LASTEXITCODE" }
+          net stop "OpenDJ Server"
+          if ($LASTEXITCODE -ne 0) { throw "net stop failed: $LASTEXITCODE" }
+          & "$root\bat\windows-service.bat" --disableService
+          if ($LASTEXITCODE -ne 0) { throw "--disableService failed: $LASTEXITCODE" }
+          if (Get-Service -DisplayName "OpenDJ Server" -ErrorAction SilentlyContinue) { throw "--disableService left the service registered" }
+      - name: uninstall.bat disables the service it finds and removes the instance
+        shell: pwsh
+        run: |
+          # Re-enable the service so the uninstaller exercises its disable path: nothing
+          # in the package owns the service, so removing it is the uninstaller's job.
+          $root = $env:OPENDJ_ROOT
+          & "$root\bat\windows-service.bat" --enableService
+          if ($LASTEXITCODE -ne 0) { throw "--enableService failed: $LASTEXITCODE" }
+          & "$root\uninstall.bat" --cli --remove-all --no-prompt --forceOnError --quiet
+          if ($LASTEXITCODE -ne 0) { throw "uninstall.bat failed: $LASTEXITCODE" }
+          if (Test-Path "$root\config\config.ldif") { throw "uninstall.bat did not remove the instance files" }
+          if (Get-Service -DisplayName "OpenDJ Server" -ErrorAction SilentlyContinue) { throw "uninstall.bat left the service registered" }
+          Write-Host "uninstall.bat removed the instance and disabled the service"
+          exit 0
+      - name: Uninstall MSI
+        shell: pwsh
+        run: |
+          $msi = (Get-ChildItem -Recurse -Filter *.msi -Path opendj-packages/opendj-msi | Select-Object -First 1).FullName
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/x `"$msi`" /quiet /qn /norestart /l*v uninstall.log"
+          if ($p.ExitCode -ne 0) { Get-Content uninstall.log -Tail 80; throw "msiexec /x failed: $($p.ExitCode)" }
+          if (Test-Path "$env:OPENDJ_ROOT\lib\opendj_service.exe") { throw "msiexec /x left the payload behind" }
+          Write-Host "Uninstalled OK"
+
+  # Upgrade path: released 5.1.2 x86 MSI (wine-built, WiX3) -> this build's x64 MSI.
+  # Verifies the new installer detects the legacy Program Files (x86) install, keeps the
+  # instance data in place, stops the running service for the file replacement and leaves
+  # its registration alone, and that the upgraded server starts with the old data.
+  test-msi-upgrade:
+    needs: wait-msi-artifact
+    runs-on: 'windows-latest'
+    permissions:
+      contents: read
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-latest-11
+      - name: Set up Java
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          java-version: '25'
+          distribution: 'zulu'
+      - name: Install released 5.1.2 MSI and configure an instance
+        shell: pwsh
+        run: |
+          $uri = "https://github.com/OpenIdentityPlatform/OpenDJ/releases/download/5.1.2/opendj-5.1.2.msi"
+          for ($i = 1; $i -le 5; $i++) {
+            try { Invoke-WebRequest -Uri $uri -OutFile opendj-5.1.2.msi; break }
+            catch { if ($i -eq 5) { throw }; Write-Host "download attempt $i failed, retrying"; Start-Sleep -Seconds (10 * $i) }
+          }
+          # 5.1.2 already contains the script-quoting fixes from #671 (the tag post-dates
+          # the merge), so install it into its own x86 default - spaces and parentheses
+          # included - to reproduce the real upgrade starting point.
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i opendj-5.1.2.msi /quiet /qn /norestart /l*v install-old.log"
+          if ($p.ExitCode -ne 0) { Get-Content install-old.log -Tail 80; throw "msiexec /i (5.1.2) failed: $($p.ExitCode)" }
+          $root = "C:\Program Files (x86)\OpenDJ"
+          if (-not (Test-Path "$root\setup.bat")) { Get-Content install-old.log -Tail 80; throw "5.1.2 install root not found at $root" }
+          $env:OPENDJ_JAVA_ARGS = "-server -Xmx512m"
+          & "$root\setup.bat" -h localhost -p 1389 --ldapsPort 1636 --adminConnectorPort 4444 --enableStartTLS --generateSelfSignedCertificate --rootUserDN "cn=Directory Manager" --rootUserPassword password --baseDN dc=example,dc=com --addBaseEntry --cli --acceptLicense --no-prompt --doNotStart
+          if ($LASTEXITCODE -ne 0) { throw "setup.bat (5.1.2) failed: $LASTEXITCODE" }
+          # Register the service the pre-MSI way, prove it works, and LEAVE IT RUNNING:
+          # the upgrade itself must stop it (StopServiceBeforeUpgrade runs elevated here)
+          # before CheckServiceStopped would otherwise refuse.
+          & "$root\bat\windows-service.bat" --enableService
+          if ($LASTEXITCODE -ne 0) { throw "windows-service --enableService failed: $LASTEXITCODE" }
+          net start "OpenDJ Server"
+          if ($LASTEXITCODE -ne 0) { throw "net start (5.1.2) failed: $LASTEXITCODE" }
+      - name: Upgrade with the newly built MSI (no OPENDJ - location auto-detected)
+        shell: pwsh
+        run: |
+          $msi = (Get-ChildItem -Recurse -Filter *.msi -Path opendj-packages/opendj-msi | Select-Object -First 1).FullName
+          if (-not $msi) { throw "MSI not found in the windows-latest-11 artifact" }
+          # The headline upgrade path: no OPENDJ property, the installer must find the
+          # legacy default directory on its own.
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i `"$msi`" /quiet /qn /norestart /l*v upgrade.log"
+          if ($p.ExitCode -ne 0) { Get-Content upgrade.log -Tail 120; throw "msiexec /i (upgrade) failed: $($p.ExitCode)" }
+          $root = "C:\Program Files (x86)\OpenDJ"
+          # New package files landed in the old directory, not the x64 default
+          if (-not (Test-Path "$root\setup.bat")) { throw "upgrade did not keep the old install dir" }
+          if (Test-Path "C:\Program Files\OpenDJ") { throw "upgrade unexpectedly installed into the x64 default dir" }
+          # Instance data survived
+          if (-not (Test-Path "$root\config\config.ldif")) { throw "instance data (config\config.ldif) lost by the upgrade" }
+          # The service registration is the administrator's, not the package's: the upgrade
+          # stopped it to free the jars, and must have left it registered and pointing at
+          # the same tree - the wrapper it names has just been replaced in place.
+          $svc = Get-Service -DisplayName "OpenDJ Server" -ErrorAction SilentlyContinue
+          if (-not $svc) { sc.exe query; throw "the upgrade unregistered the administrator's service" }
+          if ($svc.Status -ne "Stopped") { throw "the upgrade left the service $($svc.Status), expected Stopped" }
+          if (Get-Service OpenDJ -ErrorAction SilentlyContinue) { sc.exe query; throw "the package registered a service of its own" }
+          sc.exe qc "$($svc.Name)"
+          "OPENDJ_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Run upgrade.bat and start the upgraded server through the service
+        shell: pwsh
+        run: |
+          $root = $env:OPENDJ_ROOT
+          $env:OPENDJ_JAVA_ARGS = "-server -Xmx512m"
+          & "$root\upgrade.bat" --no-prompt --acceptLicense --force
+          if ($LASTEXITCODE -ne 0) { throw "upgrade.bat failed: $LASTEXITCODE" }
+          # The service registered before the upgrade still drives the refreshed tree.
+          net start "OpenDJ Server"
+          if ($LASTEXITCODE -ne 0) { throw "net start (upgraded) failed: $LASTEXITCODE" }
+          for ($i=0; $i -lt 12; $i++) { try { $c = New-Object System.Net.Sockets.TcpClient('localhost', 1636); $c.Close(); break } catch { Start-Sleep -Seconds 5 } }
+          # The pre-upgrade data must still be served
+          & "$root\bat\ldapsearch.bat" --hostname localhost --port 1636 --bindDN "cn=Directory Manager" --bindPassword password --useSsl --trustAll --baseDN "dc=example,dc=com" --searchScope base "(objectClass=*)" 1.1
+          if ($LASTEXITCODE -ne 0) { throw "ldapsearch after upgrade failed: $LASTEXITCODE" }
+          net stop "OpenDJ Server"
+          if ($LASTEXITCODE -ne 0) { throw "net stop (upgraded) failed: $LASTEXITCODE" }
+      - name: Repair must leave the service registration alone
+        shell: pwsh
+        run: |
+          # Nothing in the package controls a service, so a repair must not disturb the
+          # registration the administrator made - neither the one this upgrade inherited
+          # nor one belonging to an unrelated instance.
+          $msi = (Get-ChildItem -Recurse -Filter *.msi -Path opendj-packages/opendj-msi | Select-Object -First 1).FullName
+          $before = (Get-Service -DisplayName "OpenDJ Server").Name
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i `"$msi`" REINSTALL=ALL REINSTALLMODE=vomus /quiet /qn /norestart /l*v repair.log"
+          if ($p.ExitCode -ne 0) { Get-Content repair.log -Tail 80; throw "repair failed: $($p.ExitCode)" }
+          $after = Get-Service -DisplayName "OpenDJ Server" -ErrorAction SilentlyContinue
+          if (-not $after) { throw "repair unregistered the service" }
+          if ($after.Name -ne $before) { throw "repair changed the service key name: $before -> $($after.Name)" }
+          Write-Host "Repair left the '$before' service in place"
+      - name: Disabling the service before uninstalling leaves no orphan
+        shell: pwsh
+        run: |
+          # msiexec /x removes the files it installed and nothing else - as the WiX3-era
+          # package did. Disabling the service is the administrator's step (the install
+          # guide says so, and uninstall.bat does it too); skipping it would leave an
+          # auto-start service pointing at a deleted tree.
+          $root = $env:OPENDJ_ROOT
+          & "$root\bat\windows-service.bat" --disableService
+          if ($LASTEXITCODE -ne 0) { throw "--disableService failed: $LASTEXITCODE" }
+          if (Get-Service -DisplayName "OpenDJ Server" -ErrorAction SilentlyContinue) { throw "--disableService left the service registered" }
+      - name: Auto-detect the legacy default directory on a fresh install
+        shell: pwsh
+        run: |
+          $msi = (Get-ChildItem -Recurse -Filter *.msi -Path opendj-packages/opendj-msi | Select-Object -First 1).FullName
+          # Clean up the previous scenario first.
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/x `"$msi`" /quiet /qn /norestart /l*v uninstall1.log"
+          if ($p.ExitCode -ne 0) { Get-Content uninstall1.log -Tail 80; throw "msiexec /x failed: $($p.ExitCode)" }
+          # An existing legacy default directory must be picked up when OPENDJ is not given.
+          New-Item -ItemType Directory -Force "C:\Program Files (x86)\OpenDJ" | Out-Null
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i `"$msi`" /quiet /qn /norestart /l*v install-autodetect.log"
+          if ($p.ExitCode -ne 0) { Get-Content install-autodetect.log -Tail 80; throw "msiexec /i (autodetect) failed: $($p.ExitCode)" }
+          if (-not (Test-Path "C:\Program Files (x86)\OpenDJ\setup.bat")) { Get-Content install-autodetect.log -Tail 80; throw "installer did not auto-detect the legacy default dir" }
+          if (Test-Path "C:\Program Files\OpenDJ") { throw "installer used the x64 default dir despite an existing legacy dir" }
+          Write-Host "Legacy default directory auto-detected OK"
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/x `"$msi`" /quiet /qn /norestart /l*v uninstall2.log"
+          if ($p.ExitCode -ne 0) { Get-Content uninstall2.log -Tail 80; throw "msiexec /x (cleanup) failed: $($p.ExitCode)" }
+      - name: Registry install-location detection on a fresh install
+        shell: pwsh
+        run: |
+          # The InstallDir registry value must be picked up when OPENDJ is not given, and it
+          # must beat the legacy Program Files (x86) directory (explicit SetProperty order).
+          $msi = (Get-ChildItem -Recurse -Filter *.msi -Path opendj-packages/opendj-msi | Select-Object -First 1).FullName
+          New-Item -ItemType Directory -Force "C:\opendj-registry" | Out-Null
+          New-Item -ItemType Directory -Force "C:\Program Files (x86)\OpenDJ" | Out-Null
+          New-Item -Path HKLM:\SOFTWARE\OpenDJ -Force | Out-Null
+          Set-ItemProperty -Path HKLM:\SOFTWARE\OpenDJ -Name InstallDir -Value 'C:\opendj-registry\'
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i `"$msi`" /quiet /qn /norestart /l*v install-registry.log"
+          if ($p.ExitCode -ne 0) { Get-Content install-registry.log -Tail 80; throw "msiexec /i (registry detect) failed: $($p.ExitCode)" }
+          if (-not (Test-Path "C:\opendj-registry\setup.bat")) { Get-Content install-registry.log -Tail 80; throw "installer did not use the registry InstallDir" }
+          if (Test-Path "C:\Program Files (x86)\OpenDJ\setup.bat") { throw "legacy directory beat the registry InstallDir" }
+          Write-Host "Registry install location detected OK"
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/x `"$msi`" /quiet /qn /norestart /l*v uninstall3.log"
+          if ($p.ExitCode -ne 0) { Get-Content uninstall3.log -Tail 80; throw "msiexec /x (registry cleanup) failed: $($p.ExitCode)" }
+      - name: Silent upgrade from an undetectable directory must refuse with guidance
+        shell: pwsh
+        run: |
+          # A 5.1.x at a custom directory wrote no registry value: a /quiet upgrade
+          # without OPENDJ used to relocate to the default while RemoveExistingProducts
+          # emptied the old tree. The installer must refuse instead.
+          $msi = (Get-ChildItem -Recurse -Filter *.msi -Path opendj-packages/opendj-msi | Select-Object -First 1).FullName
+          # No detection signals at all - the guard under test is the one that fires when
+          # none resolves, so clear every one of them here rather than rely on the
+          # preceding step's uninstall having removed the registry value.
+          Remove-Item -Recurse -Force "C:\Program Files (x86)\OpenDJ" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\Program Files\OpenDJ" -ErrorAction SilentlyContinue
+          Remove-Item -Path HKLM:\SOFTWARE\OpenDJ -Recurse -Force -ErrorAction SilentlyContinue
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i opendj-5.1.2.msi /quiet /qn /norestart OPENDJ=C:\opendj-custom /l*v install-custom.log"
+          if ($p.ExitCode -ne 0) { Get-Content install-custom.log -Tail 80; throw "msiexec /i (5.1.2 custom dir) failed: $($p.ExitCode)" }
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i `"$msi`" /quiet /qn /norestart /l*v upgrade-custom.log"
+          if ($p.ExitCode -eq 0) { Get-Content upgrade-custom.log -Tail 80; throw "upgrade without OPENDJ must refuse when the old location cannot be determined" }
+          # Match on the part of the message that states the condition, not on the
+          # instruction: the wording of the guidance has already been reworded once.
+          if (-not (Select-String -Path upgrade-custom.log -Pattern "location could not be determined" -Quiet)) { Get-Content upgrade-custom.log -Tail 60; throw "expected the explicit-OPENDJ guidance message in the log" }
+          if (-not (Test-Path "C:\opendj-custom\setup.bat")) { throw "the refused upgrade damaged the original install" }
+          Write-Host "Upgrade refused with guidance, original install untouched (exit $($p.ExitCode))"
+          # A named directory that is not the installation strands exactly as much data as
+          # naming none. With no registry value and no server in the legacy default, a typo
+          # used to satisfy this guard - the resolved directory is not the default - and the
+          # relocation guard had nothing to compare it against, so RemoveExistingProducts
+          # emptied C:\opendj-custom while the new tree landed one letter away.
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i `"$msi`" OPENDJ=C:\opendj-custmo /quiet /qn /norestart /l*v upgrade-typo.log"
+          if ($p.ExitCode -ne 1603) { Get-Content upgrade-typo.log -Tail 120; throw "a named directory holding no server must be refused (expected 1603, got $($p.ExitCode))" }
+          if (-not (Select-String -Path upgrade-typo.log -Pattern "location could not be determined" -Quiet)) { Get-Content upgrade-typo.log -Tail 60; throw "expected the explicit-OPENDJ guidance message in the log" }
+          if (Test-Path "C:\opendj-custmo") { throw "the refused upgrade still created the mistyped directory" }
+          if (-not (Test-Path "C:\opendj-custom\setup.bat")) { throw "the refused upgrade damaged the original install" }
+          Write-Host "A mistyped target was refused, original install untouched (exit $($p.ExitCode))"
+          # ...and naming the directory makes the very same upgrade proceed. This is what
+          # a GUI administrator does by browsing to it in InstallDirDlg, which the refusal
+          # must leave reachable: it fires on the resolved directory, not on the absence
+          # of a command-line property.
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i `"$msi`" OPENDJ=C:\opendj-custom /quiet /qn /norestart /l*v upgrade-custom-ok.log"
+          if ($p.ExitCode -ne 0) { Get-Content upgrade-custom-ok.log -Tail 120; throw "upgrade with an explicit OPENDJ must succeed: $($p.ExitCode)" }
+          if (-not (Test-Path "C:\opendj-custom\lib\opendj_service.exe")) { throw "the upgrade did not land in C:\opendj-custom" }
+          if (Test-Path "C:\Program Files\OpenDJ") { throw "the upgrade installed into the default directory as well" }
+          Write-Host "Upgrade into the named directory succeeded"
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/x `"$msi`" /quiet /qn /norestart /l*v uninstall-custom.log"
+          if ($p.ExitCode -ne 0) { Get-Content uninstall-custom.log -Tail 80; throw "msiexec /x (custom cleanup) failed: $($p.ExitCode)" }
+          Remove-Item -Recurse -Force "C:\opendj-custom" -ErrorAction SilentlyContinue
+          Remove-Item -Path HKLM:\SOFTWARE\OpenDJ -Recurse -Force -ErrorAction SilentlyContinue
+      - name: An empty legacy directory must not be adopted during an upgrade
+        shell: pwsh
+        run: |
+          # NOT Installed holds during a major upgrade too, so the legacy-directory
+          # fallback used to fire on a leftover EMPTY Program Files (x86)\OpenDJ: the new
+          # tree would land there while RemoveExistingProducts emptied the real install
+          # somewhere else. During an upgrade the directory must prove it holds a server.
+          $msi = (Get-ChildItem -Recurse -Filter *.msi -Path opendj-packages/opendj-msi | Select-Object -First 1).FullName
+          Remove-Item -Recurse -Force "C:\Program Files (x86)\OpenDJ" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\Program Files\OpenDJ" -ErrorAction SilentlyContinue
+          Remove-Item -Path HKLM:\SOFTWARE\OpenDJ -Recurse -Force -ErrorAction SilentlyContinue
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i opendj-5.1.2.msi /quiet /qn /norestart OPENDJ=C:\opendj-old /l*v install-old-custom.log"
+          if ($p.ExitCode -ne 0) { Get-Content install-old-custom.log -Tail 80; throw "msiexec /i (5.1.2 at C:\opendj-old) failed: $($p.ExitCode)" }
+          New-Item -ItemType Directory -Force "C:\Program Files (x86)\OpenDJ" | Out-Null
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i `"$msi`" /quiet /qn /norestart /l*v upgrade-emptylegacy.log"
+          if ($p.ExitCode -eq 0) { Get-Content upgrade-emptylegacy.log -Tail 120; throw "an upgrade with no determinable location must be refused, not routed to an empty legacy directory" }
+          # A non-zero exit code on its own only says msiexec failed; both neighbouring
+          # scenarios name the guard they are about, and so must this one.
+          if (-not (Select-String -Path upgrade-emptylegacy.log -Pattern "location could not be determined" -Quiet)) { Get-Content upgrade-emptylegacy.log -Tail 60; throw "expected the explicit-OPENDJ guidance message in the log" }
+          if (Test-Path "C:\Program Files (x86)\OpenDJ\setup.bat") { throw "the upgrade installed into the empty legacy directory" }
+          if (-not (Test-Path "C:\opendj-old\setup.bat")) { throw "the refused upgrade damaged the original install" }
+          Write-Host "Empty legacy directory not adopted, upgrade refused (exit $($p.ExitCode))"
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/x opendj-5.1.2.msi /quiet /qn /norestart /l*v uninstall-old-custom.log"
+          if ($p.ExitCode -ne 0) { Get-Content uninstall-old-custom.log -Tail 80; throw "msiexec /x (5.1.2 cleanup) failed: $($p.ExitCode)" }
+          Remove-Item -Recurse -Force "C:\opendj-old" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\Program Files (x86)\OpenDJ" -ErrorAction SilentlyContinue
+      - name: An upgrade that would relocate the installation must refuse
+        shell: pwsh
+        run: |
+          # Passing a different OPENDJ over a detected installation is not a move:
+          # RemoveExistingProducts would empty the old tree while the new one is installed
+          # elsewhere, stranding config/db/logs (and any service registration) behind.
+          #
+          # The older package has to be a different ProductCode for this to be an upgrade
+          # at all: reinstalling this very MSI over itself is maintenance mode, where
+          # FindRelatedProducts does not run, so WIX_UPGRADE_DETECTED would never be set
+          # and the guard could not fire. Hence the released 5.1.2 package, installed at
+          # its native legacy default so both branches of the guard have something to
+          # compare against.
+          $msi = (Get-ChildItem -Recurse -Filter *.msi -Path opendj-packages/opendj-msi | Select-Object -First 1).FullName
+          # Clear every location this scenario reasons about itself, rather than inheriting
+          # the previous step's teardown: the starting state is what the guard is judged
+          # against, so it belongs in the step that makes the judgement.
+          Remove-Item -Path HKLM:\SOFTWARE\OpenDJ -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\Program Files\OpenDJ" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\Program Files (x86)\OpenDJ" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\opendj-b" -ErrorAction SilentlyContinue
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i opendj-5.1.2.msi /quiet /qn /norestart /l*v install-old-legacy.log"
+          if ($p.ExitCode -ne 0) { Get-Content install-old-legacy.log -Tail 80; throw "msiexec /i (5.1.2) failed: $($p.ExitCode)" }
+          if (-not (Test-Path "C:\Program Files (x86)\OpenDJ\setup.bat")) { throw "5.1.2 did not install into the legacy default" }
+          # (a) the recorded-location branch: a host that came through a 5.2.0-or-later
+          # package has its install directory in the registry.
+          New-Item -Path HKLM:\SOFTWARE\OpenDJ -Force | Out-Null
+          Set-ItemProperty -Path HKLM:\SOFTWARE\OpenDJ -Name InstallDir -Value 'C:\Program Files (x86)\OpenDJ\'
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i `"$msi`" OPENDJ=C:\opendj-b /quiet /qn /norestart /l*v relocate-reg.log"
+          if ($p.ExitCode -eq 0) { Get-Content relocate-reg.log -Tail 120; throw "a relocating upgrade must be refused (recorded location)" }
+          if (-not (Select-String -Path relocate-reg.log -Pattern "cannot move an existing installation" -Quiet)) { Get-Content relocate-reg.log -Tail 60; throw "expected the relocation guidance message in the log" }
+          if (Test-Path "C:\opendj-b") { throw "the refused relocation still created C:\opendj-b" }
+          # (b) the legacy-directory branch: no registry value, the old install proven by
+          # the setup.bat in the legacy default.
+          Remove-Item -Path HKLM:\SOFTWARE\OpenDJ -Recurse -Force -ErrorAction SilentlyContinue
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i `"$msi`" OPENDJ=C:\opendj-b /quiet /qn /norestart /l*v relocate-legacy.log"
+          if ($p.ExitCode -eq 0) { Get-Content relocate-legacy.log -Tail 120; throw "a relocating upgrade must be refused (legacy directory)" }
+          if (-not (Select-String -Path relocate-legacy.log -Pattern "cannot move an existing installation" -Quiet)) { Get-Content relocate-legacy.log -Tail 60; throw "expected the relocation guidance message in the log" }
+          if (Test-Path "C:\opendj-b") { throw "the refused relocation still created C:\opendj-b" }
+          if (-not (Test-Path "C:\Program Files (x86)\OpenDJ\setup.bat")) { throw "the refused relocation damaged the original install" }
+          Write-Host "Relocating upgrade refused on both branches, original install untouched"
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/x opendj-5.1.2.msi /quiet /qn /norestart /l*v uninstall-old-legacy.log"
+          if ($p.ExitCode -ne 0) { Get-Content uninstall-old-legacy.log -Tail 80; throw "msiexec /x (5.1.2 cleanup) failed: $($p.ExitCode)" }
+          Remove-Item -Recurse -Force "C:\Program Files (x86)\OpenDJ" -ErrorAction SilentlyContinue
+          Remove-Item -Path HKLM:\SOFTWARE\OpenDJ -Recurse -Force -ErrorAction SilentlyContinue
+      - name: A stray OpenDJ tree in the default directory must not be adopted
+        shell: pwsh
+        run: |
+          # The product being upgraded is a 5.1.x in a custom directory, which recorded
+          # nothing, while some unrelated OpenDJ tree - a zip install, a copy - sits in the
+          # x64 default. A setup.bat existence test cannot tell the two apart, so a guard
+          # keyed on it stood down: RemoveExistingProducts gutted the real installation
+          # while InstallFiles landed on the stranger, and msiexec exited 0.
+          $msi = (Get-ChildItem -Recurse -Filter *.msi -Path opendj-packages/opendj-msi | Select-Object -First 1).FullName
+          Remove-Item -Path HKLM:\SOFTWARE\OpenDJ -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\Program Files (x86)\OpenDJ" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\Program Files\OpenDJ" -ErrorAction SilentlyContinue
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i opendj-5.1.2.msi /quiet /qn /norestart OPENDJ=C:\opendj-real /l*v install-old-real.log"
+          if ($p.ExitCode -ne 0) { Get-Content install-old-real.log -Tail 80; throw "msiexec /i (5.1.2 at C:\opendj-real) failed: $($p.ExitCode)" }
+          # The decoy: everything the installer is able to ask about a directory.
+          New-Item -ItemType Directory -Force "C:\Program Files\OpenDJ\lib" | Out-Null
+          Set-Content "C:\Program Files\OpenDJ\setup.bat" '@echo off'
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i `"$msi`" /quiet /qn /norestart /l*v upgrade-decoy.log"
+          if ($p.ExitCode -eq 0) { Get-Content upgrade-decoy.log -Tail 120; throw "an upgrade must not adopt a stray tree in the default directory" }
+          if (-not (Select-String -Path upgrade-decoy.log -Pattern "location could not be determined" -Quiet)) { Get-Content upgrade-decoy.log -Tail 60; throw "expected the explicit-OPENDJ guidance message in the log" }
+          if (Test-Path "C:\Program Files\OpenDJ\lib\opendj_service.exe") { throw "the refused upgrade installed into the stray tree" }
+          if (-not (Test-Path "C:\opendj-real\setup.bat")) { throw "the refused upgrade damaged the original install" }
+          # ...and naming the real directory gets the administrator through, decoy or not.
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i `"$msi`" OPENDJ=C:\opendj-real /quiet /qn /norestart /l*v upgrade-decoy-ok.log"
+          if ($p.ExitCode -ne 0) { Get-Content upgrade-decoy-ok.log -Tail 120; throw "upgrade with an explicit OPENDJ must succeed: $($p.ExitCode)" }
+          if (-not (Test-Path "C:\opendj-real\lib\opendj_service.exe")) { throw "the upgrade did not land in C:\opendj-real" }
+          if (Test-Path "C:\Program Files\OpenDJ\lib\opendj_service.exe") { throw "the upgrade also installed into the stray tree" }
+          Write-Host "Stray default-directory tree ignored: refused, then upgraded where told"
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/x `"$msi`" /quiet /qn /norestart /l*v uninstall-real.log"
+          if ($p.ExitCode -ne 0) { Get-Content uninstall-real.log -Tail 80; throw "msiexec /x (decoy cleanup) failed: $($p.ExitCode)" }
+          Remove-Item -Recurse -Force "C:\opendj-real" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\Program Files\OpenDJ" -ErrorAction SilentlyContinue
+          Remove-Item -Path HKLM:\SOFTWARE\OpenDJ -Recurse -Force -ErrorAction SilentlyContinue
+      - name: An old server in the default directory upgrades once it is named
+        shell: pwsh
+        run: |
+          # The price of the scenario above: a 5.1.x that really does live in the x64
+          # default recorded nothing either, so the package cannot tell it from the decoy
+          # and refuses the silent upgrade that would have gone through before. What it
+          # must not do is dead-end - the directory is a configurable property, and naming
+          # it (which is also what browsing to it in the wizard amounts to) has to work.
+          #
+          # The old tree gets there by hand rather than through OPENDJ=: the released
+          # 5.1.x package is x86, and a 32-bit package cannot install into the 64-bit
+          # Program Files at all - Windows Installer resolves its [ProgramFilesFolder] to
+          # Program Files (x86) whatever the directory property says, so msiexec exits 0
+          # while the files land in the legacy default, which is a different scenario (one
+          # the legacy-directory search resolves on its own). Installing into a custom
+          # directory and moving the tree leaves exactly what this one needs: an
+          # upgradable 5.1.x registration, no recorded location, no legacy directory, and
+          # a real old server sitting in C:\Program Files\OpenDJ. That the registration is
+          # left pointing at the directory the move emptied costs nothing - no guard reads
+          # it, and RemoveExistingProducts tolerates the files being gone.
+          $msi = (Get-ChildItem -Recurse -Filter *.msi -Path opendj-packages/opendj-msi | Select-Object -First 1).FullName
+          Remove-Item -Path HKLM:\SOFTWARE\OpenDJ -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\Program Files (x86)\OpenDJ" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\Program Files\OpenDJ" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\opendj-x64src" -ErrorAction SilentlyContinue
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i opendj-5.1.2.msi /quiet /qn /norestart OPENDJ=C:\opendj-x64src /l*v install-old-x64.log"
+          if ($p.ExitCode -ne 0) { Get-Content install-old-x64.log -Tail 80; throw "msiexec /i (5.1.2 at C:\opendj-x64src) failed: $($p.ExitCode)" }
+          # Exit code 0 says msiexec ran, not that it put the files where it was told, and
+          # a directory it silently declined to use is worth naming in the failure.
+          if (-not (Test-Path "C:\opendj-x64src\setup.bat")) { Get-ChildItem "C:\Program Files\OpenDJ","C:\Program Files (x86)\OpenDJ" -ErrorAction SilentlyContinue | Select-Object -First 5 -ExpandProperty FullName; Get-Content install-old-x64.log -Tail 80; throw "5.1.2 did not install into C:\opendj-x64src" }
+          Move-Item "C:\opendj-x64src" "C:\Program Files\OpenDJ"
+          if (-not (Test-Path "C:\Program Files\OpenDJ\setup.bat")) { throw "the 5.1.2 tree did not move into C:\Program Files\OpenDJ" }
+          # 5.1.x ships lib\opendj_service.exe itself, so the file cannot say whose tree
+          # this is; its content can. Both halves below are judged on the two things only
+          # the new package produces: this payload, and the InstallDir registry value.
+          $oldWrapper = (Get-FileHash "C:\Program Files\OpenDJ\lib\opendj_service.exe").Hash
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i `"$msi`" /quiet /qn /norestart /l*v upgrade-x64-silent.log"
+          if ($p.ExitCode -eq 0) { Get-Content upgrade-x64-silent.log -Tail 120; throw "a silent upgrade with nothing recording the location must refuse" }
+          if (-not (Select-String -Path upgrade-x64-silent.log -Pattern "location could not be determined" -Quiet)) { Get-Content upgrade-x64-silent.log -Tail 60; throw "expected the explicit-OPENDJ guidance message in the log" }
+          if (Test-Path HKLM:\SOFTWARE\OpenDJ) { throw "the refused upgrade registered an install location" }
+          if ((Get-FileHash "C:\Program Files\OpenDJ\lib\opendj_service.exe").Hash -ne $oldWrapper) { throw "the refused upgrade overwrote the old server" }
+          # The signal that says "this directory was named" has to be public - a private
+          # property set in the UI sequence never reaches the installer service, where the
+          # guards run - so it must not be usable as a switch. It holds the named path and
+          # the guard requires the resolved directory to START WITH it: a flag-shaped value
+          # disarms nothing, and a value that does pass has spelled out the directory, which
+          # is naming it. It is not the only conjunct either - the target still has to hold a
+          # server - so even a matching prefix cannot stand in for that evidence.
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i `"$msi`" OPENDJ_GIVEN=1 /quiet /qn /norestart /l*v upgrade-x64-switch.log"
+          if ($p.ExitCode -ne 1603) { Get-Content upgrade-x64-switch.log -Tail 120; throw "OPENDJ_GIVEN=1 must not switch the guard off (expected 1603, got $($p.ExitCode))" }
+          if (-not (Select-String -Path upgrade-x64-switch.log -Pattern "location could not be determined" -Quiet)) { Get-Content upgrade-x64-switch.log -Tail 60; throw "the refusal must still come from the same guard" }
+          if ((Get-FileHash "C:\Program Files\OpenDJ\lib\opendj_service.exe").Hash -ne $oldWrapper) { throw "the upgrade that OPENDJ_GIVEN=1 let through overwrote the old server" }
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i `"$msi`" OPENDJ=`"C:\Program Files\OpenDJ`" /quiet /qn /norestart /l*v upgrade-x64-named.log"
+          if ($p.ExitCode -ne 0) { Get-Content upgrade-x64-named.log -Tail 120; throw "the named upgrade into the default directory must succeed: $($p.ExitCode)" }
+          if ((Get-FileHash "C:\Program Files\OpenDJ\lib\opendj_service.exe").Hash -eq $oldWrapper) { Get-Content upgrade-x64-named.log -Tail 120; throw "the upgrade did not land in C:\Program Files\OpenDJ" }
+          # The only OPENDJ in this workflow whose value carries spaces: what the package
+          # recorded proves it survived the command line and the elevation intact.
+          $recorded = (Get-ItemProperty -Path HKLM:\SOFTWARE\OpenDJ -Name InstallDir -ErrorAction SilentlyContinue).InstallDir
+          if ($recorded -notlike "C:\Program Files\OpenDJ*") { throw "the upgrade recorded '$recorded', not the directory it was told to use" }
+          Write-Host "Default-directory upgrade refused silently, accepted when named"
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/x `"$msi`" /quiet /qn /norestart /l*v uninstall-x64.log"
+          if ($p.ExitCode -ne 0) { Get-Content uninstall-x64.log -Tail 80; throw "msiexec /x (x64 default cleanup) failed: $($p.ExitCode)" }
+          Remove-Item -Recurse -Force "C:\Program Files\OpenDJ" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\opendj-x64src" -ErrorAction SilentlyContinue
+          Remove-Item -Path HKLM:\SOFTWARE\OpenDJ -Recurse -Force -ErrorAction SilentlyContinue
+      - name: Fresh install must not touch a service registered by another instance
+        shell: pwsh
+        run: |
+          # A leftover Program Files (x86)\OpenDJ plus an "OpenDJ Server" belonging to a
+          # zip instance elsewhere: installing to a third directory must leave that
+          # registration completely alone. The package controls no service at all, so this
+          # holds by construction - the scenario guards against reintroducing one.
+          $msi = (Get-ChildItem -Recurse -Filter *.msi -Path opendj-packages/opendj-msi | Select-Object -First 1).FullName
+          Remove-Item -Path HKLM:\SOFTWARE\OpenDJ -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force "C:\Program Files (x86)\OpenDJ" | Out-Null
+          sc.exe create "OpenDJ Server" binPath= "C:\zip-instance\lib\opendj_service.exe start ""C:\zip-instance.""" start= demand
+          if ($LASTEXITCODE -ne 0) { throw "sc create failed: $LASTEXITCODE" }
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i `"$msi`" OPENDJ=C:\opendj-elsewhere /quiet /qn /norestart /l*v install-elsewhere.log"
+          if ($p.ExitCode -ne 0) { Get-Content install-elsewhere.log -Tail 80; throw "msiexec /i (elsewhere) failed: $($p.ExitCode)" }
+          if (-not (Test-Path "C:\opendj-elsewhere\setup.bat")) { throw "install did not land in C:\opendj-elsewhere" }
+          if (-not (Get-Service "OpenDJ Server" -ErrorAction SilentlyContinue)) { throw "fresh install elsewhere deleted an unrelated instance's service" }
+          sc.exe delete "OpenDJ Server"
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/x `"$msi`" /quiet /qn /norestart /l*v uninstall-elsewhere.log"
+          if ($p.ExitCode -ne 0) { Get-Content uninstall-elsewhere.log -Tail 80; throw "msiexec /x (elsewhere cleanup) failed: $($p.ExitCode)" }
+          Write-Host "Fresh install elsewhere left the unrelated 'OpenDJ Server' service in place"
+      - name: An upgrade must refuse while the service is still starting
+        shell: pwsh
+        run: |
+          # The SCM takes no controls in a pending state: StopServiceBeforeUpgrade's
+          # 'net stop' fails instantly with ERROR_SERVICE_CANNOT_ACCEPT_CTRL and
+          # Return="ignore" eats it. StartPending is not 'Running', so a check that
+          # sampled the state once waved the upgrade through with a JVM coming up on the
+          # tree being replaced - and the jars are unversioned, so the delete-on-reboot
+          # entries left behind by the nested uninstall name the paths the NEW jars
+          # occupy. Reproducible because the wrapper reports START_PENDING for as long as
+          # bat\start-ds.bat runs, which service.c gives 300 s.
+          $msi = (Get-ChildItem -Recurse -Filter *.msi -Path opendj-packages/opendj-msi | Select-Object -First 1).FullName
+          Remove-Item -Path HKLM:\SOFTWARE\OpenDJ -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\Program Files (x86)\OpenDJ" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\Program Files\OpenDJ" -ErrorAction SilentlyContinue
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i opendj-5.1.2.msi /quiet /qn /norestart /l*v install-old-pending.log"
+          if ($p.ExitCode -ne 0) { Get-Content install-old-pending.log -Tail 80; throw "msiexec /i (5.1.2) failed: $($p.ExitCode)" }
+          $root = "C:\Program Files (x86)\OpenDJ"
+          $env:OPENDJ_JAVA_ARGS = "-server -Xmx512m"
+          & "$root\setup.bat" -h localhost -p 1389 --ldapsPort 1636 --adminConnectorPort 4444 --enableStartTLS --generateSelfSignedCertificate --rootUserDN "cn=Directory Manager" --rootUserPassword password --baseDN dc=example,dc=com --addBaseEntry --cli --acceptLicense --no-prompt --doNotStart
+          if ($LASTEXITCODE -ne 0) { throw "setup.bat (5.1.2) failed: $LASTEXITCODE" }
+          & "$root\bat\windows-service.bat" --enableService
+          if ($LASTEXITCODE -ne 0) { throw "windows-service --enableService failed: $LASTEXITCODE" }
+          # Hold the start open: the wrapper waits for this script, reporting START_PENDING
+          # the whole time. No JVM is needed - the guard is being asked about a service
+          # state, not about a lock.
+          Copy-Item "$root\bat\start-ds.bat" "$root\bat\start-ds.bat.orig"
+          Set-Content "$root\bat\start-ds.bat" "@echo off`r`nping -n 240 127.0.0.1 >nul"
+          sc.exe start "OpenDJ Server" | Out-Null
+          for ($i = 0; $i -lt 15; $i++) {
+            $st = (Get-Service "OpenDJ Server" -ErrorAction SilentlyContinue).Status
+            if ($st -eq 'StartPending') { break }
+            Start-Sleep -Seconds 1
+          }
+          $st = (Get-Service "OpenDJ Server" -ErrorAction SilentlyContinue).Status
+          if ($st -ne 'StartPending') { throw "expected the service to be StartPending, got '$st'" }
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i `"$msi`" /quiet /qn /norestart /l*v upgrade-pending.log"
+          # A refusal from a Return="check" custom action is 1722 in the log and 1603 out of
+          # msiexec, and nothing else. "-ne 0" would also accept 3010 - which is the FAIL-OPEN
+          # outcome, the upgrade going through and leaving the files it could not replace to a
+          # reboot - so the exact code is what gets asserted. Same reasoning for the log: the
+          # action NAME appears whether it ran and passed, ran and failed, or was skipped by
+          # its condition, so the return value has to be part of the pattern.
+          if ($p.ExitCode -ne 1603) { Get-Content upgrade-pending.log -Tail 120; throw "the upgrade must refuse while the service is starting (expected 1603, got $($p.ExitCode))" }
+          if (-not (Select-String -Path upgrade-pending.log -Pattern "CheckServiceStopped\. Return value 3" -Quiet)) { Get-Content upgrade-pending.log -Tail 60; throw "the refusal must come from CheckServiceStopped" }
+          if (-not (Test-Path "$root\config\config.ldif")) { throw "the refused upgrade damaged the instance" }
+          if (-not (Test-Path "$root\setup.bat")) { throw "the refused upgrade damaged the installation" }
+          Write-Host "Upgrade refused while the service was StartPending (exit $($p.ExitCode))"
+          # Teardown: the wrapper is still sitting on the held-open start.
+          Stop-Process -Name opendj_service -Force -ErrorAction SilentlyContinue
+          Get-Process -Name PING -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep -Seconds 5
+          Move-Item -Force "$root\bat\start-ds.bat.orig" "$root\bat\start-ds.bat"
+          & "$root\bat\windows-service.bat" --disableService
+          if (Get-Service "OpenDJ Server" -ErrorAction SilentlyContinue) { sc.exe delete "OpenDJ Server" }
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/x opendj-5.1.2.msi /quiet /qn /norestart /l*v uninstall-pending.log"
+          if ($p.ExitCode -ne 0) { Get-Content uninstall-pending.log -Tail 80; throw "msiexec /x (5.1.2 cleanup) failed: $($p.ExitCode)" }
+          Remove-Item -Recurse -Force "C:\Program Files (x86)\OpenDJ" -ErrorAction SilentlyContinue
+      - name: A decoy in the legacy default must not block the documented workaround
+        shell: pwsh
+        run: |
+          # The mirror of "a stray OpenDJ tree in the default directory must not be adopted",
+          # with the stray tree in the LEGACY default instead - where the install guide says
+          # to pass OPENDJ, and where the relocation guard used to refuse that very command:
+          # the legacy directory holds A server, the named directory is not it, refuse. The
+          # installation then had no upgrade path at all, silent or named.
+          # Both halves are asserted here, because the exception that fixes it is narrow: the
+          # named directory has to hold a server. Naming an empty one is still a relocation.
+          $msi = (Get-ChildItem -Recurse -Filter *.msi -Path opendj-packages/opendj-msi | Select-Object -First 1).FullName
+          Remove-Item -Path HKLM:\SOFTWARE\OpenDJ -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\Program Files (x86)\OpenDJ" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\Program Files\OpenDJ" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\opendj-b" -ErrorAction SilentlyContinue
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i opendj-5.1.2.msi /quiet /qn /norestart OPENDJ=C:\opendj-mine /l*v install-old-mine.log"
+          if ($p.ExitCode -ne 0) { Get-Content install-old-mine.log -Tail 80; throw "msiexec /i (5.1.2 at C:\opendj-mine) failed: $($p.ExitCode)" }
+          if (-not (Test-Path "C:\opendj-mine\setup.bat")) { Get-Content install-old-mine.log -Tail 80; throw "5.1.2 did not install into C:\opendj-mine" }
+          # The decoy: a zip installation, a copy, a decommissioned instance - anything a
+          # setup.bat search cannot tell from the product being upgraded.
+          New-Item -ItemType Directory -Force "C:\Program Files (x86)\OpenDJ\lib" | Out-Null
+          Set-Content "C:\Program Files (x86)\OpenDJ\setup.bat" '@echo off'
+          # Naming a directory that holds no server is still a relocation, decoy or not.
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i `"$msi`" OPENDJ=C:\opendj-b /quiet /qn /norestart /l*v relocate-decoy.log"
+          if ($p.ExitCode -eq 0) { Get-Content relocate-decoy.log -Tail 120; throw "naming an empty directory is a relocation and must be refused" }
+          if (-not (Select-String -Path relocate-decoy.log -Pattern "cannot move an existing installation" -Quiet)) { Get-Content relocate-decoy.log -Tail 60; throw "expected the relocation guidance message in the log" }
+          if (Test-Path "C:\opendj-b") { throw "the refused relocation still created C:\opendj-b" }
+          # ...and naming the real one is the workaround the install guide prescribes.
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i `"$msi`" OPENDJ=C:\opendj-mine /quiet /qn /norestart /l*v upgrade-mine.log"
+          if ($p.ExitCode -ne 0) { Get-Content upgrade-mine.log -Tail 120; throw "the documented workaround must upgrade the named installation: $($p.ExitCode)" }
+          if (-not (Test-Path "C:\opendj-mine\lib\opendj_service.exe")) { throw "the upgrade did not land in C:\opendj-mine" }
+          if (Test-Path "C:\Program Files (x86)\OpenDJ\lib\opendj_service.exe") { throw "the upgrade also installed into the decoy" }
+          Write-Host "Legacy-default decoy: empty target refused, named installation upgraded"
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/x `"$msi`" /quiet /qn /norestart /l*v uninstall-mine.log"
+          if ($p.ExitCode -ne 0) { Get-Content uninstall-mine.log -Tail 80; throw "msiexec /x (decoy cleanup) failed: $($p.ExitCode)" }
+          Remove-Item -Recurse -Force "C:\opendj-mine" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\Program Files (x86)\OpenDJ" -ErrorAction SilentlyContinue
+          Remove-Item -Path HKLM:\SOFTWARE\OpenDJ -Recurse -Force -ErrorAction SilentlyContinue
+      - name: An upgrade must refuse while a server runs without a service
+        shell: pwsh
+        run: |
+          # The mode this package ships by default: setup registers no service, so the
+          # server started by bat\start-ds.bat is a plain JVM holding lib\*.jar. There is no
+          # service key for the ImagePath-gated pair to match, and Restart Manager is not
+          # allowed to shut anything down, so CheckServerNotRunning - the byte-range lock on
+          # locks\server.lock - is the only thing standing between a running server and
+          # RemoveExistingProducts renaming its jars into delete-on-reboot entries.
+          $msi = (Get-ChildItem -Recurse -Filter *.msi -Path opendj-packages/opendj-msi | Select-Object -First 1).FullName
+          Remove-Item -Path HKLM:\SOFTWARE\OpenDJ -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\Program Files (x86)\OpenDJ" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\Program Files\OpenDJ" -ErrorAction SilentlyContinue
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i opendj-5.1.2.msi /quiet /qn /norestart /l*v install-old-running.log"
+          if ($p.ExitCode -ne 0) { Get-Content install-old-running.log -Tail 80; throw "msiexec /i (5.1.2) failed: $($p.ExitCode)" }
+          $root = "C:\Program Files (x86)\OpenDJ"
+          $env:OPENDJ_JAVA_ARGS = "-server -Xmx512m"
+          & "$root\setup.bat" -h localhost -p 1389 --ldapsPort 1636 --adminConnectorPort 4444 --enableStartTLS --generateSelfSignedCertificate --rootUserDN "cn=Directory Manager" --rootUserPassword password --baseDN dc=example,dc=com --addBaseEntry --cli --acceptLicense --no-prompt --doNotStart
+          if ($LASTEXITCODE -ne 0) { throw "setup.bat (5.1.2) failed: $LASTEXITCODE" }
+          & "$root\bat\start-ds.bat"
+          if ($LASTEXITCODE -ne 0) { throw "start-ds.bat failed: $LASTEXITCODE" }
+          for ($i=0; $i -lt 12; $i++) { try { $c = New-Object System.Net.Sockets.TcpClient('localhost', 1636); $c.Close(); break } catch { Start-Sleep -Seconds 5 } }
+          if (Get-Service "OpenDJ Server" -ErrorAction SilentlyContinue) { throw "this scenario is about a server with NO service registered" }
+          # The headline auto-detected upgrade, which would otherwise proceed straight into
+          # the running server's tree. The refusal costs the full 60 s grace inside the
+          # check: a server that is genuinely up never releases the lock.
+          $pendingKey = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager"
+          $pendingBefore = @((Get-ItemProperty -Path $pendingKey -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations)
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i `"$msi`" /quiet /qn /norestart /l*v upgrade-running.log"
+          # Exactly 1603 (custom action 1722), for the reason spelled out in the StartPending
+          # scenario above: 3010 is what a guard that fails open produces here, and "-ne 0"
+          # cannot tell the two apart. The action name alone cannot either - it is written to
+          # the log whether the action refused or waved the upgrade through.
+          if ($p.ExitCode -ne 1603) { Get-Content upgrade-running.log -Tail 120; throw "the upgrade must refuse while a server is running out of the tree (expected 1603, got $($p.ExitCode))" }
+          if (-not (Select-String -Path upgrade-running.log -Pattern "CheckServerNotRunning\. Return value 3" -Quiet)) { Get-Content upgrade-running.log -Tail 60; throw "the refusal must come from CheckServerNotRunning" }
+          # The signature of the fail-open, and the damage it does: RemoveExistingProducts
+          # cannot rename a jar the JVM holds, so it leaves a delete-on-reboot entry naming
+          # the path the new jar occupies. A refusal leaves none.
+          $pendingAfter = @((Get-ItemProperty -Path $pendingKey -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations)
+          $pendingNew = $pendingAfter | Where-Object { $_ -and $pendingBefore -notcontains $_ }
+          if ($pendingNew) { throw "the refused upgrade still scheduled files for delete-on-reboot: $($pendingNew -join '; ')" }
+          if (-not (Test-Path "$root\config\config.ldif")) { throw "the refused upgrade damaged the instance" }
+          & "$root\bat\ldapsearch.bat" --hostname localhost --port 1636 --bindDN "cn=Directory Manager" --bindPassword password --useSsl --trustAll --baseDN "dc=example,dc=com" --searchScope base "(objectClass=*)" 1.1
+          if ($LASTEXITCODE -ne 0) { throw "the refused upgrade disturbed the running server" }
+          Write-Host "Upgrade refused while a non-service server was running (exit $($p.ExitCode))"
+          # Stopping it makes the very same upgrade proceed - and the 60 s grace inside the
+          # check is what absorbs the gap between stop-ds returning and the JVM releasing
+          # the lock, so no wait is needed here to keep this half honest.
+          & "$root\bat\stop-ds.bat"
+          if ($LASTEXITCODE -ne 0) { throw "stop-ds.bat failed: $LASTEXITCODE" }
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i `"$msi`" /quiet /qn /norestart /l*v upgrade-stopped.log"
+          if ($p.ExitCode -ne 0) { Get-Content upgrade-stopped.log -Tail 120; throw "the upgrade must proceed once the server is stopped: $($p.ExitCode)" }
+          if (-not (Test-Path "$root\lib\opendj_service.exe")) { throw "the upgrade did not land in $root" }
+          if (-not (Test-Path "$root\config\config.ldif")) { throw "the upgrade lost the instance data" }
+          Write-Host "The same upgrade proceeded once the server was stopped"
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/x `"$msi`" /quiet /qn /norestart /l*v uninstall-running.log"
+          if ($p.ExitCode -ne 0) { Get-Content uninstall-running.log -Tail 80; throw "msiexec /x (running-server cleanup) failed: $($p.ExitCode)" }
+          Remove-Item -Recurse -Force "C:\Program Files (x86)\OpenDJ" -ErrorAction SilentlyContinue
+          Remove-Item -Path HKLM:\SOFTWARE\OpenDJ -Recurse -Force -ErrorAction SilentlyContinue

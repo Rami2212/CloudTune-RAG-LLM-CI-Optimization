@@ -1,0 +1,121 @@
+// Top-level build file where you can add configuration options common to all sub-projects/modules.
+buildscript {
+    ext.kotlin_version = '2.2.0'
+    ext.google_dagger = '2.57'
+
+    repositories {
+        maven {
+            url 'https://a8c-libs.s3.amazonaws.com/android'
+            content {
+                includeGroup "com.automattic.android"
+                includeGroup "com.automattic.android.publish-to-s3"
+            }
+        }
+        google()
+        mavenCentral()
+        maven { url 'https://maven.google.com' }
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.11.1'
+        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+        classpath "com.google.dagger:hilt-android-gradle-plugin:$google_dagger"
+        classpath 'com.automattic.android:configure:0.6.5'
+    }
+}
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+apply plugin: 'com.automattic.android.configure'
+
+def gitHash() {
+    try {
+        def code = new ByteArrayOutputStream()
+        exec {
+            commandLine 'git', 'rev-parse', '--verify', '--short', 'HEAD'
+            standardOutput = code
+        }
+        return code.toString().trim()
+    }
+    catch (ignored) {
+        return "<unknown>"
+    }
+}
+
+def gitDescribe(){
+    try {
+        def code = new ByteArrayOutputStream()
+        exec {
+            commandLine 'git', 'describe', '--always', '--dirty=-dirty'
+            standardOutput = code
+        }
+        return code.toString().trim()
+    }
+    catch (ignored) {
+        return "<unknown>"
+    }
+}
+
+def gitVersion() {
+    (gitDescribe() =~ /^v/).replaceFirst('')
+}
+
+ext {
+    sentryVersion = '5.8.0'
+
+    automatticTracksVersion = '6.0.4'
+    androidxLifecycleVersion = '2.9.2'
+
+    screengrabVersion = '2.1.1'
+}
+
+def uploadKeystore = new File(gradle.ext.decryptedSecretsDir, "upload.jks")
+def uploadCredentials = ["storePassword", "keyAlias", "keyPassword"]
+def uploadKeyAvailable = uploadKeystore.exists() &&
+        uploadCredentials.every { gradle.ext.secretProperties.containsKey(it) }
+def debugKeystore = new File(gradle.ext.decryptedSecretsDir, "debug.keystore")
+
+subprojects {
+    plugins.withId('com.android.application') {
+        android {
+            signingConfigs {
+                if (uploadKeyAvailable) {
+                    release {
+                        storeFile = uploadKeystore
+                        storePassword = gradle.ext.secretProperties.get("storePassword")
+                        keyAlias = gradle.ext.secretProperties.get("keyAlias")
+                        keyPassword = gradle.ext.secretProperties.get("keyPassword")
+                    }
+                }
+
+                if (debugKeystore.exists()) {
+                    debug {
+                        storeFile debugKeystore
+                    }
+                }
+            }
+
+            if (uploadKeyAvailable) {
+                buildTypes.release.signingConfig = signingConfigs.release
+            }
+        }
+    }
+}
+
+// Matches requested tasks, not the task graph: `lintRelease` and `testReleaseUnitTest` reach
+// `:Wear:packageRelease` through `wearApp`, and those must keep working without secrets.
+def requestsReleaseArtifact = gradle.startParameter.taskNames.any {
+    it.tokenize(":").last() ==~ /(assemble|bundle).*Release/
+}
+
+if (requestsReleaseArtifact && !uploadKeyAvailable) {
+    throw new GradleException(
+        "Release signing is not configured, so this build would not be signed. " +
+            "It needs ${uploadKeystore} and the ${uploadCredentials.join(", ")} entries in secrets.properties. " +
+            "Please run `bundle exec fastlane run configure_apply` to apply secrets."
+    )
+}

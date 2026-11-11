@@ -1,0 +1,77 @@
+name: Semantic Link Labs
+
+on: [push]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.10"
+
+      - name: Setup dotnet
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: | 
+            8.0.x
+
+      - name: Get Date
+        id: get-date
+        run: echo "today=$(/bin/date -u '+%Y%m%d')" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Cache conda
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        env:
+          # Increase this value to reset cache if environment.yml has not changed
+          CACHE_NUMBER: 0
+        with:
+          path: ~/conda_pkgs_dir
+          key:
+            ${{ runner.os }}-conda-${{ env.CACHE_NUMBER }}-${{ steps.get-date.outputs.today }}-${{ hashFiles('environment.yml') }}
+
+      - uses: conda-incubator/setup-miniconda@be893c923ea9cf1cf7cd510fbdde27c7e18cbdcb # v4.1.0
+        with:
+          auto-update-conda: true
+          activate-environment: fabric
+          python-version: "3.10"
+          environment-file: environment.yml
+          channel-priority: strict
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install package
+        shell: bash -el {0}
+        run: |
+          conda info
+          pip install -e .
+
+      # - name: Lint with flake8
+      #   shell: bash -el {0}
+      #   run: |
+      #     flake8 sempy_labs tests --count --show-source --statistics
+      #   continue-on-error: false
+
+      # - name: Lint with mypy
+      #   shell: bash -el {0}
+      #   run: |
+      #     mypy sempy_labs tests
+      #   continue-on-error: false
+
+      - name: Test with pytest
+        shell: bash -el {0}
+        run: |
+          pytest -s tests/

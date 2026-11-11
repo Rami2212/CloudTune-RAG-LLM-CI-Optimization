@@ -1,0 +1,40 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [MEDIUM] Add concurrency group to "tests.yml"
+# Estimated savings: ~2 min/run
+#
+name: Tests
+
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  integration-test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest] # , macos-latest, windows-latest
+        python-version: ["3.14"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install Home Assistant and integration
+        run: |
+          ./scripts/setup
+
+      - name: Run test suite
+        run: pytest -x --tb=short

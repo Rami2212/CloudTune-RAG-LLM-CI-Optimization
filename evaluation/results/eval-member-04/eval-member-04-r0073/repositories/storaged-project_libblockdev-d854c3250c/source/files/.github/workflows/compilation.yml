@@ -1,0 +1,37 @@
+name: Compilation with different compilers
+
+on:
+  pull_request:
+    branches:
+     - master
+
+jobs:
+  build:
+    name: compilation
+    runs-on: ubuntu-26.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: ['gcc-11', 'gcc-12', 'gcc-13', 'gcc-14', 'gcc-15', 'gcc-16',
+                   'clang-17', 'clang-18', 'clang-19', 'clang-20', 'clang-21', 'clang-22']
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Install build dependencies
+      run: |
+        sudo apt -y install ansible
+        ansible-playbook -b -i "localhost," -c local misc/install-test-dependencies.yml -e "test_dependencies=false"
+
+    - name: Install compiler
+      run: |
+        sudo apt -y install ${{ matrix.compiler }}
+
+    - name: Configure
+      run: |
+        ./autogen.sh && CC=${{ matrix.compiler }} ./configure
+
+    - name: Make
+      run: |
+        make

@@ -1,0 +1,152 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Corepack goes first so setup-node's yarn cache lookup runs the version
+      # pinned in package.json.
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: 'yarn'
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Lint
+        run: yarn lint
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [22, 24]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Corepack goes first so setup-node's yarn cache lookup runs the version
+      # pinned in package.json.
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'yarn'
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      # The typeCompat tsc compile is Node-version-independent; skip it on every
+      # non-primary matrix node so the full source type graph is compiled once,
+      # not three times. All other unit tests still run on every Node version.
+      - name: Run unit tests
+        env:
+          SKIP_TSC_TYPE_COMPAT: ${{ matrix.node-version != 22 && '1' || '' }}
+        run: yarn test
+
+      # The build (tsup --dts + webpack) recompiles the full type graph for
+      # declaration emit; that output is byte-identical across Node versions, so
+      # building on every matrix entry just recompiles the same type graph N times.
+      # Gate it to the primary Node version. Unit tests still run on all versions.
+      - name: Build
+        if: matrix.node-version == 22
+        run: yarn build
+
+  test-browser:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Corepack goes first so setup-node's yarn cache lookup runs the version
+      # pinned in package.json.
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: 'yarn'
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Build
+        run: yarn build
+
+      # Yarn 4 does not run dependency postinstall scripts, so puppeteer's own
+      # Chrome download never happens during install.
+      - name: Install Chrome for Puppeteer
+        run: yarn puppeteer browsers install chrome
+
+      - name: Run browser tests
+        run: yarn test:browser
+
+      - name: Install Playwright Chromium
+        run: yarn playwright install --with-deps chromium
+
+      # Replays the golden scenarios with real Chromium input and fails if a
+      # trace differs from its jsdom golden file. The github-actions reporter
+      # puts each failure in a check annotation.
+      - name: Browser cross-check of golden traces
+        run: yarn golden:browser --reporter=default --reporter=github-actions
+
+  coverage:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Corepack goes first so setup-node's yarn cache lookup runs the version
+      # pinned in package.json.
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: 'yarn'
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Run tests with coverage
+        run: yarn test:coverage
+
+  # NOTE: the standalone TypeScript checks (`tsc --noEmit` for source and
+  # `tsc -p typings` for the public .d.ts) are already run by `make lint` in the
+  # `lint` job above. Running them again here recompiled the full type graph a
+  # second time every CI run for no added coverage, so this job was removed and
+  # `lint` is the single owner of type-checking. Re-add a dedicated job only if
+  # `make lint` ever stops invoking tsc.

@@ -1,0 +1,33 @@
+name: Update submodules
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  update-submodules:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Darling
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Update submodules to their remote default branch
+      run: |
+        # libressl-* submodules are intentionally pinned to fixed historical
+        # tags (not moving branches), so they must not be auto-updated.
+        all=$(git config --file .gitmodules --get-regexp '\.path$' | awk '{print $2}')
+        pinned='src/external/libressl-2.2.9 src/external/libressl-2.5.5 src/external/libressl-2.6.5 src/external/libressl-2.8.3'
+        to_update=$(comm -23 <(echo "$all" | sort) <(echo "$pinned" | tr ' ' '\n' | sort))
+        git submodule update --remote --checkout $to_update
+
+    - name: Create pull request
+      uses: peter-evans/create-pull-request@v6
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        commit-message: "Update submodules to latest commits"
+        title: "Update submodules to latest commits"
+        body: "Automated update of all submodule references to the latest commit on each submodule's remote default branch."
+        branch: update-submodules
+        delete-branch: true

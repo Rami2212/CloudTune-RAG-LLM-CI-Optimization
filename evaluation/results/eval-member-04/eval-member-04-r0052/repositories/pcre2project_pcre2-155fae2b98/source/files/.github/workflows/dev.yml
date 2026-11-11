@@ -1,0 +1,814 @@
+name: Dev
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        type: choice
+        description: Specific job to run
+        default: all
+        required: true
+        options:
+        - all
+        - canary
+        - dragon
+        - puffin
+        - dodo
+        - passenger
+        - greatawk
+        - wasp
+        - bat
+        - pterodactyl
+        - bigbird
+        - camel
+        - chaffinch
+        - fruitbat
+        - ptarmigan
+        - coelacanth
+        - bison
+        - wisent
+        - zebrilus
+        - bee
+  push:
+    branches: [ main, "release/**" ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+env:
+  CFLAGS_GCC_STYLE: '-Wall -Wextra -pedantic -Wshadow -Wno-overlength-strings -Wimplicit-fallthrough'
+  CFLAGS_MSVC: '/W3'
+  CMAKE_FLAGS: '-Wdev -Werror=dev -Wdeprecated -Werror=deprecated --warn-uninitialized'
+
+jobs:
+
+  canary:
+    # Tests with: Debug & assertions; link-size=4; libedit
+    name: GCC -O0
+    runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_dispatch' || (inputs.job_id == 'all' || inputs.job_id == 'canary')
+    steps:
+      - name: Setup
+        run: |
+          echo "set man-db/auto-update false" | sudo debconf-communicate && sudo dpkg-reconfigure man-db
+          sudo apt-get -qq update
+          sudo apt-get -qq install -y libedit-dev
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      # Empty CMAKE_BUILD_TYPE to set -O0 explicitly
+      - name: Configure
+        run: cmake $CMAKE_FLAGS -DCMAKE_C_COMPILER=gcc -DCMAKE_C_FLAGS="-O0 $CFLAGS_GCC_STYLE -fsanitize=undefined,address -fsanitize-undefined-trap-on-error" -DCMAKE_BUILD_TYPE= -DCMAKE_COMPILE_WARNING_AS_ERROR=ON -DPCRE2_SUPPORT_JIT=ON -DPCRE2_BUILD_PCRE2_16=ON -DPCRE2_BUILD_PCRE2_32=ON -DPCRE2_DEBUG=ON -DPCRE2_SUPPORT_LIBEDIT=ON -DPCRE2_SUPPORT_LIBREADLINE=OFF -DPCRE2_SUPPORT_LIBZ=OFF -DPCRE2_SUPPORT_LIBBZ2=OFF -DPCRE2_LINK_SIZE=4 -DBUILD_SHARED_LIBS=ON -DBUILD_STATIC_LIBS=OFF -B build
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Test
+        run: |
+          cd build
+          rc=0
+          ctest -j$(nproc) --output-on-failure || rc=$?
+          cat ./Testing/Temporary/LastTest.log
+          exit $rc
+
+  dragon:
+    # Tests with: clang AB/UB; link-size=3. Clang's logo is a dragon.
+    name: Clang
+    runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_dispatch' || (inputs.job_id == 'all' || inputs.job_id == 'dragon')
+    strategy:
+      fail-fast: false
+      matrix:
+        opt: ["-O0", "-O2"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      # Empty CMAKE_BUILD_TYPE to set -O options explicitly
+      - name: Configure
+        run: cmake $CMAKE_FLAGS -DCMAKE_C_COMPILER=clang -DCMAKE_C_FLAGS="${{ matrix.opt }} $CFLAGS_GCC_STYLE -fsanitize=undefined,address,integer -fno-sanitize-recover=undefined,integer -fno-sanitize=unsigned-integer-overflow,unsigned-shift-base,function" -DCMAKE_BUILD_TYPE= -DCMAKE_COMPILE_WARNING_AS_ERROR=ON -DPCRE2_SUPPORT_JIT=ON -DPCRE2_BUILD_PCRE2_16=ON -DPCRE2_BUILD_PCRE2_32=ON -DPCRE2_DEBUG=ON -DPCRE2_SUPPORT_LIBREADLINE=OFF -DPCRE2_SUPPORT_LIBZ=OFF -DPCRE2_SUPPORT_LIBBZ2=OFF -DPCRE2_LINK_SIZE=3 -DBUILD_SHARED_LIBS=ON -DBUILD_STATIC_LIBS=OFF -B build
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Test
+        run: |
+          ulimit -S -s 49152 # Raise stack limit; ASAN with -O0 is very stack-hungry
+          cd build
+          rc=0
+          ctest -j$(nproc) --output-on-failure || rc=$?
+          cat ./Testing/Temporary/LastTest.log
+          exit $rc
+
+  puffin:
+    # Tests with: GCC, -O3, very latest CMake, libedit
+    name: GCC -O3, CMake
+    runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_dispatch' || (inputs.job_id == 'all' || inputs.job_id == 'puffin')
+    steps:
+      - name: Setup
+        run: |
+          echo "set man-db/auto-update false" | sudo debconf-communicate && sudo dpkg-reconfigure man-db
+          sudo apt-get -qq update
+          sudo apt-get -qq install -y git build-essential cmake zlib1g-dev libbz2-dev libedit-dev ninja-build
+
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - name: Check latest CMake
+        id: get-cmake-ver
+        run: |
+          CMAKE_VER=$(curl -s https://api.github.com/repos/Kitware/CMake/releases/latest | jq -r '.tag_name' | sed 's/^v//')
+          if ! echo "$CMAKE_VER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' ; then
+            echo "Extracted CMake version: '$CMAKE_VER'" >&2
+            echo "This does not match the expected version format" >&2
+            exit 1
+          fi
+          echo "CMAKE_VER=$CMAKE_VER" >> $GITHUB_OUTPUT
+          echo "CMAKE_VER=$CMAKE_VER" >> $GITHUB_ENV
+          echo "Latest CMake version is $CMAKE_VER"
+
+      - name: Cache CMake
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: cmake-${{ steps.get-cmake-ver.outputs.CMAKE_VER }}-linux-x86_64
+          path: cmake-${{ steps.get-cmake-ver.outputs.CMAKE_VER }}-linux-x86_64.tar.gz
+
+      - name: Install CMake
+        run: |
+          [ -f cmake-${CMAKE_VER}-linux-x86_64.tar.gz ] || curl -L -S -O "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VER}/cmake-${CMAKE_VER}-linux-x86_64.tar.gz"
+          tar -xz -f cmake-${CMAKE_VER}-linux-x86_64.tar.gz -C "$RUNNER_TEMP"
+          realpath "$RUNNER_TEMP/cmake-${CMAKE_VER}-linux-x86_64/bin" >> "$GITHUB_PATH"
+
+      - name: Configure
+        run: |
+          cmake --version | grep "version ${CMAKE_VER}" || (echo "CMake version mismatch" && exit 1)
+          cmake $CMAKE_FLAGS -DPCRE2_SUPPORT_JIT=ON -DPCRE2_BUILD_PCRE2_16=ON -DPCRE2_BUILD_PCRE2_32=ON -DBUILD_SHARED_LIBS=ON -DBUILD_STATIC_LIBS=ON -DPCRE2_DEBUG=ON -DPCRE2_SUPPORT_LIBEDIT=ON -DPCRE2_SUPPORT_LIBREADLINE=OFF -DCMAKE_C_FLAGS="$CFLAGS_GCC_STYLE" -DCMAKE_POLICY_VERSION_MINIMUM=$CMAKE_VER -DCMAKE_COMPILE_WARNING_AS_ERROR=ON -DCMAKE_BUILD_TYPE=Release -B build
+
+      - name: Build
+        run: cd build && make -j$(nproc)
+
+      - name: Test
+        run: cd build && ctest -j$(nproc) --output-on-failure && (cat ./Testing/Temporary/LastTest.log || true)
+
+      - name: Install
+        run: |
+          cd build
+          cmake --install . --prefix install-dir
+          ruby ../maint/RunManifestTest.rb install-dir ../maint/manifest-install-linux cmake
+          ruby ../maint/RunSymbolTest.rb install-dir/lib/ ../maint/
+
+      - name: Test installed CMake package with CMake
+        run: python3 maint/cmake-tests/check-interface.py install build/install-dir --generator Ninja --build-type Release
+
+      - name: Test CMake build-tree interface
+        run: python3 maint/cmake-tests/check-interface.py build-tree . --generator Ninja --build-type Debug
+
+  dodo:
+    # Tests with: Autoconf on oldest supported Ubuntu (in non-extended support)
+    name: GCC -Os, old Autotools
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    if: github.event_name != 'workflow_dispatch' || (inputs.job_id == 'all' || inputs.job_id == 'dodo')
+    steps:
+      - name: Setup
+        run: |
+          echo "set man-db/auto-update false" | debconf-communicate && dpkg-reconfigure man-db
+          export DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC
+          apt-get -qq update
+          apt-get -qq install -y git build-essential autoconf automake libtool
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - name: Prepare
+        run: ./autogen.sh
+
+      - name: Configure
+        run: ./configure CFLAGS="-Os $CFLAGS_GCC_STYLE" --enable-jit --enable-pcre2-16 --enable-pcre2-32 --enable-debug --enable-Werror
+
+      - name: Build
+        run: make -j$(nproc)
+
+      - name: Test
+        run: (make check; rc=$?; for i in test-suite.log Run*Test.log pcre2*_test.log; do echo "== $i =="; cat $i; done; exit $rc)
+
+      - name: Install
+        run: |
+          make install "DESTDIR=`pwd`/install-dir"
+          maint/RunManifestTest install-dir/usr/local maint/manifest-install-linux autoconf
+          maint/RunSymbolTest install-dir/usr/local/lib/ maint/
+
+  passenger:
+    # Tests on the oldest RHEL release in extended support with the minimum
+    # supported Autoconf version.
+    name: GCC, RHEL 8, minimum Autoconf
+    runs-on: ubuntu-latest
+    container: redhat/ubi8:8.6
+    if: github.event_name != 'workflow_dispatch' || (inputs.job_id == 'all' || inputs.job_id == 'passenger')
+    steps:
+      - name: Setup
+        run: |
+          yum -q makecache
+          yum -q install -y gcc git make automake libtool diffutils file glibc-langpack-en m4 perl curl xz
+          yum -q update -y glibc-common
+
+      - name: Cache Autoconf 2.71
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: autoconf-2.71-f14c83cfebcc9427f2c3cea7258bd90df972d92eb26752da4ddad81c87a0faa4
+          path: ${{ runner.temp }}/autoconf-2.71.tar.xz
+
+      - name: Install Autoconf 2.71
+        run: |
+          [ -f "$RUNNER_TEMP/autoconf-2.71.tar.xz" ] || \
+            curl --fail --location --retry 3 --output "$RUNNER_TEMP/autoconf-2.71.tar.xz" \
+              https://ftp.gnu.org/gnu/autoconf/autoconf-2.71.tar.xz
+          printf '%s  %s\n' \
+            f14c83cfebcc9427f2c3cea7258bd90df972d92eb26752da4ddad81c87a0faa4 \
+            "$RUNNER_TEMP/autoconf-2.71.tar.xz" | sha256sum --check --status
+          tar -C "$RUNNER_TEMP" -xf "$RUNNER_TEMP/autoconf-2.71.tar.xz"
+          pushd "$RUNNER_TEMP/autoconf-2.71"
+          ./configure --prefix="$RUNNER_TEMP/autoconf-prefix"
+          make -j"$(nproc)" install
+          popd
+          echo "$RUNNER_TEMP/autoconf-prefix/bin" >> "$GITHUB_PATH"
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - name: Prepare
+        run: ./autogen.sh
+
+      - name: Configure
+        run: ./configure CFLAGS="-O0 $CFLAGS_GCC_STYLE" --enable-jit --enable-pcre2-16 --enable-pcre2-32 --enable-debug --enable-Werror
+
+      - name: Build
+        run: make -j$(nproc)
+
+      - name: Test
+        run: (make check; rc=$?; for i in test-suite.log Run*Test.log pcre2*_test.log; do echo "== $i =="; cat $i; done; exit $rc)
+
+
+      - name: Install
+        run: |
+          make install "DESTDIR=`pwd`/install-dir"
+          maint/RunManifestTest install-dir/usr/local maint/manifest-install-linux autoconf
+          maint/RunSymbolTest install-dir/usr/local/lib/ maint/
+
+  greatawk:
+    # Tests with: GCC, -O2, oldest supported Ubuntu (in non-extended support)
+    name: GCC -O2, old CMake
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    if: github.event_name != 'workflow_dispatch' || (inputs.job_id == 'all' || inputs.job_id == 'greatawk')
+    steps:
+      - name: Setup
+        run: |
+          echo "set man-db/auto-update false" | debconf-communicate && dpkg-reconfigure man-db
+          export DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC
+          apt-get -qq update
+          apt-get -qq install -y git build-essential cmake zlib1g-dev libbz2-dev libreadline-dev python3
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - name: Configure
+        run: cmake $CMAKE_FLAGS -DPCRE2_SUPPORT_JIT=ON -DPCRE2_BUILD_PCRE2_16=ON -DPCRE2_BUILD_PCRE2_32=ON -DBUILD_SHARED_LIBS=ON -DBUILD_STATIC_LIBS=ON -DPCRE2_DEBUG=ON -DCMAKE_C_FLAGS="$CFLAGS_GCC_STYLE" -DCMAKE_COMPILE_WARNING_AS_ERROR=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo -B build
+
+      - name: Build
+        run: cd build && make -j$(nproc)
+
+      - name: Test
+        run: cd build && ctest -j$(nproc) --output-on-failure && (cat ./Testing/Temporary/LastTest.log || true)
+
+      - name: Install
+        run: |
+          cd build
+          cmake --install . --prefix install-dir
+          ../maint/RunManifestTest install-dir ../maint/manifest-install-linux cmake relwithdebinfo
+          ../maint/RunSymbolTest install-dir/lib/ ../maint/
+
+      - name: Test installed CMake package with CMake
+        run: python3 maint/cmake-tests/check-interface.py install build/install-dir --build-type RelWithDebInfo
+
+      - name: Test CMake build-tree interface
+        run: python3 maint/cmake-tests/check-interface.py build-tree . --build-type Debug
+
+  wasp:
+    # Tests with: French locale; oldest supported CMake; no JIT; -Os; libreadline
+    name: GCC -Os, very old CMake, ninja, no JIT
+    runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_dispatch' || (inputs.job_id == 'all' || inputs.job_id == 'wasp')
+    env:
+      CMAKE_VER: "3.15.7"
+    steps:
+      - name: Setup
+        run: |
+          echo "set man-db/auto-update false" | sudo debconf-communicate && sudo dpkg-reconfigure man-db
+          sudo apt-get -qq update
+          sudo apt-get -qq install -y language-pack-fr ninja-build zlib1g-dev libbz2-dev libreadline-dev
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - name: Cache CMake
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: cmake-${{ env.CMAKE_VER }}-Linux-x86_64
+          path: cmake-${{ env.CMAKE_VER }}-Linux-x86_64.tar.gz
+
+      - name: Install CMake
+        run: |
+          [ -f cmake-${CMAKE_VER}-Linux-x86_64.tar.gz ] || curl -L -S -O "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VER}/cmake-${CMAKE_VER}-Linux-x86_64.tar.gz"
+          tar -xz -f cmake-${CMAKE_VER}-Linux-x86_64.tar.gz -C "$RUNNER_TEMP"
+          realpath "$RUNNER_TEMP/cmake-${CMAKE_VER}-Linux-x86_64/bin" >> "$GITHUB_PATH"
+
+      - name: Configure
+        run: |
+          cmake --version | grep "version ${CMAKE_VER}" || (echo "CMake version mismatch" && exit 1)
+          CC='clang' cmake $CMAKE_FLAGS -G Ninja -DPCRE2_SUPPORT_JIT=ON -DPCRE2_BUILD_PCRE2_16=ON -DPCRE2_BUILD_PCRE2_32=ON -DBUILD_SHARED_LIBS=ON -DBUILD_STATIC_LIBS=ON -DPCRE2_DEBUG=ON -DPCRE2_SUPPORT_LIBREADLINE=ON -DCMAKE_C_FLAGS="$CFLAGS_GCC_STYLE" -DCMAKE_COMPILE_WARNING_AS_ERROR=ON -DCMAKE_BUILD_TYPE=MinSizeRel -B build
+
+      - name: Build
+        run: ninja -C build
+
+      - name: Test
+        run: cd build && ctest -j$(nproc) --output-on-failure && (cat ./Testing/Temporary/LastTest.log || true)
+
+      - name: Install
+        run: |
+          cd build
+          cmake --install . --prefix install-dir
+          ruby ../maint/RunManifestTest.rb install-dir ../maint/manifest-install-linux cmake minsizerel
+          ruby ../maint/RunSymbolTest.rb install-dir/lib/ ../maint/
+
+  bat:
+    # Tests with: MSVC 32-bit, and a variety of CMake options. Windows has "bat" files.
+    name: Windows (Win32)
+    runs-on: windows-latest
+    if: github.event_name != 'workflow_dispatch' || (inputs.job_id == 'all' || inputs.job_id == 'bat')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - name: Configure
+        run: cmake $CMAKE_FLAGS -DPCRE2_SUPPORT_JIT=ON -DPCRE2_BUILD_PCRE2_16=ON -DPCRE2_BUILD_PCRE2_32=ON -DPCRE2GREP_SUPPORT_CALLOUT_FORK=OFF -DPCRE2_DEBUG=ON -DPCRE2_NEWLINE=ANYCRLF -DPCRE2_STATIC_PIC=ON -DPCRE2_SUPPORT_BSR_ANYCRLF=ON -DBUILD_SHARED_LIBS=OFF -DBUILD_STATIC_LIBS=ON -DCMAKE_C_FLAGS="$CFLAGS_MSVC" -DCMAKE_COMPILE_WARNING_AS_ERROR=ON -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -B build -A Win32
+
+      - name: Build
+        run: cmake --build build --config RelWithDebInfo
+
+      - name: Test
+        run: cd build && ctest -C RelWithDebInfo -j $env:NUMBER_OF_PROCESSORS --output-on-failure && (cat ./Testing/Temporary/LastTest.log || true)
+
+  pterodactyl:
+    # Tests with: MSVC 64-bit, Debug, shared libraries
+    name: Windows (x64)
+    runs-on: windows-latest
+    if: github.event_name != 'workflow_dispatch' || (inputs.job_id == 'all' || inputs.job_id == 'pterodactyl')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - name: Configure
+        run: cmake $CMAKE_FLAGS -DPCRE2_SUPPORT_JIT=OFF -DPCRE2_BUILD_PCRE2_16=ON -DPCRE2_BUILD_PCRE2_32=ON -DPCRE2_DEBUG=ON -DBUILD_SHARED_LIBS=ON -DBUILD_STATIC_LIBS=OFF -DCMAKE_C_FLAGS="$CFLAGS_MSVC" -DCMAKE_COMPILE_WARNING_AS_ERROR=ON -B build -A x64
+
+      - name: Build
+        run: cmake --build build --config Debug
+
+      - name: Test
+        run: cd build && ctest -C Debug -j $env:NUMBER_OF_PROCESSORS --output-on-failure && (cat ./Testing/Temporary/LastTest.log || true)
+
+  bigbird:
+    # Job to execute ManyConfigTests
+    name: manyconfig
+    runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_dispatch' || (inputs.job_id == 'all' || inputs.job_id == 'bigbird')
+    steps:
+      - name: Setup
+        run: |
+          echo "set man-db/auto-update false" | sudo debconf-communicate && sudo dpkg-reconfigure man-db
+          sudo apt-get -qq update
+          sudo apt-get -qq install -y valgrind
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - name: Run
+        run: |
+          ./autogen.sh
+          ./maint/ManyConfigTests
+
+  camel:
+    # Job to execute RunPerlTest. "Camel bird" is another name for an ostrich (and it's Perl's logo).
+    name: perl
+    runs-on: ubuntu-latest
+    container: perl:stable
+    if: github.event_name != 'workflow_dispatch' || (inputs.job_id == 'all' || inputs.job_id == 'camel')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: yes
+
+      - name: Test
+        run: |
+          perl -v
+          ./RunPerlTest
+
+  chaffinch:
+    # Job to verify that the CMake "unity" build (single-file / jumbo build) passes.
+    # If this fails, it's usually because two different files define some file-static
+    # functions or macros which collide.
+    name: CMake unity build
+    runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_dispatch' || (inputs.job_id == 'all' || inputs.job_id == 'chaffinch')
+    env:
+      # Disallowing shadowing would be very spammy for unity builds, because the
+      # same variable name can be used in multiple files.
+      CFLAGS_UNITY: "-Wno-shadow"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - name: Configure
+        run: cmake $CMAKE_FLAGS -DCMAKE_UNITY_BUILD=ON -DCMAKE_UNITY_BUILD_BATCH_SIZE=0 -DPCRE2_SUPPORT_JIT=ON -DPCRE2_BUILD_PCRE2_16=ON -DPCRE2_BUILD_PCRE2_32=ON -DPCRE2_DEBUG=ON -DCMAKE_C_FLAGS="$CFLAGS_GCC_STYLE $CFLAGS_UNITY" -DCMAKE_COMPILE_WARNING_AS_ERROR=ON -DCMAKE_BUILD_TYPE=Release -B build
+
+      - name: Build
+        run: cd build && make -j$(nproc)
+
+      - name: Test
+        run: cd build && ctest -j$(nproc) --output-on-failure && (cat ./Testing/Temporary/LastTest.log || true)
+
+  fruitbat:
+    # Tests with: MSYS2 unix-on-Windows environment
+    name: MSYS2
+    runs-on: windows-latest
+    if: |
+      (github.event_name == 'workflow_dispatch' && (inputs.job_id == 'all' || inputs.job_id == 'fruitbat')) ||
+      github.event_name == 'push'
+    strategy:
+      fail-fast: false
+      matrix:
+        # UCRT64 is the new default MSYS2 runtime, which builds native 64-bit
+        # binaries which can then be shipped and run on systems without MSYS2
+        # installed (using MinGW-x64 + the UCRT).
+        # MSYS is the Unix-variant runtime, which builds binaries that have a
+        # dependency on MSYS2 being installed, but those binaries then use a
+        # full emulated Unix environment at runtime.
+        msystem: ["UCRT64", "MSYS"]
+    steps:
+      - name: Pre-checkout
+        run: git config --global core.autocrlf input
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - name: Setup
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: true
+          pacboy: diffutils gcc:p cmake:p ninja:p ${{ matrix.msystem == 'MSYS' && 'libreadline:p' || 'readline:p' }}
+
+      - name: Configure
+        shell: msys2 {0}
+        run: cmake $CMAKE_FLAGS -G Ninja -DPCRE2_BUILD_PCRE2_16=ON -DPCRE2_BUILD_PCRE2_32=ON -DBUILD_SHARED_LIBS=ON -DBUILD_STATIC_LIBS=ON -DPCRE2_DEBUG=ON -DCMAKE_C_FLAGS="$CFLAGS_GCC_STYLE" -DCMAKE_COMPILE_WARNING_AS_ERROR=ON -DCMAKE_BUILD_TYPE=Release -B build
+
+      - name: Build
+        shell: msys2 {0}
+        run: ninja -C build
+
+      - name: Test
+        shell: msys2 {0}
+        run: cd build && ctest -j$(nproc) --output-on-failure && (cat ./Testing/Temporary/LastTest.log || true)
+
+  ptarmigan:
+    # Tests with various unusual processor architectures
+    name: Multiarch
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # S390x is important, because it's basically the only supported big-endian
+          # architecture I can find anywhere. I used to work on SPARC and PPC-be systems
+          # a long time ago, but even Debian has dropped those architectures now, so
+          # it's nice that there's *least one* arch remaining to shake out endian
+          # assumptions.
+          - arch: "s390x"
+            distro: ubuntu_latest
+          # Big-iron POWER only (this is not the PowerPC arch used in old Apple Macs)
+          - arch: "ppc64le"
+            distro: "ubuntu_latest"
+          # A 32-bit Linux build. i386 is mostly gone now, so ARMv7 is all that's left.
+          - arch: "armv7"
+            distro: "ubuntu_latest"
+          # The only really widely-deployed non-x86 archicture, at least that's likely
+          # to be running PCRE2.
+          - arch: "aarch64"
+            distro: "ubuntu_latest"
+          # Not used by anyone yet, really, but potentially the "next big thing".
+          - arch: "riscv64"
+            distro: "ubuntu_latest"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # Necessary for uraimo/run-on-arch-action to use GitHub's Docker repository as a cache
+    if: |
+      (github.event_name == 'workflow_dispatch' && (inputs.job_id == 'all' || inputs.job_id == 'ptarmigan')) ||
+      github.event_name == 'push'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - name: Prepare
+        run: ./autogen.sh
+
+      - uses: uraimo/run-on-arch-action@fa1f3e7de95534497266c7265950b5188355fbfb # v3.2.1
+        name: Configure, build, and test
+        with:
+          arch: ${{ matrix.arch }}
+          distro: ${{ matrix.distro }}
+
+          # Not required, but speeds up builds by storing container images in
+          # a GitHub package registry.
+          githubToken: ${{ github.token }}
+
+          env: | # YAML, but pipe character is necessary
+            CFLAGS_GCC_STYLE: ${{ env.CFLAGS_GCC_STYLE }}
+            CMAKE_FLAGS: ${{ env.CMAKE_FLAGS }}
+
+          install: |
+            echo "set man-db/auto-update false" | debconf-communicate && dpkg-reconfigure man-db
+            apt-get -qq update
+            apt-get -qq install -y gcc cmake ninja-build zlib1g-dev libbz2-dev libreadline-dev
+
+          run: |
+            set -e
+            cmake $CMAKE_FLAGS -G Ninja -DPCRE2_SUPPORT_JIT=ON -DPCRE2_BUILD_PCRE2_16=ON -DPCRE2_BUILD_PCRE2_32=ON -DBUILD_SHARED_LIBS=ON -DBUILD_STATIC_LIBS=ON -DPCRE2_DEBUG=ON -DCMAKE_C_FLAGS="$CFLAGS_GCC_STYLE" -DCMAKE_COMPILE_WARNING_AS_ERROR=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo -B build
+            cd build
+            ninja
+            ctest -j$(nproc) --output-on-failure && (cat ./Testing/Temporary/LastTest.log || true)
+
+  coelacanth:
+    # Tests with: cross-compilation and qemu-user, for the JIT backends that no
+    # other job covers. A coelacanth is a fish that was thought to be extinct.
+    name: QEMU ${{ matrix.config.name }}
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.config.container }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          # "libc" is the Debian architecture name. It is needed because the
+          # cross compilers do not depend on the target's libc headers, and it
+          # cannot always be derived from the triple.
+          #
+          # Alpha's libc package is libc6.1-dev-alpha-cross, because Alpha uses
+          # libc6.1 rather than libc6, but it provides the libc6-dev-alpha-cross
+          # name built from the "libc" field. Only gcc-14 is packaged for it.
+          - { name: alpha,       triple: alpha-linux-gnu,             qemu: alpha,       libc: alpha,      container: "ubuntu:26.04", gcc_suffix: "-14" }
+          #
+          # Ubuntu armhf defaults to Thumb-2, so ARM mode needs asking for.
+          - { name: arm,         triple: arm-linux-gnueabihf,         qemu: arm,         libc: armhf,      container: "ubuntu:26.04", cflags: -marm }
+          - { name: arm-thumb2,  triple: arm-linux-gnueabihf,         qemu: arm,         libc: armhf,      container: "ubuntu:26.04", cflags: -mthumb }
+          - { name: loongarch64, triple: loongarch64-linux-gnu,       qemu: loongarch64, libc: loong64,    container: "ubuntu:26.04" }
+          # PowerPC big-endian; ptarmigan covers ppc64le, which is a different
+          # ABI to ppc64.
+          - { name: powerpc,     triple: powerpc-linux-gnu,           qemu: ppc,         libc: powerpc,    container: "ubuntu:26.04" }
+          - { name: powerpc64,   triple: powerpc64-linux-gnu,         qemu: ppc64,       libc: ppc64,      container: "ubuntu:26.04" }
+          # These cross compilers come from Debian, which currently has no
+          # maintainer for the MIPS cross toolchain packages, so they have not
+          # been rebuilt for the release that Ubuntu 26.04 is based on. Hence
+          # the older container. (Ubuntu itself never targeted MIPS.)
+          - { name: mips,        triple: mips-linux-gnu,              qemu: mips,        libc: mips,       container: "ubuntu:24.04" }
+          - { name: mipsel,      triple: mipsel-linux-gnu,            qemu: mipsel,      libc: mipsel,     container: "ubuntu:24.04" }
+          - { name: mips64,      triple: mips64-linux-gnuabi64,       qemu: mips64,      libc: mips64,     container: "ubuntu:24.04" }
+          - { name: mips64el,    triple: mips64el-linux-gnuabi64,     qemu: mips64el,    libc: mips64el,   container: "ubuntu:24.04" }
+          # MIPS release 6 is a different instruction set to the earlier
+          # releases, and SLJIT_MIPS_REV >= 6 selects different code. There is
+          # no separate qemu-user binary for it; the emulated CPU has to be
+          # named instead, because the defaults predate release 6.
+          - { name: mips32r6el,  triple: mipsisa32r6el-linux-gnu,     qemu: mipsel,      libc: mipsr6el,   container: "ubuntu:24.04", qemu_cpu: mips32r6-generic }
+          - { name: mips64r6el,  triple: mipsisa64r6el-linux-gnuabi64, qemu: mips64el,   libc: mips64r6el, container: "ubuntu:24.04", qemu_cpu: I6400 }
+    if: |
+      (github.event_name == 'workflow_dispatch' && (inputs.job_id == 'all' || inputs.job_id == 'coelacanth')) ||
+      github.event_name == 'push'
+    env:
+      # Where qemu-user looks for the target's shared libraries.
+      QEMU_LD_PREFIX: /usr/${{ matrix.config.triple }}
+    steps:
+      - name: Setup
+        run: |
+          apt-get -qq update
+          apt-get -qq install -y git autoconf automake libtool make \
+                                 gcc${{ matrix.config.gcc_suffix }}-${{ matrix.config.triple }} \
+                                 libc6-dev-${{ matrix.config.libc }}-cross \
+                                 qemu-user
+
+          # Not set unconditionally: an empty QEMU_CPU makes qemu fail to find
+          # a CPU definition.
+          if [ -n "${{ matrix.config.qemu_cpu }}" ]; then
+            echo "QEMU_CPU=${{ matrix.config.qemu_cpu }}" >> "$GITHUB_ENV"
+          fi
+        env:
+          DEBIAN_FRONTEND: noninteractive
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - name: Prepare
+        run: ./autogen.sh
+
+      - name: Configure
+        # Shared libraries are disabled so that the test programs are real
+        # executables rather than libtool wrapper scripts, which qemu-user
+        # cannot run.
+        run: |
+          ./configure \
+            --build=`./config.guess` \
+            --host=${{ matrix.config.triple }} \
+            CC=${{ matrix.config.triple }}-gcc${{ matrix.config.gcc_suffix }} \
+            CFLAGS="${{ matrix.config.cflags }} $CFLAGS_GCC_STYLE" \
+            --disable-shared \
+            --enable-jit \
+            --enable-pcre2-16 \
+            --enable-pcre2-32 \
+            --enable-debug \
+            --enable-Werror
+
+      - name: Build
+        run: make -j$(nproc)
+
+      - name: Test (main test script)
+        run: ./RunTest -sim qemu-${{ matrix.config.qemu }}
+
+      - name: Test (JIT test program)
+        run: qemu-${{ matrix.config.qemu }} ./pcre2_jit_test
+
+      - name: Test (pcre2posix program)
+        run: qemu-${{ matrix.config.qemu }} ./pcre2posix_test -v
+
+      # RunGrepTest is skipped as it does not have a "-sim" flag yet.
+
+  bison:
+    # Tests with: meson. Bison sounds like 'boson'.
+    name: Meson release (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    if: github.event_name != 'workflow_dispatch' || (inputs.job_id == 'all' || inputs.job_id == 'bison')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+            manifest: linux
+          - name: macOS
+            os: macos-latest
+            manifest: macos
+          - name: Windows
+            os: windows-latest
+            manifest: windows
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - name: Install Meson
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade meson
+          meson --version
+          ninja --version
+
+      - name: Configure
+        run: meson setup build ${{ runner.os == 'Windows' && '--vsenv' || '' }} --buildtype=release --prefix="${{ github.workspace }}/install-dir" --libdir=lib -Ddefault_library=both -Dpcre2_build_pcre2_16=true -Dpcre2_build_pcre2_32=true -Dpcre2_build_tests=true -Dpcre2_debug=enabled -Dpcre2_support_jit=enabled -Dwerror=true
+
+      - name: Build
+        run: meson compile -C build
+
+      - name: Test
+        run: meson test -C build --print-errorlogs
+
+      - name: Install
+        run: meson install -C build
+
+      - name: Check installation
+        run: |
+          ruby maint/RunManifestTest.rb install-dir maint/manifest-install-${{ matrix.manifest }} meson
+          ruby maint/RunSymbolTest.rb install-dir/${{ runner.os == 'Windows' && 'bin' || 'lib' }} maint
+
+      - name: Test Meson subproject interface
+        run: python maint/meson-tests/check-library-options.py
+
+  wisent:
+    # Wisent is a nearly-extinct species of bison.
+    name: Meson 1.6
+    runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_dispatch' || (inputs.job_id == 'all' || inputs.job_id == 'wisent')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - name: Install Meson 1.6.1
+        run: |
+          python -m pip install --disable-pip-version-check meson==1.6.1
+          meson --version | grep '^1\.6\.1$'
+          ninja --version
+
+      - name: Configure
+        run: meson setup build --buildtype=release --prefix="${{ github.workspace }}/install-dir" --libdir=lib -Ddefault_library=both -Dpcre2_build_pcre2_16=true -Dpcre2_build_pcre2_32=true -Dpcre2_build_tests=true -Dpcre2_support_jit=enabled -Dwerror=true
+
+      - name: Build
+        run: meson compile -C build
+
+      - name: Test
+        run: meson test -C build --print-errorlogs
+
+      - name: Install
+        run: meson install -C build
+
+      - name: Check installation
+        run: |
+          ruby maint/RunManifestTest.rb install-dir maint/manifest-install-linux meson
+          ruby maint/RunSymbolTest.rb install-dir/lib maint
+
+      - name: Test Meson subproject interface
+        run: python maint/meson-tests/check-library-options.py
+
+  zebrilus:
+    # Tests with: Zig compiler. A "zebrilus" is known as a "zigzag heron".
+    name: Zig
+    runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_dispatch' || (inputs.job_id == 'all' || inputs.job_id == 'zebrilus')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: false
+
+      # The zig version from minimum_zig_version in build.zig.zon will be installed.
+      - name: Install zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+
+      - name: Build
+        run: zig build -Dsupport_jit
+
+      - name: Test
+        run: |
+          ./RunTest --bigstack --srcdir "`pwd`" --pcre2test "`pwd`/zig-out/bin/pcre2test"
+
+  bee:
+    # Tests with: Bazel build system. A bee goes "buzz buzz buzz(el)".
+    name: Bazel
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["ubuntu-latest", "windows-latest"]
+    runs-on: ${{ matrix.os }}
+    if: github.event_name != 'workflow_dispatch' || (inputs.job_id == 'all' || inputs.job_id == 'bee')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - name: Build
+        run: bazelisk build //...
+
+      - name: Test
+        run: bazelisk test //... --test_output=all
