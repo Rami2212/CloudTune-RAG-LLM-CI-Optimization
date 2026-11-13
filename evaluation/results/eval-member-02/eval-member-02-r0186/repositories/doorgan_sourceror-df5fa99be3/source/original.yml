@@ -1,0 +1,97 @@
+name: Elixir CI
+
+on: [pull_request, push]
+
+jobs:
+  ci:
+    name: ci
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - elixir: "1.12.3"
+            otp: "24.3.4"
+            run_vendored_tests: true
+          - elixir: "1.13.4"
+            otp: "24.3.4"
+          - elixir: "1.13.4"
+            otp: "25.0.2"
+          - elixir: "1.14.3"
+            otp: "25.3.2"
+          - elixir: "1.15.5"
+            otp: "26.2.5"
+          - elixir: "1.16.0"
+            otp: "26.2.5"
+          - elixir: "1.18.3"
+            otp: "27.3.4"
+          - elixir: "1.19.1"
+            otp: "28.3.1"
+          - elixir: "1.19.5"
+            otp: "28.3.1"
+            check_formatted: true
+            run_credo: true
+            run_coveralls: true
+            run_dialyzer: true
+          - elixir: "1.20.1"
+            otp: "28.3.1"
+    steps:
+      - uses: actions/checkout@v2
+      - name: Set up Elixir
+        id: beam
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ matrix.elixir }}
+          otp-version: ${{ matrix.otp }}
+          version-type: strict
+
+      - name: Restore dependencies cache
+        uses: actions/cache@v4
+        with:
+          path: deps
+          key: ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-mix-${{ hashFiles('**/mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-mix-${{ hashFiles('**/mix.lock') }}
+            ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-mix
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Retrieve PLT Cache
+        if: matrix.run_dialyzer
+        uses: actions/cache@v4
+        id: plt-cache
+        with:
+          path: priv/plts
+          key: ${{ runner.os }}-${{ steps.beam.outputs.otp-version }}-${{ steps.beam.outputs.elixir-version }}-plts-${{ hashFiles(format('{0}{1}', github.workspace, '/mix.lock')) }}
+
+      - name: Create PLTs
+        if: matrix.run_dialyzer && steps.plt-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p priv/plts
+          mix dialyzer.build
+
+      - name: Check formatting
+        run: mix format --check-formatted
+        if: matrix.check_formatted
+
+      - name: Run dialyzer
+        run: mix dialyzer
+        if: matrix.run_dialyzer
+
+      - name: Run credo
+        run: mix credo
+        if: matrix.run_credo
+
+      - name: Run tests
+        run: mix test
+
+      - name: Run vendored tests
+        run: mix test test_vendored
+        if: matrix.run_vendored_tests
+
+      - name: Coveralls
+        run: mix coveralls.github
+        if: matrix.run_coveralls
+        env:
+          MIX_ENV: test
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

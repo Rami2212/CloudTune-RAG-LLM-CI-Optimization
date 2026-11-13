@@ -1,0 +1,386 @@
+name: Main
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+      - dev
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    name: Build and test (${{ matrix.os }})
+
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Set git to not perform line ending conversions
+        # Tests are very sensitive to line endings, so ensure they are exactly as found
+        # in the repo.
+        run: |
+          git config --global core.autocrlf false
+      - uses: actions/checkout@v7.0.1
+      - name: Check actual EOL on disk
+        run: |
+          git ls-files --eol
+      - uses: swatinem/rust-cache@v2
+      - name: Build
+        run: >
+          cargo build --locked --verbose
+
+      - name: Run tests (without coverage)
+        run: >
+          cargo test --verbose
+
+  check-clippy-and-format:
+    name: Check clippy and format
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: swatinem/rust-cache@v2
+
+      - name: Set up nightly toolchain
+        # Cannot be `minimal` profile, need `rustfmt` and `clippy`:
+        # https://rust-lang.github.io/rustup/concepts/profiles.html#profiles
+        run: >
+          rustup toolchain install nightly && rustup component add --toolchain
+          nightly rustfmt
+
+      - name: Print versions
+        run: >
+          rustc --version && cargo --version && cargo +nightly fmt --version &&
+          cargo clippy --version
+
+      - name: Check formatting
+        run: >
+          cargo +nightly fmt --all -- --check
+
+      - name: Check clippy
+        run: >
+          cargo clippy --workspace --all-targets --all-features -- --deny
+          warnings
+
+  check-dependency-changes:
+    name: Check for changes in `Cargo.toml` and `Cargo.lock`
+
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.base_ref }}
+          path: base
+      - run: cargo tree | tee tree
+        working-directory: base
+
+      - uses: actions/checkout@v7.0.1
+        with:
+          path: head
+      - run: cargo tree | tee tree
+        working-directory: head
+
+      - name: Check for changes in dependencies
+        run: diff base/tree head/tree || true
+
+  verify-msrv:
+    # Set in `Cargo.toml` manually by running `cargo msrv` locally. Then verified for
+    # its consistency here.
+    name: Verify MSRV (Minimum Supported Rust Version)
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2.87.22
+        with:
+          tool: cargo-msrv
+      - run: cargo msrv verify
+
+  bench-files:
+    name: Run benchmarks for `--glob` option
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          submodules: recursive
+      - uses: swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2.87.22
+        with:
+          tool: hyperfine
+      - name: Run benchmarks
+        run: >
+          ./benches/bench-files.sh
+
+  build-test-feature-powerset:
+    name: Build and test feature powerset
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2.87.22
+        with:
+          tool: cargo-hack
+      - name: Run tests
+        run: >
+          cargo hack --feature-powerset test
+
+  build-test-coverage:
+    name: Build and test with coverage
+
+    # Fails catastrophically on `ubuntu-latest`, as linking fails if compiling while
+    # using `insta`. macOS works (locally as well) and is the fastest runner anyway, so
+    # just use that. See also https://github.com/xd009642/tarpaulin/issues/517
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: swatinem/rust-cache@v2
+
+      - name: Install cargo-tarpaulin (for coverage)
+        # As recommened by `cargo-binstall` team:
+        # https://github.com/cargo-bins/cargo-binstall/tree/d5549ce99ebc82b1ceee93a41375137b7dbd1a1f#faq
+        uses: taiki-e/install-action@v2.87.22
+        with:
+          tool: cargo-tarpaulin
+
+      - name: Install (minimal) nightly toolchain
+        run: rustup toolchain install --profile minimal nightly
+
+      - name: Run tests (with coverage)
+        # Will read from `tarpaulin.toml`. Extra flags given here complement the config.
+        run: >
+          cargo tarpaulin --verbose
+
+  release-please:
+    name: Execute release chores
+
+    runs-on: ubuntu-latest
+
+    # Only run this on push events: `pull_request` events will not have access to
+    # secrets if coming from forks, and we do not care about release chores there
+    # anyway.
+    if: github.event_name == 'push'
+
+    outputs:
+      created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      tag_name_without_v: ${{ steps.release.outputs.major }}.${{
+        steps.release.outputs.minor }}.${{ steps.release.outputs.patch }}
+      html_url: ${{ steps.release.outputs.html_url }}
+
+    steps:
+      # https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/making-authenticated-api-requests-with-a-github-app-in-a-github-actions-workflow
+      - uses: actions/create-github-app-token@v3.2.0
+        id: app-token
+        with:
+          client-id: ${{ secrets.RELEASE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_APP_PRIVATE_KEY }}
+
+      - uses: googleapis/release-please-action@v5.0.0
+        id: release
+        with:
+          # Token needs: `contents: write`, `pull-requests: write`
+          token: ${{ steps.app-token.outputs.token }}
+
+  build-upload:
+    name: Build and upload binaries
+
+    needs: release-please
+    # Assumption: if release created, tests ran in corresponding PR, so it's safe to not
+    # `needs` tests here.
+    if: needs.release-please.outputs.created
+
+    environment:
+      name: binaries
+      url: ${{ needs.release-please.outputs.html_url }}
+
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            crate: srgn
+            binary: srgn
+            extension: ""
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            crate: srgn
+            binary: srgn
+            extension: ""
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            crate: srgn
+            binary: srgn
+            extension: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            crate: srgn
+            binary: srgn
+            extension: ".exe"
+
+    runs-on: ${{ matrix.os }}
+
+    env:
+      ASSET_FILE: "${{ matrix.crate }}-${{ matrix.target }}.tgz"
+
+    permissions:
+      contents: write # For `gh` to upload asset to release
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Add rustup target
+        # Idempotent, so just succeeds if already added.
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build
+        shell: bash
+        run: >
+          cargo build --release --locked --verbose --target ${{ matrix.target }}
+          --bin ${{ matrix.binary }}
+
+      - name: Package binary (for cargo-binstall)
+        shell: bash
+        env:
+          DIR: ${{ matrix.crate }}
+        run: >
+          mkdir "$DIR" && mv "target/${{ matrix.target }}/release/${{
+          matrix.binary }}${{ matrix.extension }}" "$DIR" && tar --create
+          --verbose --gzip --file "$ASSET_FILE" "$DIR"
+
+      - name: Attach binary to release
+        shell: bash
+        env:
+          # `gh` blows up without token, cf.
+          # https://josh-ops.com/posts/gh-auth-login-in-actions/#example-2---env-variable
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >
+          gh release upload ${{ needs.release-please.outputs.tag_name }}
+          "$ASSET_FILE"
+
+  publish-dry-run:
+    # Perform a dry run to see whether publishing *would* work. A convenience to avoid
+    # the actual publish step failing, which is super annoying as it's gated behind git
+    # tags etc. which we cannot just re-run.
+    name: Publish to crates.io - dry run
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: swatinem/rust-cache@v2
+
+      - name: Publish
+        run: >
+          cargo publish --verbose --locked --dry-run
+
+  publish:
+    name: Publish to crates.io
+
+    runs-on: ubuntu-latest
+    needs:
+      - release-please
+    # Assumption: if release created, tests ran in corresponding PR, so it's safe to not
+    # `needs` tests here.
+    if: needs.release-please.outputs.created
+
+    environment:
+      name: crates.io
+      url: https://crates.io/crates/srgn/${{
+        needs.release-please.outputs.tag_name_without_v }}
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Publish
+        # https://doc.rust-lang.org/cargo/reference/config.html?highlight=CARGO_REGISTRY_TOKEN#credentials
+        run: >
+          cargo publish --verbose --locked --no-verify --token ${{
+          secrets.CARGO_REGISTRY_TOKEN }}
+
+  release-draft:
+    name: Turn release draft into full release
+
+    runs-on: ubuntu-latest
+    needs:
+      - release-please
+      - build-upload
+    if: needs.release-please.outputs.created
+
+    permissions:
+      contents: write # For `gh` to edit release
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Remove draft status from release
+        # Now that everything is done, fully release.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >
+          gh release edit ${{ needs.release-please.outputs.tag_name }}
+          --draft=false
+
+  test-binstall-installation:
+    name: Test installation and running via cargo-binstall
+
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: macos-latest
+          - os: windows-latest
+
+    needs:
+      - release-please
+      - release-draft
+      - publish
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: cargo-bins/cargo-binstall@main
+      - name: Install binary
+        # Get the current version that was just released, and fail if no binaries are
+        # directly available (don't allow fallback to compilation from source).
+        run: >
+          cargo binstall --version ${{
+          needs.release-please.outputs.tag_name_without_v }} --strategies
+          crate-meta-data --no-confirm srgn
+      - name: Print version
+        run: srgn --version
+      - name: Print help
+        run: srgn --help
+      - name: Test version matches release
+        shell: bash
+        run: >
+          [[ $(srgn --version) == "srgn ${{
+          needs.release-please.outputs.tag_name_without_v }}" ]]
+      - uses: actions/checkout@v7.0.1
+      - name: Perform dummy run (full verbosity)
+        # A final sanity check. Can be used to check things which are super annoying to
+        # test, e.g. terminal color output (which should work in GitHub Actions).
+        # Because it's hard to test, this isn't asserted against anything. Just a nice
+        # final check. Requires overriding stdin as that is unfortunately detected as
+        # present in GitHub Actions. Should not be necessary in normal CLI use.
+        run: srgn -vvvv --stdin-detection force-unreadable --rust struct
+      - name: Perform dummy run (minimal verbosity)
+        run: srgn --stdin-detection force-unreadable --rust struct

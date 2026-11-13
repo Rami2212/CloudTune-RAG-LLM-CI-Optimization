@@ -1,0 +1,223 @@
+name: Build Polyphone for Windows x64
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+    secrets:
+      SIGNPATH_API_TOKEN:
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        required: true
+        default: '0.0.0'
+        type: string
+      
+env:
+  QT_VERSION: '6.6.2'
+  
+jobs:
+  build-windows-x64:
+    environment: production
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+
+      - name: Set the version
+        run: python packaging/set_version.py "${{ inputs.tag }}"
+
+      - name: Install Qt (MinGW)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: windows
+          target: desktop
+          arch: win64_mingw
+
+      - name: Install MSYS2 and required libraries
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: >
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-zlib
+            mingw-w64-x86_64-libogg
+            mingw-w64-x86_64-libvorbis
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-flac
+            mingw-w64-x86_64-libsndfile
+
+      - name: Configure with CMake
+        shell: msys2 {0}
+        run: |
+          export PATH="/mingw64/bin:$(cygpath -u "$QT_ROOT_DIR/bin"):$PATH"
+          cmake -S sources -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$(cygpath -m "$QT_ROOT_DIR")" \
+            -DPOLYPHONE_OFFICIAL_BUILD=ON
+
+      - name: Build Polyphone
+        shell: msys2 {0}
+        run: |
+          export PATH="/mingw64/bin:$(cygpath -u "$QT_ROOT_DIR/bin"):$PATH"
+          cmake --build build --parallel $(nproc)
+
+      - name: Prepare deployment with windeployqt
+        shell: cmd
+        run: |
+          mkdir deploy
+          copy build\bin\polyphone.exe deploy\
+          "%QT_ROOT_DIR%\bin\windeployqt.exe" ^
+            --release ^
+            --no-translations ^
+            --no-system-d3d-compiler ^
+            --no-opengl-sw ^
+            deploy\polyphone.exe
+
+      - name: Copy MSYS2 dependencies
+        shell: msys2 {0}
+        run: |
+          MINGW_BIN="/mingw64/bin"
+          cp "$MINGW_BIN"/libgcc_s_seh-1.dll deploy/
+          cp "$MINGW_BIN"/libstdc++-6.dll deploy/
+          cp "$MINGW_BIN"/libwinpthread-1.dll deploy/
+          cp "$MINGW_BIN"/libsndfile-1.dll deploy/
+          cp "$MINGW_BIN"/libFLAC.dll deploy/
+          cp "$MINGW_BIN"/libogg-0.dll deploy/
+          cp "$MINGW_BIN"/libvorbis-0.dll deploy/
+          cp "$MINGW_BIN"/libvorbisenc-2.dll deploy/
+          cp "$MINGW_BIN"/libvorbisfile-3.dll deploy/
+          cp "$MINGW_BIN"/libopus-0.dll deploy/ 2>/dev/null || true
+          cp "$MINGW_BIN"/libmp3lame-0.dll deploy/ 2>/dev/null || true
+          cp "$MINGW_BIN"/libmpg123-0.dll deploy/ 2>/dev/null || true
+          cp "$MINGW_BIN"/libcrypto-3-x64.dll deploy/ 2>/dev/null || \
+          cp "$MINGW_BIN"/libcrypto-1_1-x64.dll deploy/ 2>/dev/null || true
+          cp "$MINGW_BIN"/libssl-3-x64.dll deploy/ 2>/dev/null || \
+          cp "$MINGW_BIN"/libssl-1_1-x64.dll deploy/ 2>/dev/null || true
+          cp "$MINGW_BIN"/zlib1.dll deploy/
+          cp "$MINGW_BIN"/libssp-0.dll deploy/ 2>/dev/null || true
+
+      - name: Copy installer resources
+        shell: cmd
+        run: |
+          copy LICENSE.txt deploy\license.txt 2>nul || echo "No license file"
+          copy packaging\windows\polyphone.ico deploy\ 2>nul || echo "No icon file"
+
+      - name: Create portable archive
+        shell: pwsh
+        run: |
+          $portableName = "Polyphone_${{ inputs.tag }}-windows_x64-portable"
+          Compress-Archive -Path deploy\* -DestinationPath "$portableName.zip" -CompressionLevel Optimal
+          Write-Host "Created portable archive: $portableName.zip"
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup -y
+
+          # Version and location of Inno Setup, read from its uninstall registry key
+          $keys = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup [0-9]*_is1",
+                  "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup [0-9]*_is1"
+          $innoSetup = Get-ItemProperty -Path $keys -ErrorAction SilentlyContinue | Sort-Object PSChildName | Select-Object -Last 1
+          if (-not $innoSetup) {
+            throw "Inno Setup installation not found"
+          }
+          $innoSetupDir = $innoSetup.InstallLocation.TrimEnd("\")
+          Write-Host "Inno Setup $($innoSetup.DisplayVersion) found in $innoSetupDir"
+          "INNO_SETUP_VERSION=$($innoSetup.DisplayVersion)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "INNO_SETUP_DIR=$innoSetupDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Download Inno Setup extra translations
+        shell: pwsh
+        run: |
+          # Translations missing from the installation, taken from the sources of the same version if available
+          $tag = "is-" + $env:INNO_SETUP_VERSION.Replace(".", "_")
+          foreach ($language in "ChineseSimplified", "SerbianCyrillic") {
+            $destination = "$env:INNO_SETUP_DIR\Languages\$language.isl"
+            if (Test-Path $destination) {
+              Write-Host "$language.isl is already an official translation"
+              continue
+            }
+            $url = "https://raw.githubusercontent.com/jrsoftware/issrc/$tag/Files/Languages/Unofficial/$language.isl"
+            try {
+              Invoke-WebRequest -Uri $url -OutFile $destination
+              Write-Host "$language.isl downloaded successfully"
+            } catch {
+              Remove-Item -Path $destination -ErrorAction SilentlyContinue
+              Write-Host "::warning::$language.isl not found for Inno Setup $env:INNO_SETUP_VERSION, the language is skipped"
+            }
+          }
+
+      - name: Create installer
+        shell: pwsh
+        run: |
+          & "$env:INNO_SETUP_DIR\ISCC.exe" /DMyAppVersion=${{ inputs.tag }} /DSourceDir=../../deploy packaging/windows/polyphone.iss
+
+      - name: Upload installer artifact
+        id: upload-installer-artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: polyphone-windows-x64-installer
+          path: packaging/windows/*.exe
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload portable artifact
+        id: upload-portable-artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: polyphone-windows-x64-portable
+          path: polyphone_*-portable.zip
+          retention-days: 7
+          if-no-files-found: error
+          
+      - name: Sign the installer artifact
+        uses: signpath/github-action-submit-signing-request@v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: polyphone
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: windows-installer
+          wait-for-completion: true
+          github-artifact-id: '${{ steps.upload-installer-artifact.outputs.artifact-id }}'
+          output-artifact-directory: 'signed'
+          
+      - name: Sign the portable artifact
+        uses: signpath/github-action-submit-signing-request@v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: polyphone
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: windows-portable
+          wait-for-completion: true
+          github-artifact-id: '${{ steps.upload-portable-artifact.outputs.artifact-id }}'
+          output-artifact-directory: 'signed'
+
+      - name: Upload the signed installer as an artifact
+        uses: actions/upload-artifact@v7
+        with:
+          path: "signed/*.exe"
+          name: polyphone-windows-x64-installer-signed
+          if-no-files-found: error
+
+      - name: Upload the signed archive as an artifact
+        uses: actions/upload-artifact@v7
+        with:
+          path: "signed/*.zip"
+          name: polyphone-windows-x64-portable-signed
+          if-no-files-found: error

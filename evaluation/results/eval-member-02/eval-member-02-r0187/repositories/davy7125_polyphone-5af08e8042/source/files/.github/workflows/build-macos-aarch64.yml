@@ -1,0 +1,88 @@
+name: Build Polyphone for MacOS aarch64
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        required: true
+        default: '0.0.0'
+        type: string
+      
+env:
+  QT_VERSION: '6.7.3'
+
+jobs:
+  build-macos-aarch64:
+    environment: production
+    runs-on: macos-15
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+
+      - name: Set the version
+        run: python packaging/set_version.py "${{ inputs.tag }}"
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: mac
+          target: desktop
+          arch: clang_64
+
+      - name: Install dependencies
+        run: |
+          brew install \
+            libsndfile \
+            libogg \
+            libvorbis \
+            flac \
+            lame \
+            mpg123 \
+            opus \
+            pkgconf
+
+      - name: Configure with CMake
+        run: |
+          cmake -S sources -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
+            -DPOLYPHONE_OFFICIAL_BUILD=ON
+
+      - name: Build Polyphone
+        run: |
+          cmake --build build --parallel $(sysctl -n hw.ncpu)
+          mkdir -p macos
+          rm -rf macos/Polyphone.app
+          cp -R build/bin/Polyphone.app macos/
+
+      - name: Deploy and create dmg
+        run: |
+          cd sources
+          macdeployqt ../macos/Polyphone.app
+          xattr -cr ../macos/Polyphone.app
+          codesign --force --deep --sign - ../macos/Polyphone.app
+          codesign --verify --deep --strict --verbose=2 ../macos/Polyphone.app
+          hdiutil create -volname "Polyphone" -srcfolder ../macos/Polyphone.app -ov -format UDZO ../macos/Polyphone.dmg
+          mv ../macos/Polyphone.dmg ../macos/Polyphone_${{ inputs.tag }}-macOS_12.dmg
+
+      - name: Upload artifact
+        id: upload-artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: polyphone-macos-aarch64-installer
+          path: macos/*.dmg
+          retention-days: 7
+          if-no-files-found: error

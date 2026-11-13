@@ -1,0 +1,27 @@
+name: Deploy
+
+on:
+  push:
+    branches: ["main", "master"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Deploy to Staging Server via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_PRIVATE_KEY }}
+          script: |
+            cd winstall
+            git fetch origin "+refs/tags/${{ github.ref_name }}:refs/tags/${{ github.ref_name }}"
+            git checkout --force --detach "${{ github.sha }}"
+            npm install
+            npm run build
+            pm2 restart winstall
