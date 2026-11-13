@@ -1,0 +1,429 @@
+# docs https://github.com/marketplace/actions/create-release
+# docs https://github.com/ncipollo/release-action
+# docs https://docs.github.com/en/actions/using-jobs/choosing-the-runner-for-a-job#choosing-github-hosted-runners
+#
+# Architecture: build jobs upload workflow artifacts only. A single
+# finalize-release job creates the GitHub release with all assets + body.
+# If ANY build job fails, finalize-release is skipped and no release appears.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # Dry run. Builds, signs and uploads every artifact as a workflow artifact
+  # without publishing anything: finalize-release is skipped unless a v* tag
+  # was actually pushed. Every job reads the version from package.json rather
+  # than the tag, so a dispatch from a branch produces correctly named assets.
+  workflow_dispatch:
+
+jobs:
+  preflight:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Setup Node.js v22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable
+      - name: Install dependencies
+        run: |
+          for i in 1 2 3; do
+            echo "yarn install attempt $i"
+            yarn install --immutable && break
+            sleep 5
+            [ "$i" = "3" ] && exit 1
+          done
+      - name: Run Vitest
+        run: yarn test --run
+      - name: Lint
+        run: yarn lint
+      - name: Type check
+        run: yarn type-check
+      - name: Build React app
+        run: CI='' NODE_ENV=production yarn build
+      # Advisory only: React Doctor still runs and posts annotations for the diff
+      # since the previous tag, but a new finding must not block a release. Many
+      # error-level diagnostics flag intentional patterns, not bugs.
+      - name: Run React Doctor (advisory)
+        continue-on-error: true
+        run: |
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD^)
+          yarn doctor --diff "$PREVIOUS_TAG" --annotations
+      - name: Install stable Chrome for smoke tests
+        run: corepack yarn exec playwright install --force --with-deps chrome
+      - name: Smoke test built web app
+        run: node scripts/smoke-web-app.js --start-preview
+
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+    runs-on: ubuntu-22.04
+    needs: preflight
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Setup Node.js v22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable
+      - name: Install dependencies
+        run: |
+          for i in 1 2 3; do
+            echo "yarn install attempt $i"
+            yarn install --immutable && break
+            sleep 5
+            [ "$i" = "3" ] && exit 1
+          done
+      - name: Download IPFS and set permissions
+        run: BUILD_ARCH=${{ matrix.arch }} node electron/download-ipfs && sudo chmod +x bin/linux/ipfs
+      - name: Build React app
+        run: CI='' NODE_ENV=production yarn build
+      - name: Build Electron app for Linux (arm64)
+        if: matrix.arch == 'arm64'
+        run: yarn electron:build:linux:arm64
+      - name: Build Electron app for Linux (x64)
+        if: matrix.arch == 'x64'
+        run: yarn electron:build:linux:x64
+      - name: Stage release artifacts
+        run: |
+          mkdir -p release-assets
+          VERSION=$(node -e "console.log(require('./package.json').version)")
+          APPIMAGE_PATH=$(find out/make/AppImage -name '*.AppImage' | head -n 1)
+          [ -n "$APPIMAGE_PATH" ] || exit 1
+          cp "$APPIMAGE_PATH" "release-assets/5chan-${VERSION}-${{ matrix.arch }}.AppImage"
+      - name: Create static HTML release archive
+        if: matrix.arch == 'x64'
+        env:
+          RELEASE_MANIFEST_PRIVATE_KEY_PEM: ${{ secrets.RELEASE_MANIFEST_PRIVATE_KEY_PEM }}
+          RELEASE_MANIFEST_KEY_ID: 5chan-release-p256-2026-05
+        run: |
+          VERSION=$(node -e "console.log(require('./package.json').version)")
+          HTML_ARCHIVE_DIR="5chan-$VERSION-html"
+          rm -rf "$HTML_ARCHIVE_DIR"
+          yarn release:manifest --build-dir build --out-dir release-assets
+          cp -R build "$HTML_ARCHIVE_DIR"
+          cp release-assets/5chan-release-manifest.json "$HTML_ARCHIVE_DIR/5chan-release-manifest.json"
+          cp release-assets/5chan-release-manifest.sig.json "$HTML_ARCHIVE_DIR/5chan-release-manifest.sig.json"
+          zip -r "release-assets/${HTML_ARCHIVE_DIR}.zip" "$HTML_ARCHIVE_DIR"
+          rm -rf "$HTML_ARCHIVE_DIR"
+      - name: List release assets
+        run: ls -la release-assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-${{ matrix.arch }}
+          path: release-assets/
+
+  mac:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel # Intel x64
+            arch: x64
+          - runner: macos-latest # Apple Silicon arm64
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    needs: preflight
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Setup Node.js v22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install setuptools
+      - name: Install dependencies
+        run: |
+          for i in 1 2 3; do
+            echo "yarn install attempt $i"
+            yarn install --immutable && break
+            sleep 5
+            [ "$i" = "3" ] && exit 1
+          done
+      - name: Download IPFS and set permissions
+        run: node electron/download-ipfs && sudo chmod +x bin/mac/ipfs
+      - name: Build React app
+        run: CI='' NODE_ENV=production yarn build
+      # Import the Developer ID Application certificate into a throwaway keychain so
+      # forge can sign and notarize. Skipped (build stays unsigned) if secrets are absent.
+      - name: Import code signing certificate
+        env:
+          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          APPLE_CERT_P12_PASSWORD: ${{ secrets.APPLE_CERT_P12_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERT_P12_BASE64" ]; then
+            echo "No signing certificate configured, building unsigned"
+            exit 0
+          fi
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD=$(uuidgen)
+          echo "$APPLE_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$RUNNER_TEMP/cert.p12" -P "$APPLE_CERT_P12_PASSWORD" -A -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+          rm "$RUNNER_TEMP/cert.p12"
+      - name: Build Electron app for Mac
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          # Pass signing credentials only when the certificate was imported above, so
+          # forge's signing gate stays consistent with the keychain state.
+          APPLE_ID: ${{ secrets.APPLE_CERT_P12_BASE64 != '' && secrets.APPLE_ID || '' }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_CERT_P12_BASE64 != '' && secrets.APPLE_APP_SPECIFIC_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_CERT_P12_BASE64 != '' && secrets.APPLE_TEAM_ID || '' }}
+        run: |
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            yarn electron:build:mac:arm64
+          else
+            yarn electron:build:mac:x64
+          fi
+      - name: Stage release artifacts
+        run: |
+          mkdir -p release-assets
+          VERSION=$(node -e "console.log(require('./package.json').version)")
+          DMG_PATH=$(find out/make/dmg -name '*.dmg' | head -n 1)
+          ZIP_PATH=$(find out/make/zip -name '*.zip' | head -n 1)
+          [ -n "$DMG_PATH" ] || exit 1
+          [ -n "$ZIP_PATH" ] || exit 1
+          cp "$DMG_PATH" "release-assets/5chan-${VERSION}-${{ matrix.arch }}.dmg"
+          cp "$ZIP_PATH" "release-assets/5chan-${VERSION}-${{ matrix.arch }}.zip"
+      - name: List release assets
+        run: ls -la release-assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-mac-${{ matrix.arch }}
+          path: release-assets/
+
+  windows:
+    runs-on: windows-2022
+    needs: preflight
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Setup Node.js v22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable
+      - name: Resolve Yarn cache path
+        id: yarn-cache
+        shell: bash
+        run: echo "dir=$(corepack yarn config get cacheFolder)" >> "$GITHUB_OUTPUT"
+      - name: Cache Yarn package tarballs
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.yarn-cache.outputs.dir }}
+          key: ${{ runner.os }}-yarn-v1-${{ hashFiles('yarn.lock', 'package.json', '.yarnrc.yml') }}
+          restore-keys: ${{ runner.os }}-yarn-v1-
+      - name: Cache electron binaries
+        uses: actions/cache@v4
+        with:
+          path: ~/AppData/Local/electron/Cache
+          key: ${{ runner.os }}-electron-v2-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: ${{ runner.os }}-electron-v2-
+      - name: Install dependencies
+        shell: bash
+        run: |
+          for i in 1 2 3; do
+            echo "yarn install attempt $i"
+            yarn install --immutable && break
+            sleep 5
+            [ "$i" = "3" ] && exit 1
+          done
+      - name: Build React app
+        run: npx cross-env NODE_ENV=production yarn build
+      - name: Build Electron app for Windows (x64)
+        run: yarn electron:build:windows
+      - name: Stage release artifacts
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          VERSION=$(node -e "console.log(require('./package.json').version)")
+          SETUP_EXE_PATH=$(find out/make -iname '*setup*.exe' | head -n 1)
+          [ -n "$SETUP_EXE_PATH" ] || exit 1
+          cp "$SETUP_EXE_PATH" "release-assets/5chan-${VERSION}-x64.Setup.exe"
+      - name: List release assets
+        shell: bash
+        run: ls -la release-assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: release-assets/
+
+  android:
+    runs-on: ubuntu-22.04
+    needs: preflight
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable
+      - run: sudo apt-get install -y apksigner zipalign
+      - name: Install dependencies
+        run: |
+          for i in 1 2 3; do
+            echo "yarn install attempt $i"
+            yarn install --immutable && break
+            sleep 5
+            [ "$i" = "3" ] && exit 1
+          done
+      - name: Build React app
+        run: CI='' NODE_ENV=production yarn build
+      - name: Sync Capacitor
+        run: npx cap sync android
+      - name: Build APK
+        run: |
+          for i in 1 2 3; do
+            echo "gradlew assembleGithubRelease attempt $i"
+            (cd android && ./gradlew assembleGithubRelease --stacktrace) && break
+            sleep 10
+            [ "$i" = "3" ] && exit 1
+          done
+      - name: Optimize APK
+        run: cd android/app/build/outputs/apk/github/release && zipalign 4 app-github-release-unsigned.apk app-github-release-unsigned-zip.apk
+      - name: Check Android signing secret
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.BITSOCIAL_KEYSTORE_PASSWORD }}
+        run: |
+          if [ -z "${KEYSTORE_PASSWORD:-}" ]; then
+            echo "::error::BITSOCIAL_KEYSTORE_PASSWORD is required to sign the Android release APK."
+            exit 1
+          fi
+      # Pass the keystore password through the environment rather than the
+      # command line: it keeps the secret out of the process argument list and
+      # out of reach of shell metacharacter expansion.
+      - name: Sign APK
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.BITSOCIAL_KEYSTORE_PASSWORD }}
+        run: cd android/app/build/outputs/apk/github/release && apksigner sign --ks ../../../../../../bitsocial.keystore --ks-pass env:KEYSTORE_PASSWORD --ks-key-alias release --out app-github-release-signed.apk app-github-release-unsigned-zip.apk
+      - name: Verify APK signature
+        run: cd android/app/build/outputs/apk/github/release && apksigner verify --verbose --print-certs app-github-release-signed.apk
+      - name: Stage release artifacts
+        run: |
+          mkdir -p release-assets
+          VERSION=$(node -e "console.log(require('./package.json').version)")
+          mv android/app/build/outputs/apk/github/release/app-github-release-signed.apk "release-assets/5chan-${VERSION}.apk"
+      - name: List release assets
+        run: ls -la release-assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-android
+          path: release-assets/
+
+  finalize-release:
+    # Publication step. A workflow_dispatch run stops after the build jobs, so a
+    # dry run can never create a GitHub release or deploy to Vercel Production.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    needs: [linux, mac, windows, android]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Setup Node.js v22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable
+      - name: Install dependencies
+        run: |
+          for i in 1 2 3; do
+            echo "yarn install attempt $i"
+            yarn install --immutable && break
+            sleep 5
+            [ "$i" = "3" ] && exit 1
+          done
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: List all release assets
+        run: ls -la release-assets
+      - name: Populate dist for release-body script
+        run: |
+          mkdir -p dist
+          cp release-assets/* dist/
+      - name: Generate release body
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: node scripts/release-body > release-body.txt
+      - name: Check Vercel deployment token
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          if [ -z "${VERCEL_TOKEN:-}" ]; then
+            echo "::error::VERCEL_TOKEN is required to deploy the release HTML archive to Vercel Production."
+            exit 1
+          fi
+      - name: Create GitHub release
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: 'release-assets/*'
+          bodyFile: "release-body.txt"
+          allowUpdates: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Deploy web release to Vercel Production
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: team_drHWHjDIQypSvbjZ1F468uLm
+          VERCEL_PROJECT_ID: prj_oeEtip9l1zUvJF00QdhMXpXn2CH7
+        run: |
+          if [ -z "${VERCEL_TOKEN:-}" ]; then
+            echo "::error::VERCEL_TOKEN is required to deploy the release HTML archive to Vercel Production."
+            exit 1
+          fi
+
+          VERSION="${GITHUB_REF_NAME#v}"
+          RELEASE_ASSET="release-assets/5chan-${VERSION}-html.zip"
+          STAGED_DIR=$(node scripts/prepare-vercel-release-deploy.mjs --tag "$GITHUB_REF_NAME" --asset "$RELEASE_ASSET" --out-dir vercel-release-deploy)
+          corepack yarn dlx vercel@50.23.2 deploy "$STAGED_DIR" \
+            --prebuilt \
+            --prod \
+            --yes \
+            --force \
+            --archive=tgz \
+            --token "$VERCEL_TOKEN" \
+            --meta source=github-release \
+            --meta releaseTag="$GITHUB_REF_NAME" \
+            --meta releaseAsset="5chan-${VERSION}-html.zip"

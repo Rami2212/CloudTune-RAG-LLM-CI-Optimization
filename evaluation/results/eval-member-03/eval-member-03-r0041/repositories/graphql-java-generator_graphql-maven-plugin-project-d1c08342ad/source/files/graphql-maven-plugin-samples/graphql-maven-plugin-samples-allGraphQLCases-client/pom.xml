@@ -1,0 +1,545 @@
+<?xml version="1.0"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+	<modelVersion>4.0.0</modelVersion>
+	<parent>
+		<groupId>com.graphql-java-generator</groupId>
+		<artifactId>graphql-maven-plugin-samples</artifactId>
+		<version>0-SNAPSHOT</version>
+	</parent>
+
+	<artifactId>graphql-maven-plugin-samples-allGraphQLCases-client</artifactId>
+
+	<description>
+		This module test a maximum of different cases:
+		- Connection to three different GraphQL servers
+		- A different target/build folder
+	</description>
+
+	<properties>
+		<!--Parameters to pass to the buildScript, as it seems unable to get the maven native "project.basedir" property -->
+		<cloned_project_basedir>${project.basedir}</cloned_project_basedir>
+	</properties>
+	
+	<build>
+		<directory>${project.basedir}/target2</directory>
+		<plugins>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-compiler-plugin</artifactId>
+				<executions>
+					<execution>
+						<!--  Compilation of the GenerateCustomTemplate class, to be used in the generate-resources phase -->
+						<id>compileBuildScript</id>
+						<phase>initialize</phase>
+						<goals>
+							<goal>compile</goal>
+						</goals>
+						<configuration>
+							<compileSourceRoots>${project.basedir}/src/buildScript/java</compileSourceRoots>
+						</configuration>
+					</execution>
+		          <execution>
+		            <id>default-compile</id>
+		            <phase>compile</phase>
+		            <goals>
+		              <goal>compile</goal>
+		            </goals>
+		            <!--configuration>
+		              <source>17</source>
+		              <target>17</target>
+		              <release>17</release>
+		              <compilerArgs>
+		                <arg>-Xlint:-requires-transitive-automatic</arg>
+		              </compilerArgs>
+		              <parameters>true</parameters>
+		            </configuration-->
+		          </execution>
+		          <execution>
+		            <id>default-testCompile</id>
+		            <phase>test-compile</phase>
+		            <goals>
+		              <goal>testCompile</goal>
+		            </goals>
+		          </execution>
+				</executions>
+			</plugin>
+			<plugin>
+				<groupId>org.codehaus.mojo</groupId>
+				<artifactId>exec-maven-plugin</artifactId>
+				<executions>
+					<execution>
+						<!-- Generation of a custom template, based on the original template. This is is used by the
+						com.graphql_java_generator.customtemplates.ValidateCustomQueryIT class of the
+						graphql-maven-plugin-samples-allGraphQLCases-client maven module, to test the custom templates behavior -->
+						<id>generate-custom-templates</id>
+						<phase>generate-resources</phase>
+						<goals>
+							<goal>java</goal>
+						</goals>
+					</execution>
+				</executions>
+				<configuration>
+					<sourceRoot>${project.basedir}/src/buildScript/java</sourceRoot>
+					<mainClass>
+						com.graphql_java_generator.custom_template.GenerateCustomTemplate</mainClass>
+				</configuration>
+			</plugin>
+			<!-- End of generation of the custom templates (from the original one) -->
+			<plugin>
+				<groupId>com.graphql-java-generator</groupId>
+				<artifactId>graphql-maven-plugin</artifactId>
+				<executions>
+					<!-- These two executions allow to test the merge goal, then generate 
+						the code from the merged GraphQL schema file. The graphql-maven-plugin-samples-allGraphQLCases-server 
+						project directly generates the code from the two (non merged) GraphQL schema 
+						files -->
+					<execution>
+						<id>graphql-merge</id>
+						<goals>
+							<goal>generateGraphQLSchema</goal>
+						</goals>
+						<configuration>
+							<!-- addRelayConnections will generate all the Relay Connection stuff 
+								(Node, Edge and Connection interfaces, and creating the XxxEdge and XxxConnection 
+								interfaces or objects), for fields marked with the @RelayConnection directive. 
+								See the documentation for more information -->
+							<addRelayConnections>true</addRelayConnections>
+							<schemaFileFolder>${basedir}/src/graphqls/allGraphQLCases/</schemaFileFolder>
+							<targetSchemaFileName>merged_schemas.graphqls</targetSchemaFileName>
+						</configuration>
+					</execution>
+					<execution>
+						<id>graphql-generateCode 1</id>
+						<goals>
+							<goal>generateClientCode</goal>
+						</goals>
+						<configuration>
+							<generateDeprecatedRequestResponse>true</generateDeprecatedRequestResponse>
+							<packageName>org.allGraphQLCases.client</packageName>
+							<schemaFileFolder>${project.build.directory}/generated-resources/graphql-maven-plugin_generate-relay-schema/</schemaFileFolder>
+							<schemaPersonalizationFile>/src/graphqls/schema_personalization/schema_personalization.json</schemaPersonalizationFile>
+							<springBeanSuffix>AllGraphQLCases</springBeanSuffix>
+							<customScalars>
+								<customScalar>
+									<graphQLTypeName>Base64String</graphQLTypeName>
+									<javaType>byte[]</javaType>
+									<graphQLScalarTypeStaticField>com.graphql_java_generator.customscalars.GraphQLScalarTypeBase64String.GraphQLBase64String</graphQLScalarTypeStaticField>
+								</customScalar>
+								<customScalar>
+									<graphQLTypeName>CustomId</graphQLTypeName>
+									<javaType>com.generated.graphql.samples.customscalar.CustomId</javaType>
+									<graphQLScalarTypeStaticField>com.generated.graphql.samples.customscalar.GraphQLScalarTypeCustomId.CustomIdScalarType</graphQLScalarTypeStaticField>
+								</customScalar>
+								<customScalar>
+									<graphQLTypeName>MyCustomScalarForADate</graphQLTypeName>
+									<javaType>java.util.Date</javaType>
+									<graphQLScalarTypeStaticField>com.graphql_java_generator.customscalars.GraphQLScalarTypeDate.Date</graphQLScalarTypeStaticField>
+								</customScalar>
+								<customScalar>
+									<graphQLTypeName>MyCustomScalarForADateTime</graphQLTypeName>
+									<javaType>java.time.OffsetDateTime</javaType>
+									<graphQLScalarTypeStaticField>graphql.scalars.ExtendedScalars.DateTime</graphQLScalarTypeStaticField>
+								</customScalar>
+								<customScalar>
+									<graphQLTypeName>else</graphQLTypeName>
+									<javaType>java.lang.String</javaType>
+									<graphQLScalarTypeGetter>com.generated.customscalars.GraphQLScalarTypeElse.getElseScalar()</graphQLScalarTypeGetter>
+								</customScalar>
+								<customScalar>
+									<graphQLTypeName>JSON</graphQLTypeName>
+									<javaType>tools.jackson.databind.node.ObjectNode</javaType>
+									<graphQLScalarTypeStaticField>graphql.scalars.ExtendedScalars.Json</graphQLScalarTypeStaticField>
+								</customScalar>
+								<customScalar>
+									<graphQLTypeName>MyBoolean</graphQLTypeName>
+									<javaType>java.lang.Boolean</javaType>
+									<graphQLScalarTypeStaticField>com.generated.graphql.samples.customscalar.GraphQLScalarTypeMyBoolean.MyBooleanScalarType</graphQLScalarTypeStaticField>
+								</customScalar>
+								<customScalar>
+									<graphQLTypeName>Long</graphQLTypeName>
+									<javaType>java.lang.Long</javaType>
+									<graphQLScalarTypeStaticField>graphql.scalars.ExtendedScalars.GraphQLLong</graphQLScalarTypeStaticField>
+								</customScalar>
+								<customScalar>
+									<graphQLTypeName>NonNegativeInt</graphQLTypeName>
+									<javaType>java.lang.Integer</javaType>
+									<graphQLScalarTypeStaticField>graphql.scalars.ExtendedScalars.NonNegativeInt</graphQLScalarTypeStaticField>
+								</customScalar>
+								<customScalar>
+									<graphQLTypeName>Object</graphQLTypeName>
+									<javaType>java.lang.Object</javaType>
+									<graphQLScalarTypeStaticField>graphql.scalars.ExtendedScalars.Object</graphQLScalarTypeStaticField>
+								</customScalar>
+							</customScalars>
+							<!-- ClientINputPrefix -->
+							<inputPrefix>CINP_</inputPrefix>
+							<!-- ClientINputSuffix -->
+							<inputSuffix>_CINS</inputSuffix>
+							<!-- ClientTypePrefix -->
+							<typePrefix>CTP_</typePrefix>
+							<!-- ClientTypeSuffix etc. -->
+							<typeSuffix>_CTS</typeSuffix>
+							<interfacePrefix>CIP_</interfacePrefix>
+							<interfaceSuffix>_CIS</interfaceSuffix>
+							<unionPrefix>CUP_</unionPrefix>
+							<unionSuffix>_CUS</unionSuffix>
+							<enumPrefix>CEP_</enumPrefix>
+							<enumSuffix>_CES</enumSuffix>
+						</configuration>
+					</execution>
+					<execution>
+						<!-- This second generation of the client code for the same -->
+						<id>graphql-generateCode 2</id>
+						<goals>
+							<goal>generateClientCode</goal>
+						</goals>
+						<configuration>
+							<!-- In this pom, we choose not to copy the runtime. It allows to 
+								replace it by another one, for instance one updated for your needs. You then 
+								need to add this runtime as a dependency -->
+							<copyRuntimeSources>false</copyRuntimeSources>
+							<packageName>org.allGraphQLCases.client2</packageName>
+							<schemaFileFolder>${project.build.directory}/generated-resources/graphql-maven-plugin_generate-relay-schema/</schemaFileFolder>
+							<separateUtilityClasses>false</separateUtilityClasses>
+							<skipGenerationIfSchemaHasNotChanged>true</skipGenerationIfSchemaHasNotChanged>
+							<springBeanSuffix>AllGraphQLCases2</springBeanSuffix>
+							<targetSourceFolder>${project.build.directory}/generated-sources/graphql-maven-plugin2</targetSourceFolder>
+							<customScalars>
+								<customScalar>
+									<graphQLTypeName>Base64String</graphQLTypeName>
+									<javaType>byte[]</javaType>
+									<graphQLScalarTypeStaticField>com.graphql_java_generator.customscalars.GraphQLScalarTypeBase64String.GraphQLBase64String</graphQLScalarTypeStaticField>
+								</customScalar>
+								<customScalar>
+									<graphQLTypeName>CustomId</graphQLTypeName>
+									<javaType>com.generated.graphql.samples.customscalar.CustomId</javaType>
+									<graphQLScalarTypeStaticField>com.generated.graphql.samples.customscalar.GraphQLScalarTypeCustomId.CustomIdScalarType</graphQLScalarTypeStaticField>
+								</customScalar>
+								<customScalar>
+									<graphQLTypeName>MyCustomScalarForADate</graphQLTypeName>
+									<javaType>java.util.Date</javaType>
+									<graphQLScalarTypeStaticField>com.graphql_java_generator.customscalars.GraphQLScalarTypeDate.Date</graphQLScalarTypeStaticField>
+								</customScalar>
+								<customScalar>
+									<graphQLTypeName>MyCustomScalarForADateTime</graphQLTypeName>
+									<javaType>java.time.OffsetDateTime</javaType>
+									<graphQLScalarTypeStaticField>graphql.scalars.ExtendedScalars.DateTime</graphQLScalarTypeStaticField>
+								</customScalar>
+								<customScalar>
+									<graphQLTypeName>else</graphQLTypeName>
+									<javaType>java.lang.String</javaType>
+									<graphQLScalarTypeGetter>com.generated.customscalars.GraphQLScalarTypeElse.getElseScalar()</graphQLScalarTypeGetter>
+								</customScalar>
+								<customScalar>
+									<graphQLTypeName>JSON</graphQLTypeName>
+									<javaType>tools.jackson.databind.node.ObjectNode</javaType>
+									<graphQLScalarTypeStaticField>graphql.scalars.ExtendedScalars.Json</graphQLScalarTypeStaticField>
+								</customScalar>
+								<customScalar>
+									<graphQLTypeName>MyBoolean</graphQLTypeName>
+									<javaType>java.lang.Boolean</javaType>
+									<graphQLScalarTypeStaticField>com.generated.graphql.samples.customscalar.GraphQLScalarTypeMyBoolean.MyBooleanScalarType</graphQLScalarTypeStaticField>
+								</customScalar>
+								<customScalar>
+									<graphQLTypeName>Long</graphQLTypeName>
+									<javaType>java.lang.Long</javaType>
+									<graphQLScalarTypeStaticField>graphql.scalars.ExtendedScalars.GraphQLLong</graphQLScalarTypeStaticField>
+								</customScalar>
+								<customScalar>
+									<graphQLTypeName>NonNegativeInt</graphQLTypeName>
+									<javaType>java.lang.Integer</javaType>
+									<graphQLScalarTypeStaticField>graphql.scalars.ExtendedScalars.NonNegativeInt</graphQLScalarTypeStaticField>
+								</customScalar>
+								<customScalar>
+									<graphQLTypeName>Object</graphQLTypeName>
+									<javaType>java.lang.Object</javaType>
+									<graphQLScalarTypeStaticField>graphql.scalars.ExtendedScalars.Object</graphQLScalarTypeStaticField>
+								</customScalar>
+							</customScalars>
+						</configuration>
+					</execution>
+					<execution>
+						<id>generate-forum-client-code</id>
+						<goals>
+							<goal>graphql</goal>
+						</goals>
+						<configuration>
+							<mode>client</mode>
+							<copyRuntimeSources>false</copyRuntimeSources>
+							<generateDeprecatedRequestResponse>true</generateDeprecatedRequestResponse>
+							<packageName>org.forum.client</packageName>
+							<schemaFileFolder>${basedir}/src/graphqls/forum/</schemaFileFolder>
+							<separateUtilityClasses>false</separateUtilityClasses>
+							<skipGenerationIfSchemaHasNotChanged>true</skipGenerationIfSchemaHasNotChanged>
+							<springBeanSuffix>Forum</springBeanSuffix>
+							<targetSourceFolder>${project.build.directory}/generated-sources/graphql-maven-plugin_forum</targetSourceFolder>
+							<customScalars>
+								<customScalar>
+									<graphQLTypeName>Date</graphQLTypeName>
+									<javaType>java.util.Date</javaType>
+									<graphQLScalarTypeStaticField>com.graphql_java_generator.customscalars.GraphQLScalarTypeDate.Date</graphQLScalarTypeStaticField>
+								</customScalar>
+							</customScalars>
+							<templates>
+								<!-- The QUERY_MUTATION is found in the graphql-maven-plugin-samples-CustomTemplates-resttemplate dependency -->
+								<QUERY_MUTATION>templates/resttemplate/client_query_mutation_type.vm.java</QUERY_MUTATION>
+								<!-- The SUBSCRIPTION_EXECUTOR is found in this project, int the src/graphql/customtemplates folder -->
+								<SUBSCRIPTION>src/graphqls/customtemplates/client_subscription_type.vm.java</SUBSCRIPTION>
+							</templates>
+						</configuration>
+					</execution>
+				</executions>
+				<dependencies>
+					<!-- Dependency contains the custom template parameterized in plugin and a QueryExecutor bases on Spring Rest Template -->
+					<dependency>
+						<groupId>com.graphql-java-generator</groupId>
+						<artifactId>graphql-maven-plugin-samples-CustomTemplates-resttemplate</artifactId>
+						<version>${project.version}</version>
+					</dependency>
+				</dependencies>
+			</plugin>
+			<plugin>
+				<groupId>org.codehaus.mojo</groupId>
+				<artifactId>build-helper-maven-plugin</artifactId>
+				<executions>
+					<execution>
+						<id>add-source</id>
+						<phase>generate-sources</phase>
+						<goals>
+							<goal>add-source</goal>
+						</goals>
+						<configuration>
+							<sources>
+								<source>${project.build.directory}/generated-sources/graphql-maven-plugin</source>
+								<source>${project.build.directory}/generated-sources/graphql-maven-plugin2</source>
+								<source>${project.build.directory}/generated-sources/graphql-maven-plugin_forum</source>
+								<!-- Source code for the buildScript that generates the custom templates -->
+								<source>${project.basedir}/src/buildScript/java</source>
+							</sources>
+						</configuration>
+					</execution>
+				</executions>
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-dependency-plugin</artifactId>
+				<executions>
+					<execution>
+						<goals>
+							<goal>properties</goal>
+						</goals>
+					</execution>
+				</executions>
+			</plugin>
+			<plugin>
+				<!-- Execution of the integration tests -->
+				<!-- Direct execution with maven is possible with this command: mvn failsafe:integration-test -pl :graphql-maven-plugin-samples-allGraphQLCases-client -->
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-failsafe-plugin</artifactId>
+				<executions>
+					<execution>
+						<goals>
+							<goal>integration-test</goal>
+							<goal>verify</goal>
+						</goals>
+					</execution>
+				</executions>
+				<configuration>
+					<argLine>
+-javaagent:${org.mockito:mockito-core:jar}
+--add-opens com.graphql_java_generator.graphql_maven_plugin_project.graphql_maven_plugin_samples_allGraphQLCases_client/com.graphql_java_generator.annotation_test=tools.jackson.databind,com.graphql_java_generator.graphql_maven_plugin_project.graphql_java_common_runtime,spring.beans,spring.context,spring.core
+--add-opens com.graphql_java_generator.graphql_maven_plugin_project.graphql_maven_plugin_samples_allGraphQLCases_client/com.graphql_java_generator.customtemplates=tools.jackson.databind,com.graphql_java_generator.graphql_maven_plugin_project.graphql_java_common_runtime,spring.beans,spring.context,spring.core
+--add-opens com.graphql_java_generator.graphql_maven_plugin_project.graphql_maven_plugin_samples_allGraphQLCases_client/com.graphql_java_generator.samples.forum.test.client.subscription=tools.jackson.databind,com.graphql_java_generator.graphql_maven_plugin_project.graphql_java_common_runtime,spring.beans,spring.context,spring.core
+--add-opens com.graphql_java_generator.graphql_maven_plugin_project.graphql_maven_plugin_samples_allGraphQLCases_client/com.graphql_java_generator.schema_personalization=tools.jackson.databind,com.graphql_java_generator.graphql_maven_plugin_project.graphql_java_common_runtime,spring.beans,spring.context,spring.core
+--add-opens com.graphql_java_generator.graphql_maven_plugin_project.graphql_maven_plugin_samples_allGraphQLCases_client/org.allGraphQLCases=tools.jackson.databind,com.graphql_java_generator.graphql_maven_plugin_project.graphql_java_common_runtime,spring.beans,spring.context,spring.core
+--add-opens com.graphql_java_generator.graphql_maven_plugin_project.graphql_maven_plugin_samples_allGraphQLCases_client/org.allGraphQLCases.client=tools.jackson.databind,com.graphql_java_generator.graphql_maven_plugin_project.graphql_java_common_runtime,spring.beans,spring.context,spring.core
+--add-opens com.graphql_java_generator.graphql_maven_plugin_project.graphql_maven_plugin_samples_allGraphQLCases_client/org.allGraphQLCases.client.util=tools.jackson.databind,com.graphql_java_generator.graphql_maven_plugin_project.graphql_java_common_runtime,spring.beans,spring.context,spring.core
+--add-opens com.graphql_java_generator.graphql_maven_plugin_project.graphql_maven_plugin_samples_allGraphQLCases_client/org.allGraphQLCases.client2=tools.jackson.databind,com.graphql_java_generator.graphql_maven_plugin_project.graphql_java_common_runtime,spring.beans,spring.context,spring.core
+--add-opens com.graphql_java_generator.graphql_maven_plugin_project.graphql_maven_plugin_samples_allGraphQLCases_client/org.allGraphQLCases.graphqlrepositories=tools.jackson.databind,com.graphql_java_generator.graphql_maven_plugin_project.graphql_java_common_runtime,spring.beans,spring.context,spring.core
+--add-opens com.graphql_java_generator.graphql_maven_plugin_project.graphql_maven_plugin_samples_allGraphQLCases_client/org.allGraphQLCases.impl=tools.jackson.databind,com.graphql_java_generator.graphql_maven_plugin_project.graphql_java_common_runtime,spring.beans,spring.context,spring.core
+--add-opens com.graphql_java_generator.graphql_maven_plugin_project.graphql_maven_plugin_samples_allGraphQLCases_client/org.allGraphQLCases.oauth=tools.jackson.databind,com.graphql_java_generator.graphql_maven_plugin_project.graphql_java_common_runtime,spring.beans,spring.context,spring.core
+--add-opens com.graphql_java_generator.graphql_maven_plugin_project.graphql_maven_plugin_samples_allGraphQLCases_client/org.allGraphQLCases.subscription=tools.jackson.databind,com.graphql_java_generator.graphql_maven_plugin_project.graphql_java_common_runtime,spring.beans,spring.context,spring.core
+--add-opens com.graphql_java_generator.graphql_maven_plugin_project.graphql_maven_plugin_samples_allGraphQLCases_client/org.allGraphQLCases.subscription.graphqlrepository=tools.jackson.databind,com.graphql_java_generator.graphql_maven_plugin_project.graphql_java_common_runtime,spring.beans,spring.context,spring.core
+--add-opens com.graphql_java_generator.graphql_maven_plugin_project.graphql_maven_plugin_samples_allGraphQLCases_client/org.allGraphQLCases.two_graphql_servers=tools.jackson.databind,com.graphql_java_generator.graphql_maven_plugin_project.graphql_java_common_runtime,spring.beans,spring.context,spring.core
+--add-opens com.graphql_java_generator.graphql_maven_plugin_project.graphql_maven_plugin_samples_allGraphQLCases_client/org.forum.customtemplates=tools.jackson.databind,com.graphql_java_generator.graphql_maven_plugin_project.graphql_java_common_runtime,spring.beans,spring.context,spring.core
+--add-opens com.graphql_java_generator.graphql_maven_plugin_project.graphql_maven_plugin_samples_allGraphQLCases_client/org.forum.client=tools.jackson.databind,com.graphql_java_generator.graphql_maven_plugin_project.graphql_java_common_runtime,spring.beans,spring.context,spring.core
+					</argLine>
+					<!--
+					<parallel>methods</parallel>
+					<threadCount>10</threadCount>
+					-->
+				</configuration>
+			</plugin>
+			<plugin>
+				<!-- This plugin allows to start the SpringBoot server in the background 
+					during the integration tests -->
+				<groupId>de.eitco.cicd.exec</groupId>
+				<artifactId>process-exec-maven-plugin</artifactId>
+				<executions>
+					<execution>
+						<id>start_OAuth_server</id>
+						<phase>pre-integration-test</phase>
+						<goals>
+							<goal>start</goal>
+						</goals>
+						<configuration> 
+							<skip>${skipTests}</skip>
+							<name>graphql-maven-plugin-samples-OAuth-server</name>
+							<workingDir>OAuth-server</workingDir>
+							<processLogFile>${project.build.directory}/OAuth-server/OAuth-server.log</processLogFile>
+							<!-- waitAfterLaunch set to 0: this server will be starting while the other servers start -->
+							<waitAfterLaunch>0</waitAfterLaunch>
+							<waitForInterrupt>false</waitForInterrupt>
+							<arguments> 
+								<argument>java</argument>
+								<argument>-jar</argument>
+								<argument>${basedir}/../graphql-maven-plugin-samples-OAuth-server/target/graphql-maven-plugin-samples-OAuth-server-${project.version}.jar</argument>
+							</arguments>
+						</configuration>
+					</execution>
+					<execution>
+						<id>start_allGraphQLCases_server</id>
+						<phase>pre-integration-test</phase>
+						<goals>
+							<goal>start</goal>
+						</goals>
+						<configuration>
+							<skip>${skipTests}</skip>
+							<name>allGraphQLCases sample GraphQL server</name>
+							<workingDir>allGraphQLCases_graphql_server</workingDir>
+							<!-- processLogFile>${project.build.directory}/allGraphQLCases_graphql_server.log</processLogFile -->
+							<waitAfterLaunch>180</waitAfterLaunch>
+							<waitForInterrupt>false</waitForInterrupt>
+							<healthCheckUrl>http://localhost:8180/helloworld.html</healthCheckUrl>
+							<arguments>
+								<argument>java</argument>
+								<argument>-jar</argument>
+								<argument>${basedir}/../graphql-maven-plugin-samples-allGraphQLCases-server/target/graphql-maven-plugin-samples-allGraphQLCases-server-${project.version}.jar</argument>
+							</arguments>
+						</configuration>
+					</execution>
+					<execution>
+						<id>start-forum-server</id>
+						<phase>pre-integration-test</phase>
+						<goals>
+							<goal>start</goal>
+						</goals>
+						<configuration>
+							<skip>${skipTests}</skip>
+							<name>Forum GraphQL server</name>
+							<workingDir>forum_graphql_server</workingDir>
+							<waitAfterLaunch>60</waitAfterLaunch>
+							<waitForInterrupt>false</waitForInterrupt>
+							<healthCheckUrl>http://localhost:8182/graphiql</healthCheckUrl>
+							<arguments>
+								<argument>java</argument>
+								<argument>-jar</argument>
+								<argument>${basedir}/../graphql-maven-plugin-samples-Forum-server/target/graphql-maven-plugin-samples-Forum-server-${project.version}.jar</argument>
+							</arguments>
+						</configuration>
+					</execution>
+					<!--Stop all processes in reverse order -->
+					<execution>
+						<id>stop-all</id>
+						<phase>post-integration-test</phase>
+						<goals>
+							<goal>stop-all</goal>
+						</goals>
+					</execution>
+				</executions>
+			</plugin>
+			<plugin>
+				<groupId>org.springframework.boot</groupId>
+				<artifactId>spring-boot-maven-plugin</artifactId>
+				<configuration>
+					<mainClass>org.allGraphQLCases.Main</mainClass>
+				</configuration>
+			</plugin>
+			<plugin>
+				<!-- We don't want to spam the repository with test/sample artefacts -->
+				<artifactId>maven-deploy-plugin</artifactId>
+				<configuration>
+					<skip>true</skip>
+				</configuration>
+			</plugin>
+		</plugins>
+	</build>
+
+	<dependencies>
+		<!-- Dependencies for the generated code -->
+		<!-- In this pom, we choose not to copy the runtime. It allows to replace 
+			it by another one, for instance one updated for your needs. You then need 
+			to add this runtime as a dependency -->
+		<dependency>
+			<groupId>com.graphql-java-generator</groupId>
+			<artifactId>graphql-java-client-runtime</artifactId>
+		</dependency>
+
+		<!-- Dependency contains the custom template parameterized in plugin and a QueryExecutor based on Spring Rest Template -->
+		<dependency>
+			<groupId>com.graphql-java-generator</groupId>
+			<artifactId>graphql-maven-plugin-samples-CustomTemplates-resttemplate</artifactId>
+			<version>${project.version}</version>
+		</dependency>
+
+		<!-- Complementary graphql dependencies, for the custom scalars -->
+		<dependency>
+			<groupId>com.graphql-java</groupId>
+			<artifactId>graphql-java-extended-scalars</artifactId>
+		</dependency>
+
+		<!-- Other Spring dependencies -->
+		<!--dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-security</artifactId>
+		</dependency-->
+		<dependency>
+			<groupId>org.springframework.security</groupId>
+			<artifactId>spring-security-oauth2-client</artifactId>
+		</dependency>
+
+
+		<dependency>
+			<groupId>commons-logging</groupId>
+			<artifactId>commons-logging</artifactId>
+		</dependency>
+		
+		<!-- Dependencies for tests -->
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-test</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.junit.jupiter</groupId>
+			<artifactId>junit-jupiter-api</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.junit.jupiter</groupId>
+			<artifactId>junit-jupiter-engine</artifactId>
+			<scope>test</scope>
+		</dependency>
+	</dependencies>
+
+	<reporting>
+		<plugins>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-javadoc-plugin</artifactId>
+				<reportSets>
+					<reportSet>
+						<id>non-aggregate</id>
+						<reports>
+							<report>javadoc</report>
+						</reports>
+					</reportSet>
+				</reportSets>
+				<configuration>
+					<source>${java.majorVersion}</source>
+				</configuration>
+			</plugin>
+		</plugins>
+	</reporting>
+
+</project>
