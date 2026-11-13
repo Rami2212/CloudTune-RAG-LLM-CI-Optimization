@@ -1,0 +1,92 @@
+[2mAnalyzing workflows in C:\Users\hirun\AppData\Local\Temp\cloudtune-ci-cost-r96n0ryf\.github\workflows...[0m
+[2mFound 1 workflow file[0m
+
+[1m[36mci-cost[0m â€” GitHub Actions Cost Analyzer
+
+[2mAnalyzed 1 workflow Â· 7 jobs Â· 4 recommendations[0m
+
+[1mSEVERITY  RECOMMENDATION                                        ESTIMATED SAVINGS[0m
+[2mâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€[0m
+[33m[1mMEDIUM[0m  Add concurrency group to "ci.yml"                     [32m~2 min per run[0m
+[33m[1mMEDIUM[0m  4 jobs clone the repo â€” consider artifact sharing     [32m~1 min per run[0m
+[34m[1mLOW   [0m  Explicitly set fail-fast for large matrix job "bu...  [32m~2 min per run[0m
+[34m[1mLOW   [0m  Explicitly set fail-fast for large matrix job "ex...  [32m~2 min per run[0m
+
+[2mâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€[0m
+
+[1mRecommendations:[0m
+
+[1m1. [33m[MEDIUM][0m[1m Add concurrency group to "ci.yml"[0m
+   [2mFile: ci.yml[0m
+   "ci.yml" runs on pull requests but has no `concurrency` setting. Without it, every push to a PR branch queues a new run while the previous one is still running â€” wasting runner minutes. A concurrency group cancels stale runs automatically.
+
+   [36mFix:[0m
+   [2m# Add at the top level of your workflow (after 'on:'):[0m
+   [2mconcurrency:[0m
+   [2m  group: ${{ github.workflow }}-${{ github.ref }}[0m
+   [2m  cancel-in-progress: true[0m
+   [2m[0m
+   [2m# For deployment workflows where you want to queue instead of cancel:[0m
+   [2m# concurrency:[0m
+   [2m#   group: deploy-${{ github.ref }}[0m
+   [2m#   cancel-in-progress: false[0m
+
+[1m2. [33m[MEDIUM][0m[1m 4 jobs clone the repo â€” consider artifact sharing[0m
+   [2mFile: ci.yml[0m
+   4 jobs in "ci.yml" each run `actions/checkout`. For large repos or jobs that share build output, upload the build artifact once and download it in dependent jobs instead of re-cloning and re-building.
+
+   [36mFix:[0m
+   [2m# In your build job, upload the artifact:[0m
+   [2m      - name: Upload build artifact[0m
+   [2m        uses: actions/upload-artifact@v4[0m
+   [2m        with:[0m
+   [2m          name: build-output[0m
+   [2m          path: dist/[0m
+   [2m          retention-days: 1[0m
+   [2m[0m
+   [2m# In dependent jobs, download instead of re-building:[0m
+   [2m      - name: Download build artifact[0m
+   [2m        uses: actions/download-artifact@v4[0m
+   [2m        with:[0m
+   [2m          name: build-output[0m
+   [2m          path: dist/[0m
+
+[1m3. [34m[LOW][0m[1m Explicitly set fail-fast for large matrix job "build" (23 combinations)[0m
+   [2mFile: ci.yml Â· Job: build[0m
+   Matrix job "build" has 23 combinations. Explicitly setting `fail-fast: true` ensures the workflow cancels remaining combinations as soon as one fails, saving up to 22 runner-minutes per broken run.
+
+   [36mFix:[0m
+   [2m# In job "build", explicitly set fail-fast:[0m
+   [2m  build:[0m
+   [2m    strategy:[0m
+   [2m      fail-fast: true[0m
+   [2m      matrix:[0m
+   [2m        # ... your matrix config[0m
+
+[1m4. [34m[LOW][0m[1m Explicitly set fail-fast for large matrix job "examples" (25 combinations)[0m
+   [2mFile: ci.yml Â· Job: examples[0m
+   Matrix job "examples" has 25 combinations. Explicitly setting `fail-fast: true` ensures the workflow cancels remaining combinations as soon as one fails, saving up to 24 runner-minutes per broken run.
+
+   [36mFix:[0m
+   [2m# In job "examples", explicitly set fail-fast:[0m
+   [2m  examples:[0m
+   [2m    strategy:[0m
+   [2m      fail-fast: true[0m
+   [2m      matrix:[0m
+   [2m        # ... your matrix config[0m
+
+[2mâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€[0m
+
+[1mSummary[0m
+
+  Estimated monthly cost:   [33m~$89.60/month[0m
+  Time savings per run:     [32m~7 min/run[0m
+  Estimated monthly savings: [32m~$11.20/month[0m
+
+  Issues:  [33m2 MEDIUM[0m  [34m2 LOW[0m
+
+  [2mRun with [0m[36m--fix[0m[2m to generate optimized workflow files[0m
+
+[2mGenerating optimized workflow files in C:\Users\hirun\AppData\Local\Temp\cloudtune-ci-cost-r96n0ryf\.github\workflows\optimized...[0m
+[32mGenerated 1 optimized workflow file:[0m
+  [36mC:\Users\hirun\AppData\Local\Temp\cloudtune-ci-cost-r96n0ryf\.github\workflows\optimized\ci.yml[0m

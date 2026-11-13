@@ -1,0 +1,61 @@
+# Release Workflow: Rolling Tag Build
+#
+# This workflow builds and publishes a rolling release when the `rolling` tag is pushed.
+#
+# Jobs and steps are named for clarity in the Actions UI.
+
+name: "Release: Rolling Tag Build"
+on:
+  push:
+    tags:
+      - rolling
+  workflow_dispatch:
+
+# Ensure only one instance of this workflow runs at any time across the repository.
+# - Use the workflow identifier (`github.workflow`) so the group is unique per workflow
+#   across the repository and does not require hardcoding.
+# - `cancel-in-progress: true` cancels any currently running instance so the newest
+#   run replaces older ones and always runs (useful for rolling releases).
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  rolling-release:
+    name: "Publish Rolling Release"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          submodules: "recursive"
+
+      - name: Setup bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+
+      - name: Install project
+        run: |
+          cd vendor/obsidian-plugin-library
+          bun install --frozen-lockfile --ignore-scripts
+          bun run build:force
+          cd ../..
+          bun install --frozen-lockfile --ignore-scripts
+
+      - name: Build project
+        run: bun run build
+
+      - name: Pack release
+        run: |
+          bun pm pack --destination=.github
+          # Strip the version suffix (e.g. `-1.2.3`) so the rolling release artifact has a stable name.
+          for file in .github/*.tgz; do mv "$file" "${file%-*}.tgz"; done
+
+      - name: Upload release
+        if: ${{github.ref == 'refs/tags/rolling'}}
+        env:
+          GH_TOKEN: ${{github.token}}
+        run: |
+          gh release upload rolling .github/*.tgz main.js manifest.json styles.css --clobber

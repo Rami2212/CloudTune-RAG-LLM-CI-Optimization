@@ -1,0 +1,459 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 3 optimizations:
+# - [MEDIUM] Add concurrency group to "ci.yml"
+# - [MEDIUM] 5 jobs clone the repo — consider artifact sharing
+# - [LOW] Explicitly set fail-fast for large matrix job "build-linux" (72 combinations)
+# Estimated savings: ~5 min/run
+#
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - 0.21.x
+  pull_request:
+    branches:
+      - main
+      - 0.21.x
+  workflow_dispatch:
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  static-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install cppcheck
+        run: |
+          sudo apt update -y
+          sudo apt install -y cppcheck
+          cppcheck --version
+
+      - name: Run cppcheck against the known baseline
+        run: |
+          # The line number is requested and then stripped: cppcheck collapses messages
+          # that format identically, so without it a file reports at most one finding
+          # per kind and this check could never fail.
+          cppcheck --enable=warning --inline-suppr --quiet \
+                   --template='{id}:{file}:{line}' \
+                   -I src/include src/ 2>&1 \
+            | grep -E '^[a-zA-Z]+:src/' | sed 's/:[0-9]*$//' | sort | uniq -c \
+            | awk '{printf "%s %s\n", $2, $1}' | sort > /tmp/cppcheck-current.txt || true
+
+          grep -v '^#' .github/cppcheck-baseline.txt | grep -E '^[a-zA-Z]+:' | sort > /tmp/cppcheck-baseline.txt
+
+          status=0
+          while read -r key count; do
+            was=$(awk -v k="$key" '$1 == k {print $2}' /tmp/cppcheck-baseline.txt)
+            was=${was:-0}
+            if [ "$count" -gt "$was" ]; then
+              echo "$key: $was in the baseline, $count now"
+              status=1
+            fi
+          done < /tmp/cppcheck-current.txt
+
+          if [ "$status" -ne 0 ]; then
+            echo ""
+            echo "This change adds cppcheck findings. Fix them, or if they are false"
+            echo "positives add an inline suppression and say why in the pull request."
+            exit 1
+          fi
+
+          while read -r key count; do
+            now=$(awk -v k="$key" '$1 == k {print $2}' /tmp/cppcheck-current.txt)
+            now=${now:-0}
+            if [ "$now" -lt "$count" ]; then
+              echo "$key: down from $count to $now, please update .github/cppcheck-baseline.txt"
+            fi
+          done < /tmp/cppcheck-baseline.txt
+
+          echo "No new cppcheck findings."
+
+  format-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install clang-format
+        run: |
+          sudo apt update -y
+          sudo apt install -y lsb-release wget software-properties-common gnupg
+          wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm-snapshot.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm-snapshot.gpg] http://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-21 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt update -y
+          sudo apt remove -y clang-format 2>/dev/null || true
+          sudo apt install -y clang-format-21
+          sudo ln -sf /usr/bin/clang-format-21 /usr/bin/clang-format
+
+      - name: Check code formatting
+        run: |
+          ./clang-format.sh
+          if ! git diff --quiet; then
+            git diff
+            echo ""
+            echo "Please run './clang-format.sh' and commit the changes."
+            exit 1
+          fi
+
+  build-linux:
+    needs: [format-check]
+    runs-on: ubuntu-latest
+    container:
+      image: rockylinux/rockylinux:10
+      options: --cap-add=SYS_PTRACE
+
+    strategy:
+      matrix:
+        compiler: [gcc, clang]
+        build_type: [Debug, Release]
+        pg_version: [14, 15, 17]
+        exclude:
+          - pg_version: 14
+            compiler: gcc
+            build_type: Debug
+          - pg_version: 14
+            compiler: gcc
+            build_type: Release
+          - pg_version: 14
+            compiler: clang
+            build_type: Release
+          - pg_version: 15
+            compiler: gcc
+            build_type: Debug
+          - pg_version: 15
+            compiler: gcc
+            build_type: Release
+          - pg_version: 15
+            compiler: clang
+            build_type: Release
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Dependencies
+        run: |
+          dnf -y install dnf-plugins-core
+          dnf config-manager --set-enabled crb
+          dnf -y install epel-release
+          dnf -y install \
+            git gcc clang clang-tools-extra cmake make \
+            libev libev-devel openssl openssl-devel \
+            systemd systemd-devel zlib zlib-devel \
+            libzstd libzstd-devel lz4 lz4-devel \
+            libssh libssh-devel libatomic \
+            python3-docutils bzip2 bzip2-devel \
+            libarchive libarchive-devel libyaml-devel \
+            check check-devel llvm \
+            libasan libubsan \
+            net-tools procps-ng ncurses-devel \
+            util-linux sudo which zstd \
+            gdb strace iproute
+
+      - name: Mark workspace as safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Install PostgreSQL v${{ matrix.pg_version }}
+        run: |
+          dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-10-x86_64/pgdg-redhat-repo-latest.noarch.rpm
+          dnf -qy module disable postgresql 2>/dev/null || true
+          dnf install -y postgresql${{ matrix.pg_version }} postgresql${{ matrix.pg_version }}-server postgresql${{ matrix.pg_version }}-contrib postgresql${{ matrix.pg_version }}-libs postgresql${{ matrix.pg_version }}-devel
+
+      - name: Set Env Path Variable
+        run: |
+          echo "PATH=/usr/pgsql-${{ matrix.pg_version }}/bin:$PATH" >> $GITHUB_ENV
+          echo $PATH
+
+      - name: Install pgmoneta_ext
+        run: |
+          git_repo="https://github.com/pgmoneta/pgmoneta_ext.git"
+          cd /tmp/
+          git clone --branch "main" --single-branch --depth 1 "$git_repo"
+          cd /tmp/pgmoneta_ext/
+          mkdir build
+          cd /tmp/pgmoneta_ext/build/
+          cmake -DDOCS=false ..
+          make
+          make install
+
+      - name: Build Project
+        run: |
+          mkdir build
+          cd build
+          if [ "${{ matrix.compiler }}" = "gcc" ]; then
+            export CC=/usr/bin/gcc
+          else
+            export CC=/usr/bin/clang
+          fi
+          cmake -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DDOCS=FALSE ..
+          make -j$(nproc)
+
+      - name: Create test user
+        run: |
+          useradd -m -s /bin/bash runner
+          echo "runner ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+          chown -R runner:runner $GITHUB_WORKSPACE
+
+      - name: Run Tests
+        timeout-minutes: 45
+        run: |
+          export TEST_PG_VERSION=${{ matrix.pg_version }}
+          if [ "${{ matrix.compiler }}" = "clang" ] && [ "${{ matrix.build_type }}" = "Debug" ]; then
+            bash .github/hang_watchdog.sh ${{ matrix.pg_version }} &
+            su - runner -c "cd $GITHUB_WORKSPACE && export TEST_PG_VERSION=${{ matrix.pg_version }} && export PATH=/usr/pgsql-${{ matrix.pg_version }}/bin:\$PATH && bash ./test/check.sh ci"
+          fi
+
+      - name: Report coverage summary
+        if: matrix.compiler == 'clang' && matrix.build_type == 'Debug'
+        run: |
+          echo "## Coverage Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat /tmp/pgmoneta-test/coverage/coverage-report-*.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload All Coverage Reports as Artifact
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: coverage-reports-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ matrix.pg_version }}
+          path: /tmp/pgmoneta-test/coverage
+          retention-days: 90
+
+      - name: Upload Run Log as Artifacts
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: logs-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ matrix.pg_version }}
+          path: /tmp/pgmoneta-test/log
+          retention-days: 90
+
+  build-macos:
+    needs: [format-check]
+    runs-on: macos-latest
+    env:
+      PGMONETA_ROOT: ${{ github.workspace }}
+      BUILD_DIR: ${{ github.workspace }}/build
+      POSTGRESQL_VERSION: "@17"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Homebrew
+        id: set-up-homebrew
+        uses: Homebrew/actions/setup-homebrew@2026.09.28.1
+
+      - name: Install dependencies
+        run: |
+          brew update
+          brew install \
+            libev \
+            libssh \
+            libarchive \
+            libyaml \
+            openssl \
+            bzip2 \
+            zstd \
+            lz4 \
+            check \
+            docutils \
+            pandoc \
+            postgresql${POSTGRESQL_VERSION}
+
+      - name: Add PostgreSQL to PATH
+        run: |
+          echo "$(brew --prefix postgresql${POSTGRESQL_VERSION})/bin" >> $GITHUB_PATH
+
+      - name: Build with Clang
+        run: |
+          mkdir -p $BUILD_DIR
+          cd $BUILD_DIR
+          export CC=$(xcrun -find clang)
+          export OPENSSL_ROOT_DIR=$(brew --prefix openssl)
+          cmake -DCMAKE_BUILD_TYPE=Debug -DDOCS=FALSE ..
+          make -j$(sysctl -n hw.ncpu)
+
+      - name: Show logs on failure
+        if: failure()
+        working-directory: ${{ env.BUILD_DIR }}
+        run: |
+          cat ./log/pgmoneta.log || echo "pgmoneta.log not found"
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: macos-build-logs
+          path: |
+            ${{ env.BUILD_DIR }}/log/
+            /tmp/*.log
+          retention-days: 7
+
+      - name: Upload Generated Documentation Artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: macos-generated-docs
+          path: ${{ env.BUILD_DIR }}/doc/
+          retention-days: 7
+
+  storage-engines:
+    needs: [format-check]
+    runs-on: ubuntu-latest
+
+    env:
+      PG_VERSION: "17"
+      PG_DATABASE: mydb
+      PG_USER_NAME: myuser
+      PG_USER_PASSWORD: mypass
+      PG_REPL_USER_NAME: repl
+      PG_REPL_PASSWORD: replpass
+      ROOT_DIR: /tmp/pgmoneta-se-test
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            gcc cmake make \
+            libev-dev libssl-dev \
+            libsystemd-dev zlib1g-dev \
+            libzstd-dev liblz4-dev \
+            libssh-dev libbz2-dev \
+            libarchive-dev libyaml-dev \
+            libncurses-dev check \
+            python3-docutils
+
+      - name: Install PostgreSQL ${{ env.PG_VERSION }}
+        run: |
+          sudo apt-get install -y curl ca-certificates
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update -y
+          sudo apt-get install -y postgresql-${{ env.PG_VERSION }} postgresql-server-dev-${{ env.PG_VERSION }}
+          echo "/usr/lib/postgresql/${{ env.PG_VERSION }}/bin" >> $GITHUB_PATH
+
+      - name: Install pgmoneta_ext
+        run: |
+          cd /tmp
+          git clone --branch main --single-branch --depth 1 https://github.com/pgmoneta/pgmoneta_ext.git
+          cd pgmoneta_ext
+          mkdir build && cd build
+          cmake -DDOCS=false ..
+          make
+          sudo make install
+
+      - name: Build pgmoneta
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Debug -DDOCS=FALSE ..
+          make -j$(nproc)
+          test -x test/pgmoneta-test || { echo "pgmoneta-test was not built (is 'check' installed?)"; exit 1; }
+
+      - name: Set up PostgreSQL
+        run: |
+          CONF_DIR=${{ github.workspace }}/test/postgresql/src/postgresql${{ env.PG_VERSION }}/conf
+          PG_BIN=/usr/lib/postgresql/${{ env.PG_VERSION }}/bin
+
+          sudo mkdir -p /conf /pgdata /pgwal /pglog /tmp/pgmoneta_tblspc/ts1 /tmp/pgmoneta_tblspc/ts2
+          sudo cp "$CONF_DIR"/* /conf/
+          sudo chown -R postgres:postgres /conf /pgdata /pgwal /pglog /tmp/pgmoneta_tblspc
+          sudo chmod -R 777 /conf /pgdata /pgwal /pglog
+          sudo chmod 700 /tmp/pgmoneta_tblspc/ts1 /tmp/pgmoneta_tblspc/ts2
+
+          sudo -u postgres bash -c "
+            set -e
+            $PG_BIN/initdb -k -X /pgwal/ /pgdata/
+
+            sed -i 's/PG_MAX_CONNECTIONS/100/g;     s/PG_SHARED_BUFFERS/256MB/g; s/PG_WORK_MEM/4MB/g' /conf/postgresql.conf
+            sed -i 's/PG_MAX_PARALLEL_WORKERS/8/g;  s/PG_EFFECTIVE_CACHE_SIZE/4GB/g' /conf/postgresql.conf
+            sed -i 's/PG_MAX_WAL_SIZE/1GB/g;        s/PG_LOG_LEVEL/debug5/g' /conf/postgresql.conf
+
+            sed -i 's/PG_DATABASE/${{ env.PG_DATABASE }}/g; s/PG_USER_NAME/${{ env.PG_USER_NAME }}/g; s/PG_REPL_USER_NAME/${{ env.PG_REPL_USER_NAME }}/g' /conf/pg_hba.conf
+
+            cp /conf/postgresql.conf /conf/pg_hba.conf /pgdata/
+
+            sed -i 's/PG_DATABASE/${{ env.PG_DATABASE }}/g;        s/PG_USER_NAME/${{ env.PG_USER_NAME }}/g' /conf/setup.sql
+            sed -i 's/PG_USER_PASSWORD/${{ env.PG_USER_PASSWORD }}/g; s/PG_REPL_USER_NAME/${{ env.PG_REPL_USER_NAME }}/g' /conf/setup.sql
+            sed -i 's/PG_REPL_PASSWORD/${{ env.PG_REPL_PASSWORD }}/g' /conf/setup.sql
+
+            $PG_BIN/pg_ctl -D /pgdata/ start
+            sleep 3
+            $PG_BIN/psql -q -h /tmp -f /conf/setup.sql postgres
+          "
+
+          /usr/lib/postgresql/${{ env.PG_VERSION }}/bin/pg_isready -h localhost -p 5432
+
+      - name: Configure test harness
+        run: |
+          # Directory layout mirrors test/check.sh: the harness "base" dir is
+          # the parent of the backup dir, and the MCTF log is derived as
+          # <parent-of-base>/log (see test/runner.c:build_mctf_log_path).
+          BASE_DIR=$ROOT_DIR/base
+          mkdir -p $BASE_DIR/conf $BASE_DIR/backup $BASE_DIR/restore \
+                   $BASE_DIR/workspace $BASE_DIR/retrospect $BASE_DIR/standby \
+                   $ROOT_DIR/log
+
+          # Harness configuration. se_s3 only reads the [primary] connection
+          # details from this; the managed pgmoneta it starts writes its own
+          # S3 configuration separately.
+          cat > $BASE_DIR/conf/pgmoneta.conf <<EOF
+          [pgmoneta]
+          host = localhost
+          base_dir = $BASE_DIR/backup
+          compression = zstd
+          encryption = none
+          log_type = file
+          log_level = debug5
+          log_path = $ROOT_DIR/log/pgmoneta.log
+          unix_socket_dir = /tmp/
+          workspace = $BASE_DIR/workspace
+          create_slot = yes
+
+          [primary]
+          host = localhost
+          port = 5432
+          user = $PG_REPL_USER_NAME
+          wal_slot = repl
+          EOF
+          cp $BASE_DIR/conf/pgmoneta.conf $BASE_DIR/conf/pgmoneta.conf.sample
+
+          ./build/src/pgmoneta-admin master-key -P $PG_REPL_PASSWORD
+          ./build/src/pgmoneta-admin -f $BASE_DIR/conf/pgmoneta_users.conf \
+            -U $PG_REPL_USER_NAME -P $PG_REPL_PASSWORD user add
+
+          {
+            echo "PGMONETA_TEST_CONF=$BASE_DIR/conf/pgmoneta.conf"
+            echo "PGMONETA_TEST_CONF_SAMPLE=$BASE_DIR/conf/pgmoneta.conf.sample"
+            echo "PGMONETA_TEST_USER_CONF=$BASE_DIR/conf/pgmoneta_users.conf"
+            echo "PGMONETA_TEST_BASE_DIR=$BASE_DIR"
+            echo "PGMONETA_TEST_RESTORE_DIR=$BASE_DIR/restore"
+            echo "PGMONETA_TEST_RETROSPECT_DIR=$BASE_DIR/retrospect"
+            echo "PGMONETA_TEST_HOT_STANDBY_DIR=$BASE_DIR/standby"
+          } >> $GITHUB_ENV
+
+      - name: Run storage-engine tests
+        run: ./build/test/pgmoneta-test --integration
+
+      - name: Upload HTML test report
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: storage-engines-report-pg${{ env.PG_VERSION }}
+          path: ${{ env.ROOT_DIR }}/log/pgmoneta-test-report.html
+          retention-days: 14
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: storage-engines-logs-${{ env.PG_VERSION }}
+          path: ${{ env.ROOT_DIR }}
+          retention-days: 14

@@ -1,0 +1,77 @@
+---
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        gemfile:
+          - Gemfile
+          - gemfiles/Gemfile-rails-8-0
+          - gemfiles/Gemfile-rails-main
+        ruby: ["3.3", "3.4", "4.0"]
+        include:
+          - gemfile: "gemfiles/Gemfile-rails-main"
+            experimental: true
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    env:
+      BUNDLE_GEMFILE: ${{ github.workspace }}/${{ matrix.gemfile }}
+    continue-on-error: ${{ !!matrix.experimental }}
+    name: Ruby ${{ matrix.ruby }} on ${{ matrix.os }} with ${{matrix.gemfile}}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Remove Gemfile.lock
+        shell: bash
+        run: "rm -Rf ${{ matrix.gemfile }}.lock"
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1.338.0
+        with:
+          bundler: latest
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+          cache-version: 8
+
+      - name: Run tests
+        run: |
+          bundle exec rails db:setup
+          bundle exec rake
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1.338.0
+        with:
+          bundler: latest
+          bundler-cache: true
+          cache-version: 8
+
+      - name: Typecheck
+        run: bundle exec srb tc
+
+      - name: Lint Ruby files
+        run: bin/rubocop
+
+  summary:
+    runs-on: ubuntu-latest
+    needs: [test, lint]
+    if: always()
+    steps:
+      - name: Check test matrix status
+        if: needs.test.result != 'success'
+        run: exit 1
+
+      - name: Check lint status
+        if: needs.lint.result != 'success'
+        run: exit 1
+
+      - name: All checks passed
+        run: echo "All checks passed successfully!"
