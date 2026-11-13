@@ -1,0 +1,239 @@
+name: CI
+
+# runs on every PR without secrets or elevated permissions, safe with untrusted code
+# e2e.yml waits for this workflow on the same head SHA before any cloud E2E runs
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+    branches:
+      - main
+      - 'release-*'
+    paths-ignore:
+      - 'config/**'
+      - '**.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  lint-test:
+    name: Lint and Unit Test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version:       ${{ steps.vars.outputs.version }}
+      clusterprefix: ${{ steps.vars.outputs.clusterprefix }}
+    steps:
+      - name: Checkout PR merge commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate PR title and HEAD commit message
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          CONVENTIONAL_REGEX='^(build|chore|ci|docs|feat|fix|perf|refactor|revert|sec|style|test)(\([a-zA-Z0-9_-]+\))?!?: .+$'
+          REVERT_REGEX='^Revert ".+"$'
+
+          echo "PR title: $PR_TITLE"
+          commit_title="$(git log -1 --pretty=%s "$HEAD_SHA")"
+          echo "Commit title: $commit_title"
+
+          if [[ ! "$PR_TITLE" =~ $CONVENTIONAL_REGEX && ! "$PR_TITLE" =~ $REVERT_REGEX ]]; then
+            echo "::error::PR title must follow Conventional Commits (https://www.conventionalcommits.org) or be an auto-generated revert"
+            exit 1
+          fi
+          if [[ ! "$commit_title" =~ $CONVENTIONAL_REGEX && ! "$commit_title" =~ $REVERT_REGEX ]]; then
+            echo "::error::Commit message must follow Conventional Commits (https://www.conventionalcommits.org) or be an auto-generated revert"
+            exit 1
+          fi
+
+      - name: Setup Go
+        id: setup-go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: '**/go.sum'
+
+      - name: Restore kube-api-linter
+        id: cache-kube-api-linter
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: bin/golangci-lint-kube-api-linter
+          key: kube-api-linter-${{ runner.os }}-${{ runner.arch }}-go-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('.custom-gcl.yml') }}
+
+      - name: Verify code style
+        run: |
+          set -euo pipefail
+          make fmt vet fix
+          git add -N .
+          if ! git diff --exit-code; then
+            echo "::error::Code style produced diff. Ensure to follow the code style before commit"
+            git diff --name-only
+            exit 1
+          fi
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.15.0
+          args: --config=.golangci.yml --timeout 5m ./...
+
+      - name: Build kube-api-linter
+        if: steps.cache-kube-api-linter.outputs.cache-hit != 'true'
+        run: make kube-api-linter
+
+      - name: Lint Kubernetes APIs
+        run: make lint-kube-api
+
+      - name: Verify generated files are up-to-date
+        env:
+          BASE_COMMIT: "origin/${{ github.event.pull_request.base.ref }}"
+        run: |
+          set -euo pipefail
+          make generate-all
+          git add -N .
+          if ! git diff --exit-code; then
+            echo "::error::Generated files are out of date, please run 'make generate-all'"
+            git diff --name-only
+            exit 1
+          fi
+
+      - name: Unit tests
+        env:
+          BASE_COMMIT: "origin/${{ github.event.pull_request.base.ref }}"
+        run: make test
+
+      - name: Show coverage report
+        run: go tool cover -func=cover.out
+
+      - name: Upload coverage profile
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cover-profile-${{ github.run_id }}
+          path: cover.out
+          # a build failure leaves no cover.out; stay quiet instead of warning
+          # on top of the failure that actually matters
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Enforce coverage gate
+        run: |
+          set -euo pipefail
+          # test/ packages (e2e suites, fixture/object builders, test/scheme, test/util) are
+          # test-only scaffolding with no hand-written logic to cover, so they are excluded
+          # from the gate. Ratchet this floor up as further work lands.
+          COVER_FLOOR=55.5
+
+          awk 'NR==1 { print; next } $0 !~ /^github.com\/K0rdent\/kcm\/test\// ' cover.out > gated-cover.out
+
+          COVERAGE=$(go tool cover -func=gated-cover.out | tail -1 | awk '{print substr($3, 1, length($3)-1)}')
+          echo "Coverage (excluding test/ scaffolding): ${COVERAGE}% (floor: ${COVER_FLOOR}%)"
+
+          if awk -v cov="$COVERAGE" -v floor="$COVER_FLOOR" 'BEGIN { exit !(cov+0 < floor+0) }'; then
+            echo "::error::Coverage ${COVERAGE}% is below the ${COVER_FLOOR}% floor"
+            exit 1
+          fi
+
+      - name: Compute outputs
+        id: vars
+        run: |
+          set -euo pipefail
+          GIT_VERSION=$(git describe --tags --always)
+          {
+            echo "version=${GIT_VERSION#v}"
+            echo "clusterprefix=ci-$(date +%s | cut -b5-10)"
+          } >> "$GITHUB_OUTPUT"
+
+  # runs in parallel with lint-test to not extend the overall wall-clock time
+  lint-charts:
+    name: Lint Helm Charts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout PR merge commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # yq is installed with go install
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: '**/go.sum'
+
+      # binaries are versioned by name and the unittest plugin version is checked by make,
+      # so a stale cache from the restore keys is safely overridden
+      - name: Restore Helm tooling
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            bin/helm-*
+            bin/yq-*
+            ~/.local/share/helm/plugins
+          key: helm-tooling-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Makefile') }}
+          restore-keys: |
+            helm-tooling-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Lint and test Helm charts
+        run: make lint-charts
+
+  controller-e2etest:
+    name: E2E / Controller
+    runs-on: ubuntu-latest
+    needs:
+      - lint-test
+    if: ${{ !contains( github.event.pull_request.labels.*.name, 'test e2e') }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: '**/go.sum'
+
+      - name: Run E2E controller tests
+        env:
+          GINKGO_LABEL_FILTER:       'controller'
+          CLUSTER_DEPLOYMENT_PREFIX: ${{ needs.lint-test.outputs.clusterprefix }}
+          VERSION:                   ${{ needs.lint-test.outputs.version }}
+        run: make test-e2e
+
+      - name: Archive test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: support-bundles-controller
+          path: "/home/runner/work/kcm/kcm/support-bundle-*"
+          retention-days: 1
+          overwrite: true

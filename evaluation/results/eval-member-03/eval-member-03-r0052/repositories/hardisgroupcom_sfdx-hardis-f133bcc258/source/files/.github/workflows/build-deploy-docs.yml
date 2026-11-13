@@ -1,0 +1,59 @@
+name: "DOC - Build and deploy with sfdx-hardis"
+on:
+  push:
+    branches:
+      - main
+      - doc
+
+permissions: read-all
+
+jobs:
+  # Build & deploy docs
+  deploy:
+    runs-on: ubuntu-latest
+    environment: doc
+    permissions:
+      contents: write
+      pages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: true
+      # Build doc with sfdx-hardis
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+      - run: yarn
+      - run: yarn prepack
+      - run: npm i @salesforce/cli -g
+      - run: echo y|sf plugins install sfdx-hardis@beta
+      - run: sf hardis:doc:plugin:generate
+      # Deploy docs with Zensical (successor of mkdocs-material, reads the same mkdocs.yml)
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: 3.x
+      - run: pip install zensical mdx_truly_sane_lists json-schema-for-humans ghp-import
+      - run: zensical build
+      # Zensical has no gh-deploy command: ghp-import is the same tool mkdocs used under the hood
+      - run: |
+          git config --global user.name github-actions[bot]
+          git config --global user.email 41898282+github-actions[bot]@users.noreply.github.com
+          ghp-import --no-jekyll --push --force --message "Deployed ${GITHUB_SHA} with Zensical" site
+
+  git-sync:
+    runs-on: ubuntu-latest
+    needs: deploy
+    environment: doc
+    permissions:
+      contents: read
+    steps:
+      - name: git-sync
+        uses: wei/git-sync@55c6b63b4f21607da0e9877ca9b4d11a29fc6d83 # v3.0.0
+        with:
+          source_repo: "hardisgroupcom/sfdx-hardis"
+          source_branch: "gh-pages"
+          destination_repo: "git@github.com:sfdx-hardis/sfdx-hardis.github.io.git"
+          destination_branch: "gh-pages"
+          # ssh_private_key: ${{ secrets.SSH_PRIVATE_KEY }} # optional
+          # source_ssh_private_key: ${{ secrets.SOURCE_SSH_PRIVATE_KEY }} # optional, will override `SSH_PRIVATE_KEY`
+          destination_ssh_private_key: ${{ secrets.SFDX_HARDIS_GITHUB_IO_SSH_PRIVATE_KEY }} # optional, will override `SSH_PRIVATE_KEY`

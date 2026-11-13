@@ -1,0 +1,172 @@
+name: "Release Pipeline"
+
+# Thin caller of the shared reusable release-tag workflow in supertokens/actions.
+# The shared five-job release skeleton (setup, register-version, mark-as-success,
+# release, merge — including the post-release dev sync) lives once in the
+# reusable workflow; only node's ecosystem follow-ups (docs publish + npm
+# publish) remain here and consume the reusable workflow's outputs via `needs`.
+#
+# Two behaviour changes vs. the previous per-repo copy, both inherited from the
+# shared workflow (see supertokens/actions .github/workflows/release-tag.yml):
+#   - register-version is restored — the PUT that creates the API version row
+#     and records the FDI/CDI compatibility arrays. node previously lacked this
+#     job and silently depended on a legacy CircleCI dev-tag script.
+#   - dev is synced with the release branch after a latest-version release, so
+#     the next dev-sync computes the correct next version (this step was missing
+#     from node's copy and is what let dev drift).
+#
+# These release paths only run when a dev-sync release PR (release/vX.Y.Z) is
+# merged into a version branch, or on manual dispatch — CI on a normal PR cannot
+# exercise them.
+
+on:
+    pull_request:
+        types: [closed]
+        branches:
+            - "[0-9]+.[0-9]+"
+
+    workflow_dispatch:
+        inputs:
+            branch:
+                description: The branch to create the release tag on
+                type: string
+                required: true
+
+            skip-test-checks:
+                description: Skip tests passed checks
+                type: boolean
+                default: false
+                required: false
+
+            skip-other-version-checks:
+                description: Skip server checks for core and frontend versions
+                type: boolean
+                default: false
+                required: false
+
+permissions:
+    contents: write
+    pull-requests: read
+
+jobs:
+    release-pipeline:
+        uses: supertokens/actions/.github/workflows/release-tag.yml@main
+        secrets: inherit
+        with:
+            sdk_name: node
+            branch: ${{ inputs.branch || '' }}
+            skip-test-checks: ${{ inputs.skip-test-checks || false }}
+            skip-other-version-checks: ${{ inputs.skip-other-version-checks || false }}
+            # Must cover every .changie.yaml replacement target so the release
+            # changelog commit stages the bumped version files.
+            changelog_add_paths: ".changes/ CHANGELOG.md package.json lib/ts/version.ts lib/build/version.js"
+
+    publish-docs:
+        runs-on: ubuntu-latest
+        needs:
+            - release-pipeline
+
+        steps:
+            - uses: actions/create-github-app-token@v2
+              id: app-token
+              with:
+                  app-id: ${{ vars.RELEASE_APP_ID }}
+                  private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+                  owner: supertokens
+                  # This job checks out and dispatches a workflow in
+                  # supertokens-backend-website in addition to this repo.
+                  repositories: |
+                      ${{ github.event.repository.name }}
+                      supertokens-backend-website
+
+            - uses: actions/checkout@v4
+              with:
+                  ref: ${{ needs.release-pipeline.outputs.releaseTag }}
+                  fetch-tags: true
+                  path: supertokens-node
+
+            - uses: actions/checkout@v4
+              with:
+                  repository: supertokens/supertokens-backend-website
+                  token: ${{ steps.app-token.outputs.token }}
+                  path: supertokens-backend-website
+
+            - run: |
+                  shopt -s extglob # Enable extended globbing
+
+                  if [[ "${{ needs.release-pipeline.outputs.isLatest }}" == "true" ]]
+                  then
+                      # Delete everything except the version folders
+                      rm -rf supertokens-backend-website/app/docs/sdk/docs/nodejs/!(*.*.X)
+                      # Copy files to the root dir
+                      cp -r supertokens-node/docs/* supertokens-backend-website/app/docs/sdk/docs/nodejs/
+                  fi
+
+                  # Delete the current version folder if it exists
+                  rm -rf supertokens-backend-website/app/docs/sdk/docs/nodejs/${{ needs.release-pipeline.outputs.versionXy }}.X
+                  # Copy the current docs
+                  mkdir -p supertokens-backend-website/app/docs/sdk/docs/nodejs/${{ needs.release-pipeline.outputs.versionXy }}.X
+                  cp -r supertokens-node/docs/* supertokens-backend-website/app/docs/sdk/docs/nodejs/${{ needs.release-pipeline.outputs.versionXy }}.X
+
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: node-docs-${{ needs.release-pipeline.outputs.version }}
+                  path: supertokens-backend-website/app/docs/sdk/docs/nodejs
+
+            - name: Trigger the backend website CI
+              uses: actions/github-script@v7
+              with:
+                  github-token: ${{ steps.app-token.outputs.token }}
+                  script: |
+                      github.rest.actions.createWorkflowDispatch({
+                          owner: 'supertokens',
+                          repo: 'supertokens-backend-website',
+                          workflow_id: 'release-node-documentation-changes.yml',
+                          ref: 'master',
+                          inputs: {
+                              "version": `${{ needs.release-pipeline.outputs.version }}`,
+                              "artifact-name": `node-docs-${{ needs.release-pipeline.outputs.version }}`,
+                              "version-folder": `app/docs/sdk/docs/nodejs`,
+                              "run-id": `${{ github.run_id }}`,
+                              "stage":  "production",
+                          }
+                      })
+
+    publish:
+        runs-on: ubuntu-latest
+        environment: publish
+        # npm trusted publishing: npm exchanges this job's GitHub OIDC token for a short-lived
+        # publish token. npmjs.com -> supertokens-node -> Settings -> Trusted publisher:
+        # GitHub Actions, supertokens / supertokens-node, workflow pipeline-release-tag.yml,
+        # environment publish. With OIDC, npm also attaches a provenance attestation.
+        permissions:
+            contents: read
+            id-token: write
+        needs:
+            - release-pipeline
+
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  ref: ${{ needs.release-pipeline.outputs.releaseTag }}
+                  fetch-tags: true
+
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: "24"
+                  registry-url: "https://registry.npmjs.org/"
+
+            # Trusted publishing needs npm 11.5.1 or newer.
+            - run: npm install -g npm@^11.5.1 && npm --version
+
+            - run: |
+                  if [[ "${{ needs.release-pipeline.outputs.isLatest }}" == "true" ]]
+                  then
+                      npm publish --tag latest
+                  else
+                      npm publish --tag version-${{ needs.release-pipeline.outputs.version }}
+                  fi
+              env:
+                  # Fallback while the trusted publisher isn't set up on npm; npm tries OIDC first.
+                  # Remove it together with the NPM_TOKEN secret after the first trusted publish.
+                  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

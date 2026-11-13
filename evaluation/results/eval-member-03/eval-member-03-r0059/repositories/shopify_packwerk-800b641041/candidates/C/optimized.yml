@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - '*-stable'
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        gemfile:
+          - Gemfile
+        ruby:
+          - "3.3"
+          - "3.4"
+          - "4.0"
+    env:
+      BUNDLE_GEMFILE: ${{ matrix.gemfile }}
+    name: "Tests: Ruby ${{ matrix.ruby }} ${{ matrix.gemfile }}"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Deletes Gemfile.lock
+        run: rm Gemfile.lock
+      - name: Set up Ruby ${{ matrix.ruby }}
+        uses: ruby/setup-ruby@c4e5b1316158f92e3d49443a9d58b31d25ac0f8f # v1.306.0
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+      - name: Run tests
+        run: bin/rake test
+  loading-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        gemfile:
+          - Gemfile
+        ruby:
+          - "3.3"
+          - "3.4"
+          - "4.0"
+    env:
+      BUNDLE_GEMFILE: ${{ matrix.gemfile }}
+    name: "Loading Tests: Ruby ${{ matrix.ruby }} ${{ matrix.gemfile }}"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Delete Gemfile.lock
+        run: rm Gemfile.lock
+      - name: Set up Ruby ${{ matrix.ruby }}
+        uses: ruby/setup-ruby@c4e5b1316158f92e3d49443a9d58b31d25ac0f8f # v1.306.0
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+      - name: Run tests
+        run: bin/rake test:loading
+  lint:
+    runs-on: ubuntu-latest
+    name: Lint
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@c4e5b1316158f92e3d49443a9d58b31d25ac0f8f # v1.306.0
+        with:
+          bundler-cache: true
+      - name: Run style checks
+        run: bin/rubocop
+  static_type_checking:
+    runs-on: ubuntu-latest
+    name: Type Checking
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@c4e5b1316158f92e3d49443a9d58b31d25ac0f8f # v1.306.0
+        with:
+          bundler-cache: true
+      - name: Run static type checks
+        run: bin/srb tc
+  buildall:
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    name: Build (matrix)
+    needs: [lint, tests, static_type_checking]
+    steps:
+      - name: Check build matrix status
+        if: ${{ needs.tests.result != 'success' || needs.lint.result != 'success' || needs.static_type_checking.result != 'success' }}
+        run: exit 1
