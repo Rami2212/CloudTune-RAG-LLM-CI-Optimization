@@ -1,0 +1,155 @@
+name: Copilot Setup Steps
+
+# Runs before the Copilot cloud agent starts to prepare its ephemeral environment. In addition
+# to installing PHP, Composer, and npm (and running Boost via the post-autoload-dump hook), this
+# provisions Postgres and Redis services and prepares landlord/tenant testing databases so the
+# agent can execute the app's commands, tests, linting, and formatters.
+on: # zizmor: ignore[concurrency-limits]
+    workflow_dispatch:
+    push:
+        paths:
+            - .github/workflows/copilot-setup-steps.yml
+    pull_request:
+        paths:
+            - .github/workflows/copilot-setup-steps.yml
+
+permissions: {}
+
+jobs:
+    # The job MUST be named `copilot-setup-steps` or Copilot will not pick it up.
+    copilot-setup-steps:
+        name: Copilot Setup Steps
+        runs-on: ubuntu-24.04
+
+        permissions:
+            contents: read
+
+        timeout-minutes: 20
+
+        concurrency:
+            group: ${{ github.workflow }}-${{ github.ref }}
+            cancel-in-progress: true
+
+        env:
+            php-extensions: gd, gmp, redis, mailparse
+            php-extensions-key: ext-cache-copilot-v1
+            php-version: '8.4'
+            DB_PORT: 5432
+            DB_HOST: 127.0.0.1
+            DB_USERNAME: root
+            DB_PASSWORD: root
+            DB_DATABASE: testing_landlord
+            REDIS_HOST: 127.0.0.1
+            REDIS_PORT: '7000'
+
+        services:
+            postgres:
+                image: postgres:15@sha256:6eb0add3b77c081df18aa518ce43df58fdcc40f2e6d868a6fd08038dc7acd425
+                ports:
+                    - 5432:5432
+                env:
+                    POSTGRES_DB: testing_landlord
+                    POSTGRES_USER: root
+                    POSTGRES_PASSWORD: root
+                options: >-
+                    --health-cmd pg_isready
+                    --health-interval 10s
+                    --health-timeout 5s
+                    --health-retries 5
+
+        steps:
+            # A real 3-master cluster (ports 7000-7002) matching the cluster-mode ElastiCache Serverless used in staging and production.
+            - name: Start Redis (3-master cluster)
+              run: |
+                  docker run -d --name redis --network host \
+                    redis:7.4.12@sha256:bd28fff4b665fdf1b73e8b5b73ec05d2f858f4fa3c8ea0d7c9bc09f7f6bf7039 \
+                    sh -c '
+                      for port in 7000 7001 7002; do
+                        redis-server --daemonize yes --port "$port" --appendonly no --save "" \
+                          --cluster-enabled yes --cluster-config-file "nodes-$port.conf" --cluster-node-timeout 5000
+                      done
+                      for port in 7000 7001 7002; do
+                        until redis-cli -p "$port" ping | grep -q PONG; do sleep 1; done
+                      done
+                      redis-cli --cluster create 127.0.0.1:7000 127.0.0.1:7001 127.0.0.1:7002 --cluster-replicas 0 --cluster-yes
+                      tail -f /dev/null
+                    '
+
+                  for port in 7000 7001 7002; do
+                    until docker exec redis redis-cli -p "$port" cluster info | grep -q 'cluster_state:ok'; do sleep 1; done
+                  done
+
+            - name: Create tenant database
+              run: psql -h 127.0.0.1 -d testing_landlord -U root -c 'CREATE DATABASE testing_tenant;'
+              env:
+                  PGPASSWORD: root
+
+            - name: Setup cache environment
+              id: extcache
+              uses: shivammathur/cache-extensions@c33688ce81fd884ddd70d51cadeb62b6fb974750 #1.15.8
+              with:
+                  php-version: ${{ env.php-version }}
+                  extensions: ${{ env.php-extensions }}
+                  key: ${{ env.php-extensions-key }}
+
+            - name: Cache extensions
+              uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+              with:
+                  path: ${{ steps.extcache.outputs.dir }}
+                  key: ${{ runner.os }}-24.04-phpext-${{ env.php-version }}-${{ env.php-extensions-key }}
+                  restore-keys: ${{ runner.os }}-24.04-phpext-${{ env.php-version }}
+
+            - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 #2.40.0
+              with:
+                  php-version: ${{ env.php-version }}
+                  coverage: none
+                  extensions: ${{ env.php-extensions }}
+
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  fetch-depth: 0
+                  fetch-tags: true
+                  persist-credentials: false
+
+            - name: Copy .env
+              run: php -r "file_exists('.env') || copy('.env.example', '.env');"
+
+            - name: Cache dependencies
+              id: cache-composer
+              uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+              with:
+                  path: vendor
+                  key: ${{ runner.os }}-composer-${{ hashFiles('composer.lock', 'app-modules/**/composer.lock') }}
+
+            - if: ${{ steps.cache-composer.outputs.cache-hit != 'true' }}
+              name: Install Dependencies
+              run: composer install -q --no-ansi --no-interaction --no-scripts --no-progress --prefer-dist --optimize-autoloader
+              shell: bash
+
+            - name: Generate key
+              run: php artisan key:generate
+
+            # Fires the post-autoload-dump hook (common:publish + boost:update) which generates
+            # AGENTS.md, .github/skills, and .ai/guidelines used by the agent.
+            - name: Publish Boost instructions and skills
+              run: composer dump-autoload
+
+            - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+              with:
+                  node-version-file: '.nvmrc'
+                  cache: 'npm'
+
+            - name: Install JavaScript dependencies
+              run: npm install
+
+            - name: Build Assets
+              run: npm run build
+
+            - name: Migrate Landlord Database
+              run: php artisan migrate --database=landlord --path=database/landlord --force
+
+            - name: Set up Tenant
+              run: php artisan tenants:create test test.advisingapp.local -y
+
+            - name: Generate Helper Files
+              run: php artisan app:generate-helper-files

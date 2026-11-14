@@ -1,0 +1,155 @@
+name: Build Windows
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  release:
+    types: [published]
+
+env:
+  RUNNER_IMAGE: windows-latest
+  PYTHON_VERSION: '3.9'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        architecture: x64
+
+    - name: Show environment info
+      run: |
+        echo "RUNNER_IMAGE=${{ env.RUNNER_IMAGE }}"
+        echo "PATH=$env:PATH"
+        python --version
+        python -c "import platform; print(platform.architecture())"
+
+    - name: Set RedNotebook VERSION variable
+      run: |
+        $VERSION = python -c "from rednotebook import info; print(info.version)"
+        echo "VERSION=$VERSION" >> $env:GITHUB_ENV
+        echo "Version: $VERSION"
+
+
+    - name: Set up GTK stack
+      run: |
+        curl -Lo gtk-bundle.zip https://www.dropbox.com/s/lo0p8c96cljcc1c/gtk-bundle.zip?dl=1
+        7z x gtk-bundle.zip -oC:\gtk
+        Get-ChildItem C:\gtk
+        $env:PATH = "$env:PATH;C:\gtk\bin"
+        echo "PATH=$env:PATH" >> $env:GITHUB_ENV
+
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --no-warn-script-location -U pip setuptools tox==3.27.1 wheel
+        # Install PyGObject and pycairo from the GTK bundle wheels.
+        python -m pip install --no-warn-script-location C:\gtk\pycairo-1.21.0-cp39-cp39-win_amd64.whl
+        python -m pip install --no-warn-script-location C:\gtk\PyGObject-3.42.0-cp39-cp39-win_amd64.whl
+        # Install separately because --no-binary option disables using wheels (leading to problems for Cython).
+        python -m pip install --no-warn-script-location -U --no-binary :all: pyenchant==3.2.2
+        python -m pip install --no-warn-script-location -r win/requirements.txt
+        python -m pip freeze
+        python -m pip list --outdated
+
+    - name: Install gettext (msgfmt)
+      run: |
+        $downloadRoot = $env:RUNNER_TEMP
+        $zip = Join-Path $downloadRoot "gettext.zip"
+        Write-Host "Downloading gettext bundle to $zip"
+        curl -L -o $zip https://github.com/mlocati/gettext-iconv-windows/releases/download/v0.26-v1.17/gettext0.26-iconv1.17-shared-64.zip
+        $dest = Join-Path $downloadRoot "gettext"
+        if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
+        7z x $zip ("-o" + $dest) | Out-Null
+        # msgfmt.exe resides in the extracted bin directory
+        $binDir = Join-Path $dest "bin"
+        $binDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        Write-Host "Added gettext bin directory to PATH: $binDir"
+
+    - name: Patch GtkSourceView hook
+      run: |
+        $pythonPath = "C:\hostedtoolcache\windows\Python\${{ env.PYTHON_VERSION }}.*\x64"
+        $hookFile = Get-ChildItem "$pythonPath\Lib\site-packages\pyinstaller\hooks\hook-gi.repository.GtkSource.py"
+        $hookPath = $hookFile.FullName
+        (Get-Content $hookPath) -replace '3\.0', '4' | Set-Content $hookPath
+        echo "Patched GtkSourceView hook at: $hookPath"
+
+    - name: Set Pyenchant debug logging
+      run: |
+        echo "PYENCHANT_VERBOSE_FIND=foobar" >> $env:GITHUB_ENV
+
+    - name: Install dictionaries
+      run: |
+        curl -Lo dicts.tar.gz https://www.dropbox.com/s/f12k20aur6znpmo/myspell-dicts.tar.gz?dl=1
+        tar -xzf dicts.tar.gz
+        # Create enchant directory structure and copy dictionaries.
+        New-Item -ItemType Directory -Force -Path C:\gtk\share\enchant\myspell
+        Copy-Item -Recurse enchant\* C:\gtk\share\enchant\myspell\
+
+    - name: Run tests
+      run: |
+        python -m tox -v -e py
+
+    - name: Test sample app
+      run: |
+        cd win
+        python sampleapp.py
+        # Quote --add-data arguments so PowerShell does not split on semicolons.
+        python -m PyInstaller --additional-hooks-dir=. --add-data "C:/gtk/bin/libenchant.dll;." --add-data "C:/gtk/lib/enchant/libenchant_myspell.dll;lib/enchant/" --add-data "C:/gtk/share/enchant/myspell/myspell;share/enchant/myspell" sampleapp.py
+        # Set environment variables for enchant library in PyInstaller bundle
+        $env:PATH = "C:\Windows\system32;C:\Windows;C:\Windows\System32\Wbem;$pwd\dist\sampleapp;$pwd\dist\sampleapp\_internal"
+        $env:ENCHANT_DATA_DIR = "$pwd\dist\sampleapp\_internal\share\enchant"
+        $env:ENCHANT_MODULE_PATH = "$pwd\dist\sampleapp\_internal\lib\enchant"
+        .\dist\sampleapp\sampleapp.exe
+        cd ..
+
+    - name: Create executable
+      run: |
+        cd win
+        python -m PyInstaller --workpath=C:/build --distpath=C:/ rednotebook.spec
+        python ../dev/build_translations.py C:/dist/share/locale
+        7z a rednotebook.zip C:\dist
+        cd ..
+
+    - name: Install Inno Setup
+      run: |
+        choco install innosetup --version=6.2.2 -y --allow-downgrade
+
+    - name: Build installer
+      run: |
+        cd win
+        & "C:\Program Files (x86)\Inno Setup 6\iscc.exe" /Qp /dREDNOTEBOOK_VERSION="$env:VERSION" rednotebook.iss
+        cd ..
+
+    - name: Prepare artifacts
+      run: |
+        Move-Item win\rednotebook.zip rednotebook-$env:VERSION.zip
+        Move-Item C:\rednotebook.exe rednotebook-$env:VERSION.exe
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: windows-artifacts
+        path: |
+          rednotebook-*.zip
+          rednotebook-*.exe
+
+    - name: Deploy to GitHub Releases
+      if: github.event_name == 'release'
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          rednotebook-*.exe
+          rednotebook-*.zip
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

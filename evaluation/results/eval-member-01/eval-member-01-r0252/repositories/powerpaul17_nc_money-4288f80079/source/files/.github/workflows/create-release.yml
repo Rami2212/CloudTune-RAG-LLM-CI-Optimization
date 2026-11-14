@@ -1,0 +1,110 @@
+name: Create and publish app release
+
+on:
+  workflow_dispatch:
+    inputs:
+      increment:
+        description: Major/minor/patch?
+        type: choice
+        required: true
+        options:
+          - major
+          - minor
+          - patch
+        default: patch
+
+env:
+  PHP_VERSION: 8.4
+  NC_VERSION: stable34
+  APP_NAME: money
+  POSTGRES_PASSWORD: nextcloud
+
+jobs:
+  integration-tests:
+    uses: ./.github/workflows/integration-tests.yml
+
+  frontend-tests:
+    uses: ./.github/workflows/pull-request.yml
+
+  build-and-sign:
+    needs:
+      - integration-tests
+      - frontend-tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_PASSWORD: ${{ env.POSTGRES_PASSWORD }}
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    outputs:
+      version: ${{ steps.release-it.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: git config
+        run: |
+          git config user.name "${GITHUB_ACTOR}"
+          git config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          extensions: gd, pdo_pgsql
+          coverage: none
+
+      - name: Set up server with SQL
+        uses: SMillerDev/nextcloud-actions/setup-nextcloud@main
+        with:
+          cron: false
+          version: ${{ env.NC_VERSION }}
+          database-type: pgsql
+          database-host: localhost
+          database-port: 5432
+          database-name: postgres
+          database-user: postgres
+          database-password: ${{ env.POSTGRES_PASSWORD }}
+
+      - name: Configure server with app
+        uses: SMillerDev/nextcloud-actions/setup-nextcloud-app@main
+        with:
+          app: ${{ env.APP_NAME }}
+
+      - name: Install composer dependencies
+        run: composer install --prefer-dist --no-dev
+        working-directory: ../server/apps/${{ env.APP_NAME }}
+
+      - name: Install NPM packages
+        run: npm i
+        working-directory: ../server/apps/${{ env.APP_NAME }}
+
+      - run: npx release-it ${{ inputs.increment }}
+        id: release-it
+        working-directory: ../server/apps/${{ env.APP_NAME }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_PRIVATE_KEY: ${{ secrets.NC_MONEY_PRIVATE_KEY }}
+          APP_CERTIFICATE: ${{ secrets.NC_MONEY_CERTIFICATE}}
+          NC_APP_DIRECTORY: apps
+
+  upload-to-store:
+    runs-on: ubuntu-latest
+    needs: build-and-sign
+    steps:
+      - name: Upload app to Nextcloud appstore
+        uses: R0Wi/nextcloud-appstore-push-action@a011fe619bcf6e77ddebc96f9908e1af4071b9c1
+        with:
+          app_name: ${{ env.APP_NAME }}
+          appstore_token: ${{ secrets.NC_STORE_API_TOKEN }}
+          download_url: https://github.com/powerpaul17/nc_money/releases/download/v${{ needs.build-and-sign.outputs.version }}/money.tar.gz
+          app_private_key: ${{ secrets.NC_MONEY_PRIVATE_KEY }}

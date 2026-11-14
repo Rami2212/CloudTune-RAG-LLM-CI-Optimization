@@ -1,0 +1,94 @@
+name: "Example 13: Apple Silicon"
+
+on:
+  pull_request:
+    branches:
+      - "*"
+  push:
+    branches:
+      - "develop"
+      - "main"
+      - "master"
+  schedule:
+    # Note that cronjobs run on master/main by default
+    - cron: "0 0 * * *"
+
+concurrency:
+  group:
+    ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  example-13:
+    # prevent cronjobs from running on forks
+    if:
+      (github.event_name == 'schedule' && github.repository ==
+      'conda-incubator/setup-miniconda') || (github.event_name != 'schedule')
+    name: Ex13 (os=${{ matrix.os }} variant=${{ matrix.variant }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["macos-latest"]
+        variant: ["Miniforge3", "Miniconda", "no-variant", "empty-with"]
+        include:
+          # This is Intel, not Apple Silicon, but doesn't bundle Miniconda
+          - os: macos-15-intel
+            variant: empty-with
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./
+        if: matrix.variant == 'Miniforge3'
+        id: setup-miniforge
+        continue-on-error: true
+        with:
+          auto-update-conda: true
+          architecture: arm64
+          miniforge-variant: ${{ matrix.variant }}
+          miniforge-version: latest
+      - uses: ./
+        if: matrix.variant == 'Miniconda'
+        id: setup-miniconda
+        continue-on-error: true
+        with:
+          auto-update-conda: true
+          miniconda-version: latest
+      - uses: ./
+        if: matrix.variant == 'no-variant'
+        id: setup-miniforge-no-variant
+        continue-on-error: true
+        with:
+          miniforge-version: latest
+      - uses: ./
+        if: matrix.variant == 'empty-with'
+        id: setup-miniconda-empty-with
+        continue-on-error: true
+      - name: Conda info
+        shell: bash -el {0}
+        run: conda info
+      - name: Conda list
+        shell: bash -el {0}
+        run: conda list
+      - name: Environment
+        shell: bash -el {0}
+        run: printenv | sort
+      - name: Create an environment
+        shell: bash -el {0}
+        run: conda create -n unused --dry-run zlib
+      - name: Run mamba
+        if: matrix.variant == 'Miniforge3'
+        shell: bash -el {0}
+        run: mamba --version
+      - name: Install Python
+        shell: bash -el {0}
+        run: conda install -y python
+      - name: Check architecture
+        if: matrix.os != 'macos-15-intel'
+        shell: bash -el {0}
+        run: |
+          python -c "import platform; assert platform.machine() == 'arm64', platform.machine()"

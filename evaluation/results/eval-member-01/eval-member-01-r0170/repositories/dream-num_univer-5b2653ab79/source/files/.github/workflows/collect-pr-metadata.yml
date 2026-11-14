@@ -1,0 +1,65 @@
+name: 🎬 Setup
+
+on:
+    pull_request:
+        branches:
+            - dev
+        types:
+            - opened
+            - synchronize
+            - reopened
+            - closed
+            - ready_for_review
+
+permissions:
+    contents: read
+    pull-requests: read
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+env:
+    TURBO_TELEMETRY_DISABLED: '1'
+
+jobs:
+    set-pr-info:
+        name: set PR info
+        if: github.repository == 'dream-num/univer' && !github.event.pull_request.draft
+        runs-on: minimum-runner
+        steps:
+            - name: Save PR info
+              env:
+                  PR_ID: ${{ github.event.pull_request.number || '' }}
+                  PR_REF: ${{ github.head_ref || github.ref_name }}
+                  PR_REPO: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+                  PR_STATE: ${{ github.event.pull_request.state || '' }}
+              run: |
+                  printf '%s\n' "$PR_ID" > ./pr-id.txt
+                  printf '%s\n' "$PR_REF" > ./pr-ref.txt
+                  printf '%s\n' "$PR_REPO" > ./pr-repo.txt
+                  printf '%s\n' "$PR_STATE" > ./pr-state.txt
+
+            - name: Upload PR number
+              uses: actions/upload-artifact@v7
+              with:
+                  name: pr-id
+                  path: ./pr-id.txt
+
+            - name: Upload PR ref
+              uses: actions/upload-artifact@v7
+              with:
+                  name: pr-ref
+                  path: ./pr-ref.txt
+
+            - name: Upload PR repo
+              uses: actions/upload-artifact@v7
+              with:
+                  name: pr-repo
+                  path: ./pr-repo.txt
+
+            - name: Upload PR state
+              uses: actions/upload-artifact@v7
+              with:
+                  name: pr-state
+                  path: ./pr-state.txt

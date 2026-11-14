@@ -1,0 +1,139 @@
+# Targets
+.PHONY: help
+help: ## show definition of each function
+	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "\033[36m%-25s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+
+.PHONY: clean
+clean: ## Remove .gitignore files
+	git clean -fdX
+
+# Variables for docker-run
+HOST_PORT ?= 8080
+HOST_LOCAL_DIR ?=
+
+.PHONY: docker-build
+docker-build: ## Build the docker image
+	docker buildx build . --platform=linux/amd64 -t ghcr.io/mostly-ai/sdk
+
+.PHONY: docker-run
+docker-run: ## Start the docker container
+	@echo "Mapping port: $(HOST_PORT) (host) <-> 8080 (container)"
+	@# here we have to make sure .venv folder is set as an anonymous volume, so that it will not be overwritten by a bind mount
+	@# ref: https://docs.astral.sh/uv/guides/integration/docker/#mounting-the-project-with-docker-run
+	@if [ -z "$(HOST_LOCAL_DIR)" ]; then \
+            docker run --platform=linux/amd64 -it -p $(HOST_PORT):8080 \
+            -v ~/.cache/huggingface:/home/nonroot/.cache/huggingface \
+            ghcr.io/mostly-ai/sdk ; \
+        else \
+            if [ ! -d $(HOST_LOCAL_DIR) ]; then \
+                echo "Failed to mount local_dir: $(HOST_LOCAL_DIR) does not exist"; \
+                exit 1; \
+            fi; \
+            REAL_PATH=$$(realpath $(HOST_LOCAL_DIR)); \
+            echo "Mounting local_dir for MostlyAI SDK: $$REAL_PATH (host) <-> /home/nonroot/mostlyai (container)"; \
+            docker run --platform=linux/amd64 --rm -it -p $(HOST_PORT):8080 \
+              -v $$REAL_PATH:/home/nonroot/mostlyai \
+              -v ~/.cache/huggingface:/home/nonroot/.cache/huggingface \
+              -v /opt/app-root/src/mostlyai/.venv \
+              ghcr.io/mostly-ai/sdk ; \
+        fi;
+
+# Default files to update
+PYPROJECT_TOML = pyproject.toml
+INIT_FILE = mostlyai/sdk/__init__.py
+
+# Internal Variables for Release Workflow
+BUMP_TYPE ?= patch
+CURRENT_VERSION := $(shell grep -m 1 'version = ' $(PYPROJECT_TOML) | sed -e 's/version = "\(.*\)"/\1/')
+# Assuming current_version is already set from pyproject.toml
+NEW_VERSION := $(shell echo $(CURRENT_VERSION) | awk -F. -v bump=$(BUMP_TYPE) '{ \
+    if (bump == "patch") { \
+        printf("%d.%d.%d", $$1, $$2, $$3 + 1); \
+    } else if (bump == "minor") { \
+        printf("%d.%d.0", $$1, $$2 + 1); \
+    } else if (bump == "major") { \
+        printf("%d.0.0", $$1 + 1); \
+    } else { \
+        print "Error: Invalid BUMP_TYPE. Expected patch, minor or major. Input was BUMP_TYPE=" bump; \
+        exit 1; \
+    } \
+}')
+
+
+# Targets for Release Workflow/Automation
+.PHONY: update-version-gh release-pypi docs
+
+update-version-gh: pull-main bump-version update-vars-version create-branch ## Update version in GitHub: pull main, bump version, create and push the new branch
+
+release-pypi: clean-dist pull-main build confirm-upload upload-pypi docs  ## Release to PyPI: pull main, build and upload to PyPI
+
+pull-main: # Pull main branch
+	# stash changes
+	@git stash
+	# switch to main branch
+	@git checkout main
+	# fetch latest changes
+	@git fetch origin main
+	# get a clean copy of main branch
+	@git reset --hard origin/main
+	# clean
+	@git clean -fdX
+
+bump-version: # Bump version (default: patch, options: patch, minor, major)
+	@echo "Bumping $(BUMP_TYPE) version from $(CURRENT_VERSION) to $(NEW_VERSION)"
+	@echo "Replaces $(CURRENT_VERSION) to $(NEW_VERSION) in $(PYPROJECT_TOML)"
+	@echo "Replaces $(CURRENT_VERSION) to $(NEW_VERSION) in $(INIT_FILE)"
+	@echo "Current directory: $(shell pwd)"
+    # Check if current version was found
+	@if [ -z "$(CURRENT_VERSION)" ]; then \
+        echo "Error: Could not find current version in $(PYPROJECT_TOML)"; \
+        exit 1; \
+    fi
+    # Replace the version in pyproject.toml
+	@if [[ "$(shell uname -s)" == "Darwin" ]]; then \
+        sed -i '' 's/version = "$(CURRENT_VERSION)"/version = "$(NEW_VERSION)"/g' $(PYPROJECT_TOML); \
+        sed -i '' 's/__version__ = "$(CURRENT_VERSION)"/__version__ = "$(NEW_VERSION)"/g' $(INIT_FILE); \
+    else \
+        sed -i 's/version = "$(CURRENT_VERSION)"/version = "$(NEW_VERSION)"/g' $(PYPROJECT_TOML); \
+        sed -i 's/__version__ = "$(CURRENT_VERSION)"/__version__ = "$(NEW_VERSION)"/g' $(INIT_FILE); \
+    fi
+
+update-vars-version: # Update the required variables after bump
+	$(eval VERSION := $(shell python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])"))
+	$(eval BRANCH := verbump_$(shell echo $(VERSION) | tr '.' '_'))
+	$(eval TAG := $(VERSION))
+	@echo "Updated VERSION to $(VERSION), BRANCH to $(BRANCH), TAG to $(TAG)"
+
+create-branch: # Create verbump_{new_ver} branch
+	@git checkout -b $(BRANCH)
+	@echo "Created branch $(BRANCH)"
+	# commit the version bump
+	@git add $(INIT_FILE)
+	@git add $(PYPROJECT_TOML)
+	@git commit -m "Version Bump to $(VERSION)"
+	@echo "Committed version bump to $(VERSION)"
+	@git push --set-upstream origin $(BRANCH)
+	@echo "Pushed branch $(BRANCH) to origin"
+
+clean-dist: # Remove "volatile" directory dist
+	@rm -rf dist
+	@echo "Cleaned up dist directory"
+
+build: # Build the project and create the dist directory if it doesn't exist
+	@mkdir -p dist
+	@uv build
+	@echo "Built the project"
+	@twine check --strict dist/*
+	@echo "Project is checked"
+
+confirm-upload: # Confirm before the irreversible zone
+	@echo "Are you sure you want to upload to PyPI? (yes/no)"
+	@read ans && [ $${ans:-no} = yes ]
+
+upload-pypi: confirm-upload # Upload to PyPI (ensure the token is present in .pypirc file before running upload)
+	@twine upload dist/*$(VERSION)* --verbose
+	@echo "Uploaded version $(VERSION) to PyPI"
+
+docs: ## Update docs site
+	@mkdocs gh-deploy
+	@echo "Deployed docs"

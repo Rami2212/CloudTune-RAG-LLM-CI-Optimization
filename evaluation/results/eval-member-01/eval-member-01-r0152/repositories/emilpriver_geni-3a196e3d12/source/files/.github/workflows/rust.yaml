@@ -1,0 +1,180 @@
+name: Rust
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Run verify-version.sh
+      if: startsWith(github.ref, 'refs/tags/')
+      run: chmod +x scripts/verify-version.sh && scripts/verify-version.sh
+    - name: Run tests
+      run: cargo test --verbose
+  build-binary:
+    needs: [test]
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            image: ubuntu-latest
+            arch: 386
+            setup: |
+              sudo apt-get update
+              sudo apt-get install -qq gcc-i686-linux-gnu
+              sudo apt-get install -qq libssl-dev
+              sudo apt-get install -qq gcc-multilib
+            env: {}
+          - os: linux
+            image: ubuntu-latest
+            arch: amd64
+            env: {}
+          - os: linux
+            image: ubuntu-latest
+            arch: arm
+            setup: |
+              sudo apt-get update
+              sudo apt-get install -qq gcc-arm-linux-gnueabi 
+              sudo apt-get install -qq libssl-dev
+            env: 
+              TARGET: aarch64-unknown-linux-gnu
+          - os: linux
+            image: ubuntu-latest
+            arch: arm64
+            setup: |
+              sudo apt-get update
+              sudo apt-get install -qq gcc-aarch64-linux-gnu
+              sudo apt-get install -qq libssl-dev
+            env:
+              TARGET: aarch64-unknown-linux-gnu
+          - os: macos
+            image: macos-latest
+            arch: amd64
+            env:
+              TARGET: aarch64-apple-darwin
+          - os: macos
+            image: macos-latest
+            arch: arm64
+            env: 
+              TARGET: x86_64h-apple-darwin
+          - os: windows
+            image: windows-latest
+            arch: amd64
+            env:
+              CC: cl.exe
+              CFLAGS: -x
+              TARGET: x86_64-pc-windows-msvc
+    name: Build (${{ matrix.os }}/${{ matrix.arch }})
+    runs-on: ${{ matrix.image }}
+    env: ${{ matrix.env }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4  
+      - name: Setup environment
+        run: ${{ matrix.setup }}
+      - name: Install compiler for Windows
+        if: ${{matrix.os == 'windows'}}
+        id: install_cc
+        uses: rlalik/setup-cpp-compiler@master
+        with:
+          compiler: latest
+      - if: ${{matrix.os == 'windows'}}
+        name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1.12.1
+      - name: Build
+        run: cargo build --release --verbose
+      - name: Rename package 
+        if: ${{matrix.os != 'windows'}}
+        shell: bash
+        run: |
+          cp target/release/geni geni-${{matrix.os}}-${{matrix.arch}}
+      - name: Rename package 
+        if: ${{matrix.os == 'windows'}}
+        shell: bash
+        run: |
+          cp target/release/geni.exe geni-${{matrix.os}}-${{matrix.arch}}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.os }}-${{ matrix.arch }}
+          path: geni-${{matrix.os}}-${{matrix.arch}}
+      - name: Publish to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+            files: 'geni*'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  release-cargo:
+    needs: [build-binary]
+    runs-on: "ubuntu-latest"
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: "main"
+      - name: Install stable toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+      - name: Crates.io Login 
+        run: cargo login ${{secrets.CRATES_TOKEN}} 
+      - name: Install cargo release 
+        run: cargo install cargo-release
+      - name: Change tag name
+        run: |
+          TAG=${{ github.event.release.tag_name }}
+          echo "VERSION=${TAG#v}" >> $GITHUB_ENV
+      - name: Publish version
+        run: cargo publish
+  test-github-actions:
+    runs-on: ubuntu-latest
+    needs: [build-binary]
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+    - uses: actions/checkout@v4
+    - name: Start MariaDB
+      run: |
+        docker run -d \
+          --name mariadb-test \
+          -e MARIADB_ROOT_PASSWORD=password \
+          -e MARIADB_DATABASE=development \
+          -p 3307:3306 \
+          mariadb:11.1.3
+    - name: Wait for database
+      run: |
+        for i in {1..30}; do
+          if docker exec mariadb-test mysqladmin ping -h localhost -u root -ppassword --silent; then
+            echo "Database is ready"
+            break
+          fi
+          echo "Waiting for database..."
+          sleep 2
+        done
+    - name: Create test migrations
+      run: bash scripts/test-migrations.sh
+    - name: Run geni migrations
+      run: |
+        chmod +x geni-linux-amd64
+        ./geni-linux-amd64 up
+      env:
+        DATABASE_URL: "mariadb://root:password@localhost:3307/development"
+        DATABASE_MIGRATIONS_FOLDER: "./migrations"
+    - name: Verify migrations applied
+      run: |
+        ./geni-linux-amd64 status
+      env:
+        DATABASE_URL: "mariadb://root:password@localhost:3307/development"
+        DATABASE_MIGRATIONS_FOLDER: "./migrations"

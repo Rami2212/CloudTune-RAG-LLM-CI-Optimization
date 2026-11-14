@@ -1,0 +1,30 @@
+on: pull_request
+name: Pull Request
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          cache: 'npm'
+          node-version: 24
+      - name: Install dependencies
+        env:
+          CI: true
+        run: npm install
+      - name: Test
+        run: npm test
+      - name: Type-check public types
+        run: npm run test:types
+      - name: Build library
+        run: npm run build:lib
+      - name: Test built package
+        run: npm run test:dist
+      - name: Check docs links
+        run: node tools/check-doc-links.mjs

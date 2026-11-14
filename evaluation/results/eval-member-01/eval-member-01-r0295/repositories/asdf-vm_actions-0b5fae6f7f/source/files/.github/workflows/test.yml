@@ -1,0 +1,124 @@
+name: test
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+jobs:
+  asdf_is_installed:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["macos-latest", "ubuntu-latest"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: setup asdf
+        uses: ./setup
+      - name: asdf is available
+        run: |
+          echo ASDF_DIR="${ASDF_DIR}"
+          echo ASDF_DATA_DIR="${ASDF_DATA_DIR}"
+          echo PATH="${PATH}"
+          asdf --version
+
+  asdf_updates_clone_if_installed:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["macos-latest", "ubuntu-latest"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: "Setup: should clone repo"
+        uses: ./setup
+      - run: asdf version
+      - name: "Simulate self-hosted runner and remove /home/runner/.asdf/bin/asdf after setup"
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        run: |
+          rm -rf /home/runner/.asdf/bin/asdf
+      - name: "Simulate self-hosted runner and remove /Users/runner/.asdf/bin/asdf after setup"
+        if: ${{ matrix.os == 'macos-latest' }}
+        run: |
+          rm -rf /Users/runner/.asdf/bin/asdf
+      - name: "Setup: should update repo"
+        uses: ./setup
+      # NB: how is it that the hosted runners get to this point in the code without ~/.asdf/bin/asdf
+      #     the below execution fails because the checkout doesn't seem to fix the rm -rf.
+      #     Comment out for now & trust in the OP of #394
+      # - run: asdf version
+
+  plugin_is_tested:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["macos-latest", "ubuntu-latest"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: ./plugin-test
+        with:
+          command: alp --version
+          plugin: alp
+          giturl: https://github.com/asdf-community/asdf-alp.git
+          gitref: master
+
+  plugins_are_installed:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["macos-latest", "ubuntu-latest"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: ./plugins-add
+        with:
+          tool_versions: |
+            # tools won't be installed by this action, only plugins
+            elixir foo
+            nodejs bar
+      - run: |
+          asdf plugin list --urls --refs | grep elixir
+          asdf plugin list --urls --refs | grep nodejs
+
+  installing-plugins-already-installed-are-skiped:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["macos-latest", "ubuntu-latest"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: ./setup
+      - name: Add an asdf plugin
+        run: |
+          asdf plugin add erlang https://github.com/asdf-vm/asdf-erlang.git
+      - uses: ./plugins-add
+        with:
+          tool_versions: |
+            # tools won't be installed by this action, only plugins
+            elixir foo
+            nodejs bar
+            # plugins already installed are here
+            erlang baz
+      - run: |
+          asdf plugin list --urls --refs | grep elixir
+          asdf plugin list --urls --refs | grep nodejs
+          asdf plugin list --urls --refs | grep erlang
+
+  tools_are_installed:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["macos-latest", "ubuntu-latest"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: setup asdf
+        uses: ./install
+        with:
+          before_install: echo asdf nodejs import-keyring
+          tool_versions: nodejs 22.14.0
+      - run: node --version

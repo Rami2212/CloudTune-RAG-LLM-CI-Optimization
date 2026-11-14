@@ -1,0 +1,85 @@
+on:
+  push:
+  pull_request:
+  workflow_call:
+
+name: CI
+
+jobs:
+  test-schema:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - uses: actions/setup-node@v7
+      with:
+        node-version: 'lts/*'
+        cache: 'npm'
+    - run: npm install
+    - run: npm test
+
+  setup-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      variants: ${{ steps.setup-matrix.outputs.variants }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up matrix of variants
+        id: setup-matrix
+        env:
+          HAS_RHN: ${{ secrets.RH_ORG_ID != '' }}
+        run: |
+          variants="$(make print-variants)"
+          if [ "$HAS_RHN" != "true" ]; then
+            variants="$(echo "$variants" | tr ' ' '\n' | grep -v '^rhel' | tr '\n' ' ')"
+          fi
+          variants=$(echo "$variants" | tr -s ' ' | sed 's/^ //; s/ $//' | jq -R -c '[splits(" ")]')
+          echo "variants=$variants" >> $GITHUB_OUTPUT
+
+  test-rules:
+    needs: setup-matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJson(needs.setup-matrix.outputs.variants) }}
+    runs-on: ubuntu-latest
+    env:
+      VARIANTS: ${{ matrix.variant }}
+      RH_ORG_ID: ${{ secrets.RH_ORG_ID }}
+      RH_ACTIVATION_KEY: ${{ secrets.RH_ACTIVATION_KEY }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          driver: docker
+          install: true
+
+      - name: Restore RHEL DNF cache
+        if: startsWith(matrix.variant, 'rhel')
+        uses: actions/cache@v6
+        with:
+          path: .cache/dnf-${{ matrix.variant }}
+          key: dnf-${{ matrix.variant }}-${{ hashFiles(format('docker/{0}/Dockerfile', matrix.variant)) }}-${{ github.run_id }}
+          restore-keys: |
+            dnf-${{ matrix.variant }}-${{ hashFiles(format('docker/{0}/Dockerfile', matrix.variant)) }}-
+            dnf-${{ matrix.variant }}-
+
+      - name: Restore Rocky Linux DNF cache
+        if: startsWith(matrix.variant, 'rockylinux')
+        uses: actions/cache@v6
+        with:
+          path: .cache/dnf-${{ matrix.variant }}
+          key: dnf-${{ matrix.variant }}-${{ hashFiles(format('docker/{0}/Dockerfile', matrix.variant), 'test/rocky-dnf.conf') }}-${{ github.run_id }}
+          restore-keys: |
+            dnf-${{ matrix.variant }}-${{ hashFiles(format('docker/{0}/Dockerfile', matrix.variant), 'test/rocky-dnf.conf') }}-
+            dnf-${{ matrix.variant }}-
+
+      - name: Build image(s)
+        run: |
+          make build-all
+
+      - name: Test rules
+        run: |
+          make test-all

@@ -1,0 +1,39 @@
+name: Update Platform Members
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  update:
+    if: github.repository == 'quarkusio/quarkus-platform'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.UPDATE_PLATFORM_APP_ID }}
+          private-key: ${{ secrets.UPDATE_PLATFORM_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          java-version: 25
+          distribution: temurin
+          cache: maven
+
+      - uses: quarkusio/update-quarkus-platform-action@main
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          packages-token: ${{ secrets.GITHUB_TOKEN }}

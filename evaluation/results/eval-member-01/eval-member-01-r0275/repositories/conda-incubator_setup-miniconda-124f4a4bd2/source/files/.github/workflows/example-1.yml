@@ -1,0 +1,54 @@
+name: "Example 1: Basic usage"
+
+on:
+  pull_request:
+    branches:
+      - "*"
+  push:
+    branches:
+      - "develop"
+      - "main"
+      - "master"
+  schedule:
+    # Note that cronjobs run on master/main by default
+    - cron: "0 0 * * *"
+
+concurrency:
+  group:
+    ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  example-1:
+    # prevent cronjobs from running on forks
+    if:
+      (github.event_name == 'schedule' && github.repository ==
+      'conda-incubator/setup-miniconda') || (github.event_name != 'schedule')
+    name: Ex1 (${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["ubuntu-latest", "macos-latest", "windows-latest"]
+        python-version: ["3.8", "3.11"]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./
+        with:
+          auto-update-conda: true
+          python-version: ${{ matrix.python-version }}
+      - name: Conda info
+        shell: bash -el {0}
+        run: conda info
+      - name: Conda list
+        shell: pwsh
+        run: conda list
+      - name: Environment
+        shell: bash -el {0}
+        run: printenv | sort

@@ -1,0 +1,60 @@
+name: Test
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    name: >-
+      ${{matrix.os}}, ${{matrix.ruby}}
+    env:
+      CI: true
+      TESTOPTS: -v
+
+    runs-on: ${{matrix.os}}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: 
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+        ruby:
+          - "2.6"
+          - "2.7"
+          - "3.0"
+          - "3.1"
+          - "3.2"
+          - "3.3"
+          - "3.4"
+          - "head"
+          - "jruby"
+          - "truffleruby"
+        include:
+          - {os: windows-2022, ruby: ucrt}
+        exclude:
+          - {os: windows-latest, ruby: head}
+          - {os: windows-latest, ruby: jruby}
+          - {os: macos-latest, ruby: jruby}
+          - {os: windows-latest, ruby: truffleruby}
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: set JAVA_HOME
+        if: |
+          startsWith(matrix.ruby, 'jruby')
+        shell: bash
+        run:  |
+          echo JAVA_HOME=$JAVA_HOME_11_X64 >> $GITHUB_ENV
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{matrix.ruby}}
+          bundler-cache: true
+
+      - name: Compile
+        run: bundle exec rake compile
+
+      - name: Test
+        run: bundle exec rake spec
+        timeout-minutes: 10

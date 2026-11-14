@@ -1,0 +1,128 @@
+name: 🧪 CI Test
+
+on:
+    push:
+        branches:
+            - dev
+    pull_request:
+        branches:
+            - dev
+        types:
+            - opened
+            - synchronize
+            - reopened
+            - ready_for_review
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+    pull-requests: write
+
+env:
+    TURBO_TELEMETRY_DISABLED: '1'
+
+jobs:
+    test-shard:
+        name: test shard (${{ matrix.shard-index }}/${{ matrix.shard-total }})
+        if: github.repository == 'dream-num/univer' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        strategy:
+            matrix:
+                shard-index: [1, 2, 3, 4]
+                shard-total: [4]
+        env:
+            TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+            TURBO_TEAM: ${{ vars.TURBO_TEAM }}
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v7
+              with:
+                  persist-credentials: false
+
+            - name: Setup Node.js
+              uses: ./.github/actions/setup-node
+
+            - name: 🩺 Run test
+              run: node --experimental-strip-types ./scripts/coverage-shard.mts --shard-index=${{ matrix.shard-index }} --shard-total=${{ matrix.shard-total }} --concurrency=2
+
+            - name: 🧬 Report coverage
+              uses: codecov/codecov-action@v7
+              with:
+                  name: unit-${{ matrix.shard-index }}
+              env:
+                  CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+    test:
+        name: test
+        if: always() && github.repository == 'dream-num/univer' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
+        runs-on: minimum-runner
+        timeout-minutes: 5
+        needs: test-shard
+
+        steps:
+            - name: Check test shard results
+              run: |
+                  if [ "${{ needs.test-shard.result }}" != "success" ]; then
+                      echo "One or more test shards failed: ${{ needs.test-shard.result }}"
+                      exit 1
+                  fi
+
+                  echo "All test shards passed"
+
+    eslint:
+        if: github.repository == 'dream-num/univer' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v7
+              with:
+                  persist-credentials: false
+
+            - name: Setup Node.js
+              uses: ./.github/actions/setup-node
+
+            - name: Restore ESLint cache
+              id: eslint-cache
+              uses: actions/cache/restore@v6
+              with:
+                  path: .eslintcache
+                  key: eslint-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'package.json', 'eslint.config.ts') }}-${{ github.sha }}
+                  restore-keys: |
+                      eslint-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'package.json', 'eslint.config.ts') }}-
+
+            - name: 🌡️ Run ESLint
+              run: pnpm lint --quiet --cache --cache-location .eslintcache
+
+            - name: Save ESLint cache
+              if: github.ref_name == github.event.repository.default_branch && steps.eslint-cache.outputs.cache-hit != 'true'
+              uses: actions/cache/save@v6
+              with:
+                  path: .eslintcache
+                  key: eslint-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'package.json', 'eslint.config.ts') }}-${{ github.sha }}
+
+    typecheck:
+        if: github.repository == 'dream-num/univer' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        env:
+            TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+            TURBO_TEAM: ${{ vars.TURBO_TEAM }}
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v7
+              with:
+                  persist-credentials: false
+
+            - name: Setup Node.js
+              uses: ./.github/actions/setup-node
+
+            - name: 🧼 Type checking
+              run: pnpm typecheck

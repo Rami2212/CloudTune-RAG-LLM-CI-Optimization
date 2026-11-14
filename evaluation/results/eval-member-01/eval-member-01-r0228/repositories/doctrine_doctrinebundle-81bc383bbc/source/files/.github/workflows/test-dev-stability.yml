@@ -1,0 +1,49 @@
+
+name: "Dev dependencies stability check"
+
+on:
+  schedule:
+    - cron: "0 0 * * 0"
+
+jobs:
+  phpunit:
+    name: "PHPUnit"
+    runs-on: "ubuntu-latest"
+    env:
+      SYMFONY_REQUIRE: ${{matrix.symfony-require}}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        php-version:
+          - "8.4"
+        dependencies:
+          - "highest"
+        stability:
+          - "dev"
+        symfony-require:
+          - ""
+          - "6.*"
+
+    steps:
+      - name: "Checkout"
+        uses: "actions/checkout@v7"
+        with:
+          fetch-depth: 2
+
+      - name: "Install PHP"
+        uses: "shivammathur/setup-php@v2"
+        with:
+          php-version: "${{ matrix.php-version }}"
+          ini-file: "development"
+          extensions: "pdo_sqlite"
+          tools: "flex"
+
+      - name: "Install dependencies with Composer"
+        uses: "ramsey/composer-install@v4"
+        with:
+          dependency-versions: "${{ matrix.dependencies }}"
+          composer-options: "--prefer-dist"
+
+      - name: "Run PHPUnit"
+        run: "vendor/bin/phpunit"

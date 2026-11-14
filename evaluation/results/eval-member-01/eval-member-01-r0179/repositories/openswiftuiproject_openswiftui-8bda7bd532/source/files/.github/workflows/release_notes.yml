@@ -1,0 +1,51 @@
+name: Release / Notes
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag-name:
+        description: 'Tag name (e.g. 0.23.0)'
+        required: true
+      release-theme:
+        description: Optional title theme override, without the version number
+        default: ''
+        type: string
+  workflow_call:
+    inputs:
+      ref:
+        description: Source commit for the release
+        required: true
+        type: string
+      tag-name:
+        description: 'Tag name for the release'
+        required: true
+        type: string
+      release-theme:
+        default: ''
+        type: string
+    secrets:
+      COPILOT_GITHUB_TOKEN:
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  release-notes:
+    name: Generate Release Notes
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Update release title and notes
+        env:
+          TAG_NAME: ${{ inputs.tag-name }}
+          RELEASE_THEME: ${{ inputs['release-theme'] }}
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+        run: node Scripts/CI/release-notes.js

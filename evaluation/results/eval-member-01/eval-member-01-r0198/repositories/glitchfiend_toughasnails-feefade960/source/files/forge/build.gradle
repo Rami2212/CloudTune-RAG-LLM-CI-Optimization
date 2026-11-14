@@ -1,0 +1,92 @@
+plugins {
+    id 'net.minecraftforge.gradle' version '[7.0.17,8)'
+    id "com.matthewprenger.cursegradle" version "1.4.0"
+}
+
+base.archivesName.set("${mod_name}-forge")
+
+minecraft {
+    // Automatically finds META-INF/accesstransformer.cfg in all source sets
+    accessTransformer = true
+
+    runs {
+        configureEach {
+            workingDir.convention layout.projectDirectory.dir('run')
+            // Declare both common and forge-specific mixin configs
+            args "--mixin.config=${mod_id}.mixins.json", "--mixin.config=${mod_id}.forge.mixins.json"
+        }
+
+        register('client')
+        register('server') { args '--nogui' }
+    }
+}
+
+repositories {
+    minecraft.mavenizer(it)
+    maven fg.forgeMaven
+    maven fg.minecraftLibsMaven
+    maven { url = 'https://jitpack.io' }
+}
+
+dependencies {
+    implementation minecraft.dependency("net.minecraftforge:forge:${minecraft_version}-${forge_version}")
+    annotationProcessor 'net.minecraftforge:eventbus-validator:7.0.1'
+    annotationProcessor 'org.spongepowered:mixin:0.8.7:processor'
+    compileOnly project(":Common")
+    implementation "com.github.glitchfiend:GlitchCore-forge:${minecraft_version}-${glitchcore_version}"
+    implementation "com.github.glitchfiend:SereneSeasons-forge:${minecraft_version}-${serene_seasons_version}"
+}
+
+tasks.withType(JavaCompile).configureEach {
+    source(project(":Common").sourceSets.main.allSource)
+    options.compilerArgs += ['-AdefaultObfuscationEnv=official']
+}
+
+tasks.withType(Javadoc).configureEach {
+    source(project(":Common").sourceSets.main.allJava)
+}
+
+tasks.named("sourcesJar", Jar) {
+    from(project(":Common").sourceSets.main.allSource)
+}
+
+test {
+    failOnNoDiscoveredTests = false
+}
+
+processResources {
+    from project(":Common").sourceSets.main.resources
+}
+
+jar {
+    manifest {
+        attributes([
+            'MixinConfigs': "${mod_id}.mixins.json,${mod_id}.forge.mixins.json",
+        ])
+    }
+}
+
+curseforge {
+    apiKey = project.findProperty('curseApiKey') ?: 'unset'
+    project {
+        id = mod_curseforge_id
+
+        if (changelog_file.exists()) {
+            changelog = changelog_file
+        }
+
+        releaseType = release_channel
+        addGameVersion minecraft_version
+        addGameVersion name
+        addGameVersion 'Client'
+        addGameVersion 'Server'
+
+        mainArtifact(jar) {
+            displayName = "${mod_display_name} ${name} ${version}"
+        }
+
+        relations {
+            requiredDependency 'glitchcore'
+        }
+    }
+}

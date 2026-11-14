@@ -1,0 +1,166 @@
+import io.micronaut.build.docs.PublishGuideTask
+import io.micronaut.build.python.MicronautPythonPlugin
+import org.gradle.api.tasks.PathSensitivity
+
+plugins {
+    id "io.micronaut.build.internal.parent"
+    id "io.micronaut.build.internal.dependency-updates"
+    id "io.micronaut.build.internal.version-catalog-updates"
+    id "io.micronaut.build.internal.convention-quality"
+    alias(libs.plugins.managed.kotlin.jvm) apply false
+    alias(libs.plugins.managed.kotlin.allopen) apply false
+    alias(libs.plugins.managed.kotlin.kapt) apply false
+    alias(libs.plugins.managed.kotlin.noarg) apply false
+    alias(libs.plugins.managed.ksp) apply false
+}
+
+repositories {
+    mavenCentral()
+}
+
+def languageSnippetSources = files(
+        fileTree("test-suite/src/test/java") {
+            include "**/*.java"
+        },
+        fileTree("test-suite-groovy/src/test/groovy") {
+            include "**/*.groovy"
+        },
+        fileTree("test-suite-kotlin/src/test/kotlin") {
+            include "**/*.kt"
+        },
+        fileTree("test-suite-python/src/test/python") {
+            include "**/*.py"
+        }
+)
+
+tasks.withType(PublishGuideTask).configureEach {
+    inputs.files(languageSnippetSources)
+            .withPropertyName("languageSnippetSources")
+            .withPathSensitivity(PathSensitivity.RELATIVE)
+    // versions the guide shows in build examples, from the version catalog
+    properties.put("kotlinVersion", libs.versions.managed.kotlin.asProvider())
+    properties.put("kspVersion", libs.versions.managed.ksp)
+}
+
+tasks.named("updateVersionCatalogs") {
+    // we set the list to empty because we accept upgrades which improve the status
+    rejectedQualifiers = []
+    // Invalid POM files
+    ignoredModules.add("io.micronaut.ignite:micronaut-ignite-core")
+    ignoredModules.add("io.micronaut.ignite:micronaut-ignite-cache")
+    // workaround Gradle variant selection problem
+    ignoredModules.add("com.github.ben-manes.caffeine:caffeine")
+}
+
+// Projects whose tests exercise Python without having Python sources of their own. Projects with
+// Python sources apply the io.micronaut.build.internal.python plugin, which takes care of them itself.
+def pythonTestProjects = [
+        ":micronaut-inject-python",
+        ":micronaut-inject-python-test",
+        ":micronaut-context-python",
+        ":micronaut-context-python-netty",
+        ":test-suite-dev-python",
+        ":test-suite-python-corpus"
+]
+// Projects whose tests all run in the first Python CI job instead of being split across the jobs: the
+// corpus is one test class
+def pythonUnshardedProjects = [
+        ":test-suite-dev-python",
+        ":test-suite-python-corpus"
+]
+def pythonProjects = pythonTestProjects + [":test-suite-python"]
+
+if (System.getenv("SONAR_TOKEN") != null) {
+    // deprecated and compile time only classes excluded from analysis
+    def analysisExcludes = [
+        "**/StreamSoftServiceLoader.java",
+        "**/ServiceDescriptionProcessor.java",
+        "**/GraalReflectionConfigurer.java",
+        "**/graal/ServiceLoaderInitialization.java",
+        "**/graal/ServiceLoaderInitialization.java",
+        "**/DirectoryClassWriterOutputVisitor.java",
+        "**/GroovyClassWriterOutputVisitor.java",
+        "**/MutableHttpRequestWrapper.java",
+        "**/tck/**",
+        "**/test/support/**",
+        "**/micronaut/annotation/processing/test/**"
+    ]
+    // Python module tests run in a separate CI workflow without Sonar coverage collection.
+    def pythonCoverageExcludes = pythonProjects.collect {
+        "${project(it).projectDir.name}/**/*"
+    }
+    // GraalVM Feature code only ever executes during native image generation, so it can never be
+    // covered by the JVM test suite. It is still analysed for issues, just not for coverage.
+    def coverageExcludes = pythonCoverageExcludes + [
+        "**/ServiceLoaderFeature.java"
+    ]
+    sonarqube {
+        skipProject = project.name.contains("test")
+        properties {
+            property "sonar.exclusions", analysisExcludes.join(",")
+            property "sonar.coverage.exclusions", coverageExcludes.join(",")
+            // Test sources are not analysed for issues. Coverage of the main sources still comes
+            // from the JaCoCo reports, which do not need the test files to be indexed.
+            property "sonar.test.exclusions", "**/*"
+        }
+    }
+}
+
+configurations.jacocoAggregation.dependencies.removeIf {
+    it instanceof ProjectDependency && it.path.startsWith(":test-")
+}
+configurations.javadocAggregatorBase.dependencies.removeIf {
+    it instanceof ProjectDependency && it.path.startsWith(":test-")
+}
+
+// Python tests need a GraalVM runtime and are slow: they only run in the Python CI workflow,
+// which runs `pythonCheck -Ppython-ci`, split across the jobs of a matrix (python-ci-shards in
+// gradle.properties) which each run one shard of the test classes. The
+// `io.micronaut.build.internal.python` plugin applies the same conventions to the projects with
+// Python sources and adds them to `pythonCheck`.
+def pythonCiShard = providers.gradleProperty("python-ci-shard")
+subprojects { project ->
+    if (project.path in pythonTestProjects) {
+        if (!providers.gradleProperty("python-ci").isPresent()) {
+            project.tasks.withType(Test).configureEach {
+                enabled = false
+            }
+        }
+        if (project.path in pythonUnshardedProjects) {
+            project.tasks.withType(Test).configureEach {
+                onlyIf("the tests of ${project.path} run in the first Python CI job") {
+                    pythonCiShard.map { it.startsWith("1/") }.getOrElse(true)
+                }
+            }
+        } else {
+            MicronautPythonPlugin.shardTests(project)
+        }
+    }
+}
+// A Python test runs its guest code too briefly for Truffle's compiled code to pay off, and every
+// GraalPy engine a test creates compiles its code again: with runtime compilation on, the Truffle
+// and host compiler threads used two thirds of the CPU of a Python test JVM. The host code runs
+// with C2, which compiles far less eagerly than the Graal JIT.
+subprojects { project ->
+    if (project.path in pythonProjects) {
+        project.tasks.withType(Test).configureEach {
+            jvmArgs(
+                    "-XX:+UnlockExperimentalVMOptions",
+                    "-XX:-UseJVMCICompiler",
+                    // with compilation off a fifth of the CPU went to G1
+                    "-XX:+UseParallelGC",
+                    // Truffle's interpreter-only runtime: unlike polyglot.engine.Compilation=false it exists on
+                    // every GraalVM, including one whose Truffle version doesn't match GraalPy's
+                    "-Dtruffle.TruffleRuntime=com.oracle.truffle.api.impl.DefaultTruffleRuntime",
+                    "-Dpolyglot.engine.WarnInterpreterOnly=false"
+            )
+        }
+    }
+}
+tasks.matching { it.name == "pythonCheck" }.configureEach {
+    dependsOn pythonTestProjects.collect { "${it}:check" }
+}
+// The benchmarks have no tests: the Java CI already compiles them
+if (providers.gradleProperty("python-ci").isPresent()) {
+    gradle.startParameter.excludedTaskNames.add(":benchmarks:check")
+}

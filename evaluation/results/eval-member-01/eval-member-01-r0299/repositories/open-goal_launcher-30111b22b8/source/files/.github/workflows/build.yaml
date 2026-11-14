@@ -1,0 +1,82 @@
+name: 🔨 Build
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - v*
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    name: App
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ubuntu-24.04, windows-latest, macos-15-intel, macos-15]
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: yarn
+
+      - name: Install Rust Stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+        name: Cache Rust Build
+        with:
+          shared-key: tauri-build-${{ matrix.platform }}
+          workspaces: src-tauri
+
+      - name: Install Linux Dependencies
+        if: matrix.platform == 'ubuntu-24.04'
+        # NOTE: have to pull in the experimental appimage stuff manually for now until merged
+        # https://github.com/tauri-apps/tauri/pull/12491
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+          cargo install tauri-cli --git https://github.com/tauri-apps/tauri --branch feat/truly-portable-appimage
+
+      - name: Install NPM Dependencies
+        run: |
+          yarn install --frozen-lockfile
+          yarn build
+
+      - uses: tauri-apps/tauri-action@v1
+        if: matrix.platform != 'ubuntu-24.04'
+        name: Build Tauri App
+        timeout-minutes: 30
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: "--verbose"
+
+      - uses: tauri-apps/tauri-action@v1
+        if: matrix.platform == 'ubuntu-24.04'
+        name: Build Tauri App (Linux)
+        timeout-minutes: 30
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_BUNDLER_NEW_APPIMAGE_FORMAT: true
+        with:
+          args: "--verbose"
+          # NOTE: so that we can use the experimental appimage stuff
+          tauriScript: "cargo tauri"
+
+      - name: Upload appimage bundle
+        if: matrix.platform == 'ubuntu-24.04'
+        uses: actions/upload-artifact@v7
+        with:
+          name: AppImage Bundle
+          path: ./src-tauri/target/release/bundle/appimage/*.AppImage

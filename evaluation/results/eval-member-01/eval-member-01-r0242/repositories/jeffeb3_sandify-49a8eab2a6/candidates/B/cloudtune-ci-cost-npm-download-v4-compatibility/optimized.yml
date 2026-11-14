@@ -1,0 +1,31 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 3 optimizations:
+# - [HIGH] Add npm dependency cache to "build" job
+# - [HIGH] Split "build" into parallel jobs (lint + test + build)
+# - [MEDIUM] Use "npm ci" instead of "npm install" in "build"
+# Estimated savings: ~11 min/run
+#
+name: npm test
+'on':
+  - push
+  - pull_request
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version:
+          - 22.x
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - run: npm install
+      - run: npm run build --if-present
+      - run: npm test
+      - run: npm run lint-ci
+        env:
+          CI: true

@@ -1,0 +1,44 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [HIGH] Add npm dependency cache to "build" job
+# - [HIGH] Add npm dependency cache to "publish-npm" job
+# Estimated savings: ~8 min/run
+#
+name: Node.js Publish
+'on':
+  release:
+    types:
+      - created
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    services:
+      rabbitmq:
+        image: rabbitmq:3-management-alpine
+        ports:
+          - '5672:5672'
+          - '15672:15672'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24.x
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+  publish-npm:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24.x
+          cache: npm
+      - run: npm install -g npm@latest
+      - run: npm ci
+      - run: npm stage publish

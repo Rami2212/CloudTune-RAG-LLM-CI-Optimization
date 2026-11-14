@@ -1,0 +1,98 @@
+name: AtomUI NuGet Packages Release
+on:
+   workflow_dispatch:
+      inputs:
+         TargetRef:
+            description: 'Branch, tag, or commit SHA to build'
+            type: string
+            required: true
+            default: 'release/6.0'
+         BuildType:
+            description: 'Build type'
+            type: choice
+            required: true
+            default: 'Release'
+            options:
+               - Release
+               - Debug
+         PackageValidationBaselineVersion:
+            description: 'Released version to validate packages against (e.g. 6.1.8). Empty skips validation.'
+            type: string
+            required: false
+            default: ''
+         PublishToNuget:
+            description: 'Publish to nuget.org'
+            type: boolean
+            required: false
+            default: false
+env:
+   SOURCE_DIR: ${{ github.workspace }}
+   BASE_OUTPUT_DIR: ${{ github.workspace }}/nuget-artifacts
+   LOCAL_NUGET_DIR: ${{ github.workspace }}/nuget
+jobs:
+   BuildAtomUINuget:
+      name: Build AtomUI NuGet packages
+      runs-on: windows-latest
+      steps:
+         -  name: Checkout code
+            uses: actions/checkout@v6
+            with:
+               ref: ${{ inputs.TargetRef }}
+         - name: Setup .NET 10
+           uses: actions/setup-dotnet@v5
+           with:
+              dotnet-version: '10.0.x'
+         -  name: Create local NuGet feed
+            run: |
+               $localFeedPath = $env:LOCAL_NUGET_DIR
+               New-Item -Path $localFeedPath -ItemType Directory -Force | Out-Null
+               Write-Output "Local NuGet feed created at: $localFeedPath"
+               dotnet nuget add source $localFeedPath --name local-feed
+               $sources = dotnet nuget list source
+               if ($sources -match "local-feed") {
+                  Write-Output "Local feed added successfully"
+               } else {
+                  Write-Error "Failed to add local feed"
+                  exit 1
+               }
+         -  name: Build and pack AtomUI NuGet packages
+            shell: pwsh
+            run: |
+               ./scripts/BuildNuGetPackages.ps1 `
+                  -BuildType "${{ inputs.BuildType }}" `
+                  -PackageOutputDir $env:BASE_OUTPUT_DIR `
+                  -PackageValidationBaselineVersion "${{ inputs.PackageValidationBaselineVersion }}"
+         -  name: Validate packages with local NuGet feed
+            shell: pwsh
+            run: |
+               $ErrorActionPreference = "Stop"
+               $packages = Get-ChildItem -LiteralPath $env:BASE_OUTPUT_DIR -Filter "*.nupkg" -File |
+                  Sort-Object Name
+               if (-not $packages) {
+                  throw "No NuGet packages were produced"
+               }
+               foreach ($pkg in $packages) {
+                  dotnet nuget push $pkg.FullName --source $env:LOCAL_NUGET_DIR
+                  if ($LASTEXITCODE -ne 0) {
+                     throw "Failed to push $($pkg.Name) to the local NuGet feed"
+                  }
+               }
+         -  name: Upload NuGet artifacts
+            uses: actions/upload-artifact@v7
+            with:
+               name: NuGetPackages
+               path: ${{ env.BASE_OUTPUT_DIR }}/*.nupkg
+               if-no-files-found: error
+         -  name: Publish to nuget.org
+            if: ${{ inputs.PublishToNuget == true }}
+            shell: pwsh
+            run: |
+               $ErrorActionPreference = "Stop"
+               $packages = Get-ChildItem -LiteralPath $env:BASE_OUTPUT_DIR -Filter "*.nupkg" -File |
+                  Sort-Object Name
+               foreach ($pkg in $packages) {
+                  dotnet nuget push $pkg.FullName --api-key "${{ secrets.NUGET_API_KEY }}" --source https://api.nuget.org/v3/index.json --skip-duplicate
+                  if ($LASTEXITCODE -ne 0) {
+                     throw "Failed to publish $($pkg.Name) to nuget.org"
+                  }
+               }

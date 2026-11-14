@@ -1,0 +1,552 @@
+#
+#  Makefile
+#
+
+# this is horrible magic, we use it to open a nice welcome message for
+# the user in tmux in the shell that they normally use (e.g. bash, zsh)
+# https://unix.stackexchange.com/questions/352316/finding-out-the-default-shell-of-a-user-within-a-shell-script
+LOGIN_SHELL = $(shell finger $(USER) | grep 'Shell:*' | cut -f3 -d ":")
+
+# Check for the environment variable OWID_SCRIPT_SHELL and fall back to LOGIN_SHELL if not set
+SCRIPT_SHELL ?= $(or $(shell echo $$OWID_SCRIPT_SHELL),$(LOGIN_SHELL))
+
+
+# setting .env variables as Make variables for validate.env targets
+# https://lithic.tech/blog/2020-05/makefile-dot-env/
+ifneq (,$(wildcard ./.env))
+	include .env
+endif
+
+# .env lines with inline comments (`FOO=bar  # baz`) keep the spaces before the
+# `#` in the value when included by make — strip the variables we interpolate
+# into container names, session names and URLs. The ifdef guards keep absent
+# variables undefined so the `?=` defaults on the targets still apply.
+ifdef COMPOSE_PROJECT_NAME
+COMPOSE_PROJECT_NAME := $(strip $(COMPOSE_PROJECT_NAME))
+endif
+ifdef TMUX_SESSION_NAME
+TMUX_SESSION_NAME := $(strip $(TMUX_SESSION_NAME))
+endif
+ifdef ADMIN_SERVER_PORT
+ADMIN_SERVER_PORT := $(strip $(ADMIN_SERVER_PORT))
+endif
+ifdef VITE_PORT
+VITE_PORT := $(strip $(VITE_PORT))
+endif
+ifdef WRANGLER_PORT
+WRANGLER_PORT := $(strip $(WRANGLER_PORT))
+endif
+
+.PHONY: help up up.headless up.worktree setup.worktree sessions wait.yarn-install require.worktree up.full down down.headless down.worktree refresh refresh.wp refresh.private refresh.full migrate svgtest svgtest.reset svgtest.full svgtest.grapher-views svgtest.mdims svgtest.thumbnails svgtest.md5s playwright playwright.ui playwright.standalone check-not-prod
+
+help:
+	@echo 'Available commands:'
+	@echo
+	@echo '  GRAPHER ONLY'
+	@echo '  make up                     start dev environment via docker-compose and tmux'
+	@echo '  make up.headless            start dev environment without tmux (AI agents, cloud sandboxes, CI)'
+	@echo '  make up.worktree            start this git worktree'"'"'s dev environment next to your main one'
+	@echo '  make setup.worktree         only write this checkout'"'"'s .env (random free ports, own tmux session)'
+	@echo '  make down                   stop any services still running'
+	@echo '  make down.headless          stop services started by make up.headless'
+	@echo '  make down.worktree          stop services started by make up.worktree (leaves MySQL up)'
+	@echo '  make sessions               list the running dev tmux sessions of all checkouts and worktrees'
+	@echo '  make refresh                (while up) download a new grapher snapshot and update MySQL'
+	@echo '  make refresh.private        (while up) download and load the private sidecar dump: admin keys + analytics (needs access)'
+	@echo '  make refresh.full           (while up) run refresh and refresh.private'
+	@echo '  make migrate                (while up) run any outstanding db migrations'
+	@echo '  make test                   run full suite (except db tests) of CI checks including unit tests'
+	@echo '  make dbtest                 run db test suite that needs a running mysql db'
+	@echo '  make playwright-browsers    install Playwright browsers'
+	@echo '  make playwright             (while up) start Playwright test environment'
+	@echo '  make playwright.ui          (while up) start Playwright test environment with UI'
+	@echo '  make playwright.standalone  run the standalone Playwright suite (own db and server)'
+	@echo '  make svgtest                run the SVG tests for graphers'
+	@echo '  make svgtest.full           run the SVG tests for all suites'
+	@echo '  make local-bake             do a full local site bake'
+	@echo '  make archive                create an archived version of our charts'
+	@echo '  make wikipedia-archive      create a Wikipedia archive (strips GTM, rewrites archive URLs)'
+	@echo
+	@echo '  GRAPHER + CLOUDFLARE (staff-only)'
+	@echo '  make up.full                start dev environment via docker-compose and tmux'
+	@echo '  make update.chart-entities  update the charts_x_entities join table'
+	@echo '  make reindex                reindex (or initialise) search in Algolia'
+	@echo '  make bench.search           run search benchmarks'
+	@echo '  make sync-cloudflare-images sync Cloudflare Images with local DB'
+
+up: export DEBUG = 'knex:query'
+up: export COMPOSE_PROJECT_NAME ?= owid-grapher
+up: export TMUX_SESSION_NAME ?= grapher
+up: export ADMIN_SERVER_PORT ?= 3030
+up: export VITE_PORT ?= 8090
+
+up: require create-if-missing.env tmp-downloads/owid_metadata.sql.gz node_modules
+	@make validate.env
+	@make check-port-3306
+
+	@if tmux has-session -t =$(TMUX_SESSION_NAME) 2>/dev/null; then \
+		echo '==> Killing existing tmux session'; \
+		tmux kill-session -t =$(TMUX_SESSION_NAME); \
+	fi
+
+	@echo '==> Starting dev environment'
+	@mkdir -p logs
+	tmux new-session -s $(TMUX_SESSION_NAME) \
+		-n docker 'COMPOSE_PROJECT_NAME=$(COMPOSE_PROJECT_NAME) docker compose -f docker-compose.grapher.yml up' \; \
+			set remain-on-exit on \; \
+		set-option -g default-shell $(SCRIPT_SHELL) \; \
+		new-window -n admin \
+			'ADMIN_SERVER_PORT=$(ADMIN_SERVER_PORT) devTools/docker/wait-for-mysql.sh && ADMIN_SERVER_PORT=$(ADMIN_SERVER_PORT) VITE_PORT=$(VITE_PORT) yarn startAdminDevServer' \; \
+			set remain-on-exit on \; \
+		new-window -n vite 'VITE_PORT=$(VITE_PORT) yarn run startSiteFront' \; \
+			set remain-on-exit on \; \
+		new-window -n welcome 'ADMIN_SERVER_PORT=$(ADMIN_SERVER_PORT) VITE_PORT=$(VITE_PORT) devTools/docker/banner.sh; exec $(LOGIN_SHELL)' \; \
+		bind R respawn-pane -k \; \
+		bind X kill-pane \; \
+		bind Q kill-server \; \
+		set -g mouse on \
+		|| make down
+
+up.devcontainer: export TMUX_SESSION_NAME ?= grapher
+up.devcontainer: export ADMIN_SERVER_PORT ?= 3030
+up.devcontainer: export VITE_PORT ?= 8090
+
+up.devcontainer: create-if-missing.env.devcontainer tmp-downloads/owid_metadata.sql.gz node_modules
+	@make validate.env
+	@make check-port-3306
+
+	@echo '==> Starting dev environment'
+	@mkdir -p logs
+	tmux new-session -s $(TMUX_SESSION_NAME) \
+		-n admin \
+			'ADMIN_SERVER_PORT=$(ADMIN_SERVER_PORT) devTools/docker/wait-for-mysql.sh && ADMIN_SERVER_PORT=$(ADMIN_SERVER_PORT) VITE_PORT=$(VITE_PORT) yarn startAdminDevServer' \; \
+			set remain-on-exit on \; \
+		new-window -n vite 'VITE_PORT=$(VITE_PORT) yarn run startSiteFront' \; \
+			set remain-on-exit on \; \
+		new-window -n welcome 'ADMIN_SERVER_PORT=$(ADMIN_SERVER_PORT) VITE_PORT=$(VITE_PORT) devTools/docker/banner.sh; exec $(LOGIN_SHELL)' \; \
+		bind R respawn-pane -k \; \
+		bind X kill-pane \; \
+		bind Q kill-server
+
+# Headless variant of `make up` for environments without a terminal to attach
+# tmux to (AI agents, cloud sandboxes, CI) — see the script for details.
+up.headless: require.headless create-if-missing.env node_modules
+	@make validate.env
+	@./devTools/docker/up-headless.sh
+
+down.headless:
+	@./devTools/docker/down-headless.sh
+
+require.headless:
+	@echo '==> Checking your environment has the necessary commands...'
+	@which docker >/dev/null 2>&1 || (echo "ERROR: docker compose is required."; exit 1)
+	@which yarn >/dev/null 2>&1 || (echo "ERROR: yarn is required."; exit 1)
+
+# `setup.worktree` writes the .env this reads, so don't export ports here: make
+# includes .env when it parses this file, i.e. before that .env exists on a
+# freshly created worktree. up-worktree.sh sources it once it is there.
+up.worktree: require.worktree setup.worktree wait.yarn-install node_modules
+	@make validate.env
+	@./devTools/docker/up-worktree.sh
+
+setup.worktree:
+	@./devTools/docker/setup-worktree-env.sh
+
+# before `node_modules`, so a checkout mid-install (Orca's setup script) finishes
+# that install instead of make starting a second one next to it
+wait.yarn-install:
+	@./devTools/docker/wait-for-yarn-install.sh
+
+down.worktree: TMUX_SESSION_NAME ?= grapher-$(notdir $(CURDIR))
+down.worktree:
+	@echo '==> Killing the $(TMUX_SESSION_NAME) tmux session'
+	@tmux kill-session -t =$(TMUX_SESSION_NAME) 2>/dev/null || echo '    (no such session, nothing to stop)'
+	@echo '==> Leaving MySQL up, your other checkouts share it (stop it with `make down`)'
+
+sessions:
+	@./devTools/docker/list-sessions.sh
+
+require.worktree: require.headless
+	@which tmux >/dev/null 2>&1 || (echo "ERROR: tmux is required."; exit 1)
+	@which mysql >/dev/null 2>&1 || (echo "ERROR: the mysql client is required (macOS: brew install mysql-client, then add it to your PATH as brew says)."; exit 1)
+
+up.full: export DEBUG = 'knex:query'
+up.full: export COMPOSE_PROJECT_NAME ?= owid-grapher
+up.full: export TMUX_SESSION_NAME ?= grapher
+up.full: export ADMIN_SERVER_PORT ?= 3030
+up.full: export VITE_PORT ?= 8090
+up.full: export WRANGLER_PORT ?= 8788
+up.full: export BESPOKE_PORT ?= 8089
+
+up.full: require create-if-missing.env.full tmp-downloads/owid_metadata.sql.gz node_modules
+	@make validate.env.full
+	@make check-port-3306
+
+	@if tmux has-session -t =$(TMUX_SESSION_NAME) 2>/dev/null; then \
+		echo '==> Killing existing tmux session'; \
+		tmux kill-session -t =$(TMUX_SESSION_NAME); \
+	fi
+
+	@echo '==> Starting dev environment'
+	tmux new-session -s $(TMUX_SESSION_NAME) \
+		-n docker 'COMPOSE_PROJECT_NAME=$(COMPOSE_PROJECT_NAME) docker compose -f docker-compose.grapher.yml up' \; \
+			set remain-on-exit on \; \
+		set-option -g default-shell $(SCRIPT_SHELL) \; \
+		new-window -n admin \
+			'ADMIN_SERVER_PORT=$(ADMIN_SERVER_PORT) devTools/docker/wait-for-mysql.sh && ADMIN_SERVER_PORT=$(ADMIN_SERVER_PORT) VITE_PORT=$(VITE_PORT) BESPOKE_PORT=$(BESPOKE_PORT) yarn startAdminDevServer' \; \
+			set remain-on-exit on \; \
+		new-window -n vite 'VITE_PORT=$(VITE_PORT) BESPOKE_PORT=$(BESPOKE_PORT) yarn run startSiteFront' \; \
+			set remain-on-exit on \; \
+		new-window -n functions 'WRANGLER_PORT=$(WRANGLER_PORT) yarn startLocalCloudflareFunctions' \; \
+			set remain-on-exit on \; \
+		new-window -n bespoke 'BESPOKE_PORT=$(BESPOKE_PORT) yarn startBespokeDevServer' \; \
+			set remain-on-exit on \; \
+		new-window -n welcome 'ADMIN_SERVER_PORT=$(ADMIN_SERVER_PORT) VITE_PORT=$(VITE_PORT) WRANGLER_PORT=$(WRANGLER_PORT) BESPOKE_PORT=$(BESPOKE_PORT) devTools/docker/banner.sh --full; exec $(LOGIN_SHELL)' \; \
+		bind R respawn-pane -k \; \
+		bind X kill-pane \; \
+		bind Q kill-server \; \
+		set -g mouse on \
+		|| make down
+
+migrate: node_modules
+	@echo '==> Running DB migrations'
+	yarn runDbMigrations
+
+refresh:
+	@make check-not-prod
+
+	@echo '==> Downloading chart data'
+	./devTools/docker/download-grapher-metadata-mysql.sh
+
+	@echo '==> Updating grapher database'
+	DATA_FOLDER=tmp-downloads ./devTools/docker/refresh-grapher-data.sh
+
+	@echo '!!! If you use ETL, wipe indicators from your R2 staging with `rclone delete r2:owid-api-staging/[yourname]/ ' \
+	'--fast-list --transfers 32 --checkers 32  --verbose`'
+
+refresh.atomic:
+	@make check-not-prod
+
+	@echo '==> Downloading chart data'
+	./devTools/docker/download-grapher-metadata-mysql.sh
+
+	@echo '==> Downloading private sidecar dump'
+	./devTools/docker/download-grapher-private-mysql.sh
+
+	@echo '==> Updating grapher database (atomic swap)'
+	DATA_FOLDER=tmp-downloads ./devTools/docker/atomic-grapher-data.sh
+
+	@echo '!!! If you use ETL, wipe indicators from your R2 staging with `rclone delete r2:owid-api-staging/[yourname]/ ' \
+	'--fast-list --transfers 32 --checkers 32  --verbose`'
+
+refresh.private:
+	@make check-not-prod
+
+	@echo '==> Downloading private sidecar dump'
+	./devTools/docker/download-grapher-private-mysql.sh
+
+	@echo '==> Refreshing private tables'
+	DATA_FOLDER=tmp-downloads ./devTools/docker/refresh-private-data.sh
+
+sync-images:
+	@echo 'Task has been deprecated.'
+
+bake-images:
+	@echo 'Task has been deprecated.'
+
+# Only needed to run once to seed the prod DB with initially
+sync-cloudflare-images: node_modules
+	@echo '==> Syncing images table with Cloudflare Images'
+	@yarn syncCloudflareImages
+
+refresh.full: refresh refresh.private
+	@echo '==> Full refresh completed'
+
+down: export COMPOSE_PROJECT_NAME ?= owid-grapher
+
+down:
+	@echo '==> Stopping services'
+	COMPOSE_PROJECT_NAME=$(COMPOSE_PROJECT_NAME) docker compose -f docker-compose.grapher.yml down
+
+require:
+	@echo '==> Checking your local environment has the necessary commands...'
+	@which docker >/dev/null 2>&1 || (echo "ERROR: docker compose is required."; exit 1)
+	@which yarn >/dev/null 2>&1 || (echo "ERROR: yarn is required."; exit 1)
+	@which tmux >/dev/null 2>&1 || (echo "ERROR: tmux is required."; exit 1)
+	@which mysql >/dev/null 2>&1 || (echo "ERROR: the mysql client is required (macOS: brew install mysql-client, then add it to your PATH as brew says)."; exit 1)
+	@which finger >/dev/null 2>&1 || (echo "ERROR: finger is required."; exit 1)
+
+guard-%:
+	@if [ -z "${${*}}" ]; then echo 'ERROR: .env variable $* not set' && exit 1; fi
+
+create-if-missing.env:
+	@if test ! -f .env; then \
+		echo 'Copying .env.example-grapher --> .env'; \
+		cp .env.example-grapher .env; \
+	fi
+
+create-if-missing.env.devcontainer:
+	@if test ! -f .env; then \
+		echo 'Copying .env.devcontainer --> .env'; \
+		cp .env.devcontainer .env; \
+	fi
+
+validate.env:
+	@echo '==> Validating your .env file for make up'
+	@grep '=' .env.example-grapher | grep -v optional | sed 's/=.*//' | while read variable; \
+		do make guard-$$variable 2>/dev/null || exit 1; \
+	done
+	@echo '.env file valid for make up'
+
+create-if-missing.env.full:
+	@if test ! -f .env; then \
+		echo 'Copying .env.example-full --> .env'; \
+		cp .env.example-full .env; \
+	fi
+
+validate.env.full:
+	@echo '==> Validating your .env file for make up.full'
+	@grep '=' .env.example-full | grep -v optional | sed 's/=.*//' | while read variable; \
+		do make guard-$$variable 2>/dev/null || exit 1; \
+	done
+	@echo '.env file valid for make up.full'
+
+check-port-3306:
+	@echo "==> Checking port"
+	@if [ "${GRAPHER_DB_PORT}" = "3306" ]; then \
+		echo "Your database port is set to 3306.\
+		\nThis will likely conflict with any pre-existing MySQL instances you have running.\
+		\nWe recommend using a different port (like 3307)";\
+	fi
+
+check-not-prod:
+	@if grep -q "ENV=production" .env; then \
+		echo "ERROR: Cannot run this command in production environment."; \
+		exit 1; \
+	fi
+	@if [ "${GRAPHER_DB_HOST}" = "prod-db.owid.io" ]; then \
+		echo "ERROR: GRAPHER_DB_HOST is set to prod-db.owid.io. Refusing to run against the production database."; \
+		exit 1; \
+	fi
+
+tmp-downloads/owid_metadata.sql.gz:
+	@echo '==> Downloading metadata'
+	./devTools/docker/download-grapher-metadata-mysql.sh
+
+test: node_modules
+	@echo '==> Linting'
+	yarn testLint
+
+	@echo '==> Checking formatting'
+	yarn testFormatAll
+
+	@echo '==> Checking Raycast snippets'
+	yarn checkRaycastSnippets
+
+	@echo '==> Running tests'
+	yarn run test
+
+dbtest: node_modules
+	@echo '==> Running db test script'
+	./db/tests/run-db-tests.sh
+
+playwright.standalone: node_modules playwright-browsers
+	@echo '==> Running standalone Playwright tests'
+	yarn testPlaywrightStandalone
+
+playwright-browsers:
+	@echo '==> Installing Playwright browser'
+	yarn playwright install --with-deps --no-shell chromium
+
+playwright: export TMUX_SESSION_NAME ?= playwright
+
+playwright: node_modules playwright-browsers
+	@if tmux has-session -t =$(TMUX_SESSION_NAME) 2>/dev/null; then \
+		echo '==> Killing existing tmux session'; \
+		tmux kill-session -t =$(TMUX_SESSION_NAME); \
+	fi
+
+	@echo '==> Starting Playwright test environment'
+	tmux new-session -s $(TMUX_SESSION_NAME) \
+		-n playwright 'PWTEST_WATCH=1 yarn playwright test' \; \
+			set remain-on-exit on \; \
+		set-option -g default-shell $(SCRIPT_SHELL) \; \
+		new-window -n welcome 'devTools/docker/banner-playwright.sh; exec $(LOGIN_SHELL)' \; \
+		bind R respawn-pane -k \; \
+		bind X kill-pane \; \
+		bind K kill-session \; \
+		set -g mouse on
+
+playwright.ui: export TMUX_SESSION_NAME ?= playwright-ui
+
+playwright.ui: node_modules playwright-browsers
+	@if tmux has-session -t =$(TMUX_SESSION_NAME) 2>/dev/null; then \
+		echo '==> Killing existing tmux session'; \
+		tmux kill-session -t =$(TMUX_SESSION_NAME); \
+	fi
+
+	@echo '==> Starting Playwright test environment with UI'
+	tmux new-session -s $(TMUX_SESSION_NAME) \
+		-n playwright 'yarn playwright test --ui --ui-host=0.0.0.0' \; \
+			set remain-on-exit on \; \
+		set-option -g default-shell $(SCRIPT_SHELL) \; \
+		new-window -n welcome 'devTools/docker/banner-playwright.sh; exec $(LOGIN_SHELL)' \; \
+		bind R respawn-pane -k \; \
+		bind X kill-pane \; \
+		bind K kill-session \; \
+		set -g mouse on
+
+lint: node_modules
+	@echo '==> Linting'
+	yarn testLint
+
+check-formatting: node_modules
+	@echo '==> Checking formatting'
+	yarn testFormatAll
+
+format: node_modules
+	@echo '==> Fixing formatting'
+	yarn fixFormatAll
+
+unittest: node_modules
+	@echo '==> Running tests'
+	yarn run test
+
+../owid-grapher-svgs:
+	cd .. && git clone git@github.com:owid/owid-grapher-svgs
+
+svgtest.reset: ../owid-grapher-svgs
+	@echo '==> Resetting owid-grapher-svgs repo to a clean state'
+	cd ../owid-grapher-svgs && git fetch && git checkout -f master && git reset --hard origin/master && git clean -fdx
+
+svgtest: svgtest.reset node_modules
+	@echo '==> Running the SVG tests for graphers'
+
+	@# generate a full new set of svgs and compare them against the references
+	yarn tsx --tsconfig tsconfig.tsx.json devTools/svgTester/verify-graphs.ts || [ $$? -eq 2 ]
+
+	@if [ -z "$$(ls -A ../owid-grapher-svgs/graphers/differences 2>/dev/null)" ]; then \
+		echo '==> No differences (graphers)'; \
+	fi
+
+svgtest.full: svgtest.reset node_modules
+	@echo '==> Running all SVG test suites'
+
+	@# run test suite for stand-alone graphers
+	yarn tsx --tsconfig tsconfig.tsx.json devTools/svgTester/verify-graphs.ts || [ $$? -eq 2 ]
+
+	@if [ -z "$$(ls -A ../owid-grapher-svgs/graphers/differences 2>/dev/null)" ]; then \
+		echo '==> No differences (graphers)'; \
+	fi
+
+	@# run test suite for grapher views
+	yarn tsx --tsconfig tsconfig.tsx.json devTools/svgTester/verify-graphs.ts grapher-views || [ $$? -eq 2 ]
+
+	@if [ -z "$$(ls -A ../owid-grapher-svgs/grapher-views/differences 2>/dev/null)" ]; then \
+		echo '==> No differences (grapher-views)'; \
+	fi
+
+	@# run test suite for mdims
+	yarn tsx --tsconfig tsconfig.tsx.json devTools/svgTester/verify-graphs.ts mdims || [ $$? -eq 2 ]
+
+	@if [ -z "$$(ls -A ../owid-grapher-svgs/mdims/differences 2>/dev/null)" ]; then \
+		echo '==> No differences (mdims)'; \
+	fi
+
+	@# run test suite for thumbnails
+	yarn tsx --tsconfig tsconfig.tsx.json devTools/svgTester/verify-graphs.ts thumbnails || [ $$? -eq 2 ]
+
+	@if [ -z "$$(ls -A ../owid-grapher-svgs/thumbnails/differences 2>/dev/null)" ]; then \
+		echo '==> No differences (thumbnails)'; \
+	fi
+
+svgtest.grapher-views: svgtest.reset node_modules
+	@echo '==> Running the SVG tests for grapher-views'
+
+	@# run test suite for grapher-views
+	yarn tsx --tsconfig tsconfig.tsx.json devTools/svgTester/verify-graphs.ts grapher-views || [ $$? -eq 2 ]
+
+	@if [ -z "$$(ls -A ../owid-grapher-svgs/grapher-views/differences 2>/dev/null)" ]; then \
+		echo '==> No differences (grapher-views)'; \
+	fi
+
+svgtest.mdims: svgtest.reset node_modules
+	@echo '==> Running the SVG tests for mdims'
+
+	@# run test suite for mdims
+	yarn tsx --tsconfig tsconfig.tsx.json devTools/svgTester/verify-graphs.ts mdims || [ $$? -eq 2 ]
+
+	@if [ -z "$$(ls -A ../owid-grapher-svgs/mdims/differences 2>/dev/null)" ]; then \
+		echo '==> No differences (mdims)'; \
+	fi
+
+svgtest.thumbnails: svgtest.reset node_modules
+	@echo '==> Running the SVG tests for thumbnails'
+
+	@# run test suite for thumbnails
+	yarn tsx --tsconfig tsconfig.tsx.json devTools/svgTester/verify-graphs.ts thumbnails || [ $$? -eq 2 ]
+
+	@if [ -z "$$(ls -A ../owid-grapher-svgs/thumbnails/differences 2>/dev/null)" ]; then \
+		echo '==> No differences (thumbnails)'; \
+	fi
+
+svgtest.md5s: ../owid-grapher-svgs node_modules
+	@echo '==> Recomputing reference md5s in ../owid-grapher-svgs'
+
+	yarn tsx --tsconfig tsconfig.tsx.json devTools/svgTester/update-reference-md5s.ts graphers
+	yarn tsx --tsconfig tsconfig.tsx.json devTools/svgTester/update-reference-md5s.ts grapher-views
+	yarn tsx --tsconfig tsconfig.tsx.json devTools/svgTester/update-reference-md5s.ts mdims
+	yarn tsx --tsconfig tsconfig.tsx.json devTools/svgTester/update-reference-md5s.ts thumbnails
+
+node_modules: package.json yarn.lock yarn.config.cjs
+	@echo '==> Installing packages'
+	yarn install
+	touch -m $@
+
+update.chart-entities: node_modules
+	@echo '==> Updating chart entities table'
+	yarn tsx --tsconfig tsconfig.tsx.json baker/updateChartEntities.js --all
+
+validate-chart-configs: node_modules
+	@echo '==> Validating every stored chart config against the grapher schema'
+	yarn tsx --tsconfig tsconfig.tsx.json devTools/schema/checkChartConfigsAgainstSchema.js
+
+reindex: node_modules
+	@echo '==> Reindexing search in Algolia'
+	@echo '--- Running configureAlgolia...'
+	yarn tsx --tsconfig tsconfig.tsx.json baker/algolia/configureAlgolia.js
+	@echo '--- Running indexPagesToAlgolia...'
+	yarn tsx --tsconfig tsconfig.tsx.json baker/algolia/indexPagesToAlgolia.js
+	@echo '--- Running indexPagesChronologicalToAlgolia...'
+	yarn tsx --tsconfig tsconfig.tsx.json baker/algolia/indexPagesChronologicalToAlgolia.js
+	@echo '--- Running indexExplorerViewsMdimViewsAndChartsToAlgolia...'
+	yarn tsx --tsconfig tsconfig.tsx.json baker/algolia/indexExplorerViewsMdimViewsAndChartsToAlgolia.js
+
+index-scheduled: node_modules
+	@echo '==> Indexing scheduled (newly-live) gdocs into the pages-chronological Algolia index'
+	yarn tsx --tsconfig tsconfig.tsx.json baker/algolia/indexScheduledPagesChronologicalToAlgolia.js
+
+delete-algolia-index: node_modules
+	@echo '==> Deleting Algolia index'
+	yarn tsx --tsconfig tsconfig.tsx.json baker/algolia/deleteAlgoliaIndex.js
+
+bench.search: node_modules
+	@echo '==> Running search benchmarks'
+	@yarn tsx --tsconfig tsconfig.tsx.json site/search/evaluateSearch.js
+
+local-bake: node_modules
+	@echo '==> Baking site'
+	yarn buildVite
+	yarn buildLocalBake
+
+archive: node_modules
+	@echo '==> Creating archived page versions'
+	PRIMARY_ENV_FILE=.env.archive yarn buildViteArchive
+	PRIMARY_ENV_FILE=.env.archive yarn tsx --tsconfig tsconfig.tsx.json ./baker/archival/archiveChangedPages.ts --latestDir
+
+wikipedia-archive: archive
+	@echo '==> Creating Wikipedia archive (stripping analytics, rewriting archive URLs)'
+	PRIMARY_ENV_FILE=.env.archive yarn tsx --tsconfig tsconfig.tsx.json ./baker/archival/createWikipediaArchive.ts
+
+clean:
+	rm -rf node_modules

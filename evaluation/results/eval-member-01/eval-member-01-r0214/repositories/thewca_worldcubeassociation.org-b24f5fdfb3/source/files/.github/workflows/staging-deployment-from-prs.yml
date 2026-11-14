@@ -1,0 +1,76 @@
+name: Deployment to Staging
+
+on:
+  issue_comment:
+    types:
+      - created
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    if: >-
+      github.event.issue.pull_request &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+
+    steps:
+      - name: Trigger deployment on comment
+        id: trigger-deployment
+        uses: shanegenschaw/pull-request-comment-trigger@v3.0.1
+        with:
+          trigger: '@thewca-bot deploy staging'
+          reaction: rocket
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Checkout primary branch
+        uses: actions/checkout@v7
+      - name: Switch to PR branch
+        run: gh pr checkout $PR_NUMBER
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        if: steps.trigger-deployment.outputs.triggered == 'true'
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        if: steps.trigger-deployment.outputs.triggered == 'true'
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::285938427530:role/wca-on-rails-github-deploy-staging
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+        if: steps.trigger-deployment.outputs.triggered == 'true'
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+        if: steps.trigger-deployment.outputs.triggered == 'true'
+      - name: Get the SHA of the current branch/fork
+        shell: bash
+        run: |
+          echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+      - name: Build staging images
+        if: steps.trigger-deployment.outputs.triggered == 'true'
+        uses: ./.github/actions/build-environment
+        with:
+          environment: staging
+          build_tag: ${{ env.SHORT_SHA }}
+          registry: ${{ steps.login-ecr.outputs.registry }}/wca-on-rails
+      - name: Build and push nextjs Image
+        if: steps.trigger-deployment.outputs.triggered == 'true'
+        uses: ./.github/actions/build-js-image
+        with:
+          registry: ${{ steps.login-ecr.outputs.registry }}/wca-nextjs
+          tag: nextjs-staging
+          base_url: staging.worldcubeassociation.org
+          asset_bucket: assets-staging.worldcubeassociation.org
+      - name: Deploy staging if triggered
+        if: steps.trigger-deployment.outputs.triggered == 'true'
+        run: |
+          aws ecs update-service --cluster wca-on-rails --service wca-on-rails-staging --force-new-deployment
+          aws ecs update-service --cluster wca-on-rails --service wca-on-rails-staging-sqs-worker --force-new-deployment
+          aws ecs update-service --cluster wca-on-rails --service wca-on-rails-staging-API --force-new-deployment
+          aws ecs update-service --cluster wca-on-rails --service wca-on-rails-staging-auxiliary-services --force-new-deployment
+          aws ecs update-service --cluster wca-on-rails --service wca-on-rails-staging-nextjs --force-new-deployment

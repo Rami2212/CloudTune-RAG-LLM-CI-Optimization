@@ -1,0 +1,494 @@
+---
+# This workflow will install Python dependencies, run tests and lint with a variety of Python versions
+# For more information see: https://help.github.com/actions/language-and-framework-guides/using-python-with-github-actions
+
+name: Run GCOVR CI
+
+on:
+  workflow_dispatch:  # For manual triggering
+    inputs:
+      do_test_release:
+        type: boolean
+        description: Do a release to test.pypi.org
+        default: false
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+jobs:
+
+  # -----------------------------------------------------------------------------------------------
+  zizmor:
+    name: Run zizmor 🌈
+    runs-on: ubuntu-24.04
+    permissions:
+      security-events: write # Required for upload-sarif (used by zizmor-action) to upload SARIF files.
+      contents: read         # Only needed for private repos. Needed to clone the repo.
+      actions: read          # Only needed for private repos. Needed for upload-sarif to read workflow run info.
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run zizmor 🌈
+        uses: zizmorcore/zizmor-action@85b2b9fb8e3325e7a23d7d0a9d7ba5ae0f999e3e # v0.7.1
+
+  # -----------------------------------------------------------------------------------------------
+  changelog:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      PR_BODY: "${{ github.event.pull_request.body }}"
+      CHANGELOG_ISSUE: ":issue:`${{ github.event.pull_request.number }}`"
+    outputs:
+      tag: ${{ steps.changelog.outputs.tag || '' }}
+      tag_message: ${{ steps.changelog.outputs.tag_message || '' }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 75
+          persist-credentials: false
+      - run: git fetch --tags
+        shell: bash
+
+      - name: Check if PR is mentioned in changelog
+        run: |
+          if [ -z "${{ github.event.pull_request.number }}" ]; then
+            echo 'No PR defined'
+          else
+            if grep -qE '^\[no changelog\]' <<<"$PR_BODY"; then
+              echo 'Marker "[no changelog]" found in PR body'
+              if [ "$(grep -F "$CHANGELOG_ISSUE" CHANGELOG.rst)" != "" ]; then
+                echo "ERROR: $CHANGELOG_ISSUE found in CHANGELOG.rst."
+                exit 1
+              else
+                echo "OK: $CHANGELOG_ISSUE not found in CHANGELOG.rst"
+              fi
+            else
+              echo 'Marker "[no changelog]" not found in PR body'
+              if [ "$(grep -F "$CHANGELOG_ISSUE" CHANGELOG.rst)" == "" ]; then
+                echo "ERROR: $CHANGELOG_ISSUE not found in CHANGELOG.rst."
+                exit 1
+              else
+                echo "OK: $CHANGELOG_ISSUE found in CHANGELOG.rst"
+              fi
+            fi
+          fi
+          exit 0
+
+      - name: Set output variables
+        id: changelog
+        run: |
+          if [ -z "$(sed -n '/Next Release/ p' CHANGELOG.rst)" ] ; then
+            tag="$(sed -n 's/^\([1-9][0-9]*\.[0-9][0-9]*\).*/\1/ p' CHANGELOG.rst | head -n 1)"
+            echo "tag=$tag" >> $GITHUB_OUTPUT
+            echo "tag_message=$tag ($(date -I))" >> $GITHUB_OUTPUT
+          fi
+
+
+  # -----------------------------------------------------------------------------------------------
+  spell-check:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install spellchecker
+        run: |
+          cd admin/cspell
+          npm ci
+      - uses: tj-actions/changed-files@9426d40962ed5378910ee2e21d5f8c6fcbf2dd96  # v47.0.6
+        id: changed-files
+        with:
+          separator: ","
+          files_ignore: "**/reference/**"
+      - name: Run spellchecker
+        run: |
+          # Run spellchecker with changed files
+          if [ -z "${STEPS_CHANGED_FILES_OUTPUTS_ALL_CHANGED_FILES}" ] ; then
+            echo "No files to check"
+            exit 0
+          fi
+          mapfile -d ',' -t added_modified_files < <(printf '%s,' "${STEPS_CHANGED_FILES_OUTPUTS_ALL_CHANGED_FILES}")
+          ./admin/cspell/node_modules/.bin/cspell --config cspell.json --color --show-suggestions "${added_modified_files[@]}"
+        env:
+          STEPS_CHANGED_FILES_OUTPUTS_ALL_CHANGED_FILES: ${{ steps.changed-files.outputs.all_changed_files }}
+
+  # -----------------------------------------------------------------------------------------------
+  upload-coverage:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Copy coverage reports
+        run: |
+          mkdir -p /tmp/coverage-upload
+          rm -rf /tmp/coverage-upload/*
+          cp --target-directory=/tmp/coverage-upload ./tests/exclusion/reference/exclude-line-branch/gcc-5/*.*
+          cp --target-directory=/tmp/coverage-upload --force ./tests/exclusion/reference/exclude-line-branch/gcc-14/*.*
+          # Patch the paths inside the coverage files
+          find /tmp/coverage-upload -type f -name '*' -exec sed -e 's^output/^source/^g ; s^output^source^g ;' -i '' {} \;
+      - name: Upload coverage
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-reference
+          path: /tmp/coverage-upload/*.*
+
+  # -----------------------------------------------------------------------------------------------
+  build-package:
+    needs: [changelog, spell-check]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      FORCE_COLOR: "1"
+    outputs:
+      tag: ${{ needs.changelog.outputs.tag }}
+      tag_message: ${{ needs.changelog.outputs.tag_message }}
+      gcovr_version_output: ${{ steps.gcov_version.outputs.gcovr_version_output }}
+      gcovr_compiler_list: ${{ steps.gcovr_compiler.outputs.gcovr_compiler_list }}
+
+      # The variables used for publishing the data
+      publish_run_job: >-
+        ${{
+          (github.repository == 'gcovr/gcovr') && (github.event.ref == 'refs/heads/main') && (needs.changelog.outputs.tag != '')
+          || inputs.do_test_release
+        }}
+      publish_environment_name: ${{ (((needs.changelog.outputs.tag == '') || inputs.do_test_release) && 'test.pypi') || 'pypi' }}
+      publish_environment_url: https://${{ (((needs.changelog.outputs.tag == '') || inputs.do_test_release) && 'test.pypi') || 'pypi' }}.org/p/gcovr
+      publish_push_tag: ${{ (github.repository == 'gcovr/gcovr') && (github.event.ref == 'refs/heads/main') && (needs.changelog.outputs.tag != '') }}
+      # Use https://upload.pypi.org/legacy for a tag in pypi environment or in all other cases https://test.pypi.org/legacy
+      publish_repository_url:
+        https://${{ (((needs.changelog.outputs.tag == '') || inputs.do_test_release) && 'test.pypi') || 'upload.pypi' }}.org/legacy/
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 75
+          persist-credentials: false
+
+      - name: Prepare package version
+        uses: "$/.github/actions/prepare-package-version"
+        with:
+          tag: ${{ needs.changelog.outputs.tag }}
+          tag_message: ${{ needs.changelog.outputs.tag_message }}
+          do_test_release: ${{ inputs.do_test_release || false }}
+
+      - name: Set up runner
+        uses: "$/.github/actions/setup-runner"
+        with:
+          os: ubuntu-24.04
+          python-version: 3.12
+
+      - name: Lint files
+        run: |
+          nox --non-interactive --session lint
+
+      - name: Build and check the distribution 📦
+        run: |
+          nox --non-interactive --session build_distribution
+
+      - name: Set GCOVR version
+        id: gcovr_version
+        run: |
+          . .nox/check_distribution/bin/activate
+          gcovr_version_output="$(gcovr --version | head -n 1)"
+          echo "gcovr_version_output=$gcovr_version_output" | tee --append $GITHUB_OUTPUT
+
+      - name: Set compiler test versions
+        id: gcovr_compiler
+        run: |
+          . .nox/check_distribution/bin/activate
+          echo "gcovr_compiler_list=$(nox -l -k docker_run_compiler --json | jq -c '[map(select(.call_spec != {}))[].call_spec.cc]')" \
+            | tee --append $GITHUB_OUTPUT
+
+      - name: Upload distribution 📦
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: python-package-distributions
+          path: dist/**
+
+  # -----------------------------------------------------------------------------------------------
+  documentation:
+    needs: [build-package]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      FORCE_COLOR: "1"
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 75
+          persist-credentials: false
+
+      - name: Prepare package version
+        uses: "$/.github/actions/prepare-package-version"
+        with:
+          tag: ${{ needs.build-package.outputs.tag }}
+          tag_message: ${{ needs.build-package.outputs.tag_message }}
+
+      - name: Set up runner
+        uses: "$/.github/actions/setup-runner"
+        with:
+          os: ubuntu-24.04
+          python-version: 3.12
+
+      - name: Generate documentation
+        run: |
+          nox --non-interactive --session doc
+
+      - name: Set release notes as job summary
+        run: |
+          cat doc/build/job_summary.md >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload release notes
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-notes
+          path: doc/build/release_notes.md
+
+  # -----------------------------------------------------------------------------------------------
+  host:
+    needs: [build-package]
+    uses: $/.github/workflows/gcovr-ci-job.yml
+    with:
+      os: ${{ matrix.os }}
+      gcc: ${{ matrix.gcc }}
+      python-version: ${{ matrix.python-version }}
+      upload-app: ${{ matrix.upload-app || false }}  # Explicit set to false if not set
+      tag: ${{ needs.build-package.outputs.tag }}
+      tag_message: ${{ needs.build-package.outputs.tag_message }}
+    permissions:
+      contents: read
+    # Testing strategy
+    # ----------------
+    #
+    # We have different axes of the testing matrix:
+    #
+    # OS: Linux, Windows
+    # Compiler: GCC-5 to GCC-14, Clang-10 to CLANG-19
+    # Python: 3.10 -- 3.14, pypy3
+    #
+    # Instead of testing all combinations, we try to achieve full coverage
+    # across each axis. The main test matrix just represents the Python axis on
+    # Linux. The OS=Windows and Compiler axis are added manually.
+    #
+    # Some cases (Clang compiler) are handled via the Docker-tests.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04]
+        gcc: [gcc-11]
+        # FIXME: Temporary version pin to avoid PyPy 7.3.21
+        python-version: ['3.10', '3.11', '3.12', '3.13', '3.14', 'pypy-3.11-v7.3.20']
+
+        include:
+
+          # Test additional compilers with Linux.
+          # Note that all compiler versions are also handled via Docker.
+          - os: ubuntu-24.04
+            gcc: gcc-11
+            python-version: '3.14'
+            upload-app: true
+
+          # Test minimum and maximum Python version on Windows.
+          - os: windows-2022
+            gcc: gcc
+            python-version: '3.10'
+          - os: windows-2025
+            gcc: gcc
+            python-version: '3.14'
+            upload-app: true
+
+          # Test minimum and maximum Python version on Mac OS.
+          - os: macos-15
+            gcc: gcc
+            python-version: '3.10'
+            upload-app: true
+          - os: macos-26
+            gcc: gcc-15
+            python-version: '3.14'
+            upload-app: true
+
+
+  # -----------------------------------------------------------------------------------------------
+  docker:
+    needs: [build-package]
+    uses: $/.github/workflows/gcovr-ci-job.yml
+    with:
+      container: true
+      gcc: ${{ matrix.gcc }}
+      python-version: 3.12
+      tag: ${{ needs.build-package.outputs.tag }}
+      tag_message: ${{ needs.build-package.outputs.tag_message }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        gcc: ${{ fromJson(needs.build-package.outputs.gcovr_compiler_list) }}
+
+
+  # -----------------------------------------------------------------------------------------------
+  merge_coverage:
+    needs: [host, docker]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      FORCE_COLOR: "1"
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up runner
+        uses: "$/.github/actions/setup-runner"
+        with:
+          os: ubuntu-24.04
+          python-version: 3.12
+
+      - name: Download artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          pattern: coverage-pytest-*
+
+      - name: Combine coverage
+        run: |
+          nox --non-interactive --session combine_coverage -- $(find . -name '.coverage_*')
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-merged
+          path: |
+            coverage.xml
+            htmlcov
+
+
+  # -----------------------------------------------------------------------------------------------
+  publish-push-tag:
+    needs: [build-package, documentation, host, docker]
+    if: ${{ needs.build-package.outputs.publish_run_job == 'true' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      FORCE_COLOR: "1"
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: true
+
+      - name: Check if all needed jobs succeed
+        uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35  # v1.3.0
+        with:
+          jobs: ${{ toJSON(needs) }}
+
+      - name: Prepare package version
+        uses: "$/.github/actions/prepare-package-version"
+        with:
+          tag: ${{ needs.build-package.outputs.tag }}
+          tag_message: ${{ needs.build-package.outputs.tag_message }}
+
+      - name: Push new tag
+        if: ${{ needs.build-package.outputs.publish_push_tag == 'true' }}
+        run: |
+          git push origin "refs/tags/$TAG"
+        env:
+          TAG: ${{ needs.build-package.outputs.tag }}
+
+
+  # -----------------------------------------------------------------------------------------------
+  publish-github-release:
+    needs: [build-package, publish-push-tag]
+    if: ${{ needs.build-package.outputs.publish_run_job == 'true' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      FORCE_COLOR: "1"
+    timeout-minutes: 5
+
+    steps:
+      - name: Check if all needed jobs succeed
+        uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35  # v1.3.0
+        with:
+          jobs: ${{ toJSON(needs) }}
+
+      - name: Download all applications
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          pattern: app-*
+          path: build/
+          merge-multiple: true
+
+      - name: Download the release notes
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: release-notes
+
+      - name: Create release and upload build artifacts
+        if: ${{ needs.build-package.outputs.publish_push_tag == 'true' }}
+        run: |
+          gh release create --notes-file release_notes.md ${TAG_NAME} build/*
+        env:
+          TAG_NAME: ${{ needs.build-package.outputs.tag }}
+
+  # -----------------------------------------------------------------------------------------------
+  publish-pypi:
+    needs: [build-package, documentation, host, docker]
+    if: ${{ needs.build-package.outputs.publish_run_job == 'true' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write  # IMPORTANT: mandatory for trusted publishing
+    environment:  # Environment for trusted publishing
+      name: ${{ needs.build-package.outputs.publish_environment_name }}
+      url: ${{ needs.build-package.outputs.publish_environment_url }}
+    env:
+      FORCE_COLOR: "1"
+    timeout-minutes: 10
+
+    steps:
+      - name: Check if all needed jobs succeed
+        uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35  # v1.3.0
+        with:
+          jobs: ${{ toJSON(needs) }}
+
+      - name: Download all the distribution 📦
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Publish distribution 📦 to ${{ ((needs.build-package.outputs.tag == '') && 'test.pypi') || 'pypi' }}.org
+        if: >-
+          ${{
+            (needs.build-package.outputs.publish_push_tag == 'true')
+            || ((github.repository == 'gcovr/gcovr') && inputs.do_test_release)
+          }}
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
+        with:
+          repository-url: ${{ needs.build-package.outputs.publish_repository_url }}
+          verbose: ${{ inputs.do_test_release || false }}

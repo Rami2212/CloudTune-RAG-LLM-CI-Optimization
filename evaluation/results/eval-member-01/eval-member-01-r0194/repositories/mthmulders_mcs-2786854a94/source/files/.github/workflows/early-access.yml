@@ -1,0 +1,83 @@
+# Inspired by & copied from JReleaser sample:
+# https://github.com/jreleaser/jreleaser/blob/main/.github/workflows/trigger-early-access.yml
+
+name: Publish Early Access builds
+permissions:
+  contents: read
+
+on:
+  # Triggered after the Build workflow completes successfully
+  workflow_run:
+    workflows: ["Build"]
+    types:
+      - completed
+    branches: [ main ]
+
+jobs:
+  # Collect all executables and release
+  release:
+    runs-on: ubuntu-24.04
+    permissions: write-all
+    # Only run if the Build workflow succeeded
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK
+        uses: actions/setup-java@v6.0.1
+        with:
+          java-version: 25
+          distribution: 'temurin'
+          cache: maven
+
+      # Using third-party action because actions/download-artifact@v5 cannot download from different workflow runs (workflow_run context).
+      - name: Download native binary artifacts from Build workflow
+        uses: dawidd6/action-download-artifact@v27
+        with:
+          run_id: ${{ github.event.workflow_run.id }}
+          path: /tmp/artifacts
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Move build artifacts to correct folder
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          mkdir -p target
+          
+          # Move MCS distribution artifacts to artifacts/ directory for JReleaser.
+          # Names use platform classifiers from os-detector-maven-plugin.
+          find /tmp/artifacts/ -type f \( -name "*.zip" -o -name "*.tar.gz" \) -exec mv -v {} artifacts/ \;
+          find /tmp/artifacts/ -type f -name "*.jar" -exec mv -v {} target/ \;
+
+      - name: Cache Maven packages
+        uses: actions/cache@v6.1.0
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+
+      - name: Release with JReleaser
+        shell: bash
+        run: |
+          ./mvnw \
+            --batch-mode \
+            --errors \
+            -Prelease \
+            -DartifactsDir=artifacts \
+            jreleaser:full-release
+        env:
+          JRELEASER_GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+
+      - name: Capture JReleaser output
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: jreleaser-release-output
+          retention-days: 7
+          path: |
+            target/jreleaser/trace.log
+            target/jreleaser/output.properties

@@ -1,0 +1,168 @@
+name: Performance Compare Workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_branch:
+        description: 'Base branch to compare with'
+        required: false
+        default: 'master'
+      target_pr_number:
+        description: 'Target pr number to compare with'
+        required: true
+
+env:
+  BASE_BRANCH: ${{ github.event.inputs.base_branch || 'master' }}
+  TARGET_PR_NUMBER: ${{ github.event.inputs.target_pr_number }}
+
+permissions:
+  contents: read # for actions/checkout to fetch code
+
+jobs:
+  base-performance-test:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+    steps:
+      # Free up disk space on Ubuntu
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
+        with:
+          # this might remove tools that are actually needed, if set to "true" but frees about 6 GB
+          preinstalled-runtimes: false
+          # all of these default to true, but feel free to set to "false" if necessary for your workflow
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
+
+      - name: checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Number of commits to fetch. 0 indicates all history for all branches and tags.
+          # We need to guess version via git tags.
+          fetch-depth: 0
+          ref: ${{ env.BASE_BRANCH }}
+          
+      - name: install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: setup performance test environment
+        run: |
+          hack/local-up-performance.sh
+          
+      - name: run performance test
+        run: |
+          export OUTPUT_FILE=${{ github.workspace }}/base-metrics/karmada-metrics.json
+          hack/run-performance-test.sh
+
+      - name: upload metrics file
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: base-metrics
+          path: ${{ github.workspace }}/base-metrics/
+          
+  target-performance-test:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+    steps:
+      - name: Validate TARGET_PR_NUMBER
+        run: |
+          if [ -z "${{ env.TARGET_PR_NUMBER }}" ]; then
+            echo "::error::TARGET_PR_NUMBER is required and must not be empty."
+            exit 1
+          fi
+          if ! [[ "${{ env.TARGET_PR_NUMBER }}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::TARGET_PR_NUMBER must be a positive integer, got: ${{ env.TARGET_PR_NUMBER }}"
+            exit 1
+          fi
+          echo "TARGET_PR_NUMBER is valid: ${{ env.TARGET_PR_NUMBER }}"
+
+      # Free up disk space on Ubuntu
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
+        with:
+          # this might remove tools that are actually needed, if set to "true" but frees about 6 GB
+          preinstalled-runtimes: false
+          # all of these default to true, but feel free to set to "false" if necessary for your workflow
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
+
+      - name: checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Number of commits to fetch. 0 indicates all history for all branches and tags.
+          # We need to guess version via git tags.
+          fetch-depth: 0
+          ref: refs/pull/${{ env.TARGET_PR_NUMBER }}/head
+          
+      - name: install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: setup performance test environment
+        run: |
+          hack/local-up-performance.sh
+          
+      - name: run performance test
+        run: |
+          export OUTPUT_FILE=${{ github.workspace }}/target-metrics/karmada-metrics.json
+          hack/run-performance-test.sh
+
+      - name: upload metrics file
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: target-metrics
+          path: ${{ github.workspace }}/target-metrics/
+    
+  compare-performance:
+    needs: [base-performance-test, target-performance-test]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Download base metrics
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: base-metrics
+          path: ${{ github.workspace }}/base-metrics/
+
+      - name: Download target metrics
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: target-metrics
+          path: ${{ github.workspace }}/target-metrics/
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-pip
+          pip3 install matplotlib
+
+      - name: Compare performance
+        run: |
+          python3 hack/performance/visualize-metrics.py \
+            --baseline ${{ github.workspace }}/base-metrics/karmada-metrics.json \
+            --target ${{ github.workspace }}/target-metrics/karmada-metrics.json \
+            --output-dir ${{ github.workspace }}/performance-comparison/
+
+      - name: Upload performance comparison image
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: performance-comparison
+          path: ${{ github.workspace }}/performance-comparison/

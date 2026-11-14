@@ -1,0 +1,90 @@
+name: macOS 
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+    secrets:
+      CODECOV_TOKEN:
+        required: false
+    outputs:
+      verified-sha:
+        value: ${{ jobs.macos_test.outputs.sha }}
+  push:
+    branches: [main]
+    paths:
+      - 'Sources/**'
+      - 'Tests/**'
+      - 'Package.swift'
+      - 'Scripts/CI/**'
+      - '.github/workflows/macos.yml'
+  pull_request:
+    paths:
+      - 'Sources/**'
+      - 'Tests/**'
+      - 'Package.swift'
+      - 'Scripts/CI/**'
+      - '.github/workflows/macos.yml'
+
+jobs:
+  macos_test:
+    name: Execute tests on macOS
+    outputs:
+      sha: ${{ steps.checkout.outputs.commit }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15]
+        xcode-version: ["26.6"]
+        release: [2024]
+    runs-on:
+      - self-hosted
+      - ${{ matrix.os }}
+      - xcode-26.6
+    env:
+      OPENSWIFTUI_WERROR: 0 # Disable it to avoid enable OAG's werror and hit conflicts
+      OPENSWIFTUI_OPENATTRIBUTESHIMS_ATTRIBUTEGRAPH: 1
+      OPENSWIFTUI_COMPATIBILITY_TEST: 0
+      OPENSWIFTUI_SWIFT_LOG: 0
+      OPENSWIFTUI_SWIFT_CRYPTO: 0
+      OPENSWIFTUI_TARGET_RELEASE: ${{ matrix.release }}
+      OPENSWIFTUI_USE_LOCAL_DEPS: 1
+      OPENSWIFTUI_LINK_TESTING: 1
+      OPENSWIFTUI_ENABLE_PRIVATE_IMPORTS: 1
+      # Match Xcode's test launcher so OSLogStore can read current-process debug messages.
+      OS_ACTIVITY_DT_MODE: "YES"
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        id: checkout
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - name: Setup Xcode
+        uses: OpenSwiftUIProject/setup-xcode@v2
+        with:
+          xcode-version: ${{ matrix.xcode-version }}
+      - name: Set up build environment
+        run: Scripts/CI/darwin_setup_build.sh
+        shell: bash
+      - name: Install xcbeautify
+        run: brew install xcbeautify
+      - name: Build and run tests in debug mode with coverage
+        run: |
+          set -o pipefail
+          NSUnbufferedIO=YES swift test \
+            -c debug \
+            --filter OpenSwiftUITests \
+            --filter OpenSwiftUICoreTests \
+            --enable-code-coverage \
+            --build-path .build-test-debug \
+            2>&1 | xcbeautify --renderer github-actions --preserve-unbeautified
+          xcrun llvm-cov show \
+            -instr-profile=.build-test-debug/debug/codecov/default.profdata \
+            .build-test-debug/debug/OpenSwiftUIPackageTests.xctest/Contents/MacOS/OpenSwiftUIPackageTests \
+            > coverage.txt
+      - uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          verbose: true

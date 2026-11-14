@@ -1,0 +1,32 @@
+name: Re-build on jackson-databind v3 push
+on:
+  repository_dispatch:
+    types: [jackson-databind-pushed-v2]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Do we want wide matrix build? For now, limited
+    runs-on: 'ubuntu-22.04'
+    strategy:
+      fail-fast: false
+      matrix:
+        java_version: ['17', '21']
+    env:
+      JAVA_OPTS: "-XX:+TieredCompilation -XX:TieredStopAtLevel=1"
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: 3.x
+    - name: Set up JDK
+      uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+      with:
+        distribution: 'temurin'
+        java-version: ${{ matrix.java_version }}
+        cache: 'maven'
+    - name: Build and test
+      run: ./mvnw -B -ff -ntp clean verify
+
+# No recursive rebuild (yet?)

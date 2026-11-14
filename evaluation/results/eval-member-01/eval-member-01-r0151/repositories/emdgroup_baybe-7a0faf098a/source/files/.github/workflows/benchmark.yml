@@ -1,0 +1,117 @@
+name: Benchmark
+
+on:
+  release:
+    types:
+      - published
+      
+  workflow_dispatch:
+    inputs:
+      group_selection:
+        description: "Group of Benchmarks to Run:"
+        required: true
+        default: "All"
+        type: choice
+        options:
+          - "All"
+          - "Transfer Learning"
+          - "Synthetic"
+          - "Non Transfer Learning"
+
+env:
+  TRANSFER_LEARNING_BENCHMARKS: '["aryl_halide_CT_IM_tl","aryl_halide_IP_CP_tl","aryl_halide_CT_I_BM_tl","direct_arylation_tl_temperature","easom_tl_47_negate_noise5","hartmann_tl_3_20_15","hartmann_tl_inv_3_20_15","hartmann_tl_shift_3_20_15","michalewicz_tl_continuous"]'
+  SYNTHETIC_BENCHMARKS: '["synthetic_2C1D_1C","hartmann_3d_discretized","hartmann_6d","hartmann_3d"]'
+  ALL_BENCHMARKS: '["direct_arylation_multi_batch","direct_arylation_single_batch","aryl_halide_CT_IM_tl","aryl_halide_IP_CP_tl","aryl_halide_CT_I_BM_tl","direct_arylation_tl_temperature","easom_tl_47_negate_noise5","hartmann_tl_3_20_15","hartmann_tl_inv_3_20_15","hartmann_tl_shift_3_20_15","michalewicz_tl_continuous","synthetic_2C1D_1C","hartmann_3d_discretized","hartmann_6d","hartmann_3d"]'
+  NON_TL_BENCHMARKS: '["direct_arylation_multi_batch","direct_arylation_single_batch","synthetic_2C1D_1C","hartmann_3d_discretized","hartmann_6d","hartmann_3d"]'
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      benchmarks_to_execute: ${{ steps.set_benchmarks.outputs.benchmarks_to_execute }}
+    env:
+      RUN_GROUP: ${{ github.event.inputs.group_selection || 'All' }}
+    steps:
+      - name: Build matrix from group
+        id: build_matrix_from_group
+        run: |
+          benchmarks_to_execute='{"benchmark_list": []}'
+
+          if [ "$RUN_GROUP" = "Transfer Learning" ]; then
+            benchmarks_to_execute='{"benchmark_list": ${{ env.TRANSFER_LEARNING_BENCHMARKS }} }'
+          fi
+          if [ "$RUN_GROUP" = "Non Transfer Learning" ]; then
+            benchmarks_to_execute='{"benchmark_list": ${{ env.NON_TL_BENCHMARKS }} }'
+          fi
+          if [ "$RUN_GROUP" = "Synthetic" ]; then
+            benchmarks_to_execute='{"benchmark_list": ${{ env.SYNTHETIC_BENCHMARKS }} }'
+          fi
+          if [ "$RUN_GROUP" = "All" ]; then
+            benchmarks_to_execute='{"benchmark_list": ${{ env.ALL_BENCHMARKS }} }'
+          fi
+
+          echo "benchmarks_to_execute=$benchmarks_to_execute" >> "$GITHUB_ENV"
+
+
+      - name: Set benchmarks output
+        id: set_benchmarks
+        run: |
+          echo "benchmarks_to_execute=$benchmarks_to_execute" >> "$GITHUB_OUTPUT"
+          number_of_tasks=$(echo "$benchmarks_to_execute" | jq '.benchmark_list | length')
+
+          if [ "$number_of_tasks" -le 0 ]; then
+            echo "Please run at least one benchmark"
+            exit 1
+          fi
+
+  benchmark-test:
+    name: run
+    needs: [prepare]
+    runs-on: M
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.benchmarks_to_execute) }}
+    timeout-minutes: 1440
+    env:
+      BAYBE_BENCHMARKING_PERSISTENCE_PATH: ${{ secrets.TEST_RESULT_S3_BUCKET }}
+      BAYBE_PARALLELIZE_SIMULATION_RUNS: false
+    steps:
+      - name: System Information
+        run: |
+          echo -e "\033[1;34m===== SYSTEM INFORMATION =====\033[0m"
+          uname -a
+          echo -e "\n\n\n\033[1;34m===== CPU INFORMATION =====\033[0m"
+          lscpu
+          echo -e "\n\n\n\033[1;34m===== BLOCK DEVICES =====\033[0m"
+          lsblk
+          echo -e "\n\n\n\033[1;34m===== MEMORY INFORMATION =====\033[0m"
+          free -h
+          echo -e "\n\n\n\033[1;34m===== DISK USAGE =====\033[0m"
+          df -h
+          if [ -x "$(command -v nvidia-smi)" ]; then
+            echo -e "\n\n\n\033[1;34m===== GPU INFORMATION =====\033[0m"
+            nvidia-smi
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: "Set up Python"
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v6
+        with:
+          python-version: "3.10"
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          enable-cache: false
+      - name: Install the project
+        run: uv sync --locked --extra benchmarking
+      - name: Benchmark
+        env:
+          BENCHMARK_LIST: ${{ matrix.benchmark_list }}
+        run: uv run -m benchmarks --benchmark-list "$BENCHMARK_LIST"

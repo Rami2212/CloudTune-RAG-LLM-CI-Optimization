@@ -1,0 +1,55 @@
+name: set-version
+
+run-name: Set version ${{ inputs.version }} on branch ${{ github.ref_name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Please input the new version number. e.g. `v2.0.0-alpha.0` with leading `v`"
+        required: true
+        type: string
+
+jobs:
+  log-the-inputs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Version validation
+        env:
+          SELECTED_VERSION: ${{ inputs.version }}
+        run: |
+          SEMVER_REGEX="^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(\\-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$"
+          [[ "${SELECTED_VERSION}" =~ $SEMVER_REGEX ]] || { echo "Invalid version number '$SELECTED_VERSION'. Should be e.g. 'v2.0.0-alpha.0' with leading 'v'." ; exit 1; }
+
+      - uses: actions/checkout@v6
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22.21.1
+          cache: "yarn"
+
+      - name: Install Utilities
+        run: yarn install
+
+      - name: Setup Git
+        run: |
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+
+      - name: Set helm to v3.12.3
+        shell: bash
+        run: |
+          sudo rm /usr/local/bin/helm
+          sudo  curl -fsSL https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 > /tmp/helm.sh
+          sudo chmod +x /tmp/helm.sh
+          sudo /tmp/helm.sh --version v3.12.3
+          helm version
+
+      - name: Set version
+        env:
+          SELECTED_VERSION: ${{ inputs.version }}
+        run: |
+          VERSION_NUM=$(echo ${SELECTED_VERSION} | cut -b 2-)
+          yarn set-version -y ${VERSION_NUM}
+          git push

@@ -1,0 +1,80 @@
+# This workflow runs checks for unsafe code. In crates that don't have any unsafe code, this can be
+# removed. Runs:
+# - address sanitizer - detects memory errors
+# - leak sanitizer - detects memory leaks
+# - miri - detects undefined behavior and memory leaks
+# See check.yml for information about how the concurrency cancellation and workflow triggering works
+permissions:
+  contents: read
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+name: safety
+jobs:
+  sanitizers:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install nightly
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-10-21
+      - uses: ./.github/actions/install-sdl2
+      - run: |
+            # to get the symbolizer for debug symbol resolution
+            sudo apt install llvm
+            # to fix buggy leak analyzer:
+            # https://github.com/japaric/rust-san#unrealiable-leaksanitizer
+            # ensure there's a profile.dev section
+            if ! grep -qE '^[ \t]*[profile.dev]' Cargo.toml; then
+                echo >> Cargo.toml
+                echo '[profile.dev]' >> Cargo.toml
+            fi
+            # remove pre-existing opt-levels in profile.dev
+            sed -i '/^\s*\[profile.dev\]/,/^\s*\[/ {/^\s*opt-level/d}' Cargo.toml
+            # now set opt-level to 1
+            sed -i '/^\s*\[profile.dev\]/a opt-level = 1' Cargo.toml
+            cat Cargo.toml
+        name: Enable debug symbols
+      - name: cargo test -Zsanitizer=address
+        # only --lib --tests b/c of https://github.com/rust-lang/rust/issues/53945
+        run: cargo test --lib --tests --all-features --target x86_64-unknown-linux-gnu
+        env:
+          ASAN_OPTIONS: "detect_odr_violation=0:detect_leaks=0"
+          PROPTEST_RNG_SEED: 0
+          RUSTFLAGS: "-Z sanitizer=address"
+      - name: cargo test -Zsanitizer=leak
+        if: always()
+        run: cargo test --all-features --target x86_64-unknown-linux-gnu
+        env:
+          LSAN_OPTIONS: "suppressions=lsan-suppressions.txt"
+          PROPTEST_RNG_SEED: 0
+          RUSTFLAGS: "-Z sanitizer=leak"
+  miri:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install nightly
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-10-21
+          components: miri
+      - name: Install cargo-nextest
+        uses: baptiste0928/cargo-install@v3.3.2
+        with:
+          crate: cargo-nextest
+          version: "0.9.122"
+      - name: cargo miri test
+        timeout-minutes: 120
+        run: cargo miri nextest run --no-default-features --features=image/default
+        env:
+          MIRIFLAGS: ""
+          PROPTEST_RNG_SEED: 0

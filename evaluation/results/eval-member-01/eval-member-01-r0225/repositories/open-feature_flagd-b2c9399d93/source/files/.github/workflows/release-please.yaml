@@ -1,0 +1,265 @@
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Stringified list of items that should be published
+  PUBLISHABLE_ITEMS: '["flagd","flagd-proxy"]'
+  REGISTRY: ghcr.io
+  REPO_OWNER: ${{ github.repository_owner }}
+  DEFAULT_GO_VERSION: '~1.27'
+  PUBLIC_KEY_FILE: publicKey.pub
+  GOPRIVATE: buf.build/gen/go
+  # The toolchain determines which FIPS snapshots exist, so pin it.
+  GOTOOLCHAIN: local
+
+name: Release Please
+jobs:
+  release-please:
+    name: Release Please
+    runs-on: ubuntu-latest
+    # Release-please creates a PR that tracks all changes
+    steps:
+      - name: Get current date
+        id: date
+        run: echo "::set-output name=date::$(date +'%Y-%m-%d')"
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5
+        id: release
+        with:
+          token: ${{secrets.RELEASE_PLEASE_ACTION_TOKEN}}
+      - name: Dump Release Please Output
+        env:
+          RELEASE_PLEASE_OUTPUT: ${{ toJson(steps.release.outputs) }}
+        run: |
+          echo "$RELEASE_PLEASE_OUTPUT"
+      - name: Determine what should be published
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        id: items-to-publish
+        env:
+          CHANGED_ITEMS: "${{ steps.release.outputs.paths_released }}"
+        with:
+          # Release please outputs a string representation of an array under the key paths_released
+          # This script parses the output, and filters each of the changed items (provided as paths to the root of the package, e.g. flagd or core)
+          # to remove any values not present in the PUBLISHABLE_ITEMS array. This filtered array is then stringified and exported as items-to-publish.outputs.result
+          # this can be picked up by subsequent jobs and used in a matrix to loop over the PUBLISHABLE_ITEMS within the release
+          script: |
+            const changedItems = JSON.parse(process.env.CHANGED_ITEMS || '[]');
+            console.log("changed items", changedItems);
+            const eligibleItems = JSON.parse(process.env.PUBLISHABLE_ITEMS || '[]');
+            console.log("eligible items", eligibleItems);
+            const itemsToPublish = changedItems.filter(i => eligibleItems.includes(i));
+            console.log("items to publish", itemsToPublish);
+            return itemsToPublish;
+    outputs:
+      date: ${{ steps.date.outputs.date }}
+      items_to_publish: ${{ steps.items-to-publish.outputs.result }}
+      flagd_version: ${{ steps.release.outputs.flagd--version }}
+      flagd_tag_name: ${{ steps.release.outputs.flagd--tag_name }}
+      flagd-proxy_version: ${{ steps.release.outputs.flagd-proxy--version }}
+      flagd-proxy_tag_name: ${{ steps.release.outputs.flagd-proxy--tag_name }}
+
+  container-release:
+    name: Build and push containers to GHCR
+    needs: release-please
+    environment: publish
+    runs-on: ubuntu-latest
+    if: ${{ needs.release-please.outputs.items_to_publish != '' && toJson(fromJson(needs.release-please.outputs.items_to_publish)) != '[]' }}
+    strategy:
+      matrix:
+        path: ${{ fromJSON(needs.release-please.outputs.items_to_publish) }}
+
+    env:
+      TAG: ${{ needs.release-please.outputs[format('{0}_tag_name', matrix.path)] }}
+      VERSION: v${{ needs.release-please.outputs[format('{0}_version', matrix.path)] }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@3d58c274f17dffee475a5520cbe67f0a882c4dbb
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@8e5442c4ef9f78752691e2d8f8d19755c6f78e81
+        with:
+          images: ${{ env.REGISTRY }}/${{ matrix.path }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: all
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build
+        id: build
+        uses: docker/build-push-action@4a13e500e55cf31b7a5d59a38ab2040ab0f42f56 # v5
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          context: .
+          file: ./${{ matrix.path }}/build.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          provenance: mode=max
+          sbom: true
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.REPO_OWNER }}/${{ matrix.path }}:latest
+            ${{ env.REGISTRY }}/${{ env.REPO_OWNER }}/${{ matrix.path }}:${{ env.VERSION }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ env.VERSION }}
+            COMMIT=${{ github.sha }}
+            DATE=${{ needs.release-please.outputs.date }}
+      - name: Build FIPS variant
+        id: build-fips
+        uses: docker/build-push-action@4a13e500e55cf31b7a5d59a38ab2040ab0f42f56 # v5
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          context: .
+          file: ./${{ matrix.path }}/build.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          provenance: mode=max
+          sbom: true
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.REPO_OWNER }}/${{ matrix.path }}:latest-fips
+            ${{ env.REGISTRY }}/${{ env.REPO_OWNER }}/${{ matrix.path }}:${{ env.VERSION }}-fips
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ env.VERSION }}
+            COMMIT=${{ github.sha }}
+            DATE=${{ needs.release-please.outputs.date }}
+            FIPS=on
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@e1523de7571e31dbe865fd2e80c5c7c23ae71eb4
+
+      - name: Sign the images
+        run: |
+          cosign sign --yes --key env://COSIGN_PRIVATE_KEY ${{ env.REGISTRY }}/${{ env.REPO_OWNER }}/${{ matrix.path }}@${{ steps.build.outputs.digest }}
+          cosign sign --yes --key env://COSIGN_PRIVATE_KEY ${{ env.REGISTRY }}/${{ env.REPO_OWNER }}/${{ matrix.path }}@${{ steps.build-fips.outputs.digest }}
+          cosign public-key --key env://COSIGN_PRIVATE_KEY --outfile ${{ env.PUBLIC_KEY_FILE }}
+        env:
+          COSIGN_PRIVATE_KEY: ${{secrets.COSIGN_PRIVATE_KEY}}
+          COSIGN_PASSWORD: ${{secrets.COSIGN_PASSWORD}}
+
+      - name: Bundle release assets
+        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
+        with:
+          tag_name: ${{ env.TAG }}
+          files: |
+            ${{ env.PUBLIC_KEY_FILE }}
+
+  release-go-binaries:
+    name: Create and publish binaries to GitHub
+    needs: release-please
+    runs-on: ubuntu-latest
+    if: ${{ needs.release-please.outputs.items_to_publish != '' && toJson(fromJson(needs.release-please.outputs.items_to_publish)) != '[]' }}
+    strategy:
+      matrix:
+        path: ${{ fromJSON(needs.release-please.outputs.items_to_publish) }}
+
+    env:
+      TAG: ${{ needs.release-please.outputs[format('{0}_tag_name', matrix.path)] }}
+      VERSION: v${{ needs.release-please.outputs[format('{0}_version', matrix.path)] }}
+      VERSION_NO_PREFIX: ${{ needs.release-please.outputs[format('{0}_version', matrix.path)] }}
+      COMMIT: ${{ github.sha }}
+      DATE: ${{ needs.release-please.outputs.date }}
+      BUILD_ARGS: '-a -ldflags "-X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${DATE}"'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Set up Go
+        uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5
+        with:
+          go-version: ${{ env.DEFAULT_GO_VERSION }}
+      - name: Download cyclonedx-gomod
+        uses: CycloneDX/gh-gomod-generate-sbom@efc74245d6802c8cefd925620515442756c70d8f # v2
+        with:
+          version: v1
+      - name: setup for builds
+        # TODO: The README should also be moved ready for bundling once both flagd-proxy and flagd have package specific READMEs
+        run: |
+          make workspace-init
+          mv ./${{ matrix.path }}/CHANGELOG.md CHANGELOG.md 
+          cd ${{ matrix.path }} && cyclonedx-gomod app > ../sbom.xml
+      - name: build darwin arm64
+        run: |
+          env CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build ${{ env.BUILD_ARGS }} -o ./${{ matrix.path }}_darwin_arm64 ./${{ matrix.path }}/main.go
+          tar -cvzf ${{ matrix.path }}_${{ env.VERSION_NO_PREFIX }}_Darwin_arm64.tar.gz ./${{ matrix.path }}_darwin_arm64 ./LICENSE ./CHANGELOG.md ./README.md ./sbom.xml
+      - name: build darwin x86_64
+        run: |
+          env CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build ${{ env.BUILD_ARGS }} -o ./${{ matrix.path }}_darwin_x86_64 ./${{ matrix.path }}/main.go
+          tar -cvzf ${{ matrix.path }}_${{ env.VERSION_NO_PREFIX }}_Darwin_x86_64.tar.gz ./${{ matrix.path }}_darwin_x86_64 ./LICENSE ./CHANGELOG.md ./README.md ./sbom.xml
+      - name: build linux arm64
+        run: |
+          env CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build ${{ env.BUILD_ARGS }} -o ./${{ matrix.path }}_linux_arm64 ./${{ matrix.path }}/main.go
+          tar -cvzf ${{ matrix.path }}_${{ env.VERSION_NO_PREFIX }}_Linux_arm64.tar.gz ./${{ matrix.path }}_linux_arm64 ./LICENSE ./CHANGELOG.md ./README.md ./sbom.xml
+      - name: build linux x86_64
+        run: |
+          env CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${{ env.BUILD_ARGS }} -o ./${{ matrix.path }}_linux_x86_64 ./${{ matrix.path }}/main.go
+          tar -cvzf ${{ matrix.path }}_${{ env.VERSION_NO_PREFIX }}_Linux_x86_64.tar.gz ./${{ matrix.path }}_linux_x86_64 ./LICENSE ./CHANGELOG.md ./README.md ./sbom.xml
+      # Windows artifacts use .zip archive
+      - name: build windows x86_64
+        run: |
+          env CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build ${{ env.BUILD_ARGS }} -o ./${{ matrix.path }}_windows_x86_64 ./${{ matrix.path }}/main.go
+          zip -r ${{ matrix.path }}_${{ env.VERSION_NO_PREFIX }}_Windows_x86_64.zip ./${{ matrix.path }}_windows_x86_64 ./LICENSE ./CHANGELOG.md ./README.md ./sbom.xml
+      - name: build windows i386
+        run: |
+          env CGO_ENABLED=0 GOOS=windows GOARCH=386 go build ${{ env.BUILD_ARGS }} -o ./${{ matrix.path }}_windows_i386 ./${{ matrix.path }}/main.go
+          zip -r ${{ matrix.path }}_${{ env.VERSION_NO_PREFIX }}_Windows_i386.zip ./${{ matrix.path }}_windows_i386 ./LICENSE ./CHANGELOG.md ./README.md ./sbom.xml
+
+      # FIPS variant. Fewer targets than the standard build: FIPS mode is
+      # unsupported on windows/386, and linux/386 is not a validated operating
+      # environment for the module.
+      - name: build FIPS variant
+        env:
+          # The CMVP-certified Go Cryptographic Module v1.0.0 (certificate #5247).
+          GOFIPS140: v1.0.0
+        run: |
+          set -euo pipefail
+          build_fips() {
+            goos="$1"; goarch="$2"; label="$3"; format="$4"
+            bin="./${{ matrix.path }}-fips_${goos}_${goarch}"
+            env CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build ${{ env.BUILD_ARGS }} -tags fips140 -o "$bin" ./${{ matrix.path }}/main.go
+            # The toolchain adds fips140v1.0 only when GOFIPS140 is set, so both
+            # tags together prove the binary built as the FIPS variant.
+            build_info=$(go version -m "$bin")
+            grep -q -- '-tags=fips140,fips140v1.0' <<<"$build_info" \
+              || { echo "::error::$bin is not a FIPS 140-3 build"; exit 1; }
+            archive="${{ matrix.path }}-fips_${{ env.VERSION_NO_PREFIX }}_${label}"
+            if [ "$format" = tar ]; then
+              tar -cvzf "${archive}.tar.gz" "$bin" ./LICENSE ./CHANGELOG.md ./README.md ./sbom.xml
+            else
+              zip -r "${archive}.zip" "$bin" ./LICENSE ./CHANGELOG.md ./README.md ./sbom.xml
+            fi
+          }
+          build_fips darwin  arm64 Darwin_arm64   tar
+          build_fips darwin  amd64 Darwin_x86_64  tar
+          build_fips linux   arm64 Linux_arm64    tar
+          build_fips linux   amd64 Linux_x86_64   tar
+          build_fips windows amd64 Windows_x86_64 zip
+      # Bundle release artifacts
+      - name: Bundle release assets
+        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
+        with:
+          tag_name: ${{ env.TAG }}
+          files: |
+            ./sbom.xml
+            ./*.tar.gz
+            ./*.zip

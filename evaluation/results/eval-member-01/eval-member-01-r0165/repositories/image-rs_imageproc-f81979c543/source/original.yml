@@ -1,0 +1,113 @@
+# This is the main CI workflow that runs the test suite on all pushes to main and all pull requests.
+# It runs the following jobs:
+# - required: runs the test suite on ubuntu with the specified rust toolchains
+# - direct-minimal: runs the test suite with the minimal versions of the dependencies that satisfy the
+#   requirements of this crate
+# - os-check: runs the test suite on mac and windows
+# See check.yml for information about how the concurrency cancellation and workflow triggering works
+permissions:
+  contents: read
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+name: test
+jobs:
+  vars:
+    runs-on: ubuntu-24.04
+    # https://rust-lang.github.io/rustup-components-history/
+    outputs:
+      nightly: nightly-2025-10-21
+    steps:
+      - run: echo "dummy job"
+  required:
+    needs: vars
+    runs-on: ubuntu-24.04
+    name: ubuntu / ${{ matrix.toolchain }}
+    strategy:
+      matrix:
+        toolchain: ["${{ needs.vars.outputs.nightly }}"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: ./.github/actions/install-sdl2
+      - name: Install ${{ matrix.toolchain }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - name: cargo generate-lockfile
+        # enable this ci template to run regardless of whether the lockfile is checked in or not
+        if: hashFiles('Cargo.lock') == ''
+        run: cargo generate-lockfile
+      # https://twitter.com/jonhoo/status/1571290371124260865
+      - name: cargo test --locked
+        run: cargo test --locked --all-features --all-targets
+        env:
+          PROPTEST_RNG_SEED: 0
+      # https://github.com/rust-lang/cargo/issues/6669
+      - name: cargo test --doc
+        run: cargo test --locked --all-features --doc
+        env:
+          PROPTEST_RNG_SEED: 0
+  direct-minimal:
+    needs: vars
+    strategy:
+      matrix:
+        toolchain: ["${{ needs.vars.outputs.nightly }}"]
+    runs-on: ubuntu-24.04
+    name: ubuntu / ${{ matrix.toolchain }} / direct-minimal-versions
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: ./.github/actions/install-sdl2
+      - name: Install ${{ matrix.toolchain }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - name: cargo update -Zdirect-minimal-versions
+        run: cargo update -Zdirect-minimal-versions
+      - name: cargo test
+        run: cargo test --locked --all-features --all-targets
+        env:
+          PROPTEST_RNG_SEED: 0
+  os-check:
+    # run cargo test on mac and windows
+    needs: vars
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.os }} / ${{ matrix.toolchain }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, windows-2025]
+        toolchain: ["${{ needs.vars.outputs.nightly }}"]
+    steps:
+      # if your project needs OpenSSL, uncomment this to fix Windows builds.
+      # it's commented out by default as the install command takes 5-10m.
+      # - run: echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Append
+      #   if: runner.os == 'Windows'
+      # - run: vcpkg install openssl:x64-windows-static-md
+      #   if: runner.os == 'Windows'
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: ./.github/actions/install-sdl2
+      - name: Install ${{ matrix.toolchain }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - name: cargo generate-lockfile
+        if: hashFiles('Cargo.lock') == ''
+        run: cargo generate-lockfile
+      - name: cargo test
+        run: cargo test --locked --all-features --all-targets
+        env:
+          PROPTEST_RNG_SEED: 0
+      - name: cargo test --doc
+        run: cargo test --locked --all-features --doc
+        env:
+          PROPTEST_RNG_SEED: 0

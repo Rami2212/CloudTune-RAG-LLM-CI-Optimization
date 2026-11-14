@@ -1,0 +1,84 @@
+name: Test pull request
+
+on:
+  pull_request:
+    branches: [ "master" ]
+
+permissions:
+  contents: read
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  indexer-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: [ "3.12" ]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-${{ matrix.python-version }}-
+
+      - name: Install dependencies
+        working-directory: indexer
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run tests
+        working-directory: indexer
+        run: |
+          pytest tests
+
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      CC: clang-20
+      CXX: clang++-20
+
+    steps:
+    - name: Check out repository
+      uses: actions/checkout@v3
+      with:      
+        submodules: 'recursive'
+    
+    - uses: actions/setup-go@v5
+      with:
+        go-version: '>=1.23.0'
+
+    - name: Install system libraries
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential clang-20 git cmake ninja-build zlib1g-dev libcurl4-openssl-dev libsecp256k1-dev libmicrohttpd-dev libsodium-dev liblz4-dev libjemalloc-dev libhiredis-dev
+#        wget https://apt.llvm.org/llvm.sh
+#        chmod +x llvm.sh
+#        sudo ./llvm.sh 16 all
+
+    - name: Setup cmake
+      uses: jwlawson/actions-setup-cmake@v2
+      with:
+        cmake-version: '3.x'
+
+    - name: Configure CMake
+      run: cmake -B ${{github.workspace}}/build -DCMAKE_C_COMPILER=clang-20 -DCMAKE_CXX_COMPILER=clang++-20
+
+    - name: Build C++ libraries
+      run: touch suppression_mappings.txt && cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target ton-index-postgres ton-index-postgres-migrate ton-index-clickhouse ton-trace-emulator ton-trace-task-emulator ton-index-go ton-streaming-go --parallel $(nproc)
+
+    # - name: Test
+    #   working-directory: ${{github.workspace}}/build
+    #   run: ./ton-index-worker/tondb-scanner/test-tondb

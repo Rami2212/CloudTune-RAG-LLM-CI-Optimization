@@ -1,0 +1,78 @@
+name: Run tests and update dependencies
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [ main, 'feature/**' ]
+    paths-ignore:
+    - 'README.md'
+    - 'CHANGELOG.md'
+
+jobs:
+  test:
+    name: Run tests
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 0
+
+    - name: Setup Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version-file: 'go.mod'
+        cache: false
+
+    - name: Cache Go modules and build
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+    - run: go test -v ./... -coverprofile=coverage.out
+
+    - name: Build assets
+      if: startsWith(matrix.os, 'ubuntu') == true
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: 26
+        cache: 'npm'
+    - if: startsWith(matrix.os, 'ubuntu') == true
+      run: npm ci --ignore-scripts
+    - if: startsWith(matrix.os, 'ubuntu') == true
+      run: npm run build
+
+    - name: SonarQube Scan
+      if: startsWith(matrix.os, 'ubuntu') == true
+      uses: SonarSource/sonarqube-scan-action@e805d875275f728fac1885b413934be6d7c63f65 # v8.4.1
+      env:
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  dependabot:
+    name: Auto-approve and merge Dependabot PRs
+    needs: [ test ]
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: write
+      actions: write
+    if: ${{ github.actor == 'dependabot[bot]' && github.event_name == 'pull_request'}}
+    steps:
+      - id: metadata
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        with:
+          github-token: "${{ secrets.GITHUB_TOKEN }}"
+      - run: |
+          gh pr review --approve "$PR_URL"
+          gh pr merge --merge --auto "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.REPO_MERGE_TOKEN }}

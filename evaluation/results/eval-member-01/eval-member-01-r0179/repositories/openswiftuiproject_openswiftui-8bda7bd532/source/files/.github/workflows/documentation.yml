@@ -1,0 +1,102 @@
+name: Documentation
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build DocC site
+    runs-on:
+      - self-hosted
+      - xcode-26.6
+    env:
+      OPENSWIFTUI_WERROR: 0
+      OPENSWIFTUI_OPENATTRIBUTESHIMS_ATTRIBUTEGRAPH: 1
+      OPENSWIFTUI_COMPATIBILITY_TEST: 0
+      OPENSWIFTUI_SWIFT_LOG: 0
+      OPENSWIFTUI_SWIFT_CRYPTO: 0
+      OPENSWIFTUI_TARGET_RELEASE: 2024
+      OPENSWIFTUI_USE_LOCAL_DEPS: 1
+      OPENSWIFTUI_LINK_TESTING: 0
+      DOCC_RENDERER_REPOSITORY: OpenSwiftUIProject/swift-docc-render-artifact
+      DOCC_RENDERER_REF: release/6.3-colorful
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Setup Xcode
+        uses: OpenSwiftUIProject/setup-xcode@v2
+        with:
+          xcode-version: "26.6"
+      - name: Set up build environment
+        run: Scripts/CI/darwin_setup_build.sh
+        shell: bash
+      - name: Check out DocC renderer
+        run: |
+          renderer_path="${RUNNER_TEMP}/swift-docc-render-artifact"
+          rm -rf "$renderer_path"
+          git clone \
+            --depth 1 \
+            --filter=blob:none \
+            --single-branch \
+            --branch "$DOCC_RENDERER_REF" \
+            "https://github.com/${DOCC_RENDERER_REPOSITORY}.git" \
+            "$renderer_path"
+          test -d "$renderer_path/dist"
+          echo "DOCC_HTML_DIR=$renderer_path/dist" >> "$GITHUB_ENV"
+        shell: bash
+      - name: Restore versioned documentation cache
+        uses: actions/cache@v6
+        with:
+          path: .docs/cache/versioned-docc
+          key: versioned-docc-${{ runner.os }}-${{ hashFiles('.vdc.json', 'Package.resolved', 'Scripts/extract-documentation-symbol-graphs.sh') }}-${{ github.sha }}
+          restore-keys: |
+            versioned-docc-${{ runner.os }}-${{ hashFiles('.vdc.json', 'Package.resolved', 'Scripts/extract-documentation-symbol-graphs.sh') }}-
+            versioned-docc-${{ runner.os }}-
+      - uses: oras-project/setup-oras@v1
+      - name: Log in to GitHub Container Registry
+        run: echo "${{ github.token }}" | oras login ghcr.io --username "${{ github.actor }}" --password-stdin
+      - name: Extract additional module symbol graphs
+        run: Scripts/extract-documentation-symbol-graphs.sh
+        shell: bash
+      - name: Build versioned DocC site
+        uses: DocCLab/VersionedDocC@0.1.2
+        with:
+          config: .vdc.json
+          publish-oci-cache: true
+      - name: Install GNU tar
+        run: |
+          if ! command -v gtar >/dev/null 2>&1; then
+            brew install gnu-tar
+          fi
+        shell: bash
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: .docs/build/versioned-site
+
+  deploy:
+    name: Deploy DocC site
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: pages
+      cancel-in-progress: true
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

@@ -1,0 +1,293 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 5 optimizations:
+# - [MEDIUM] Switch "build-windows-cl-arm" from Windows to ubuntu runner
+# - [MEDIUM] Switch "build-windows-cl" from Windows to ubuntu runner
+# - [LOW] Explicitly set fail-fast for large matrix job "build-linux" (22 combinations)
+# - [LOW] Explicitly set fail-fast for large matrix job "build-linux-libcpp" (14 combinations)
+# - [LOW] Explicitly set fail-fast for large matrix job "build-windows" (12 combinations)
+# Estimated savings: ~6 min/run
+#
+name: build
+
+on:
+  push:
+    paths:
+      - '**.cpp'
+      - '**.h'
+      - '**.hpp'
+      - '**/CMakeLists.txt'
+      - '**.cmake'
+      - '.github/workflows/build.yml'
+  pull_request:
+    paths:
+      - '**.cpp'
+      - '**.h'
+      - '**.hpp'
+      - '**/CMakeLists.txt'
+      - '**.cmake'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux:
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { os: ubuntu-22.04, pkg: gcc-10, exe: g++-10 }
+          - { os: ubuntu-22.04, pkg: clang-11, exe: clang++-11 }
+          - { os: ubuntu-22.04, pkg: clang-12, exe: clang++-12 }
+          - { os: ubuntu-latest, pkg: gcc-13, exe: g++-13 }
+          - { os: ubuntu-latest, pkg: gcc-14, exe: g++-14 }
+          - { os: ubuntu-latest, pkg: gcc, exe: g++ }
+          - { os: ubuntu-latest, pkg: clang-14, exe: clang++-14 }
+          - { os: ubuntu-latest, pkg: clang-15, exe: clang++-15 }
+          - { os: ubuntu-latest, pkg: clang-16, exe: clang++-16 }
+          - { os: ubuntu-latest, pkg: clang-17, exe: clang++-17 }
+          - { os: ubuntu-latest, pkg: clang, exe: clang++ }
+        build_type: [Release, Debug]
+    runs-on: ${{matrix.target.os}}
+
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Install compiler
+      run: |
+        sudo apt update
+        sudo apt install -y ${{matrix.target.pkg}}
+
+    - name: ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: ccache-${{matrix.target.os}}-${{matrix.target.pkg}}-${{matrix.build_type}}
+        create-symlink: true
+
+    - name: Configure CMake
+      env:
+        CC: "ccache ${{matrix.target.pkg}}"
+        CXX: "ccache ${{matrix.target.exe}}"
+      run: |
+        cmake -DCMAKE_BUILD_TYPE=${{matrix.build_type}} -DGAIA_BUILD_UNITTEST=ON -DGAIA_BUILD_EXAMPLES=ON -DGAIA_BUILD_BENCHMARK=OFF -DGAIA_GENERATE_CC=OFF -S . -B ${{github.workspace}}/build
+
+    - name: Build
+      env:
+        CC: "ccache ${{matrix.target.pkg}}"
+        CXX: "ccache ${{matrix.target.exe}}"
+      run: |
+        cmake --build ${{github.workspace}}/build --config ${{matrix.build_type}}
+
+    - name: Test
+      run: |
+        ${{github.workspace}}/build/src/test/gaia_test
+
+  build-linux-libcpp:
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { os: ubuntu-22.04, pkg: clang-11, exe: clang++-11 }
+          - { os: ubuntu-22.04, pkg: clang-12, exe: clang++-12 }
+          - { os: ubuntu-latest, pkg: clang-14, exe: clang++-14 }
+          - { os: ubuntu-latest, pkg: clang-15, exe: clang++-15 }
+          - { os: ubuntu-latest, pkg: clang-16, exe: clang++-16 }
+          - { os: ubuntu-latest, pkg: clang-17, exe: clang++-17 }
+          - { os: ubuntu-latest, pkg: clang, exe: clang++ }
+        build_type: [Release, Debug]
+    runs-on: ${{matrix.target.os}}
+
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Install compiler
+      run: |
+        sudo apt update
+        sudo apt install -y ${{matrix.target.pkg}} libc++-dev libc++abi-dev
+
+    - name: ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: ccache-${{matrix.target.os}}-${{matrix.target.pkg}}-${{matrix.build_type}}
+        create-symlink: true
+        
+    - name: Configure CMake
+      env:
+        CC: "ccache ${{matrix.target.pkg}}"
+        CXX: "ccache ${{matrix.target.exe}}"
+      run: |
+        cmake -DCMAKE_BUILD_TYPE=${{matrix.build_type}} -DGAIA_USE_LIBCPP=ON -DGAIA_BUILD_UNITTEST=ON -DGAIA_BUILD_EXAMPLES=ON -DGAIA_BUILD_BENCHMARK=OFF -DGAIA_GENERATE_CC=OFF -S . -B ${{github.workspace}}/build
+
+    - name: Build
+      env:
+        CC: "ccache ${{matrix.target.pkg}}"
+        CXX: "ccache ${{matrix.target.exe}}"
+      run: |
+        cmake --build ${{github.workspace}}/build --config ${{matrix.build_type}}
+
+    - name: Test
+      run: |
+        ${{github.workspace}}/build/src/test/gaia_test
+
+  build-windows-arm:
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # The Windows 10.0.26100 SDK header (winnt.h) expects _CountOneBits64 to exist, but that intrinsic is only defined by MSVC v143
+        # and newer for ARM/ARM64. When you compile with v142, the compiler does not provide that intrinsic, so the header breaks.
+        # As a result, we can not build on v142 for ARM.
+        toolset: [default, v143]
+        include:
+          - toolset: v143
+            toolset_option: -T"v143"
+        build_type: [Release, Debug]
+    runs-on: windows-11-arm
+
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Configure CMake
+      run: |
+        cmake ${{matrix.toolset_option}} -DCMAKE_BUILD_TYPE=${{matrix.build_type}} -DGAIA_BUILD_UNITTEST=ON -DGAIA_BUILD_EXAMPLES=ON -DGAIA_BUILD_BENCHMARK=OFF -DGAIA_GENERATE_CC=OFF -S . -B ${{github.workspace}}/build
+
+    - name: Build
+      run: |
+        cmake --build ${{github.workspace}}/build --config ${{matrix.build_type}}
+
+    - name: Test
+      run: |
+        ${{github.workspace}}/build/src/test/${{matrix.build_type}}/gaia_test.exe
+
+  build-windows:
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        toolset: [default, v142, v143]
+        include:
+          - toolset: v142
+            toolset_option: -T"v142"
+          - toolset: v143
+            toolset_option: -T"v143"
+        build_type: [Release, Debug]
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: sccache
+      uses: mozilla-actions/sccache-action@v0.0.9
+      with:
+        version: "v0.10.0"
+
+    - name: Configure CMake
+      run: |
+        cmake -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache ${{matrix.toolset_option}} -DCMAKE_BUILD_TYPE=${{matrix.build_type}} -DGAIA_BUILD_UNITTEST=ON -DGAIA_BUILD_EXAMPLES=ON -DGAIA_BUILD_BENCHMARK=OFF -DGAIA_GENERATE_CC=OFF -S . -B ${{github.workspace}}/build
+
+    - name: Build
+      run: |
+        cmake --build ${{github.workspace}}/build --config ${{matrix.build_type}}
+
+    - name: Test
+      run: |
+        ${{github.workspace}}/build/src/test/${{matrix.build_type}}/gaia_test.exe
+
+  build-windows-cl-arm:
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        toolset: [clang-cl]
+        include:
+          - toolset: clang-cl
+            toolset_option: -T"ClangCl"
+        build_type: [Release, Debug]
+    runs-on: windows-11-arm
+
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Configure CMake
+      env:
+        SCCACHE_GHA_ENABLED: "true"
+      run: |
+        cmake ${{matrix.toolset_option}} -DCMAKE_BUILD_TYPE=${{matrix.build_type}} -DGAIA_BUILD_UNITTEST=OFF -DGAIA_BUILD_EXAMPLES=ON -DGAIA_BUILD_BENCHMARK=OFF -DGAIA_GENERATE_CC=OFF -S . -B ${{github.workspace}}/build
+
+    - name: Build
+      run: |
+        cmake --build ${{github.workspace}}/build --config ${{matrix.build_type}}
+
+    - name: Test
+      run: |
+        ctest --test-dir ${{github.workspace}}/build -C ${{matrix.build_type}} --output-on-failure
+
+  build-windows-cl:
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        toolset: [clang-cl]
+        include:
+          - toolset: clang-cl
+            toolset_option: -T"ClangCl"
+        build_type: [Release, Debug]
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: sccache
+      uses: mozilla-actions/sccache-action@v0.0.9
+      with:
+        version: "v0.10.0"
+
+    - name: Configure CMake
+      env:
+        SCCACHE_GHA_ENABLED: "true"
+      run: |
+        cmake -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache ${{matrix.toolset_option}} -DCMAKE_BUILD_TYPE=${{matrix.build_type}} -DGAIA_BUILD_UNITTEST=OFF -DGAIA_BUILD_EXAMPLES=ON -DGAIA_BUILD_BENCHMARK=OFF -DGAIA_GENERATE_CC=OFF -S . -B ${{github.workspace}}/build
+
+    - name: Build
+      run: |
+        cmake --build ${{github.workspace}}/build --config ${{matrix.build_type}}
+
+    - name: Test
+      run: |
+        ctest --test-dir ${{github.workspace}}/build -C ${{matrix.build_type}} --output-on-failure
+
+  build-macos:
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Release, Debug]
+    runs-on: macOS-latest
+
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: ccache-${{runner.os}}-${{matrix.build_type}}
+        create-symlink: true
+
+    - name: Configure CMake
+      run: |
+        cmake -DCMAKE_BUILD_TYPE=${{matrix.build_type}} -DGAIA_MACOS_BUILD_HACK=ON -DGAIA_BUILD_UNITTEST=ON -DGAIA_BUILD_EXAMPLES=ON -DGAIA_BUILD_BENCHMARK=OFF -DGAIA_GENERATE_CC=OFF -S . -B ${{github.workspace}}/build
+
+    - name: Build
+      run: |
+        cmake --build ${{github.workspace}}/build --config ${{matrix.build_type}}
+
+    - name: Test
+      run: |
+        ${{github.workspace}}/build/src/test/gaia_test

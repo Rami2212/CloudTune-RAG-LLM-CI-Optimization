@@ -1,0 +1,298 @@
+name: Compatibility tests
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+      platform:
+        default: all
+        type: string
+    outputs:
+      verified-sha:
+        description: Commit verified on both platforms
+        value: ${{ jobs.compatibility_tests_ios.outputs.sha == jobs.compatibility_tests_macos.outputs.sha && jobs.compatibility_tests_ios.outputs.sha || '' }}
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Platform to test
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - ios
+          - macos
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+jobs:
+  prepare_compatibility_tests:
+    uses: ./.github/workflows/prepare_optional_ci.yml
+    with:
+      command: /compatibilitytest
+      ref: ${{ inputs.ref || '' }}
+      target: ${{ inputs.platform || 'all' }}
+      status-contexts: '{"ios":"Compatibility tests / iOS","macos":"Compatibility tests / macOS"}'
+
+  compatibility_tests_macos:
+    name: Execute compatibility tests for macOS
+    outputs:
+      sha: ${{ steps.checkout.outputs.commit }}
+    needs: prepare_compatibility_tests
+    if: contains(fromJSON(needs.prepare_compatibility_tests.outputs.targets || '[]'), 'macos')
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15]
+        xcode-version: ["26.6"]
+        release: [2024]
+    runs-on:
+      - self-hosted
+      - ${{ matrix.os }}
+      - xcode-26.6
+    env:
+      STATUS_CONTEXT: Compatibility tests / macOS
+      STATUS_ENABLED: ${{ needs.prepare_compatibility_tests.outputs.status-enabled }}
+      STATUS_SHA: ${{ needs.prepare_compatibility_tests.outputs.ref }}
+      OPENSWIFTUI_WERROR: 0 # Disable it to avoid enable OAG's werror and hit conflicts
+      OPENSWIFTUI_OPENATTRIBUTESHIMS_ATTRIBUTEGRAPH: 1
+      OPENSWIFTUI_SWIFT_LOG: 0
+      OPENSWIFTUI_SWIFT_CRYPTO: 0
+      OPENSWIFTUI_TARGET_RELEASE: ${{ matrix.release }}
+      OPENSWIFTUI_USE_LOCAL_DEPS: 1
+      OPENSWIFTUI_LINK_TESTING: 1
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Mark PR status running
+        if: env.STATUS_ENABLED == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            await github.rest.repos.createCommitStatus({
+              owner,
+              repo,
+              sha: process.env.STATUS_SHA,
+              state: "pending",
+              target_url: `${process.env.GITHUB_SERVER_URL}/${owner}/${repo}/actions/runs/${context.runId}`,
+              description: "macOS compatibility tests are running.",
+              context: process.env.STATUS_CONTEXT,
+            });
+      - uses: actions/checkout@v4
+        id: checkout
+        with:
+          repository: ${{ needs.prepare_compatibility_tests.outputs.repository }}
+          ref: ${{ needs.prepare_compatibility_tests.outputs.ref }}
+          persist-credentials: false
+      - name: Setup Xcode
+        uses: OpenSwiftUIProject/setup-xcode@v2
+        with:
+          xcode-version: ${{ matrix.xcode-version }}
+      - name: Set up build environment
+        run: Scripts/CI/darwin_setup_build.sh
+        shell: bash
+      - name: Install xcbeautify
+        run: brew install xcbeautify
+      - name: Run compatibility tests on OpenSwiftUI + macOS
+        run: |
+          set -o pipefail
+          NSUnbufferedIO=YES swift test \
+            --filter OpenSwiftUICompatibilityTests \
+            --build-path .build-compatibility-test-debug \
+            2>&1 | xcbeautify --renderer github-actions --preserve-unbeautified
+        env:
+          OPENSWIFTUI_COMPATIBILITY_TEST: 0
+      - name: Run compatibility tests on SwiftUI + macOS
+        run: |
+          set -o pipefail
+          NSUnbufferedIO=YES swift test \
+            --filter OpenSwiftUICompatibilityTests \
+            --build-path .build-compatibility-test-debug \
+            2>&1 | xcbeautify --renderer github-actions --preserve-unbeautified
+        env:
+          OPENSWIFTUI_COMPATIBILITY_TEST: 1
+      - name: Complete PR status
+        if: always() && env.STATUS_ENABLED == 'true'
+        uses: actions/github-script@v7
+        env:
+          JOB_STATUS: ${{ job.status }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const state = process.env.JOB_STATUS === "success" ? "success" :
+              process.env.JOB_STATUS === "cancelled" ? "error" : "failure";
+            await github.rest.repos.createCommitStatus({
+              owner,
+              repo,
+              sha: process.env.STATUS_SHA,
+              state,
+              target_url: `${process.env.GITHUB_SERVER_URL}/${owner}/${repo}/actions/runs/${context.runId}`,
+              description: `macOS compatibility tests completed with ${process.env.JOB_STATUS}.`,
+              context: process.env.STATUS_CONTEXT,
+            });
+
+  compatibility_tests_ios:
+    name: Execute compatibility tests for iOS
+    outputs:
+      sha: ${{ steps.checkout.outputs.commit }}
+    needs: prepare_compatibility_tests
+    if: contains(fromJSON(needs.prepare_compatibility_tests.outputs.targets || '[]'), 'ios')
+    permissions:
+      contents: read
+      statuses: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        xcode-version: ["26.6"]
+        release: [2024]
+        ios-version: ["18.5"]
+        include:
+          - ios-version: "18.5"
+            ios-simulator-name: "iPhone 16 Pro"
+    runs-on:
+      - xcode-26.6
+      - ios-simulator-18.5
+    env:
+      STATUS_CONTEXT: Compatibility tests / iOS
+      STATUS_ENABLED: ${{ needs.prepare_compatibility_tests.outputs.status-enabled }}
+      STATUS_SHA: ${{ needs.prepare_compatibility_tests.outputs.ref }}
+      OPENSWIFTUI_WERROR: 0 # Disable it to avoid enable OAG's werror and hit conflicts
+      OPENSWIFTUI_OPENATTRIBUTESHIMS_ATTRIBUTEGRAPH: 1
+      OPENSWIFTUI_SWIFT_LOG: 0
+      OPENSWIFTUI_SWIFT_CRYPTO: 0
+      OPENSWIFTUI_TARGET_RELEASE: ${{ matrix.release }}
+      OPENSWIFTUI_SUPPORT_MULTI_PRODUCTS: 0
+      OPENSWIFTUI_USE_LOCAL_DEPS: 1
+      OPENSWIFTUI_LINK_TESTING: 1
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Mark PR status running
+        if: env.STATUS_ENABLED == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            await github.rest.repos.createCommitStatus({
+              owner,
+              repo,
+              sha: process.env.STATUS_SHA,
+              state: "pending",
+              target_url: `${process.env.GITHUB_SERVER_URL}/${owner}/${repo}/actions/runs/${context.runId}`,
+              description: "iOS compatibility tests are running.",
+              context: process.env.STATUS_CONTEXT,
+            });
+      - uses: actions/checkout@v4
+        id: checkout
+        with:
+          repository: ${{ needs.prepare_compatibility_tests.outputs.repository }}
+          ref: ${{ needs.prepare_compatibility_tests.outputs.ref }}
+          persist-credentials: false
+      - name: Setup Xcode
+        uses: OpenSwiftUIProject/setup-xcode@v2
+        with:
+          xcode-version: ${{ matrix.xcode-version }}
+      - name: Set up mise
+        uses: jdx/mise-action@v2
+        with:
+          install: false
+          cache: false
+      - name: Set up Tuist
+        run: |
+          source Scripts/Tuist/common.sh
+          tuist_ci_setup
+        shell: bash
+      - name: Set up build environment
+        run: Scripts/CI/darwin_setup_build.sh
+        shell: bash
+      - name: Install xcbeautify
+        run: brew install xcbeautify
+      - name: Prepare isolated DerivedData
+        shell: bash
+        run: |
+          openswiftui_derived_data_path="${RUNNER_TEMP:-/tmp}/compatibility-ios-derived-data-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-0}-${{ matrix.ios-version }}-${{ matrix.release }}-openswiftui"
+          swiftui_derived_data_path="${RUNNER_TEMP:-/tmp}/compatibility-ios-derived-data-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-0}-${{ matrix.ios-version }}-${{ matrix.release }}-swiftui"
+          openswiftui_result_bundle_path="${RUNNER_TEMP:-/tmp}/compatibility-ios-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-0}-${{ matrix.ios-version }}-${{ matrix.release }}-openswiftui.xcresult"
+          swiftui_result_bundle_path="${RUNNER_TEMP:-/tmp}/compatibility-ios-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-0}-${{ matrix.ios-version }}-${{ matrix.release }}-swiftui.xcresult"
+          rm -rf "$openswiftui_derived_data_path" "$swiftui_derived_data_path"
+          mkdir -p "$openswiftui_derived_data_path" "$swiftui_derived_data_path"
+          {
+            echo "OPENSWIFTUI_DERIVED_DATA_PATH=$openswiftui_derived_data_path"
+            echo "SWIFTUI_DERIVED_DATA_PATH=$swiftui_derived_data_path"
+            echo "OPENSWIFTUI_RESULT_BUNDLE_PATH=$openswiftui_result_bundle_path"
+            echo "SWIFTUI_RESULT_BUNDLE_PATH=$swiftui_result_bundle_path"
+          } >> "$GITHUB_ENV"
+      - name: Run compatibility tests on OpenSwiftUI + iOS
+        run: |
+          set -o pipefail
+          source Scripts/Tuist/common.sh
+          # Xcode 26.6 can otherwise link the host macro object into the iOS Simulator test bundle.
+          NSUnbufferedIO=YES tuist_xcodebuild "$OPENSWIFTUI_RESULT_BUNDLE_PATH" test -IDEPackageEnablePrebuilts=NO \
+            -scheme OpenSwiftUI \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,OS=${{ matrix.ios-version }},name=${{ matrix.ios-simulator-name }}" \
+            -only-testing:OpenSwiftUICompatibilityTests \
+            -derivedDataPath "$OPENSWIFTUI_DERIVED_DATA_PATH" \
+            -skipMacroValidation \
+            -skipPackagePluginValidation \
+            2>&1 | xcbeautify --renderer github-actions --preserve-unbeautified
+        env:
+          OPENSWIFTUI_COMPATIBILITY_TEST: 0
+      - name: Run compatibility tests on SwiftUI + iOS
+        run: |
+          set -o pipefail
+          source Scripts/Tuist/common.sh
+          # Match the package prebuilt setting used by the OpenSwiftUI compatibility test.
+          NSUnbufferedIO=YES tuist_xcodebuild "$SWIFTUI_RESULT_BUNDLE_PATH" test -IDEPackageEnablePrebuilts=NO \
+            -scheme OpenSwiftUI \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,OS=${{ matrix.ios-version }},name=${{ matrix.ios-simulator-name }}" \
+            -only-testing:OpenSwiftUICompatibilityTests \
+            -derivedDataPath "$SWIFTUI_DERIVED_DATA_PATH" \
+            -skipMacroValidation \
+            -skipPackagePluginValidation \
+            2>&1 | xcbeautify --renderer github-actions --preserve-unbeautified
+        env:
+          OPENSWIFTUI_COMPATIBILITY_TEST: 1
+      - name: Clean up isolated DerivedData
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "${OPENSWIFTUI_DERIVED_DATA_PATH:-}" ]]; then
+            rm -rf "$OPENSWIFTUI_DERIVED_DATA_PATH"
+          fi
+          if [[ -n "${SWIFTUI_DERIVED_DATA_PATH:-}" ]]; then
+            rm -rf "$SWIFTUI_DERIVED_DATA_PATH"
+          fi
+          if [[ -n "${OPENSWIFTUI_RESULT_BUNDLE_PATH:-}" ]]; then
+            rm -rf "$OPENSWIFTUI_RESULT_BUNDLE_PATH"
+          fi
+          if [[ -n "${SWIFTUI_RESULT_BUNDLE_PATH:-}" ]]; then
+            rm -rf "$SWIFTUI_RESULT_BUNDLE_PATH"
+          fi
+      - name: Complete PR status
+        if: always() && env.STATUS_ENABLED == 'true'
+        uses: actions/github-script@v7
+        env:
+          JOB_STATUS: ${{ job.status }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const state = process.env.JOB_STATUS === "success" ? "success" :
+              process.env.JOB_STATUS === "cancelled" ? "error" : "failure";
+            await github.rest.repos.createCommitStatus({
+              owner,
+              repo,
+              sha: process.env.STATUS_SHA,
+              state,
+              target_url: `${process.env.GITHUB_SERVER_URL}/${owner}/${repo}/actions/runs/${context.runId}`,
+              description: `iOS compatibility tests completed with ${process.env.JOB_STATUS}.`,
+              context: process.env.STATUS_CONTEXT,
+            });

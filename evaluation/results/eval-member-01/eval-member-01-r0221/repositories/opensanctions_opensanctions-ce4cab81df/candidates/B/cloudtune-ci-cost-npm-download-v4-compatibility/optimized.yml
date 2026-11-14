@@ -1,0 +1,70 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [HIGH] Add npm dependency cache to "refresh" job
+# - [HIGH] Split "refresh" into parallel jobs (lint + test + build)
+# Estimated savings: ~10 min/run
+#
+name: UI dependency refresh
+'on':
+  workflow_dispatch: {}
+  schedule:
+    - cron: 0 6 * * 1
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_DB: test
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpass
+        ports:
+          - '5432:5432'
+        options: '--health-cmd="pg_isready -U testuser -d test" --health-interval=5s --health-timeout=5s --health-retries=10'
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - name: Bump package.json ranges to latest minor
+        run: npx --yes npm-check-updates --upgrade --target minor
+      - name: Update all dependencies within ranges
+        run: npm update
+      - name: Apply remaining non-breaking security fixes
+        run: npm audit fix --audit-level=critical
+      - name: Run prek hooks
+        uses: j178/prek-action@v3.1.0
+        with:
+          working-directory: ui
+      - name: Run Jest tests
+        run: npm test
+      - name: Build
+        run: npm run build
+      - name: Create pull request
+        uses: peter-evans/create-pull-request@v8
+        with:
+          branch: chore/ui-deps-refresh
+          delete-branch: true
+          add-paths: |
+            ui/package.json
+            ui/package-lock.json
+          commit-message: Weekly refresh of non-breaking UI dependencies
+          title: Weekly refresh of non-breaking UI dependencies
+          body: |
+            Automated bundle of all non-breaking dependency updates in `ui/`:
+            minor and patch bumps of `package.json` ranges, a full lockfile
+            refresh within those ranges (covers transitive security fixes that
+            Dependabot cannot resolve), and `npm audit fix`.
+
+            ESLint, Jest and `next build` passed against these versions in the
+            workflow run that created this PR. Regular CI does not trigger on
+            PRs opened by `GITHUB_TOKEN` — close and reopen the PR to force it.

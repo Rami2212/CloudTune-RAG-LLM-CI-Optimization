@@ -1,0 +1,127 @@
+name: Plugins/package deployer
+
+on:
+  # Deploy package from manual action
+  workflow_dispatch:
+    inputs:
+      gh_ref:
+        description: 'Name of the branch'
+        type: choice
+        required: true
+        default: 'develop'
+        options:
+          - develop
+          - staging
+          - main
+      plugin_name:
+        description: 'Pluging name (like plugins/apps/<plugin_name>-plugin)'
+        type: string
+        required: true
+  workflow_call:
+    inputs:
+      gh_ref:
+        description: 'Name of the branch'
+        type: string
+        required: true
+      plugin_name:
+        description: 'Publig name (from plugins/apps/<plugin_name>-plugin)'
+        type: string
+        required: true
+    secrets:
+      CLOUDFLARE_ACCOUNT_ID:
+        required: false
+      CLOUDFLARE_API_TOKEN:
+        required: false
+      MATTERMOST_WEBHOOK:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: penpot-standar-runner
+    container:
+      image: penpotapp/devenv:latest
+      volumes:
+        # Persistent pnpm store shared by all runner instances on the host.
+        # pnpm's content-addressable store is safe for concurrent access.
+        - /var/cache/github-runner/pnpm-store:/root/.local/share/pnpm/store
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_REF: ${{ inputs.gh_ref }}
+      PLUGIN_NAME: ${{ inputs.plugin_name }}
+    steps:
+      # plugin_name is a free-form string that ends up in paths, worker names
+      # and GITHUB_ENV; reject anything that is not a plain slug before it is
+      # used anywhere.
+      - name: Validate inputs
+        run: |
+          if ! [[ "$PLUGIN_NAME" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+            echo "::error::Invalid plugin_name: must match ^[a-z0-9][a-z0-9-]*$"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ inputs.gh_ref }}
+
+      - name: Install deps
+        working-directory: ./plugins
+        shell: bash
+        run: |
+          pnpm install --frozen-lockfile;
+          pnpm add -D -w wrangler@latest;
+
+      - name: "Build package for ${{ inputs.plugin_name }}-plugin"
+        working-directory: plugins
+        shell: bash
+        run: pnpm --filter "${PLUGIN_NAME}-plugin" build
+
+      - name: Select Worker name
+        run: |
+          case "$GH_REF" in
+            main)
+              echo "WORKER_NAME=${PLUGIN_NAME}-plugin-pro" >> $GITHUB_ENV
+              echo "WORKER_URI=${PLUGIN_NAME}.plugins.penpot.app" >> $GITHUB_ENV ;;
+            staging)
+              echo "WORKER_NAME=${PLUGIN_NAME}-plugin-pre" >> $GITHUB_ENV
+              echo "WORKER_URI=${PLUGIN_NAME}.plugins.penpot.dev" >> $GITHUB_ENV ;;
+            develop)
+              echo "WORKER_NAME=${PLUGIN_NAME}-plugin-hourly" >> $GITHUB_ENV
+              echo "WORKER_URI=${PLUGIN_NAME}.plugins.hourly.penpot.dev" >> $GITHUB_ENV ;;
+            *) echo "Unsupported branch ${GH_REF}" && exit 1 ;;
+          esac
+
+      - name: Set the custom url
+        working-directory: plugins
+        shell: bash
+        run: |
+          sed -i "s/WORKER_URI/${WORKER_URI}/g" "apps/${PLUGIN_NAME}-plugin/wrangler.toml"
+
+      - name: Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3
+        with:
+          workingDirectory: plugins
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy --config apps/${{ inputs.plugin_name }}-plugin/wrangler.toml --name ${{ env.WORKER_NAME }}
+
+      - name: Notify Mattermost
+        if: failure()
+        uses: mattermost/action-mattermost-notify@ae31bb6f9e26a54336e79696f108a2c91cf55b4e # v2.1.0
+        with:
+          MATTERMOST_WEBHOOK_URL: ${{ secrets.MATTERMOST_WEBHOOK }}
+          MATTERMOST_CHANNEL: bot-alerts-cicd
+          TEXT: |
+            ❌ 🧩📦 *[PENPOT PLUGINS] Error deploying ${{ env.WORKER_NAME }}.*
+            📄 Triggered from ref: `${{ inputs.gh_ref }}`
+               Plugin name: `${{ inputs.plugin_name }}-plugin`
+               Cloudflare worker name: `${{ env.WORKER_NAME }}`
+            🔗 Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            @infra

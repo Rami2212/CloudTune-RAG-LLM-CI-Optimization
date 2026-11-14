@@ -1,0 +1,60 @@
+name: ScyllaDB tests
+
+on:
+  push:
+    branches: [ main, 'devnet_*', 'testnet_*' ]
+  pull_request:
+    branches:
+      - "**"
+    paths:
+      - '.github/workflows/scylladb.yml'
+      - 'toolchains/**'
+      - 'linera-views/**'
+      - 'linera-storage/**'
+      - 'linera-service/src/storage.rs'
+  workflow_dispatch:
+
+# This allows a subsequently queued workflow run to interrupt previous runs on pull requests
+concurrency:
+  group: '${{ github.workflow }} @ ${{ github.event.pull_request.head.label || github.head_ref || github.run_id }}'
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: short
+  RUSTFLAGS: "-D warnings"
+  RUSTUP_MAX_RETRIES: 10
+  RUST_LOG: warn
+
+permissions:
+  contents: read
+
+jobs:
+
+  test:
+    runs-on: linera-io-self-hosted-ci
+    timeout-minutes: 50
+
+    steps:
+    - uses: actions/checkout@v6.0.2
+    - uses: actions-rust-lang/setup-rust-toolchain@v1
+    - name: Install Protoc
+      uses: ./.github/actions/install-protoc
+    - name: Build example applications
+      run: |
+        cd examples
+        cargo build --locked --release --target wasm32-unknown-unknown
+    - name: Build
+      run: |
+        cargo build --locked --features scylladb
+    - name: Setup local ScyllaDB instance
+      run: |
+        docker run --name my_scylla_container -d -p 9042:9042 scylladb/scylla:6.1 --smp 1
+    - name: Run ScyllaDB tests
+      run: |
+        RUST_LOG=linera=info cargo test --locked --features scylladb -- scylla --nocapture
+    - name: Run ScyllaDB opentelemetry tests
+      run: |
+        RUST_LOG=linera=info cargo test test_end_to_end_benchmark::scylladb_ --features scylladb,opentelemetry

@@ -1,0 +1,55 @@
+name: Long Faucet chain test
+
+on:
+  push:
+    branches: [ main, 'devnet_*', 'testnet_*' ]
+  pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - 'mdbook/**'
+      - 'kubernetes/**'
+      - 'docker/dashboards/**'
+  merge_group:
+  workflow_dispatch:
+
+# This allows a subsequently queued workflow run to interrupt previous runs on pull requests
+concurrency:
+  group: '${{ github.workflow }} @ ${{ github.event.pull_request.head.label || github.head_ref || github.run_id }}'
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  LINERA_STORAGE_SERVICE: 127.0.0.1:1235
+  RUST_LOG: warn
+  RUST_LOG_FORMAT: plain
+  LINERA_TEST_ITERATIONS: 1000
+
+jobs:
+  long-faucet-chain-test:
+    if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || github.event_name == 'push' }}
+    runs-on: linera-io-self-hosted-ci
+    timeout-minutes: 55
+
+    steps:
+    - uses: actions/checkout@v6.0.2
+    - uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        cache-workspaces: |
+          -> target
+    - name: Clear up some space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /opt/ghc
+        sudo rm -rf "/usr/local/share/boost"
+        sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+    - name: Install Protoc
+      uses: ./.github/actions/install-protoc
+    - name: Build
+      run: |
+        cargo build --release -p linera-service
+    - name: Run end-to-end tests
+      run: |
+        cargo run --release -p linera-storage-service -- memory --endpoint $LINERA_STORAGE_SERVICE &
+        cargo test --release -p linera-service --features storage-service -- --ignored test_end_to_end_faucet_with_long_chains --nocapture

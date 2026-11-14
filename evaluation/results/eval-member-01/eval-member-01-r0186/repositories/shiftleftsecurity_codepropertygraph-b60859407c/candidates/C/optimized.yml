@@ -1,0 +1,83 @@
+name: master & release build
+
+on:
+  push:
+    branches: [ master ]
+  workflow_dispatch:    # allow to manually trigger this workflow
+
+jobs:
+  test-codepropertygraph:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        lfs: true
+        fetch-depth: 0
+    - name: Clone submodules
+      run: git submodule update --init --recursive
+    - name: apt-get update
+      run: sudo apt-get update
+    - name: Set up JDK
+      uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+      with:
+        distribution: temurin
+        java-version: 21
+        cache: sbt
+    - uses: sbt/setup-sbt@67d461eba2c4753196c230e02da850757ba4775e # v1.5.14
+    - name: Check formatting
+      run: sbt scalafmtCheck Test/scalafmtCheck
+    - run: echo "Previous step failed because code is not formatted. Run 'sbt scalafmt'"
+      if: ${{ failure() }}
+    - name: Check domain classes
+      run: sbt generateDomainClassesCheck
+    - run: echo "Previous step failed because latest domain classes are not committed. Run 'sbt generateDomainClasses' (should be triggered automatically by `sbt compile`, so maybe you just forgot to commit?)"
+      if: ${{ failure() }}
+    - name: Compile and run tests
+      run: sbt +test
+
+  release:
+    concurrency: release
+    needs: [test-codepropertygraph]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          lfs: true
+          fetch-depth: 0
+      - name: Clone submodules
+        run: git submodule update --init --recursive
+      - name: apt-get update
+        run: sudo apt-get update
+      - name: Install gnupg
+        run: sudo apt update && sudo apt install -y gnupg
+      - name: Import GPG key
+        run: echo $PGP_SECRET | base64 --decode | gpg --batch --import
+        env:
+            PGP_SECRET: ${{ secrets.PGP_SECRET }}
+      - name: Set up JDK
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: sbt
+      - uses: sbt/setup-sbt@67d461eba2c4753196c230e02da850757ba4775e # v1.5.14
+      - name: Release to Sonatype
+        run: sbt ciReleaseTagNextVersion ciReleaseSonatype
+        env:
+          SONATYPE_PASSWORD: ${{ secrets.SONATYPE_PASSWORD }}
+          SONATYPE_USERNAME: ${{ secrets.SONATYPE_USERNAME }}
+      - name: Export ENV vars
+        run:
+          echo "LATEST_TAG=$(git describe --tags --abbrev=0)" >> $GITHUB_ENV
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@0cb9c9b65d5d1901c1f53e5e66eaf4afd303e70e # v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ env.LATEST_TAG }}
+          release_name: ${{ env.LATEST_TAG }}
+          draft: false
+          prerelease: false

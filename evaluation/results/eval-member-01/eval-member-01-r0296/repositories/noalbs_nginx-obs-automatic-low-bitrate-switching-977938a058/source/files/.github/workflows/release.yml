@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - v[0-9]+.*
+
+jobs:
+  release:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - build: linux
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+
+          - build: windows
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+          - build: mac
+            os: macos-latest
+            target: x86_64-apple-darwin
+            
+          - build: mac-silicon
+            os: macos-latest
+            target: aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Get the version
+        id: get_version
+        run: echo "::set-output name=VERSION::${GITHUB_REF/refs\/tags\//}"
+        shell: bash
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          target: ${{ matrix.target }}
+
+      - name: Install musl
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get -y install musl-tools
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Strip linux and mac binary
+        if: matrix.build == 'linux' || matrix.build == 'mac' || matrix.build == 'mac-silicon'
+        run: strip "target/${{ matrix.target }}/release/noalbs"
+
+      - name: Archive
+        shell: bash
+        run: |
+          folder="noalbs-${{ steps.get_version.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "$folder/"
+
+          cp {.env,config.json} "$folder/"
+
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp "target/${{ matrix.target }}/release/noalbs.exe" "$folder/"
+            7z a "$folder.zip" "$folder"
+            echo "ARCHIVE=$folder.zip" >> $GITHUB_ENV
+          else
+            cp "launch.sh" "$folder/"
+            cp "target/${{ matrix.target }}/release/noalbs" "$folder/"
+            tar czf "$folder.tar.gz" "$folder"
+            echo "ARCHIVE=$folder.tar.gz" >> $GITHUB_ENV
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ${{ env.ARCHIVE }}

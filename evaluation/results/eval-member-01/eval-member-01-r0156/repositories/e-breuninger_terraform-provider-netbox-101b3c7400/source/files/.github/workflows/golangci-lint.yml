@@ -1,0 +1,42 @@
+---
+name: linting
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+  # Optional: allow read access to pull request. Use with `only-new-issues` option.
+  # pull-requests: read
+
+jobs:
+  golangci:
+    name: golangci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9.3.0
+        with:
+          version: v2.11
+
+  doc-check:
+    name: docs check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: |
+          make docs
+          git add --intent-to-add --all
+          git diff --exit-code || (echo "::error title=Doc generation changes detected::Please update the docs and commit them to the PR" && exit 1)

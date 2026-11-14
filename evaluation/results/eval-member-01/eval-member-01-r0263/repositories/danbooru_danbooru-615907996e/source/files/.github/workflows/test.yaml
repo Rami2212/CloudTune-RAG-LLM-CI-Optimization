@@ -1,0 +1,192 @@
+# Run the test suite in the development image.
+#
+# Called by pipeline.yaml after the development image is built (only on master),
+# or started by hand from the Actions tab.
+#
+# Test locally:
+#
+#     # https://github.com/settings/tokens
+#     # https://github.com/nektos/act
+#     GITHUB_TOKEN="..."
+#     echo $GITHUB_TOKEN | docker login ghcr.io -u evazion --password-stdin
+#    ./act -s GITHUB_TOKEN=$GITHUB_TOKEN -j test -v --artifact-server-path tmp/artifacts
+
+name: Test
+
+# https://docs.github.com/en/actions/reference/workflow-syntax-for-github-actions#permissions
+permissions: read-all
+
+on:
+  # https://docs.github.com/en/actions/sharing-automations/reusing-workflows
+  workflow_call:
+
+  workflow_dispatch:
+    inputs:
+      test_suite:
+        type: choice
+        description: "Which tests to run"
+        required: false
+        default: all
+        options:
+          - all
+          - components
+          - functional
+          - jobs
+          # - system
+          - unit
+      debug_enabled:
+        type: boolean
+        description: "Run the workflow with remote debugging enabled (https://github.com/marketplace/actions/debugging-with-tmate)"
+        required: false
+        default: false
+
+defaults:
+  run:
+    working-directory: /danbooru
+
+# Don't run the test suite multiple times for the same branch.
+concurrency:
+  group: "test-${{ github.ref_name }}"
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    container:
+      # The development image of the commit that is tested.
+      image: ghcr.io/${{ github.repository }}:development-${{ github.sha }}
+      options: --user root -v /var/run/docker.sock:/var/run/docker.sock
+
+    env:
+      HOME: /root
+      RAILS_ENV: test
+      PARALLEL_WORKERS: 8 # number of parallel tests to run
+      RUBYOPT: -W0 # silence ruby warnings
+      VIPS_WARNING: 0 # silence libvips warnings
+
+      COVERAGE: "1"
+
+      DATABASE_URL: postgresql://danbooru:danbooru@postgres/danbooru
+      DANBOORU_SECRET_KEY_BASE: fake-test-key
+      DANBOORU_AWS_SQS_ENABLED: false
+      DANBOORU_SKIP_EXTRACTOR_TESTS: true
+      DANBOORU_PIXIV_PHPSESSID: ${{ secrets.DANBOORU_PIXIV_PHPSESSID }}
+      DANBOORU_NIJIE_LOGIN: ${{ secrets.DANBOORU_NIJIE_LOGIN }}
+      DANBOORU_NIJIE_PASSWORD: ${{ secrets.DANBOORU_NIJIE_PASSWORD }}
+      DANBOORU_NICO_SEIGA_USER_SESSION: ${{ secrets.DANBOORU_NICO_SEIGA_USER_SESSION }}
+      DANBOORU_TUMBLR_CONSUMER_KEY: ${{ secrets.DANBOORU_TUMBLR_CONSUMER_KEY }}
+      DANBOORU_DEVIANTART_CLIENT_ID: ${{ secrets.DANBOORU_DEVIANTART_CLIENT_ID }}
+      DANBOORU_DEVIANTART_CLIENT_SECRET: ${{ secrets.DANBOORU_DEVIANTART_CLIENT_SECRET }}
+      DANBOORU_PAWOO_ACCESS_TOKEN: ${{ secrets.DANBOORU_PAWOO_ACCESS_TOKEN }}
+      DANBOORU_BARAAG_ACCESS_TOKEN: ${{ secrets.DANBOORU_BARAAG_ACCESS_TOKEN }}
+      DANBOORU_FANTIA_SESSION_ID: ${{ secrets.DANBOORU_FANTIA_SESSION_ID }}
+      DANBOORU_FURAFFINITY_COOKIE_A: ${{ secrets.DANBOORU_FURAFFINITY_COOKIE_A }}
+      DANBOORU_FURAFFINITY_COOKIE_B: ${{ secrets.DANBOORU_FURAFFINITY_COOKIE_B }}
+      DANBOORU_TINAMI_SESSION_ID: ${{ secrets.DANBOORU_TINAMI_SESSION_ID }}
+      DANBOORU_DISCORD_WEBHOOK_ID: ${{ secrets.DANBOORU_DISCORD_WEBHOOK_ID }}
+      DANBOORU_DISCORD_WEBHOOK_SECRET: ${{ secrets.DANBOORU_DISCORD_WEBHOOK_SECRET }}
+      DANBOORU_RAKISMET_KEY: ${{ secrets.DANBOORU_RAKISMET_KEY }}
+      DANBOORU_RAKISMET_URL: ${{ secrets.DANBOORU_RAKISMET_URL }}
+      DANBOORU_IP_REGISTRY_API_KEY: ${{ secrets.DANBOORU_IP_REGISTRY_API_KEY }}
+      DANBOORU_GOOGLE_CLOUD_CREDENTIALS: ${{ secrets.DANBOORU_GOOGLE_CLOUD_CREDENTIALS }}
+
+    services:
+      postgres:
+        image: ghcr.io/danbooru/postgres:18.6
+        env:
+          POSTGRES_USER: danbooru
+          POSTGRES_PASSWORD: danbooru
+        options: >-
+          --mount type=tmpfs,destination=/var/lib/postgresql
+
+      # XXX: system tests are too flaky. There's some way to optimize them,
+      #  but it takes a lot of testing to get it right.
+      # playwright:
+      #   image: mcr.microsoft.com/playwright:v1.62.1-noble
+      #   command: npx -y playwright@1.62.1 run-server --port 3000 --host 0.0.0.0
+      #   # https://playwright.dev/docs/docker
+      #   options: >-
+      #     --init
+      #     --shm-size=2g
+      #     --ipc=host
+
+      sftp:
+        image: atmoz/sftp
+        command: testuser:testpass:::upload
+
+    steps:
+      - name: Setup tmate session
+        uses: mxschmitt/action-tmate@v3
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_enabled }}
+        with:
+          limit-access-to-actor: true
+          sudo: false
+
+      - name: Prepare database
+        run: |
+          bin/rails db:test:prepare
+
+      - name: Run tests
+        env:
+          TEST_SUITE: ${{ inputs.test_suite || 'all' }}
+        run: |
+          case "$TEST_SUITE" in
+            all)                 bin/rails test ;;
+            *)                   bin/rails test "test/$TEST_SUITE" ;;
+          esac
+        # run: |
+        #   case "$TEST_SUITE" in
+        #     all)    bin/rails test:all ;;
+        #     system) bin/rails test:system ;;
+        #     *)      bin/rails test "test/$TEST_SUITE" ;;
+        #   esac
+
+      # https://github.com/marketplace/actions/codecov
+      - name: Upload coverage reports to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v7
+        with:
+          root_dir: /danbooru
+          working-directory: /danbooru
+          files: tmp/coverage/coverage.xml # generated by SimpleCov's CoberturaFormatter
+          report_type: "coverage"
+          # Attach the report to the commit that was tested.
+          override_commit: ${{ github.sha }}
+          override_branch: ${{ github.ref_name }}
+          verbose: true
+
+      # https://docs.codecov.com/docs/test-analytics
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v7
+        with:
+          root_dir: /danbooru
+          working-directory: /danbooru
+          files: tmp/junit-test-results/TEST-*.xml
+          report_type: "test_results"
+          # Attach the report to the commit that was tested.
+          override_commit: ${{ github.sha }}
+          override_branch: ${{ github.ref_name }}
+          verbose: true
+
+      - name: Upload test results to Github
+        uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: test-results
+          include-hidden-files: true
+          # if we ever re-enable system tests, add this too below to capture failure screenshots:
+          # /danbooru/tmp/screenshots/*.png
+          path: |
+            /danbooru/tmp/coverage
+            /danbooru/tmp/html-test-results/index.html
+            /danbooru/tmp/junit-test-results/TEST-*.xml
+          if-no-files-found: error
+
+      - name: Publish test results
+        if: ${{ !cancelled() }}
+        run: |
+          bin/github-print-test-results /tmp/junit-test-results/TEST-*.xml

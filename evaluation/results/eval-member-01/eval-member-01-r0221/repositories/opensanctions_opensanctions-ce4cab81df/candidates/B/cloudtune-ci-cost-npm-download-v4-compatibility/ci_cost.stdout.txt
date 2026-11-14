@@ -1,0 +1,87 @@
+[2mAnalyzing workflows in C:\Users\Ishara\AppData\Local\Temp\cloudtune-ci-cost-b_a8un8s\.github\workflows...[0m
+[2mFound 1 workflow file[0m
+
+[1m[36mci-cost[0m â€” GitHub Actions Cost Analyzer
+
+[2mAnalyzed 1 workflow Â· 1 job Â· 2 recommendations[0m
+
+[1mSEVERITY  RECOMMENDATION                                        ESTIMATED SAVINGS[0m
+[2mâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€[0m
+[31m[1mHIGH  [0m  Add npm dependency cache to "refresh" job             [32m~4 min per run[0m
+[31m[1mHIGH  [0m  Split "refresh" into parallel jobs (lint + test +...  [32m~6 min per run[0m
+
+[2mâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€[0m
+
+[1mRecommendations:[0m
+
+[1m1. [31m[HIGH][0m[1m Add npm dependency cache to "refresh" job[0m
+   [2mFile: ui-deps-refresh.yml Â· Job: refresh[0m
+   Job "refresh" installs npm dependencies without caching. Add `actions/cache` before the install step to restore the npm cache across runs. This is one of the highest-impact optimizations for most CI workflows.
+
+   [36mFix:[0m
+   [2m# Add before your npm install step in job "refresh":[0m
+   [2m      - name: Cache node_modules[0m
+   [2m        uses: actions/cache@v4[0m
+   [2m        with:[0m
+   [2m          path: node_modules[0m
+   [2m          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}[0m
+   [2m          restore-keys: |[0m
+   [2m            ${{ runner.os }}-node-[0m
+
+[1m2. [31m[HIGH][0m[1m Split "refresh" into parallel jobs (lint + test + build)[0m
+   [2mFile: ui-deps-refresh.yml Â· Job: refresh[0m
+   Job "refresh" runs lint, test, and/or build sequentially in a single job. Splitting them into separate parallel jobs can cut total runtime by 50â€“70% since they can run concurrently. Each job only needs to wait for the steps it depends on.
+
+   [36mFix:[0m
+   [2m# Split "refresh" into parallel jobs:[0m
+   [2mjobs:[0m
+   [2m  lint:[0m
+   [2m    runs-on: ubuntu-latest[0m
+   [2m    steps:[0m
+   [2m      - uses: actions/checkout@v4[0m
+   [2m      - uses: actions/setup-node@v4[0m
+   [2m        with:[0m
+   [2m          node-version: '20'[0m
+   [2m          cache: 'npm'[0m
+   [2m      - run: npm ci[0m
+   [2m      - run: npm run lint[0m
+   [2m      - run: npm run typecheck[0m
+   [2m[0m
+   [2m  test:[0m
+   [2m    runs-on: ubuntu-latest[0m
+   [2m    steps:[0m
+   [2m      - uses: actions/checkout@v4[0m
+   [2m      - uses: actions/setup-node@v4[0m
+   [2m        with:[0m
+   [2m          node-version: '20'[0m
+   [2m          cache: 'npm'[0m
+   [2m      - run: npm ci[0m
+   [2m      - run: npm test[0m
+   [2m[0m
+   [2m  build:[0m
+   [2m    runs-on: ubuntu-latest[0m
+   [2m    needs: [lint, test][0m
+   [2m    steps:[0m
+   [2m      - uses: actions/checkout@v4[0m
+   [2m      - uses: actions/setup-node@v4[0m
+   [2m        with:[0m
+   [2m          node-version: '20'[0m
+   [2m          cache: 'npm'[0m
+   [2m      - run: npm ci[0m
+   [2m      - run: npm run build[0m
+
+[2mâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€[0m
+
+[1mSummary[0m
+
+  Estimated monthly cost:   [33m~$12.80/month[0m
+  Time savings per run:     [32m~10 min/run[0m
+  Estimated monthly savings: [32m~$16.00/month[0m
+
+  Issues:  [31m2 HIGH[0m
+
+  [2mRun with [0m[36m--fix[0m[2m to generate optimized workflow files[0m
+
+[2mGenerating optimized workflow files in C:\Users\Ishara\AppData\Local\Temp\cloudtune-ci-cost-b_a8un8s\.github\workflows\optimized...[0m
+[32mGenerated 1 optimized workflow file:[0m
+  [36mC:\Users\Ishara\AppData\Local\Temp\cloudtune-ci-cost-b_a8un8s\.github\workflows\optimized\ui-deps-refresh.yml[0m

@@ -1,0 +1,61 @@
+name: 📦 Build
+
+on:
+    push:
+        branches:
+            - dev
+    pull_request:
+        branches:
+            - dev
+        types:
+            - opened
+            - synchronize
+            - reopened
+            - ready_for_review
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+
+env:
+    TURBO_TELEMETRY_DISABLED: '1'
+
+jobs:
+    build:
+        if: github.repository == 'dream-num/univer' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+
+        env:
+            TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+            TURBO_TEAM: ${{ vars.TURBO_TEAM }}
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v7
+              with:
+                  repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+                  ref: ${{ github.event.pull_request.head.sha || github.sha }}
+                  persist-credentials: false
+
+            - name: Setup Node.js
+              uses: ./.github/actions/setup-node
+              with:
+                  save-cache: 'true'
+
+            - name: 📦 Build
+              run: pnpm build:ci
+
+            - name: Check for uncommitted changes
+              run: |
+                  if [[ -n $(git status --porcelain) ]]; then
+                      echo "Error: Uncommitted changes detected after build."
+                      echo "Changed files:"
+                      git status --porcelain
+                      echo "Diff of changes:"
+                      git diff
+                      exit 1
+                  fi
