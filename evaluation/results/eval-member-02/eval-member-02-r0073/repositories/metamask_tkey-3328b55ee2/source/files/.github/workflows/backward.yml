@@ -1,0 +1,68 @@
+# Runs compatibility tests
+
+name: Backward Compatibility Tests
+
+# Controls when the action will run.
+on:
+  create:
+  # Triggers the workflow on push or pull request events but only for the master branch
+  #push:
+  #  branches: [master]
+  #pull_request:
+  #  branches: [master]
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Backward Compatibility Tests
+    strategy:
+      matrix:
+        node: ["24.x"]
+        os: [ubuntu-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: checkout tkey repo
+        uses: actions/checkout@v6
+        with:
+          path: tkey
+
+      - name: switch path
+        run: |
+          cd ./tkey
+
+      - name: Set up node
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          cache: "npm"
+
+      - name: Install dependencies, pack
+        run: |
+          npm ci
+          npm run pack:lerna
+
+      - name: Clone comp tests
+        uses: actions/checkout@v6
+        with:
+          repository: tkey/backward-compatibility-tests
+          path: backward-compatibility-tests
+
+      - name: Setup comp tests
+        run: |
+          cd ./backward-compatibility-tests
+          npm i
+          for filename in ../tkey/packages/* ; do
+            echo "installing $filename" || continue
+            # ... install packed packages
+            packagename="`ls ${filename}| grep tkey`"
+            npm i "${filename}/${packagename}"
+          done
+
+      - name: Running comp tests
+        run: |
+          cd ./backward-compatibility-tests
+          npm test

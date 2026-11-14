@@ -1,0 +1,115 @@
+name: Upload Package
+
+on:
+  push:
+    branches:
+      - main
+      - release/*
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+permissions: {}
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1  # v4.4.0
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302  # v6.2.0
+        with:
+          images: |
+            ghcr.io/${{ github.repository }}
+
+      - name: Build and push Docker images
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=blint
+          cache-to: type=gha,mode=max,scope=blint
+
+  pypi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Linux packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install zlib1g-dev libzstd-dev llvm-18 llvm-18-dev
+
+      - name: Install dependencies
+        run: |
+          pipx install poetry
+          pipx ensurepath
+
+      - name: Verify Project TOML Version
+        id: prep
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          poetry install --no-cache --all-groups --all-extras
+          toml_version=$(echo "v"$(poetry version -s))
+          if [[ $toml_version != $(echo $GITHUB_REF | cut -d / -f 3) ]]; then
+            echo "TOML version does not match tag."
+            exit 1
+          fi
+        env:
+          NYXSTONE_LLVM_PREFIX: /usr/lib/llvm-18
+      - name: Build dist
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          poetry build --no-cache
+        env:
+          NYXSTONE_LLVM_PREFIX: /usr/lib/llvm-18
+      - name: Release PyPI
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
+
+      - name: Generate SBOM with cdxgen
+        run: |
+          npm install -g @cdxgen/cdxgen
+          cdxgen -t python -o bom.json $(pwd) -p
+      - name: Upload bom to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3.0.3
+        with:
+          files: |
+            bom.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

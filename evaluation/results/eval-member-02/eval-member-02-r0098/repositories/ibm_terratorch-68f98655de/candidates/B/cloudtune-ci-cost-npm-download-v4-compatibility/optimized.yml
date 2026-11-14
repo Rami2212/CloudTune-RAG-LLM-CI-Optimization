@@ -1,0 +1,133 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [MEDIUM] Add concurrency group to "tests.yaml"
+# Estimated savings: ~2 min/run
+#
+name: terratorch tuning toolkit
+
+on: 
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+      - 'tests/resources/**'
+      - 'examples/**/*'
+      - '**/*.svg'
+      - '**/*.png'
+      - '**/*.txt'
+      - '**/*.ipynb'
+      - 'integrationtests/**/*'
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+      - 'tests/resources/**'
+      - 'examples/**/*'
+      - '**/*.svg'
+      - '**/*.png'
+      - '**/*.txt'
+      - '**/*.ipynb'
+      - 'integrationtests/**/*'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'
+jobs:
+  build:
+    environment: cicd
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        python-version: ["3.13"]
+    env:
+      R_TESTS_VERBOSE: 2
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+    steps:
+      - name: Clone repo
+        uses: actions/checkout@v5
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+      - name: Install dependencies
+        run: |
+          pip install pip==25.1
+          pip --version
+          pip install -e .[test,tortilla,logging] -c constraints/test-py313.txt
+      - name: List pip dependencies
+        run: pip list
+      - name: Test with pytest (fast)
+        run: |
+          pytest -s -v -m "not slow" tests
+
+  slow-tests:
+    if: github.event_name != 'pull_request'
+    environment: cicd
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        python-version: ["3.13"]
+    env:
+      R_TESTS_VERBOSE: 2
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+    steps:
+      - name: Clone repo
+        uses: actions/checkout@v5
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+      - name: Install dependencies
+        run: |
+          pip install pip==25.1
+          pip --version
+          pip install -e .[test,tortilla,logging] -c constraints/test-py313.txt
+      - name: Test with pytest (slow)
+        run: |
+          # pytest exit code 5 == "no tests collected". The only slow-marked tests
+          # (test_detr.py) require the rfdetr extra and run in the rfdetr-tests job,
+          # so nothing is selected here; treat 5 as success instead of failing the job.
+          pytest -s -v -m "slow" tests || [ "$?" -eq 5 ]
+
+  rfdetr-tests:
+    environment: cicd
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        python-version: ["3.13"]
+    env:
+      R_TESTS_VERBOSE: 2
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+    steps:
+      - name: Clone repo
+        uses: actions/checkout@v5
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+      - name: Install dependencies
+        run: |
+          pip install pip==25.1
+          pip --version
+          pip install -e .[test,rfdetr] -c constraints/test-py313.txt
+      - name: Test RF-DETR integration
+        run: |
+          pytest -s -v tests/test_detr.py -k "rfdetr"

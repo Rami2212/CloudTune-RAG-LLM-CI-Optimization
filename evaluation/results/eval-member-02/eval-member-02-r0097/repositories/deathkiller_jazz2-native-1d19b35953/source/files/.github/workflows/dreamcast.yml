@@ -1,0 +1,131 @@
+name: 'Sega Dreamcast'
+
+on:
+  push:
+    branches:
+      - 'master'
+  pull_request:
+    types: [ opened, synchronize ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  Build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - BuildType: Release
+
+    runs-on: 'ubuntu-latest'
+    container:
+      # sh-elf/arm-eabi toolchains prebuilt by the KallistiOS CI (see utils/kos-chain/docker in the KOS repository)
+      image: pcercuei/dreamcast-toolchain:stable
+      options: --user root
+
+    env:
+      # Pinned to the revisions the game is developed and tested against - an unpinned clone of KOS
+      # master can break this workflow (or silently change the runtime) with no change in this repository
+      KOS_COMMIT: 1c6398f9faa55eb397018ef830b3285e6839421b
+      KOS_PORTS_COMMIT: f4faacc42faaf552625777b7709e871a827e1055
+      MKDCDISC_COMMIT: ade5d8a54f5e0e729faedf5a0ceadffec6aa8ccb
+
+    steps:
+    - name: 'Checkout Repository'
+      uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+
+    - name: 'Install Dependencies'
+      shell: bash
+      run: |
+        # GNU tar and zstd are for actions/cache in the step below - it shells out to `tar --posix --files-from`,
+        # which the image's BusyBox tar doesn't understand, so saving the cache fails during post-job cleanup
+        apk add --no-cache cmake meson ninja pkgconf libisofs-dev zlib-dev tar zstd
+
+        # mkdcdisc is used to create a bootable CDI image with the game content included
+        git init /tmp/mkdcdisc
+        cd /tmp/mkdcdisc
+        git remote add origin https://gitlab.com/simulant/mkdcdisc.git
+        git fetch --depth 1 origin ${MKDCDISC_COMMIT}
+        git checkout FETCH_HEAD
+        meson setup build
+        ninja -C build
+        cp ./build/mkdcdisc /usr/local/bin/
+
+    - name: 'Cache KallistiOS'
+      id: cache-kos
+      uses: actions/cache@v4
+      with:
+        path: |
+          /opt/toolchains/dc/kos
+          /opt/toolchains/dc/kos-ports
+        key: kos-${{ env.KOS_COMMIT }}-${{ env.KOS_PORTS_COMMIT }}
+
+    - name: 'Build KallistiOS'
+      if: steps.cache-kos.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        # The toolchain image contains only the compilers, KOS itself has to be built from source
+        git init /opt/toolchains/dc/kos
+        cd /opt/toolchains/dc/kos
+        git remote add origin https://github.com/KallistiOS/KallistiOS.git
+        git fetch --depth 1 origin ${KOS_COMMIT}
+        git checkout FETCH_HEAD
+        # The defaults in the sample match the toolchain paths inside the image
+        cp doc/environ.sh.sample environ.sh
+        mkdir -p /opt/toolchains/dc/bin
+        source environ.sh
+        make -j $(nproc)
+
+        # zlib is required for compressed game content
+        git init /opt/toolchains/dc/kos-ports
+        cd /opt/toolchains/dc/kos-ports
+        git remote add origin https://github.com/KallistiOS/kos-ports.git
+        git fetch --depth 1 origin ${KOS_PORTS_COMMIT}
+        git checkout FETCH_HEAD
+
+        # The port pulls the release tarball straight from zlib.net with a bare `curl -O -L`. That has no --fail,
+        # so when the host answers a hosted runner with an error page instead of the file, the page is written out
+        # under the tarball's name and the build stops at the size check that follows. Seeding the file skips the
+        # download entirely (see kos-ports scripts/download.mk) - the GitHub release asset is byte-identical, and
+        # the checksum in the port's own distinfo still gets to verify it.
+        ZLIB_VERSION=$(sed -n 's/^PORTVERSION *= *//p' /opt/toolchains/dc/kos-ports/zlib/Makefile | tr -d '[:space:]')
+        mkdir -p /opt/toolchains/dc/kos-ports/zlib/dist/
+        curl -fsSL -o /opt/toolchains/dc/kos-ports/zlib/dist/zlib-${ZLIB_VERSION}.tar.gz \
+          https://github.com/madler/zlib/releases/download/v${ZLIB_VERSION}/zlib-${ZLIB_VERSION}.tar.gz
+
+        # The port installs into the KOS tree itself, so the cache above covers it too
+        make -C /opt/toolchains/dc/kos-ports/zlib install
+
+    - name: 'Configure CMake'
+      shell: bash
+      run: |
+        rm -f ./Content/Translations/*.po
+
+        git config --global --add safe.directory '*'
+        source /opt/toolchains/dc/kos/environ.sh
+        cmake -B ./_build/ -D CMAKE_BUILD_TYPE=${{ matrix.BuildType }} -D CMAKE_TOOLCHAIN_FILE=${KOS_BASE}/utils/cmake/kallistios.toolchain.cmake
+
+    - name: 'Build'
+      shell: bash
+      run: |
+        source /opt/toolchains/dc/kos/environ.sh
+        make -j $(nproc) -C ./_build/
+
+    - name: 'Create Package'
+      run: |
+        # The CDI image is bootable directly in emulators and contains the game content
+        mkdir ./_package/
+        cp -f ./_build/jazz2.cdi ./_package/Jazz2.cdi
+        cp -f ./_build/jazz2.elf ./_package/Jazz2.elf
+        cp -f ./LICENSE ./_package/LICENSE
+
+    - name: 'Upload Package'
+      uses: actions/upload-artifact@v7
+      with:
+        name: Jazz2_Dreamcast
+        path: ./_package/

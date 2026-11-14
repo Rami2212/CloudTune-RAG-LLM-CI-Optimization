@@ -1,0 +1,54 @@
+name: Claude Code
+
+on:
+  # Interactive: Respond to @claude mentions
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  issues:
+    types: [opened, assigned]
+
+jobs:
+  claude:
+    if: |
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read  # Required for Claude to read CI results on PRs
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code
+        id: claude
+        uses: anthropics/claude-code-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+
+          additional_permissions: |
+            actions: read
+
+          # Custom instructions for CNVkit
+          custom_instructions: |
+            This is a bioinformatics Python package for copy number variant detection.
+
+            - Follow the project's code style conventions (see CLAUDE.md)
+            - All code must work with Python 3.11+
+            - Security tools (bandit) are configured to allow subprocess calls needed for bioinformatics tools
+            - R is required for segmentation (DNAcopy package)
+            - Pre-commit hooks are configured - run before committing
+            - Use pytest for testing, not unittest
+            - Respect the existing architecture (see CLAUDE.md for details)

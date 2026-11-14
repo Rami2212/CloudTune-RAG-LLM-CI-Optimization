@@ -1,0 +1,814 @@
+name: CI
+
+on:
+  push:
+    branches: [development, master]
+  pull_request:
+    branches: [development, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same PR supersedes its older run, which frees runners on the org's shared job limit.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Detect Electron Changes
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      electron: ${{ steps.filter.outputs.electron }}
+    steps:
+      - uses: actions/checkout@v4
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 2
+
+      # Pushes always package every platform; PRs package Windows and Apple Silicon only when Electron, packaging,
+      # or production build inputs change, since those jobs are the only Windows/macOS builds a PR gets.
+      - name: Check packaging inputs
+        id: filter
+        if: github.event_name == 'pull_request'
+        run: |
+          # The PR merge commit's first parent is the base branch tip.
+          changed=$(git diff --no-renames --name-only HEAD^1 HEAD)
+          printf '%s\n' "$changed"
+          if printf '%s\n' "$changed" | grep -qE '^(electron/|forge\.config\.js$|vite\.config\.js$|package\.json$|yarn\.lock$|\.yarnrc\.yml$|public/(icon|windows-icon)|scripts/(static-shell/|vite-[^/]+\.mjs$|generate-asset-manifest\.js$|banners\.mjs$|sync-directories\.js$|find-forge-executable\.js$|verify-electron-native-modules\.js$)|\.github/workflows/ci\.yml$)'; then
+            echo "electron=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "electron=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  checks:
+    name: Tests + Static Checks
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js v22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable
+
+      - name: Resolve Yarn cache path
+        id: yarn-cache
+        shell: bash
+        run: echo "dir=$(corepack yarn config get cacheFolder)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Yarn package tarballs
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.yarn-cache.outputs.dir }}
+          key: ${{ runner.os }}-${{ runner.arch }}-yarn-v2-${{ hashFiles('yarn.lock', 'package.json', '.yarnrc.yml') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-yarn-v2-
+
+      - name: Install dependencies
+        run: |
+          for i in 1 2 3; do
+            echo "yarn install attempt $i"
+            yarn install --immutable && break
+            sleep 5
+            [ "$i" = "3" ] && exit 1
+          done
+
+      - name: Check AI workflows
+        run: |
+          yarn ai-workflow:check
+          yarn ai-workflow:test
+
+      - name: Lint
+        run: yarn lint
+
+      - name: Type check
+        run: yarn type-check
+
+      - name: React Doctor diagnostics
+        run: yarn doctor:check
+        env:
+          PERF_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || (github.event.before != '0000000000000000000000000000000000000000' && github.event.before) || '' }}
+
+      - name: Run Vitest
+        if: github.event_name == 'pull_request'
+        run: yarn test --run
+
+      # Pushes collect coverage instead. It runs test files one at a time, which #1132 needed for a stable coverage run.
+      - name: Collect coverage
+        if: github.event_name != 'pull_request'
+        run: yarn test:coverage
+
+      - name: Write coverage badge payload
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        run: node scripts/write-coverage-badge.mjs
+
+      - name: Upload coverage badge
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-badge
+          path: badges/coverage.json
+          if-no-files-found: error
+
+      - name: Upload coverage summary
+        if: always() && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-summary
+          path: coverage/coverage-summary.json
+          if-no-files-found: warn
+
+  build:
+    name: Build + Smoke
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js v22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable
+
+      - name: Resolve Yarn cache path
+        id: yarn-cache
+        shell: bash
+        run: echo "dir=$(corepack yarn config get cacheFolder)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Yarn package tarballs
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.yarn-cache.outputs.dir }}
+          key: ${{ runner.os }}-${{ runner.arch }}-yarn-v2-${{ hashFiles('yarn.lock', 'package.json', '.yarnrc.yml') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-yarn-v2-
+
+      - name: Install dependencies
+        run: |
+          for i in 1 2 3; do
+            echo "yarn install attempt $i"
+            yarn install --immutable && break
+            sleep 5
+            [ "$i" = "3" ] && exit 1
+          done
+
+      - name: Build React app
+        run: yarn build
+        env:
+          CI: ''
+
+      - name: Check startup asset ceiling
+        run: yarn perf:startup-bytes
+
+      - name: Verify production excludes React development instrumentation
+        run: |
+          if grep -rlE "__REACT_PERF__|agentation-dev-tools|data-feedback-toolbar|__ELEMENT_SOURCE__" build/assets; then
+            echo "::error::React profiling or development inspectors leaked into the production bundle"
+            exit 1
+          fi
+
+      - name: Build preload script
+        run: yarn build:preload
+
+      - name: Verify build outputs
+        run: |
+          ls -la build/ || exit 1
+          ls -la build/electron/preload.cjs || exit 1
+          ls -la build/index.html || exit 1
+
+      - name: Verify forge config
+        run: node -e "import('./forge.config.js').then(c => console.log('Config loaded, makers:', c.default.makers?.length || 0)).catch(e => { console.error(e); process.exit(1); })"
+
+      - name: Install stable Chrome for smoke tests
+        run: corepack yarn exec playwright install --force --with-deps chrome
+
+      - name: Smoke test built web app
+        run: node scripts/smoke-web-app.js --start-preview
+
+  load:
+    name: Cold Load (${{ matrix.shard }}/${{ strategy.job-total }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js v22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable
+
+      - name: Resolve Yarn cache path
+        id: yarn-cache
+        shell: bash
+        run: echo "dir=$(corepack yarn config get cacheFolder)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Yarn package tarballs
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.yarn-cache.outputs.dir }}
+          key: ${{ runner.os }}-${{ runner.arch }}-yarn-v2-${{ hashFiles('yarn.lock', 'package.json', '.yarnrc.yml') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-yarn-v2-
+
+      - name: Install dependencies
+        run: |
+          for i in 1 2 3; do
+            echo "yarn install attempt $i"
+            yarn install --immutable && break
+            sleep 5
+            [ "$i" = "3" ] && exit 1
+          done
+
+      # Rebuilding here is faster than waiting for the Build + Smoke job and downloading its output.
+      - name: Build React app
+        run: yarn build
+        env:
+          CI: ''
+
+      - name: Install performance browser
+        run: yarn perf:install --force --with-deps
+
+      - name: Check cold-load layout stability and static shell handoff
+        run: yarn perf:load --check --profile cpu4 --samples 2 --shard ${{ matrix.shard }}/${{ strategy.job-total }} --output .react-perf/ci-load
+
+      - name: Upload cold-load evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: react-performance-load-${{ matrix.shard }}
+          path: .react-perf/
+          include-hidden-files: true
+          if-no-files-found: warn
+
+  perf:
+    name: React Runtime (${{ matrix.shard }}/${{ strategy.job-total }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js v22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable
+
+      - name: Resolve Yarn cache path
+        id: yarn-cache
+        shell: bash
+        run: echo "dir=$(corepack yarn config get cacheFolder)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Yarn package tarballs
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.yarn-cache.outputs.dir }}
+          key: ${{ runner.os }}-${{ runner.arch }}-yarn-v2-${{ hashFiles('yarn.lock', 'package.json', '.yarnrc.yml') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-yarn-v2-
+
+      - name: Install dependencies
+        run: |
+          for i in 1 2 3; do
+            echo "yarn install attempt $i"
+            yarn install --immutable && break
+            sleep 5
+            [ "$i" = "3" ] && exit 1
+          done
+
+      - name: Install performance browser
+        run: yarn perf:install --force --with-deps
+
+      - name: Check React runtime scenarios
+        run: yarn perf:check --shard ${{ matrix.shard }}/${{ strategy.job-total }} --output .react-perf/ci
+
+      - name: Upload React performance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: react-performance-runtime-${{ matrix.shard }}
+          path: .react-perf/
+          include-hidden-files: true
+          if-no-files-found: warn
+
+  # Keeps the required "Quality + Smoke" check: it passes only when every split quality job passed.
+  quality:
+    name: Quality + Smoke
+    runs-on: ubuntu-22.04
+    needs: [changes, checks, build, load, perf]
+    # always(): a timed-out or cancelled quality job must fail this required check, not skip it.
+    if: always()
+    timeout-minutes: 5
+    steps:
+      - name: Require every quality job to pass
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Quality job results: $RESULTS"
+          for result in $RESULTS; do
+            [ "$result" = "success" ] || exit 1
+          done
+
+  publish-coverage-badge:
+    name: Publish Badges
+    runs-on: ubuntu-22.04
+    needs: quality
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    env:
+      COVERAGE_PAGES_ARTIFACT: coverage-pages-${{ github.run_attempt }}
+    steps:
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Download coverage badge
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-badge
+          path: ${{ runner.temp }}/coverage-badge
+
+      - name: Check published coverage badge
+        id: published-badge
+        env:
+          BADGE_SOURCE_PATH: ${{ runner.temp }}/coverage-badge/coverage.json
+          PUBLISHED_BADGE_PATH: ${{ runner.temp }}/published-coverage.json
+        run: |
+          if curl -fsSL --retry 3 --retry-delay 5 "https://bitsocialnet.github.io/5chan/badges/coverage.json" -o "${PUBLISHED_BADGE_PATH}" &&
+            cmp -s "${BADGE_SOURCE_PATH}" "${PUBLISHED_BADGE_PATH}"; then
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            echo "Coverage badge is already up to date."
+          else
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Prepare Pages artifact
+        if: steps.published-badge.outputs.changed == 'true'
+        env:
+          BADGE_SOURCE_PATH: ${{ runner.temp }}/coverage-badge/coverage.json
+          PAGES_OUTPUT_PATH: ${{ runner.temp }}/github-pages
+        run: |
+          mkdir -p "${PAGES_OUTPUT_PATH}/badges"
+          cp "${BADGE_SOURCE_PATH}" "${PAGES_OUTPUT_PATH}/badges/coverage.json"
+          touch "${PAGES_OUTPUT_PATH}/.nojekyll"
+
+      - name: Upload Pages artifact
+        if: steps.published-badge.outputs.changed == 'true'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          name: ${{ env.COVERAGE_PAGES_ARTIFACT }}
+          path: ${{ runner.temp }}/github-pages
+
+      - name: Deploy badge site
+        if: steps.published-badge.outputs.changed == 'true'
+        id: deployment
+        continue-on-error: true
+        uses: actions/deploy-pages@v4
+        with:
+          artifact_name: ${{ env.COVERAGE_PAGES_ARTIFACT }}
+
+      - name: Wait before badge deploy retry
+        if: steps.published-badge.outputs.changed == 'true' && steps.deployment.outcome == 'failure'
+        run: sleep 60
+
+      - name: Retry badge site deploy
+        if: steps.published-badge.outputs.changed == 'true' && steps.deployment.outcome == 'failure'
+        id: deployment_retry
+        continue-on-error: true
+        uses: actions/deploy-pages@v4
+        with:
+          artifact_name: ${{ env.COVERAGE_PAGES_ARTIFACT }}
+
+      - name: Report badge deploy failure
+        if: steps.published-badge.outputs.changed == 'true' && steps.deployment.outcome == 'failure' && steps.deployment_retry.outcome != 'success'
+        run: |
+          echo "::warning::Coverage badge artifact was generated, but GitHub Pages rejected the badge deployment. App CI remains green because badge publishing is advisory."
+
+  android-build:
+    name: Android Build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.gradle/caches
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+
+      - name: Setup Node.js v22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable
+
+      - name: Resolve Yarn cache path
+        id: yarn-cache
+        shell: bash
+        run: echo "dir=$(corepack yarn config get cacheFolder)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Yarn package tarballs
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.yarn-cache.outputs.dir }}
+          key: ${{ runner.os }}-${{ runner.arch }}-yarn-v2-${{ hashFiles('yarn.lock', 'package.json', '.yarnrc.yml') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-yarn-v2-
+
+      - name: Install dependencies
+        run: |
+          for i in 1 2 3; do
+            echo "yarn install attempt $i"
+            yarn install --immutable && break
+            sleep 5
+            [ "$i" = "3" ] && exit 1
+          done
+
+      - name: Build React app
+        run: yarn build
+        env:
+          CI: ''
+
+      - name: Sync Capacitor Android project
+        run: npx cap sync android
+
+      - name: Run Android unit tests and assemble debug APKs
+        run: cd android && ./gradlew testGithubDebugUnitTest testFdroidDebugUnitTest assembleGithubDebug assembleFdroidDebug --stacktrace
+
+  package-linux:
+    name: Package Linux (Ubuntu)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js v22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable
+
+      - name: Resolve Yarn cache path
+        id: yarn-cache
+        shell: bash
+        run: echo "dir=$(corepack yarn config get cacheFolder)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Yarn package tarballs
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.yarn-cache.outputs.dir }}
+          key: ${{ runner.os }}-${{ runner.arch }}-yarn-v2-${{ hashFiles('yarn.lock', 'package.json', '.yarnrc.yml') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-yarn-v2-
+
+      - name: Cache electron binaries
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/electron
+          key: ${{ runner.os }}-electron-v2-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: ${{ runner.os }}-electron-v2-
+
+      - name: Install dependencies
+        run: |
+          for i in 1 2 3; do
+            echo "yarn install attempt $i"
+            yarn install --immutable && break
+            sleep 5
+            [ "$i" = "3" ] && exit 1
+          done
+
+      - name: Build React app
+        run: yarn build
+        env:
+          CI: ''
+
+      - name: Build preload script
+        run: yarn build:preload
+
+      - name: Verify build outputs
+        run: |
+          ls -la build/ || exit 1
+          ls -la build/electron/preload.cjs || exit 1
+          ls -la build/index.html || exit 1
+
+      - name: Rebuild and verify Electron native modules
+        timeout-minutes: 10
+        run: yarn electron:prepare-package
+
+      - name: Package Electron app
+        timeout-minutes: 30
+        run: |
+          set -o pipefail
+          yarn electron-forge package 2>&1 | tee forge-output.log
+          ls -la out/
+
+      - name: Verify executable
+        run: |
+          ls -la out/
+          EXE=$(node scripts/find-forge-executable.js)
+          echo "Found executable: $EXE"
+          test -f "$EXE" && test -x "$EXE" && echo "Executable is valid"
+
+  package-mac-intel:
+    name: Package Mac (Intel)
+    runs-on: macos-15-intel
+    # The slowest packaging job runs on pushes only; PRs cover macOS packaging on Apple Silicon.
+    if: github.event_name != 'pull_request'
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js v22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable
+
+      - name: Resolve Yarn cache path
+        id: yarn-cache
+        shell: bash
+        run: echo "dir=$(corepack yarn config get cacheFolder)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Yarn package tarballs
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.yarn-cache.outputs.dir }}
+          key: ${{ runner.os }}-${{ runner.arch }}-yarn-v2-${{ hashFiles('yarn.lock', 'package.json', '.yarnrc.yml') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-yarn-v2-
+
+      - name: Install setuptools for native modules
+        run: pip3 install --break-system-packages setuptools || pip3 install --user setuptools || true
+
+      - name: Cache electron binaries
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/electron
+          key: ${{ runner.os }}-electron-v2-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: ${{ runner.os }}-electron-v2-
+
+      - name: Install dependencies
+        run: |
+          for i in 1 2 3; do
+            echo "yarn install attempt $i"
+            yarn install --immutable && break
+            sleep 5
+            [ "$i" = "3" ] && exit 1
+          done
+
+      - name: Build React app
+        run: yarn build
+        env:
+          CI: ''
+
+      - name: Build preload script
+        run: yarn build:preload
+
+      - name: Verify build outputs
+        run: |
+          ls -la build/ || exit 1
+          ls -la build/electron/preload.cjs || exit 1
+          ls -la build/index.html || exit 1
+
+      - name: Rebuild and verify Electron native modules
+        timeout-minutes: 10
+        run: yarn electron:prepare-package
+
+      - name: Package Electron app
+        timeout-minutes: 30
+        run: |
+          set -o pipefail
+          yarn electron-forge package 2>&1 | tee forge-output.log
+          ls -la out/
+
+      - name: Verify executable
+        run: |
+          ls -la out/
+          EXE=$(node scripts/find-forge-executable.js)
+          echo "Found executable: $EXE"
+          test -f "$EXE" && test -x "$EXE" && echo "Executable is valid"
+
+  package-mac-arm:
+    name: Package Mac (Apple Silicon)
+    runs-on: macos-latest
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.electron == 'true'
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js v22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable
+
+      - name: Resolve Yarn cache path
+        id: yarn-cache
+        shell: bash
+        run: echo "dir=$(corepack yarn config get cacheFolder)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Yarn package tarballs
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.yarn-cache.outputs.dir }}
+          key: ${{ runner.os }}-${{ runner.arch }}-yarn-v2-${{ hashFiles('yarn.lock', 'package.json', '.yarnrc.yml') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-yarn-v2-
+
+      - name: Install setuptools for native modules
+        run: pip3 install --break-system-packages setuptools || pip3 install --user setuptools || true
+
+      - name: Cache electron binaries
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/electron
+          key: ${{ runner.os }}-electron-v2-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: ${{ runner.os }}-electron-v2-
+
+      - name: Install dependencies
+        run: |
+          for i in 1 2 3; do
+            echo "yarn install attempt $i"
+            yarn install --immutable && break
+            sleep 5
+            [ "$i" = "3" ] && exit 1
+          done
+
+      - name: Build React app
+        run: yarn build
+        env:
+          CI: ''
+
+      - name: Build preload script
+        run: yarn build:preload
+
+      - name: Verify build outputs
+        run: |
+          ls -la build/ || exit 1
+          ls -la build/electron/preload.cjs || exit 1
+          ls -la build/index.html || exit 1
+
+      - name: Rebuild and verify Electron native modules
+        timeout-minutes: 10
+        run: yarn electron:prepare-package
+
+      - name: Package Electron app
+        timeout-minutes: 30
+        run: |
+          set -o pipefail
+          yarn electron-forge package 2>&1 | tee forge-output.log
+          ls -la out/
+
+      - name: Verify executable
+        run: |
+          ls -la out/
+          EXE=$(node scripts/find-forge-executable.js)
+          echo "Found executable: $EXE"
+          test -f "$EXE" && test -x "$EXE" && echo "Executable is valid"
+
+  package-windows:
+    name: Package Windows
+    runs-on: windows-2022
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.electron == 'true'
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js v22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable
+
+      - name: Resolve Yarn cache path
+        id: yarn-cache
+        shell: bash
+        run: echo "dir=$(corepack yarn config get cacheFolder)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Yarn package tarballs
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.yarn-cache.outputs.dir }}
+          key: ${{ runner.os }}-${{ runner.arch }}-yarn-v2-${{ hashFiles('yarn.lock', 'package.json', '.yarnrc.yml') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-yarn-v2-
+
+      - name: Cache electron binaries
+        uses: actions/cache@v4
+        with:
+          path: ~/AppData/Local/electron/Cache
+          key: ${{ runner.os }}-electron-v2-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: ${{ runner.os }}-electron-v2-
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          for i in 1 2 3; do
+            echo "yarn install attempt $i"
+            yarn install --immutable && break
+            sleep 5
+            [ "$i" = "3" ] && exit 1
+          done
+
+      - name: Build React app
+        shell: bash
+        run: yarn build
+        env:
+          CI: ''
+
+      - name: Build preload script
+        shell: bash
+        run: yarn build:preload
+
+      - name: Verify build outputs
+        shell: bash
+        run: |
+          ls -la build/ || exit 1
+          ls -la build/electron/preload.cjs || exit 1
+          ls -la build/index.html || exit 1
+
+      - name: Rebuild and verify Electron native modules
+        shell: bash
+        timeout-minutes: 10
+        run: yarn electron:prepare-package
+
+      - name: Make Electron installer
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          set -o pipefail
+          yarn electron-forge make --platform=win32 --arch=x64 2>&1 | tee forge-output.log
+          ls -la out/make/
+
+      - name: Verify ASAR runtime files
+        shell: bash
+        run: |
+          APP_ASAR=$(find out -path '*/resources/app.asar' | head -n 1)
+          KUBO_EXE=$(find out -path '*/resources/app.asar.unpacked/bin/win/ipfs.exe' | head -n 1)
+          # better-sqlite3 13 loads its bundled N-API prebuild for the platform and arch.
+          SQLITE_MODULE=$(find out -path '*/resources/app.asar.unpacked/node_modules/better-sqlite3/prebuilds/win32-x64.node' | head -n 1)
+          DATACHANNEL_MODULE=$(find out -path '*/resources/app.asar.unpacked/node_modules/@node-datachannel/win32-x64-msvc/node_datachannel.node' | head -n 1)
+          echo "Found ASAR: $APP_ASAR"
+          echo "Found Kubo: $KUBO_EXE"
+          echo "Found SQLite module: $SQLITE_MODULE"
+          echo "Found data channel module: $DATACHANNEL_MODULE"
+          test -f "$APP_ASAR"
+          test -f "$KUBO_EXE"
+          test -f "$SQLITE_MODULE"
+          test -f "$DATACHANNEL_MODULE"
+          "$KUBO_EXE" version
+
+      - name: Verify Squirrel installer
+        shell: bash
+        run: |
+          SETUP_EXE=$(find out/make -iname '*setup*.exe' | head -n 1)
+          echo "Found installer: $SETUP_EXE"
+          test -n "$SETUP_EXE" && test -f "$SETUP_EXE" && echo "Installer is valid"
+
+      - name: Verify executable
+        shell: bash
+        run: |
+          ls -la out/
+          EXE=$(node scripts/find-forge-executable.js)
+          echo "Found executable: $EXE"
+          test -f "$EXE" && test -x "$EXE" && echo "Executable is valid"

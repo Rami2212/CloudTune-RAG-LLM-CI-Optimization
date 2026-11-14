@@ -1,0 +1,62 @@
+plugins {
+  id 'java'
+  alias(libs.plugins.jmh)
+}
+
+description 'A JMH benchmark to assert the overhead imposed by various types of BTrace instrumentation.'
+
+def env = System.getenv()
+def javaHome = env['JAVA_HOME']
+
+dependencies {
+  implementation project(path: ":btrace-dist", configuration: "shadow")
+  implementation project(":btrace-compiler")
+  jmh tasks.getByPath(':btrace-dist:btraceJar').outputs.getFiles()
+
+  jmh libs.jmh
+  jmh libs.jmh.annprocess
+}
+
+task btracec(type: JavaExec) {
+  group 'Build'
+  inputs.files 'src/main/resources/scripts'
+  outputs.dir buildDir.toPath().resolve("classes/java/main")
+
+  environment('BTRACE_HOME', "$projectDir")
+  classpath configurations.runtimeClasspath
+  mainClass = 'io.btrace.compiler.Compiler'
+  args '-d'
+  args "${buildDir}/classes/java/main/"
+  args '-packext'
+  args 'btclass'
+  args fileTree(dir: "src/jmh/btrace", include: 'TraceScript.java')
+}
+compileJmhJava.dependsOn btracec
+jmhClasses.dependsOn btracec
+
+jmhJar {
+  include 'META-INF/BenchmarkList'
+  include 'META-INF/CompilerHints'
+  include 'org/openjdk/jmh/**'
+  include 'io/btrace/bench/**/*.class'
+  include 'io/btrace/generated/**/*'
+  include "joptsimple/**"
+  include "org/apache/**"
+  include 'jmh*'
+  include 'benchmark/**'
+  include '*.btclass'
+}
+
+jmh {
+  warmupIterations = 5
+  iterations = 10
+  fork = 2
+  jvm = "${env['JAVA_HOME']}/bin/java"
+  duplicateClassesStrategy = DuplicatesStrategy.WARN
+  def agentJarPath = tasks.getByPath(':btrace-dist:btraceJar').outputs.getFiles().getSingleFile()
+  def scriptPath = buildDir.toPath().resolve('classes/java/main/TraceScript.btclass')
+  def agent = "-javaagent:${agentJarPath}=stdout=false,noServer=true,debug=false,script=${scriptPath}"
+  jvmArgsAppend = ["-Djmh.basedir=${buildDir.getParentFile()}", "-Dproject.version=${project.version}", "-Xmx128m", "-agentpath:/tmp/libasyncProfiler.dylib=start,event=cpu,jfr=7,file=/tmp/btrace.jfr", "${agent}"]
+  includes = ['.*BTraceBench.*']
+  profilers = ['stack']
+}

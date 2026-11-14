@@ -1,0 +1,85 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [MEDIUM] Add concurrency group to "ci.yml"
+# Estimated savings: ~2 min/run
+#
+name: continuous-integration
+on:
+  push:
+    branches:
+      - master
+      - release/*
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  unit-testing:
+    name: PHPUnit (PHP ${{ matrix.php-versions }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php-versions: ['8.3','8.4']
+        coverage: ['pcov']
+        code-style: ['no']
+        code-analysis: ['no']
+        rector-check: ['no']
+        include:
+          - php-versions: '8.2'
+            coverage: 'pcov'
+            code-style: 'yes'
+            code-analysis: 'yes'
+            rector-check: 'no'
+          - php-versions: '8.5'
+            coverage: 'pcov'
+            code-style: 'no'
+            code-analysis: 'yes'
+            rector-check: 'yes'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup PHP, with composer and extensions
+        uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # v2.40.0
+        with:
+          php-version: ${{ matrix.php-versions }}
+          extensions: mbstring, dom, fileinfo, mysql, redis, opcache
+          coverage: ${{ matrix.coverage }}
+          tools: composer
+
+      - name: Get composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+
+      - name: Cache composer dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          # Use composer.json for key, if composer.lock is not committed.
+          # key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.json') }}
+          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+          restore-keys: ${{ runner.os }}-composer-
+
+      - name: Install composer dependencies
+        run: composer install --no-progress --prefer-dist --optimize-autoloader
+
+      - name: Code Analysis (PHP CS-Fixer)
+        if: matrix.code-style == 'yes'
+        run: PHP_CS_FIXER_IGNORE_ENV=true php vendor/bin/php-cs-fixer fix --dry-run --diff
+
+      - name: Code Analysis (PHPStan)
+        if: matrix.code-analysis == 'yes'
+        run: composer phpstan
+
+      - name: Code Refactoring (rector)
+        if: matrix.rector-check == 'yes'
+        run: composer rector-check
+
+      - name: Test with phpunit
+        run: vendor/bin/phpunit --configuration tests/phpunit.xml --coverage-clover clover.xml
+
+      - name: Code Coverage
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        if: matrix.coverage != 'none'

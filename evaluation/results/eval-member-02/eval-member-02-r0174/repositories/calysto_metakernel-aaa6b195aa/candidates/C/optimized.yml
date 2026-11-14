@@ -1,0 +1,191 @@
+name: Tests
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  schedule:
+    - cron: "0 0 * * *"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+    contents: read
+
+jobs:
+  build:
+    name: Build and Inspect Package
+    runs-on: ubuntu-latest
+    outputs:
+      supported_python_classifiers_json_array: ${{ steps.baipp.outputs.python-versions }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: calysto/maintainer_tools/actions/build@v1
+        id: baipp
+
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    # Delay the test builds so the cover builds get a chance to start first.
+    needs: [build]
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJSON(needs.build.outputs.supported_python_classifiers_json_array) }}
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Cache poetry dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pypoetry
+          key: ${{ runner.os }}-poetry-${{ hashFiles('poetry.lock') }}-${{ matrix.python-version }}
+          restore-keys: |
+            ${{ runner.os }}-poetry-${{ hashFiles('poetry.lock') }}-
+            ${{ runner.os }}-poetry-
+      - uses: calysto/maintainer_tools/actions/base-setup@v1
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: just test -v
+
+  test_sdist:
+    name: Test SDist
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: calysto/maintainer_tools/actions/base-setup@v1
+      - uses: calysto/maintainer_tools/actions/test-sdist@v1
+
+  cover:
+    name: Cover (${{ matrix.os }}, Python 3.10)
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    env:
+      OS: ${{ matrix.os }}
+      PYTHON: "3.10"
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: calysto/maintainer_tools/actions/base-setup@v1
+      - name: Install graphviz
+        if: runner.os == 'Linux'
+        uses: tecolicom/actions-use-apt-tools@065d3fb036b7fc85487573596f97732ed0d3fce1 # v1.7
+        with:
+          tools: graphviz
+      - run: just cover -v
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          env_vars: OS,PYTHON
+          fail_ci_if_error: false
+
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: calysto/maintainer_tools/actions/base-setup@v1
+      - uses: calysto/maintainer_tools/actions/pre-commit-run@v1
+      - run: just docs
+      - run: just help
+      - name: Test typing
+        run: just typing
+      - name: Validate pyproject.toml
+        run: |
+          pipx install 'validate-pyproject[all]'
+          validate-pyproject pyproject.toml
+      - name: Check package metadata
+        run: |
+          poetry build
+          pipx install twine
+          twine check --strict dist/*
+
+  test_minimum_versions:
+    name: Test Minimum Versions
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: calysto/maintainer_tools/actions/base-setup@v1
+      - uses: calysto/maintainer_tools/actions/test-minimum-versions@v1
+
+  run_notebooks:
+    name: Run Notebooks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: calysto/maintainer_tools/actions/base-setup@v1
+      - run: just run-notebooks
+
+  markdown_link_check:
+    name: Markdown Link Check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: calysto/maintainer_tools/actions/markdown-link-check@v1
+        with:
+          ignore-paths: "node_modules,.git,metakernel/magics/README.md"
+
+  test_release:
+    name: Test Release (Dry Run)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: calysto/maintainer_tools/actions/base-setup@v1
+      - uses: calysto/maintainer_tools/actions/release@v1
+        with:
+          version: patch
+          dry_run: "true"
+          ref: ${{ github.head_ref }}
+
+  tests_check: # This job does nothing and is only used for the branch protection
+    if: always()
+    needs:
+      - build
+      - test
+      - test_sdist
+      - cover
+      - static
+      - test_minimum_versions
+      - run_notebooks
+      - markdown_link_check
+      - test_release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Decide whether the needed jobs succeeded or failed
+        uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # release/v1
+        with:
+          jobs: ${{ toJSON(needs) }}

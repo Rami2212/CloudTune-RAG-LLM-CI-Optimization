@@ -1,0 +1,33 @@
+name: Trigger end-to-end tests on external PR approval
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+concurrency:
+  # On a re-approval, only the latest run's artifact matters to phase 2.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  test:
+    name: Trigger end-to-end tests
+    # If reviewed by a repo(/org) owner
+    if: |
+      github.event.pull_request.author_association != 'MEMBER'
+      && github.event.review.author_association == 'MEMBER'
+      && github.event.review.state == 'approved'
+      && contains(github.event.review.body, '/e2e')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Store PR number in a file
+        run: echo "PR_NUMBER=${PR_NUMBER}" > pr_number.txt
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+      - name: Save artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pr_number
+          path: pr_number.txt

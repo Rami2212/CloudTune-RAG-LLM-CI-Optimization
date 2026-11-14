@@ -1,0 +1,281 @@
+# Consumes the three plain build tarballs (topling includes dcompact_worker).
+# Runs write-side db_bench under CPUQuota cgroup; Topling compact via same-host
+# dcompact_worker on remaining cores; RocksDB (Phase 1) whole-process same quota
+# (pessimistic baseline — no open-box remote compaction).
+#
+# First-acceptance: workflow_dispatch only. Restore workflow_run after ci-first-run.
+name: "db_bench-dcompact-run"
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: db_bench-build run id (downloads db_bench-plain-*.tgz)
+        required: true
+        type: string
+      num:
+        description: db_bench -num (default 100000000)
+        required: false
+        default: "100000000"
+        type: string
+      cpu_quota:
+        description: Write-side systemd CPUQuota (default 50%)
+        required: false
+        default: "50%"
+        type: string
+      value_size:
+        description: db_bench -value_size bytes (default 50)
+        required: false
+        default: "50"
+        type: string
+      cached_pages_use_sys:
+        description: >-
+          If true, drop page cache before each sampled bench and set
+          SYS_CACHED_OF_EMPTY from /proc/meminfo Cached so pagecache is
+          system-wide Cached growth (pages). Default: per-fd cachestat.
+        required: false
+        default: false
+        type: boolean
+
+# Must match plain run — serialize gh-pages pushes.
+concurrency:
+  group: pages-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+  actions: read
+
+jobs:
+  bench-and-publish:
+    runs-on: ubuntu-latest
+    env:
+      VARIANT: dcompact
+      BUILD_RUN_ID: ${{ inputs.build_run_id }}
+      NUM: ${{ inputs.num }}
+      CPU_QUOTA: ${{ inputs.cpu_quota }}
+      VALUE_SIZE: ${{ inputs.value_size || '50' }}
+      CACHED_PAGES_USE_SYS: ${{ inputs.cached_pages_use_sys || false }}
+    steps:
+      - name: Checkout build commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install runtime dependencies
+        run: |
+          set -xe
+          sudo apt-get update -y && sudo apt-get install -y \
+            gcc \
+            libjemalloc-dev libaio-dev libgflags-dev zlib1g-dev \
+            libbz2-dev libcurl4-openssl-dev liburing-dev \
+            libsnappy-dev liblz4-dev libzstd-dev curl
+          chmod +x .github/scripts/ensure_sample_statm_fdcache.sh \
+            .github/scripts/run_sample_statm_fdcache.sh
+          .github/scripts/ensure_sample_statm_fdcache.sh
+
+      - name: Download engine tarballs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: db_bench-plain-*
+          merge-multiple: true
+          run-id: ${{ env.BUILD_RUN_ID }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: _artifact
+
+      - name: Unpack engine tarballs
+        run: |
+          set -xe
+          RUN_PREFIX="$PWD/_run_prefix"
+          rm -rf "$RUN_PREFIX" logs
+          mkdir -p "$RUN_PREFIX" logs
+          test -f _artifact/topling.tgz
+          test -f _artifact/rocksdb-v8.10.tgz
+          test -f _artifact/rocksdb-master.tgz
+          tar -C "$RUN_PREFIX" -xzf _artifact/topling.tgz
+          tar -C "$RUN_PREFIX" -xzf _artifact/rocksdb-v8.10.tgz
+          tar -C "$RUN_PREFIX" -xzf _artifact/rocksdb-master.tgz
+          test -d "$RUN_PREFIX/topling"
+          test -d "$RUN_PREFIX/rocksdb-v8.10"
+          test -d "$RUN_PREFIX/rocksdb-master"
+          test -x "$RUN_PREFIX/topling/bin/db_bench"
+          test -x "$RUN_PREFIX/topling/bin/dcompact_worker.exe"
+          test -f "$RUN_PREFIX/topling/toplingdb-conf/db_bench_enterprise_dcompact_zipkeyonly.yaml"
+          test -f "$RUN_PREFIX/topling/toplingdb-conf/db_bench_enterprise_dcompact_zipkeyvalue.yaml"
+          test -x "$RUN_PREFIX/rocksdb-v8.10/bin/db_bench"
+          test -x "$RUN_PREFIX/rocksdb-v8.10/bin/remote_compact_broker"
+          test -x "$RUN_PREFIX/rocksdb-v8.10/bin/remote_compact_worker"
+          test -x "$RUN_PREFIX/rocksdb-master/bin/db_bench"
+          test -x "$RUN_PREFIX/rocksdb-master/bin/remote_compact_broker"
+          test -x "$RUN_PREFIX/rocksdb-master/bin/remote_compact_worker"
+          echo "RUN_PREFIX=$RUN_PREFIX" >> "$GITHUB_ENV"
+          df -h /dev/shm
+          sudo mount -o remount,size=75% /dev/shm
+          df -h /dev/shm
+
+      - name: Compute RocksDB cache_size
+        run: |
+          set -xe
+          mem_total_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+          cache_size_bytes=$(( mem_total_kb * 1024 / 2 ))
+          echo "ROCKSDB_CACHE_SIZE=$cache_size_bytes" >> "$GITHUB_ENV"
+          echo "MEM_TOTAL_BYTES=$(( mem_total_kb * 1024 ))" >> "$GITHUB_ENV"
+
+      - name: Collect runner environment
+        run: |
+          set -xe
+          {
+            echo "os_pretty_name=$(grep -oP 'PRETTY_NAME="\K[^"]+' /etc/os-release || echo unknown)"
+            echo "kernel=$(uname -r)"
+            echo "cpu_model=$(lscpu | grep -oP 'Model name:\s+\K.*')"
+            echo "cpu_count=$(nproc)"
+            echo "mem_total_bytes=$MEM_TOTAL_BYTES"
+            echo "shm_size_bytes=$(df -B1 /dev/shm | awk 'NR==2{print $2}')"
+            echo "cpu_quota_write=$CPU_QUOTA"
+            echo "compact_mode_topling=dcompact_worker"
+            echo "compact_mode_rocksdb=compaction_service_spool"
+            echo "num=$NUM"
+          } | tee logs/runner_env.txt
+
+      - name: Run ToplingDB dcompact benches (write @ CPU_QUOTA)
+        run: |
+          set -xeo pipefail
+          chmod +x .github/scripts/run_dcompact_bench.sh
+          export CI=1
+          export PREFIX="$RUN_PREFIX/topling"
+          export LOGDIR_BASE=logs
+          export NUM
+          export CPU_QUOTA
+          export HOSTER_HTTP_URL=http://127.0.0.1:2011/CompactionExecutorFactory/dcompact
+          .github/scripts/run_dcompact_bench.sh
+
+      - name: Run RocksDB v8.10 (write @ CPU_QUOTA + CompactionService worker)
+        run: |
+          set -xeo pipefail
+          chmod +x .github/scripts/run_rocksdb_cs_bench.sh
+          test -x "$RUN_PREFIX/rocksdb-v8.10/bin/remote_compact_broker"
+          test -x "$RUN_PREFIX/rocksdb-v8.10/bin/remote_compact_worker"
+          export CI=1
+          export PREFIX="$RUN_PREFIX/rocksdb-v8.10"
+          export LOGDIR=logs/rocksdb-v8.10
+          export NUM
+          export CPU_QUOTA
+          export CACHE_SIZE="$ROCKSDB_CACHE_SIZE"
+          export WRITE_BUFFER_SIZE=67108864
+          export DB_PATH=/dev/shm/db_bench_rocksdb_v810
+          export SPOOL_DIR=/dev/shm/rocksdb-cs-spool-v810
+          .github/scripts/run_rocksdb_cs_bench.sh
+
+      - name: Run RocksDB master (write @ CPU_QUOTA + CompactionService worker)
+        run: |
+          set -xeo pipefail
+          chmod +x .github/scripts/run_rocksdb_cs_bench.sh
+          test -x "$RUN_PREFIX/rocksdb-master/bin/remote_compact_broker"
+          test -x "$RUN_PREFIX/rocksdb-master/bin/remote_compact_worker"
+          export CI=1
+          export PREFIX="$RUN_PREFIX/rocksdb-master"
+          export LOGDIR=logs/rocksdb-master
+          export NUM
+          export CPU_QUOTA
+          export CACHE_SIZE="$ROCKSDB_CACHE_SIZE"
+          export WRITE_BUFFER_SIZE=67108864
+          export DB_PATH=/dev/shm/db_bench_rocksdb_master
+          export SPOOL_DIR=/dev/shm/rocksdb-cs-spool-master
+          .github/scripts/run_rocksdb_cs_bench.sh
+
+      - name: Upload DB INFO LOGs (Actions artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: db-info-logs-${{ env.VARIANT }}
+          path: logs/*/LOG-*
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Emit pages fragment
+        run: |
+          set -xe
+          python3 .github/scripts/bench_dcompact_pages.py emit \
+            --variant "$VARIANT" \
+            --run-id "$GITHUB_RUN_ID" \
+            --log-root logs \
+            --engine-meta-root "$RUN_PREFIX" \
+            --actions-run-url "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --out _pages
+
+      - name: Checkout gh-pages
+        id: checkout_pages
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: _gh_pages
+
+      - name: Init gh-pages if missing
+        if: steps.checkout_pages.outcome == 'failure'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -xe
+          rm -rf _gh_pages
+          mkdir -p _gh_pages
+          cd _gh_pages
+          git init
+          git checkout -b gh-pages
+          echo '[]' > history.json
+          touch .nojekyll
+          printf '%s\n' '<!DOCTYPE html><html><body><h1>ToplingDB vs RocksDB</h1><p>empty</p></body></html>' > index.html
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "Initialize gh-pages for db_bench results"
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push -u origin gh-pages
+
+      - name: Merge into gh-pages tree
+        run: |
+          set -xe
+          python3 .github/scripts/bench_dcompact_pages.py merge \
+            --merge-into _gh_pages \
+            --from _pages
+
+      - name: Push gh-pages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -xe
+          cd _gh_pages
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No site changes to commit"
+          else
+            git commit -m "db_bench ${VARIANT} comparison from run ${GITHUB_RUN_ID}"
+          fi
+          git push origin HEAD:gh-pages
+
+      - name: Prepare Pages payload without .git
+        run: |
+          set -xe
+          rm -rf _pages_payload
+          mkdir -p _pages_payload
+          tar -C _gh_pages --exclude .git -cf - . | tar -C _pages_payload -xf -
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _pages_payload
+
+  deploy:
+    needs: bench-and-publish
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

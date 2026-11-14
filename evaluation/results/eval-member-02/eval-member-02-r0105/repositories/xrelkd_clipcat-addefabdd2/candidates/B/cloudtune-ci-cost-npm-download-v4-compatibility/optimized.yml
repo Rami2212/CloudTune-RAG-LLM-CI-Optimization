@@ -1,0 +1,61 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [MEDIUM] Add concurrency group to "lints.yaml"
+# - [LOW] Use shallow clone in "commit" job
+# Estimated savings: ~2 min/run
+#
+name: Lint
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - ci/*
+      - feat/*
+      - feature/*
+      - hotfix/*
+      - release/*
+
+  pull_request:
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  format:
+    name: Lint format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v23
+
+      - uses: DeterminateSystems/magic-nix-cache-action@v15
+        with:
+          use-gha-cache: false
+
+      - name: Check format
+        run: nix build .#check-format
+
+  commit:
+    name: Lint commit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Run commitlint
+        uses: wagoid/commitlint-github-action@v6.2.1
+
+  typos:
+    name: Typos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Typos
+        uses: crate-ci/typos@master

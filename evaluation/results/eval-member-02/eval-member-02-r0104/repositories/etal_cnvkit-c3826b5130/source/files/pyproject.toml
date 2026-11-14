@@ -1,0 +1,181 @@
+[project]
+name = "CNVkit"
+description = "Copy number variation toolkit for high-throughput sequencing."
+readme = "README.rst"
+#license = "Apache-2.0"
+license = {"text" = "Apache-2.0"}
+authors = [
+  {name = "Eric Talevich", email = "me+code@etal.mozmail.com"}
+]
+maintainers = [
+  {name = "Eric Talevich", email = "me+code@etal.mozmail.com"}
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Science/Research",
+  "Intended Audience :: Healthcare Industry",
+  "Operating System :: MacOS :: MacOS X",
+  "Operating System :: POSIX",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: Unix",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Scientific/Engineering",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+  "Topic :: Scientific/Engineering :: Medical Science Apps.",
+  "Topic :: Scientific/Engineering :: Visualization"
+]
+requires-python = ">=3.11"
+dynamic = ["version", "dependencies", "optional-dependencies"]
+
+[project.urls]
+homepage = "https://github.com/etal/cnvkit"
+documentation = "https://cnvkit.readthedocs.io"
+repository = "https://github.com/etal/cnvkit"
+changelog = "https://github.com/etal/cnvkit/releases"
+
+[project.scripts]
+"cnvkit.py" = "cnvlib.cnvkit:main"
+"cnv_annotate.py" = "cnvlib.cli.cnv_annotate:main"
+"cnv_expression_correlate.py" = "cnvlib.cli.cnv_expression_correlate:main"
+"cnv_gene_info.py" = "cnvlib.cli.cnv_gene_info:main"
+"cnv_updater.py" = "cnvlib.cli.cnv_updater:main"
+"genome_instability_index.py" = "cnvlib.cli.genome_instability_index:main"
+"guess_baits.py" = "cnvlib.cli.guess_baits:main"
+"reference2targets.py" = "cnvlib.cli.reference2targets:main"
+"skg_convert.py" = "skgenome.cli.skg_convert:main"
+"snpfilter.py" = "cnvlib.cli.snpfilter:main"
+
+[build-system]
+# Minimum requirements for the build system to execute (PEP 508)
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["cnvlib", "cnvlib.cli", "cnvlib.segmentation", "skgenome", "skgenome.cli", "skgenome.tabio"]
+
+[tool.setuptools.dynamic]
+version = {attr = "cnvlib._version.__version__"}
+dependencies = {file = "requirements/core.txt"}
+optional-dependencies = {test = {file = "requirements/tests.txt"}}
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+markers = [
+    "slow: tests that take >5 seconds (skip with -m 'not slow')",
+    "hypothesis: property-based tests using Hypothesis (skip with -m 'not hypothesis')",
+]
+filterwarnings = [
+    "error",
+    # bioframe <=0.8.0 uses df.groupby(['col']).groups with a single-element
+    # list, which pandas 3.0 deprecates via Pandas4Warning.
+    "ignore:In a future version, the keys of:Warning",
+    # Hypothesis internal warnings that would otherwise be promoted to errors
+    "ignore::hypothesis.errors.NonInteractiveExampleWarning",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["cnvlib", "skgenome"]
+
+[tool.coverage.paths]
+source = ["cnvlib", "skgenome"]
+
+[tool.coverage.report]
+precision = 2
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+]
+
+[tool.coverage.html]
+directory = "htmlcov"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+
+[tool.ruff.lint]
+select = [
+    "E",       # pycodestyle errors
+    "W",       # pycodestyle warnings
+    "F",       # pyflakes (incl. F401 unused-import, F841 unused-variable)
+    "UP",      # pyupgrade
+    "B",       # flake8-bugbear
+    "NPY",     # numpy rules
+    "PD",      # pandas-vet
+    "RUF",     # ruff's extra rules (incl. RUF100 unused-noqa)
+    "TC",      # flake8-type-checking
+    "PERF",    # perflint (numpy/loop performance)
+    "C4",      # flake8-comprehensions
+    "PIE",     # flake8-pie (misc. quality)
+    "I",       # isort (import ordering)
+    "Q",       # flake8-quotes (defensive: format.quote-style enforces double)
+    "PLC0415", # pylint: imports outside top level (lazy imports must justify with noqa)
+    # Evaluated and deferred -- noqa cost outweighs the signal here, the
+    # 3-reviewer code-review protocol catches the real cases better:
+    #   "SIM" -- flake8-simplify; SIM401/SIM115 produce false positives on
+    #            domain types (GenomicArray has no .get(); ctx-via-with is
+    #            invisible to it) and SIM108 compresses readable per-branch
+    #            comments into inline annotations.
+    #   "PT"  -- flake8-pytest-style; requires unittest.TestCase -> pytest migration
+    #   "N"   -- pep8-naming; collides with scientific names (X, Y, log2, chi2)
+    #   "D"   -- pydocstyle; needs a docs-style policy decision
+    #   "ERA" -- commented-out code; needs per-occurrence judgment in this codebase
+    #   "RET" -- return-statement style; RET504 (assign-then-return) is stylistic
+    #   "ARG" -- unused-args; mix of real bugs and intentional API contracts (ABC methods, plugin hooks)
+    #   "ANN" -- flake8-annotations; defer until full annotation coverage decided
+]
+ignore = [
+    "E402",  # import not at top -- some lazy imports remain legitimate
+    "E501",  # line too long -- too noisy without a reflow pass
+    "E731",  # inline lambda -- common in argparse setups
+    "UP031", # % format -- kept; modernization is a separate focused PR
+    "B007",  # loop variable not used in body -- common idiom in this code
+    "B023",  # def closing over loop variable -- intentional in some places
+    "PD009", # use .iloc instead of .iat -- iat is faster for scalar access
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Test suites use `from cnvlib import (access, antitarget, ...)` smoke-test
+# blocks (see CLAUDE.md "Imports in Tests"). The imports are intentionally
+# "unused" -- they verify each submodule loads cleanly. F401 must not fire
+# on these blocks but should still catch real unused imports in cnvlib/.
+"test/*" = ["F401"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+# numpy >= 2.5 ships PEP 695 ``type`` aliases in its stubs, which mypy only
+# parses with a 3.12+ target; the type-check CI job runs on 3.12. (The runtime
+# baseline stays 3.11, enforced by ruff target-version and the py311 test job.)
+python_version = "3.12"
+packages = ["cnvlib", "skgenome"]
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_no_return = true
+warn_return_any = true
+warn_unused_configs = true
+warn_unreachable = true
+enable_error_code = ["ignore-without-code"]
+
+[tool.bandit]
+# Skip security rules inappropriate for bioinformatics toolkit that needs to call external tools
+skips = [
+    "B101",  # assert_used - asserts are an intentional idiom here, incl. type narrowing
+    "B404",  # subprocess module - needed for calling bioinformatics tools like samtools, R
+    "B603",  # subprocess without shell=True - this is actually good security practice
+    "B607",  # partial executable path - standard practice for bioinformatics pipelines
+]

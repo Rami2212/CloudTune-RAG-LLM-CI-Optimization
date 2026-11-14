@@ -1,0 +1,49 @@
+name: Invite to the private end-to-end test repository
+
+on: # zizmor: ignore[dangerous-triggers] PR authors /invite themselves, so this must run on comments. We never check out PR code, and only the PR author or a maintainer can trigger it.
+  issue_comment:
+    types: [created]
+
+concurrency:
+  # Invitations must run to completion, so never cancel one in flight.
+  group: ${{ github.workflow }}-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  invite:
+    name: Invite everyone to the e2e private repo
+    if: |
+      github.event.issue.pull_request
+      && contains(github.event.comment.body, '/invite')
+      && (
+        github.event.comment.user.login == github.event.issue.user.login
+        || contains(fromJson('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+      )
+    runs-on: ubuntu-latest
+    environment: e2e
+    strategy:
+      matrix:
+        collaborator:
+          - LOGIN: kieferro
+            PERMISSION: admin
+            ENABLED: true
+
+          - LOGIN: ewjoachim
+            PERMISSION: admin
+            ENABLED: true
+
+          - LOGIN: ${{ github.event.issue.user.login }}
+            PERMISSION: push
+            ENABLED: ${{ !contains(fromJson('["kieferro", "ewjoachim"]'), github.event.issue.user.login) }}
+
+    steps:
+      - name: Invite @${{ matrix.collaborator.LOGIN }} to the e2e private repo
+        run: gh api --method PUT "/repos/mihcaojwe/python-coverage-comment-action-end-to-end-${NUMBER}-private/collaborators/${LOGIN}" -f "permission=${PERMISSION}"
+        if: ${{ matrix.collaborator.ENABLED == true }}
+        env:
+          LOGIN: ${{ matrix.collaborator.LOGIN }}
+          NUMBER: ${{ github.event.issue.number }}
+          PERMISSION: ${{ matrix.collaborator.PERMISSION }}
+          GITHUB_TOKEN: ${{ secrets.COVERAGE_COMMENT_E2E_GITHUB_TOKEN_USER_1 }}

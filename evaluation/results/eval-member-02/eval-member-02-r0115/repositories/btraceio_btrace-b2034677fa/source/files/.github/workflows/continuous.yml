@@ -1,0 +1,324 @@
+# This workflow will build a Java project with Gradle
+# For more information see: https://help.github.com/actions/language-and-framework-guides/building-and-testing-java-with-gradle
+
+name: BTrace CI/CD
+
+on:
+  push:
+    branches: [ develop ]
+  pull_request:
+    branches: [ develop ]
+  # Required checks must also report on the merge queue's groups, or the queue drops every entry
+  merge_group:
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Java 24
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        with:
+          java-version: 24
+          distribution: temurin
+      - name: Set up Java 28 (EA, runs the ClassFile API backend tests on version-72 class files)
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        with:
+          java-version: 28-ea
+          distribution: temurin
+      - name: Set up Java
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        with:
+          java-version: 21
+          distribution: temurin
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6
+      - name: Generate cache key
+        id: cache-key
+        run: |
+          key="${{ runner.os }}-gradle-1-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}"
+          echo "key=${key}" >> $GITHUB_ENV
+          echo "cache-key=${key}" >> $GITHUB_OUTPUT
+      - name: Cache Gradle
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.gradle/caches/modules-2
+            ~/.gradle/wrapper
+          key: ${{ env.key }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+      - name: Build
+        run: ./gradlew --no-daemon --parallel --build-cache build
+      - name: Run V2 Protocol Tests
+        run: |
+          ./gradlew :btrace-core:test --tests "io.btrace.core.comm.v2.*" \
+                                       --tests "io.btrace.core.comm.Protocol*" \
+                                       --tests "io.btrace.core.comm.WireProtocol*"
+      - name: Upload dist build data
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: dist-build
+          retention-days: 1
+          path: |
+            btrace-dist/build
+            btrace-agent/build/classes/traces
+      - name: Upload test trace data
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: test-trace
+          retention-days: 1
+          path: |
+            btrace-agent/build/classes/traces
+      - name: Archive test reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: test-reports
+          path: |
+            **/reports/**/*
+    outputs:
+      cache-key: ${{ steps.cache-key.outputs.cache-key }}
+
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    # forkEvery=1 on :integration-tests:test (one JVM per test class, for isolation) adds real
+    # per-class startup overhead on top of a suite that was already close to the old 15-minute
+    # ceiling. A job hitting timeout-minutes gets forcibly cancelled by GitHub Actions -- which
+    # looks identical to a flaky test failure in the run summary, but isn't one. Widened to give
+    # real headroom; see docs/superpowers/plans/2026-07-12-extension-loader-classcircularity-investigation.md.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Lanes are never pinned to a build: SDKMAN drops superseded builds from its catalogue
+        # (27.ea.31-open was retired at 27 GA; its list shows one build per vendor and major), so a
+        # pin fails `sdk install` until someone bumps it. Each lane is the newest Temurin build of
+        # its major (GA, or EA for `<major>-ea`) from actions/setup-java, except where `sdkman: true`
+        # routes it through scripts/resolve-sdkman-java.sh (newest GA build SDKMAN lists for that
+        # major: Temurin, else Oracle JDK, else the java.net GA build).
+        java: [ '8', '11', '17', '21', '25', '27', '28-ea' ]
+        include:
+          # Temurin 27 is not published yet; SDKMAN lists 27.0.0-oracle. Drop this entry once
+          # actions/setup-java can serve Temurin 27.
+          - java: '27'
+            sdkman: true
+    env:
+      # TEST_JAVA_HOME is exported by the "Prepare JDK" step once the lane JDK is installed. Gradle
+      # toolchains (8, 11, 24) come from the runner image and the foojay resolver, not from here.
+      # Runners are ephemeral, so the Testcontainers Ryuk reaper is unnecessary. Disabling it
+      # removes a Docker Hub image pull that intermittently times out and fails Docker-based tests.
+      TESTCONTAINERS_RYUK_DISABLED: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6
+      - name: Prepare OS
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl zip unzip
+      - name: Set up Temurin ${{ matrix.java }} (lane JDK)
+        # check-latest ignores an older pre-installed build of the same major on the runner image.
+        # The "Set up Java 24" step below restores JAVA_HOME for Gradle afterwards.
+        if: matrix.sdkman != true
+        id: lane-jdk
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        with:
+          java-version: ${{ matrix.java }}
+          distribution: temurin
+          check-latest: true
+      - name: Prepare JDK ${{ matrix.java }}
+        run: |
+          if [[ "${{ matrix.sdkman }}" == "true" ]]; then
+            curl -s "https://get.sdkman.io" | bash
+            source "$HOME/.sdkman/bin/sdkman-init.sh"
+            JAVA_ID=$(scripts/resolve-sdkman-java.sh "${{ matrix.java }}")
+            echo "Lane ${{ matrix.java }} -> SDKMAN java ${JAVA_ID}"
+            echo 'n' | sdk install java "${JAVA_ID}"
+            TARGET_JAVA_HOME="${HOME}/.sdkman/candidates/java/${JAVA_ID}"
+          else
+            TARGET_JAVA_HOME="${{ steps.lane-jdk.outputs.path }}"
+            echo "Lane ${{ matrix.java }} -> Temurin ${{ steps.lane-jdk.outputs.version }} at ${TARGET_JAVA_HOME}"
+          fi
+          echo "TEST_JAVA_HOME=${TARGET_JAVA_HOME}" >> "$GITHUB_ENV"
+          "${TARGET_JAVA_HOME}/bin/java" -version
+      - name: Cache Gradle
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.gradle/caches/modules-2
+            ~/.gradle/wrapper
+          key: ${{ needs.build.outputs.cache-key }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+      - name: Download build data
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: dist-build
+          path: btrace-dist/build
+      - name: Download test trace data
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: test-trace
+          path: btrace-agent/build/classes/traces
+      - name: Set up Java 24
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        with:
+          java-version: 24
+          distribution: temurin
+      - name: Build btrace-agent jar
+        run: |
+          ./gradlew --no-daemon --parallel --build-cache :btrace-agent:jar
+      - name: Report runner resources
+        run: |
+          echo "CPUs: $(nproc)"
+          free -h
+          uptime
+      - name: Run tests
+        run: |
+          set +x
+          ./gradlew --no-daemon --parallel --build-cache -Pintegration -PCI :integration-tests:test
+      - name: Check Gradle cache size
+        run: du -sh ~/.gradle/caches
+      - name: Integration test reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: integration-test-reports-${{ matrix.java }}
+          path: |
+            integration-tests/build/reports/**/*
+      - name: Archive binary artifacts
+        if: success() && matrix.java == '11'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: btrace-dist
+          path: |
+            btrace-dist/build/distributions/**/btrace-*-bin*.tar.gz
+
+  # Resilience and demo-replay harness (btrace-qe): launches real target JVMs with the masked jar,
+  # drives the client against them, and checks the shipped behaviour the docs and demos promise.
+  # Lightweight enough for every push; its self tests cover the harness itself.
+  qe:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Set up Java 24
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        with:
+          java-version: 24
+          distribution: temurin
+      - name: Set up Java
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        with:
+          java-version: 21
+          distribution: temurin
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6
+      - name: Run harness self tests and all surfaces
+        run: |
+          ./gradlew --no-daemon --build-cache :btrace-qe:qeSelfTest :btrace-qe:qe -Pqe.failOn=S2
+      - name: Harness reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: qe-report
+          path: |
+            btrace-qe/build/qe-report/**/*
+            btrace-qe/build/reports/**/*
+
+  # Single required status check for the test matrix. Matrix jobs report as `test (8)`,
+  # `test (11)`, ...; branch protection matches check names exactly, so it cannot require the
+  # matrix as a whole, and listing every lane goes stale when a lane is added or dropped. Make
+  # this job's check (`tests-passed`) required instead. `if: always()` keeps it from being
+  # skipped when `build` or a lane fails: a skipped required check counts as passing.
+  tests-passed:
+    if: always()
+    needs:
+      - build
+      - test
+      - qe
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require build, every test lane and the harness to succeed
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          QE_RESULT: ${{ needs.qe.result }}
+        run: |
+          echo "build: ${BUILD_RESULT}, test: ${TEST_RESULT}, qe: ${QE_RESULT}"
+          if [ "${BUILD_RESULT}" != "success" ] || [ "${TEST_RESULT}" != "success" ] || [ "${QE_RESULT}" != "success" ]; then
+            echo "::error::build, all test lanes and the qe harness must succeed (build=${BUILD_RESULT}, test=${TEST_RESULT}, qe=${QE_RESULT})"
+            exit 1
+          fi
+
+  publish:
+    if: github.ref == 'refs/heads/develop'
+    needs: 
+      - test
+      - build
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+    - name: Grant execute permission for gradlew
+      run: chmod +x gradlew
+    - name: Setup Gradle
+      uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6
+    - name: Set up Java
+      uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+      with:
+        java-version: 24
+        distribution: temurin
+    - name: Cache Gradle
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      with:
+        path: |
+          ~/.gradle/caches/modules-2
+          ~/.gradle/wrapper
+        key: ${{ needs.build.outputs.cache-key }}
+        restore-keys: |
+          ${{ runner.os }}-gradle-
+    - name: Download build data
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+      with:
+        name: dist-build
+    - name: Deploy Maven
+      run: |
+        if [ -z "${GPG_SIGNING_KEY}" ] || [ -z "${GPG_SIGNING_PWD}" ] || [ -z "${SONATYPE_USER}" ] || [ -z "${SONATYPE_PASSWORD}" ]; then
+          echo "::notice::Skipping Maven snapshot publish because signing or Sonatype credentials are not configured."
+          exit 0
+        fi
+        ./gradlew -x test :btrace-dist:publish
+      env:
+        GPG_SIGNING_KEY: ${{ secrets.GPG_SIGNING_KEY }}
+        GPG_SIGNING_PWD: ${{ secrets.GPG_SIGNING_PWD }}
+        SONATYPE_USER: ${{ secrets.SONATYPE_USERNAME || secrets.BTRACE_SONATYPE_USER }}
+        SONATYPE_PASSWORD: ${{ secrets.SONATYPE_PASSWORD || secrets.BTRACE_SONATYPE_PWD }}
+
+  cleanup:
+    runs-on: ubuntu-latest
+    needs: publish
+    steps:
+      - name: Cleanup temporary artifacts
+        uses: geekyeggo/delete-artifact@176a747ab7e287e3ff4787bf8a148716375ca118 # v6
+        with:
+          name: dist-build

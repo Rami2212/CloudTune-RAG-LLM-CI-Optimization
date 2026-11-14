@@ -1,0 +1,203 @@
+name: Rust
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - ci/*
+      - feat/*
+      - feature/*
+      - fix/*
+      - hotfix/*
+      - release/*
+
+  pull_request:
+    paths:
+      - "**/src/**"
+      - ".github/**"
+      - Cargo.lock
+      - Cargo.toml
+      - deny.toml
+      - rust-toolchain.toml
+      - rustfmt.toml
+
+env:
+  CARGO_TERM_COLOR: always
+  SCCACHE_GHA_ENABLED: true
+  RUSTC_WRAPPER: "sccache"
+
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rustfmt:
+    name: Check Rust format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v23
+
+      - uses: DeterminateSystems/magic-nix-cache-action@v15
+
+      - name: Show rustfmt version
+        run: |
+          nix develop --command cargo fmt --version
+
+      - name: Run cargo fmt
+        run: |
+          nix develop --command cargo fmt --all --verbose --check
+
+  clippy:
+    name: Clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs:
+      - rustfmt
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Nix
+        if: runner.os == 'Linux'
+        uses: DeterminateSystems/nix-installer-action@v23
+
+      - uses: DeterminateSystems/magic-nix-cache-action@v15
+        if: runner.os == 'Linux'
+
+      - name: Setup Rust toolchain
+        if: runner.os == 'macOS'
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          cache: false
+
+      - name: Install build dependencies
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Pre Cache
+        run: |
+          rm -rf ~/.cargo/registry/index/ ~/.cargo/registry/cache/ ~/.cargo/git/db/ ./target/
+
+      - name: Cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ./target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('flake.lock', '**/Cargo.lock') }}
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Show cargo clippy version
+        if: runner.os == 'Linux'
+        run: |
+          nix develop --command cargo clippy --version
+
+      - name: Show cargo clippy version (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cargo clippy --version
+
+      - name: Run cargo clippy
+        if: runner.os == 'Linux'
+        run: |
+          nix develop --command cargo clippy-all
+
+      - name: Run cargo clippy (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cargo clippy --workspace --bins --examples --tests --benches --all-targets
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs:
+      - clippy
+
+    env:
+      NEXTEST_RETRIES: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        mode:
+          - release
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v23
+
+      - uses: DeterminateSystems/magic-nix-cache-action@v15
+
+      - name: Pre Cache
+        run: |
+          rm -rf ~/.cargo/registry/index/ ~/.cargo/registry/cache/ ~/.cargo/git/db/ ./target/
+
+      - name: Cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ./target/
+          key: ${{ runner.os }}-cargo-${{ matrix.mode }}-${{ hashFiles('flake.lock', '**/Cargo.lock') }}
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Show cargo-nextest version
+        run: |
+          nix develop --command cargo nextest --version
+
+      - name: Test with cargo-nextest
+        uses: coactions/setup-xvfb@v1
+        with:
+          run: |
+            nix develop --command cargo nextest-all ${{ matrix.mode == 'release' && '--release' || '' }}
+
+  doc:
+    name: Doc
+    runs-on: ubuntu-latest
+    needs:
+      - clippy
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: "true"
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v23
+
+      - uses: DeterminateSystems/magic-nix-cache-action@v15
+
+      - name: Pre Cache
+        run: |
+          rm -rf ~/.cargo/registry/index/ ~/.cargo/registry/cache/ ~/.cargo/git/db/ ./target/
+
+      - name: Cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ./target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('flake.lock', '**/Cargo.lock') }}
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Run cargo doc
+        run: |
+          nix develop --command cargo doc-all

@@ -1,0 +1,146 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'main' && github.sha || 'anysha' }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup | Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ubuntu-test-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Test
+        run: |
+          rustup component add clippy
+          cargo install cargo-machete -f
+          cargo machete
+          cargo clippy
+          cargo test
+      - name: Lint output
+        run: make test:lint
+      - name: Init test
+        run: make test:init
+      - name: Lint output JSON
+        run: make test:lint-json
+
+  test_node:
+    name: Test for Node.js
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get yarn cache directory path
+        id: yarn-cache-dir-path
+        run: echo "::set-output name=dir::$(yarn cache dir)"
+      - name: Setup | Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ${{ steps.yarn-cache-dir-path.outputs.dir }}
+            target/
+          key: ubuntu-test-cargo-yarn-${{ hashFiles('**/Cargo.lock') }}
+      - uses: actions/setup-node@v3
+        with:
+          node-version: 21
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Test Node.js
+        run: |
+          make test:node
+
+  test_python:
+    name: Test for Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup | Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ~/.cache/pip
+            target/
+          key: ubuntu-test-cargo-python-${{ hashFiles('**/Cargo.lock') }}
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+      - name: Install pytest
+        run: python3 -m pip install pytest
+      - name: Test Python
+        run: make test:python
+
+  test_ruby:
+    name: Test for Ruby
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup | Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ubuntu-test-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: 3.4
+          bundler-cache: true
+      - name: Test Ruby
+        run: make test:ruby
+
+  test_java:
+    strategy:
+      fail-fast: true
+      matrix:
+        settings:
+          - host: ubuntu-latest
+          - host: macos-latest
+    runs-on: ${{ matrix.settings.host }}
+    name: Test for Java on ${{ matrix.settings.host }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup | Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ~/.m2/repository
+            target/
+          key: ${{ matrix.settings.host }}-cargo-maven-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install JDK
+        uses: actions/setup-java@v3
+        with:
+          java-version: "11"
+          distribution: "temurin"
+      - name: Test Java
+        run: make test:java

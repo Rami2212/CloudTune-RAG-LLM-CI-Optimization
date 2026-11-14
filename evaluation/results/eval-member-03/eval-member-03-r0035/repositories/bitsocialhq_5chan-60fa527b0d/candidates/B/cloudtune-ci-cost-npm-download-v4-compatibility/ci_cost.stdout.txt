@@ -1,0 +1,180 @@
+[2mAnalyzing workflows in C:\Users\USER\AppData\Local\Temp\cloudtune-ci-cost-yn0anois\.github\workflows...[0m
+[2mFound 1 workflow file[0m
+
+[1m[36mci-cost[0m â€” GitHub Actions Cost Analyzer
+
+[2mAnalyzed 1 workflow Â· 12 jobs Â· 13 recommendations[0m
+
+[1mSEVERITY  RECOMMENDATION                                        ESTIMATED SAVINGS[0m
+[2mâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€[0m
+[31m[1mHIGH  [0m  Split "checks" into parallel jobs (lint + test + ...  [32m~6 min per run[0m
+[31m[1mHIGH  [0m  Switch "package-mac-intel" from macOS to ubuntu r...  [32m~$0.072/min saved (10x cost reduction)[0m
+[31m[1mHIGH  [0m  Switch "package-mac-arm" from macOS to ubuntu runner  [32m~$0.072/min saved (10x cost reduction)[0m
+[33m[1mMEDIUM[0m  10 jobs clone the repo â€” consider artifact sharing    [32m~1 min per run[0m
+[34m[1mLOW   [0m  Use shallow clone in "checks" job                     [32m~30 sec per run[0m
+[34m[1mLOW   [0m  Use shallow clone in "build" job                      [32m~30 sec per run[0m
+[34m[1mLOW   [0m  Use shallow clone in "load" job                       [32m~30 sec per run[0m
+[34m[1mLOW   [0m  Use shallow clone in "perf" job                       [32m~30 sec per run[0m
+[34m[1mLOW   [0m  Use shallow clone in "android-build" job              [32m~30 sec per run[0m
+[34m[1mLOW   [0m  Use shallow clone in "package-linux" job              [32m~30 sec per run[0m
+[2m  ... and 3 more recommendations[0m
+
+[2mâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€[0m
+
+[1mRecommendations:[0m
+
+[1m1. [31m[HIGH][0m[1m Split "checks" into parallel jobs (lint + test + build)[0m
+   [2mFile: ci.yml Â· Job: checks[0m
+   Job "checks" runs lint, test, and/or build sequentially in a single job. Splitting them into separate parallel jobs can cut total runtime by 50â€“70% since they can run concurrently. Each job only needs to wait for the steps it depends on.
+
+   [36mFix:[0m
+   [2m# Split "checks" into parallel jobs:[0m
+   [2mjobs:[0m
+   [2m  lint:[0m
+   [2m    runs-on: ubuntu-latest[0m
+   [2m    steps:[0m
+   [2m      - uses: actions/checkout@v4[0m
+   [2m      - uses: actions/setup-node@v4[0m
+   [2m        with:[0m
+   [2m          node-version: '20'[0m
+   [2m          cache: 'npm'[0m
+   [2m      - run: npm ci[0m
+   [2m      - run: npm run lint[0m
+   [2m      - run: npm run typecheck[0m
+   [2m[0m
+   [2m  test:[0m
+   [2m    runs-on: ubuntu-latest[0m
+   [2m    steps:[0m
+   [2m      - uses: actions/checkout@v4[0m
+   [2m      - uses: actions/setup-node@v4[0m
+   [2m        with:[0m
+   [2m          node-version: '20'[0m
+   [2m          cache: 'npm'[0m
+   [2m      - run: npm ci[0m
+   [2m      - run: npm test[0m
+   [2m[0m
+   [2m  build:[0m
+   [2m    runs-on: ubuntu-latest[0m
+   [2m    needs: [lint, test][0m
+   [2m    steps:[0m
+   [2m      - uses: actions/checkout@v4[0m
+   [2m      - uses: actions/setup-node@v4[0m
+   [2m        with:[0m
+   [2m          node-version: '20'[0m
+   [2m          cache: 'npm'[0m
+   [2m      - run: npm ci[0m
+   [2m      - run: npm run build[0m
+
+[1m2. [31m[HIGH][0m[1m Switch "package-mac-intel" from macOS to ubuntu runner[0m
+   [2mFile: ci.yml Â· Job: package-mac-intel[0m
+   Job "package-mac-intel" uses `macos-15-intel` (10x more expensive than ubuntu) but doesn't appear to need macOS-specific tools. macOS runners cost $0.08/min vs $0.008/min for ubuntu. Unless you're building iOS/macOS apps, switch to ubuntu.
+
+   [36mFix:[0m
+   [2m# In job "package-mac-intel", change:[0m
+   [2m  package-mac-intel:[0m
+   [2m    runs-on: ubuntu-latest   # was: macos-15-intel[0m
+
+[1m3. [31m[HIGH][0m[1m Switch "package-mac-arm" from macOS to ubuntu runner[0m
+   [2mFile: ci.yml Â· Job: package-mac-arm[0m
+   Job "package-mac-arm" uses `macos-latest` (10x more expensive than ubuntu) but doesn't appear to need macOS-specific tools. macOS runners cost $0.08/min vs $0.008/min for ubuntu. Unless you're building iOS/macOS apps, switch to ubuntu.
+
+   [36mFix:[0m
+   [2m# In job "package-mac-arm", change:[0m
+   [2m  package-mac-arm:[0m
+   [2m    runs-on: ubuntu-latest   # was: macos-latest[0m
+
+[1m4. [33m[MEDIUM][0m[1m 10 jobs clone the repo â€” consider artifact sharing[0m
+   [2mFile: ci.yml[0m
+   10 jobs in "ci.yml" each run `actions/checkout`. For large repos or jobs that share build output, upload the build artifact once and download it in dependent jobs instead of re-cloning and re-building.
+
+   [36mFix:[0m
+   [2m# In your build job, upload the artifact:[0m
+   [2m      - name: Upload build artifact[0m
+   [2m        uses: actions/upload-artifact@v4[0m
+   [2m        with:[0m
+   [2m          name: build-output[0m
+   [2m          path: dist/[0m
+   [2m          retention-days: 1[0m
+   [2m[0m
+   [2m# In dependent jobs, download instead of re-building:[0m
+   [2m      - name: Download build artifact[0m
+   [2m        uses: actions/download-artifact@v4[0m
+   [2m        with:[0m
+   [2m          name: build-output[0m
+   [2m          path: dist/[0m
+
+[1m5. [34m[LOW][0m[1m Use shallow clone in "checks" job[0m
+   [2mFile: ci.yml Â· Job: checks[0m
+   Job "checks" uses `actions/checkout` without `fetch-depth: 1`. By default, GitHub fetches the entire git history, which is wasteful for most CI tasks. Add `fetch-depth: 1` to only fetch the latest commit.
+
+   [36mFix:[0m
+   [2m# In job "checks", update your checkout step:[0m
+   [2m      - uses: actions/checkout@v4[0m
+   [2m        with:[0m
+   [2m          fetch-depth: 1   # Only fetch the latest commit (much faster for large repos)[0m
+
+[1m6. [34m[LOW][0m[1m Use shallow clone in "build" job[0m
+   [2mFile: ci.yml Â· Job: build[0m
+   Job "build" uses `actions/checkout` without `fetch-depth: 1`. By default, GitHub fetches the entire git history, which is wasteful for most CI tasks. Add `fetch-depth: 1` to only fetch the latest commit.
+
+   [36mFix:[0m
+   [2m# In job "build", update your checkout step:[0m
+   [2m      - uses: actions/checkout@v4[0m
+   [2m        with:[0m
+   [2m          fetch-depth: 1   # Only fetch the latest commit (much faster for large repos)[0m
+
+[1m7. [34m[LOW][0m[1m Use shallow clone in "load" job[0m
+   [2mFile: ci.yml Â· Job: load[0m
+   Job "load" uses `actions/checkout` without `fetch-depth: 1`. By default, GitHub fetches the entire git history, which is wasteful for most CI tasks. Add `fetch-depth: 1` to only fetch the latest commit.
+
+   [36mFix:[0m
+   [2m# In job "load", update your checkout step:[0m
+   [2m      - uses: actions/checkout@v4[0m
+   [2m        with:[0m
+   [2m          fetch-depth: 1   # Only fetch the latest commit (much faster for large repos)[0m
+
+[1m8. [34m[LOW][0m[1m Use shallow clone in "perf" job[0m
+   [2mFile: ci.yml Â· Job: perf[0m
+   Job "perf" uses `actions/checkout` without `fetch-depth: 1`. By default, GitHub fetches the entire git history, which is wasteful for most CI tasks. Add `fetch-depth: 1` to only fetch the latest commit.
+
+   [36mFix:[0m
+   [2m# In job "perf", update your checkout step:[0m
+   [2m      - uses: actions/checkout@v4[0m
+   [2m        with:[0m
+   [2m          fetch-depth: 1   # Only fetch the latest commit (much faster for large repos)[0m
+
+[1m9. [34m[LOW][0m[1m Use shallow clone in "android-build" job[0m
+   [2mFile: ci.yml Â· Job: android-build[0m
+   Job "android-build" uses `actions/checkout` without `fetch-depth: 1`. By default, GitHub fetches the entire git history, which is wasteful for most CI tasks. Add `fetch-depth: 1` to only fetch the latest commit.
+
+   [36mFix:[0m
+   [2m# In job "android-build", update your checkout step:[0m
+   [2m      - uses: actions/checkout@v4[0m
+   [2m        with:[0m
+   [2m          fetch-depth: 1   # Only fetch the latest commit (much faster for large repos)[0m
+
+[1m10. [34m[LOW][0m[1m Use shallow clone in "package-linux" job[0m
+   [2mFile: ci.yml Â· Job: package-linux[0m
+   Job "package-linux" uses `actions/checkout` without `fetch-depth: 1`. By default, GitHub fetches the entire git history, which is wasteful for most CI tasks. Add `fetch-depth: 1` to only fetch the latest commit.
+
+   [36mFix:[0m
+   [2m# In job "package-linux", update your checkout step:[0m
+   [2m      - uses: actions/checkout@v4[0m
+   [2m        with:[0m
+   [2m          fetch-depth: 1   # Only fetch the latest commit (much faster for large repos)[0m
+
+[2mâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€[0m
+
+[1mSummary[0m
+
+  Estimated monthly cost:   [33m~$281.60/month[0m
+  Time savings per run:     [32m~7 min/run[0m
+  Estimated monthly savings: [32m~$11.20/month[0m
+
+  Issues:  [31m3 HIGH[0m  [33m1 MEDIUM[0m  [34m9 LOW[0m
+
+  [2mRun with [0m[36m--fix[0m[2m to generate optimized workflow files[0m
+
+[2mGenerating optimized workflow files in C:\Users\USER\AppData\Local\Temp\cloudtune-ci-cost-yn0anois\.github\workflows\optimized...[0m
+[32mGenerated 1 optimized workflow file:[0m
+  [36mC:\Users\USER\AppData\Local\Temp\cloudtune-ci-cost-yn0anois\.github\workflows\optimized\ci.yml[0m

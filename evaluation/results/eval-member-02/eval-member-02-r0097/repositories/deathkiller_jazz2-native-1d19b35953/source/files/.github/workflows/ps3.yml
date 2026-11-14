@@ -1,0 +1,168 @@
+name: 'PlayStation 3'
+
+on:
+  push:
+    branches:
+      - 'master'
+  pull_request:
+    types: [ opened, synchronize ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  Build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - BuildType: Release
+
+    # The only console here without a published toolchain image, so unlike the PSP/Vita/Wii workflows
+    # this one installs the SDK itself - the prebuilt compilers from ps3toolchain's release assets, then
+    # PSL1GHT and the portlibs from its own steps 8 and 9 (see Docs/Consoles.dox, "Toolchain")
+    runs-on: 'ubuntu-latest'
+
+    env:
+      # PSL1GHT is deliberately NOT set job-wide, because the two halves of this workflow mean different
+      # things by it and one value cannot serve both - see the install and configure steps below.
+      PS3DEV: /opt/ps3dev
+
+    steps:
+    - name: 'Checkout Repository'
+      uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+
+    - name: 'Resolve Toolchain Version'
+      id: toolchain
+      run: |
+        # ps3toolchain publishes rolling nightlies rather than tagged versions, so - unlike the Dreamcast
+        # workflow, which pins KallistiOS to a commit - there is nothing stable to pin to. The newest
+        # asset is resolved here instead, and its release tag becomes the cache key so a new nightly
+        # rebuilds rather than restoring a stale tree. If a nightly ever breaks this build, replace the
+        # query with a fixed download URL and the cache key with that release's tag.
+        RELEASES=$(curl -fsSL -H "Authorization: Bearer ${{ github.token }}" \
+          https://api.github.com/repos/ps3dev/ps3toolchain/releases)
+        ASSET=$(echo "${RELEASES}" | jq -r '[.[] | select(.assets[]?.name == "ps3dev-linux-X64.tar.gz")][0]')
+        TAG=$(echo "${ASSET}" | jq -r '.tag_name')
+        URL=$(echo "${ASSET}" | jq -r '.assets[] | select(.name == "ps3dev-linux-X64.tar.gz") | .browser_download_url')
+        if [ -z "${URL}" ] || [ "${URL}" = "null" ]; then
+          echo "No ps3dev-linux-X64.tar.gz asset found in any ps3toolchain release" >&2
+          exit 1
+        fi
+        echo "tag=${TAG}" >> $GITHUB_OUTPUT
+        echo "url=${URL}" >> $GITHUB_OUTPUT
+        echo "Using ps3dev ${TAG}"
+
+    - name: 'Cache Toolchain'
+      id: cache-ps3dev
+      uses: actions/cache@v4
+      with:
+        path: /opt/ps3dev
+        key: ps3dev-${{ steps.toolchain.outputs.tag }}
+
+    - name: 'Install Dependencies'
+      run: |
+        # toolchain.sh runs EVERY one of its depends/check-*.sh up front, whichever steps are asked for,
+        # so all of them have to pass even though this job only builds PSL1GHT and the portlibs. This is
+        # the upstream Debian list minus what an ubuntu-latest runner already has (gcc, g++, make, patch,
+        # wget). Two of these are easy to get wrong: Debian splits libtool into the macros (`libtool`) and
+        # the binary that check-libtool.sh actually looks for (`libtool-bin`), and check-libelf.sh wants
+        # the headers from `libelf-dev`, not the runtime library.
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          autoconf automake bison flex libelf-dev libgmp3-dev libncurses-dev libssl-dev \
+          libtool libtool-bin pkg-config python-is-python3 texinfo zlib1g-dev
+
+    - name: 'Install Toolchain'
+      if: steps.cache-ps3dev.outputs.cache-hit != 'true'
+      run: |
+        # The prebuilt powerpc64-ps3-elf compilers - building them from source takes hours. The toolchain
+        # is relocatable (nothing bakes the prefix in), so it can live wherever PS3DEV points. Unpacked
+        # through a temporary directory because whether the asset carries its own top-level folder is not
+        # something to depend on, and getting it wrong would nest the tree one level too deep.
+        curl -fsSL -o /tmp/ps3dev.tar.gz "${{ steps.toolchain.outputs.url }}"
+        mkdir -p /tmp/ps3dev-extract
+        tar xzf /tmp/ps3dev.tar.gz -C /tmp/ps3dev-extract
+        SRC=/tmp/ps3dev-extract
+        if [ "$(ls -1 "${SRC}" | wc -l)" = "1" ] && [ -d "${SRC}/$(ls -1 "${SRC}")" ]; then
+          SRC="${SRC}/$(ls -1 "${SRC}")"
+        fi
+        sudo mkdir -p "${PS3DEV}"
+        sudo cp -a "${SRC}/." "${PS3DEV}/"
+        sudo chown -R "$(id -u):$(id -g)" "${PS3DEV}"
+        test -x "${PS3DEV}/ppu/bin/ppu-gcc" || { echo "ppu-gcc missing under ${PS3DEV} after unpacking" >&2; ls -la "${PS3DEV}"; exit 1; }
+
+        # Step 8 builds PSL1GHT itself (librsx, libgcm_sys, libio, libaudio, libsysutil) together with the
+        # host tools the packaging step runs - fself, make_self_npdrm, sfo, pkg, sprxlinker. Step 9 builds
+        # the portlibs, of which zlib is a hard requirement: without it DeflateStream has no implementation
+        # and the game's compatibility layer does not link.
+        #
+        # PSL1GHT must equal PS3DEV for these scripts, and both of their constraints say so: check-psl1ght.sh
+        # refuses to run unless it is set at all, while the portlibs that include PSL1GHT's `base_rules`
+        # (pthread-emb) resolve their compiler as `$(PSL1GHT)/ppu/bin/ppu-gcc` and so read it as the
+        # TOOLCHAIN prefix. That is the SDK's native layout - the headers land in $PS3DEV/ppu/include
+        # alongside newlib's - and it is what the configure step detects afterwards. Our CMake toolchain
+        # file means something narrower by the same name: the directory holding ppu-lv2.h.
+        export PSL1GHT="${PS3DEV}"
+        export PATH="${PS3DEV}/bin:${PS3DEV}/ppu/bin:${PS3DEV}/spu/bin:${PATH}"
+        git clone --depth 1 https://github.com/ps3dev/ps3toolchain /tmp/ps3toolchain
+        cd /tmp/ps3toolchain
+        ./toolchain.sh 8 9
+
+    - name: 'Configure CMake'
+      run: |
+        rm -f ./Content/Translations/*.po
+
+        # The packaging tools live in $PS3DEV/bin
+        echo "${PS3DEV}/bin" >> $GITHUB_PATH
+        echo "${PS3DEV}/ppu/bin" >> $GITHUB_PATH
+        echo "${PS3DEV}/spu/bin" >> $GITHUB_PATH
+
+        # Now that the toolchain scripts have run and can no longer be confused by it, PSL1GHT is pinned
+        # to wherever step 8 actually put the SDK headers - which is what our toolchain file means by it.
+        # Both layouts are accepted because the historical one installs into the toolchain prefix itself.
+        # ppu-gcc reads this out of the environment and refuses to run without it, so it is exported for
+        # this step's configure and recorded for the build step, which runs in a fresh shell.
+        if [ -f "${PS3DEV}/psl1ght/ppu/include/ppu-lv2.h" ]; then
+          PSL1GHT="${PS3DEV}/psl1ght"
+        elif [ -f "${PS3DEV}/ppu/include/ppu-lv2.h" ]; then
+          PSL1GHT="${PS3DEV}"
+        else
+          echo "PSL1GHT not found: no ppu-lv2.h under ${PS3DEV}/psl1ght or ${PS3DEV}" >&2
+          exit 1
+        fi
+        export PSL1GHT
+        echo "PSL1GHT=${PSL1GHT}" >> $GITHUB_ENV
+        echo "Using PSL1GHT=${PSL1GHT}"
+
+        git config --global --add safe.directory '*'
+        # PSL1GHT is Makefile-based and ships no CMake toolchain file, so this one lives with the project.
+        # libopenmpt is compiled from source here (ps3dev packages none), which the configure step fetches.
+        cmake -B ./_build/ -D CMAKE_BUILD_TYPE=${{ matrix.BuildType }} -D CMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/cmake/toolchains/ps3dev.cmake
+
+    - name: 'Build'
+      run: |
+        # The EBOOT.BIN, the SELF and the NPDRM package are produced by the `jazz2` target itself, so
+        # there is no separate packaging invocation the way the disc-image consoles have
+        cmake --build ./_build/ --parallel $(nproc)
+
+    - name: 'Create Package'
+      run: |
+        # The .pkg is what a retail-firmware console installs and carries the game content with it. The
+        # unsigned .self boots directly on CFW and in RPCS3, and EBOOT.BIN is what gets dropped into an
+        # existing dev_hdd0 install - which is how the port is developed against the emulator.
+        mkdir ./_package/
+        cp -f ./_build/jazz2.pkg ./_package/Jazz2.pkg
+        cp -f ./_build/jazz2.self ./_package/Jazz2.self
+        cp -f ./_build/pkg/USRDIR/EBOOT.BIN ./_package/EBOOT.BIN
+        cp -f ./LICENSE ./_package/LICENSE
+
+    - name: 'Upload Package'
+      uses: actions/upload-artifact@v7
+      with:
+        name: Jazz2_PS3
+        path: ./_package/

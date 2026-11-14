@@ -1,0 +1,270 @@
+name: CI
+
+# This workflow will test and build the different artifacts (cli, webui, server) when necessary
+# and push built docker images as snapshot to ghcr.io on the following conditions:
+#  - in the upstream repo (not in a fork)
+#  - not triggered by dependabot
+#  - pushes to the master branch or pull_requests to the master branch not from forks
+
+# The package can be accessed via `ghcr.io/eclipse-openvsx/openvsx-server-snapshot:<sha or branch>`
+
+# Tagging rules:
+#  - <sha> for pushes to main where <sha> corresponds to the commit hash
+#  - <branch_name> for pushes to pull request branches, will be overwritten with any subsequent push
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
+
+env:
+  REGISTRY: ghcr.io
+  SERVER_IMAGE: openvsx-server-snapshot
+  WEBUI_IMAGE: openvsx-webui-snapshot
+
+jobs:
+  build-cli:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.x
+
+      - name: Verify Yarn
+        working-directory: cli
+        # Yarn 1 on the runner must delegate to the release at .yarnrc.yml's yarnPath.
+        run: |
+          want=$(node -p "require('./package.json').packageManager.split('@')[1]")
+          got=$(yarn --version) || { echo "yarn not found on runner"; exit 1; }
+          [ "$got" = "$want" ] || { echo "yarn $got, expected $want"; exit 1; }
+
+      - name: Build CLI
+        working-directory: cli
+        run: yarn
+
+      - name: Test CLI
+        working-directory: cli
+        run: yarn test
+
+  build-and-push-webui:
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    - name: Get all changed webui files
+      id: changed_webui_files
+      uses: tj-actions/changed-files@9426d40962ed5378910ee2e21d5f8c6fcbf2dd96 # v47.0.6
+      with:
+        files: webui/**
+
+    - name: Log in to the Container registry
+      if: steps.changed_webui_files.outputs.any_changed == 'true'
+      uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata (tags, labels) for Docker
+      if: steps.changed_webui_files.outputs.any_changed == 'true'
+      id: meta
+      uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+      with:
+        images: |
+          ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.WEBUI_IMAGE }}
+        tags: |
+          type=raw,value=${{ github.head_ref }},enable={{is_not_default_branch}}
+          type=raw,value={{sha}},enable={{is_default_branch}}
+        labels: |
+          org.opencontainers.image.title=OpenVSX WebUI Snapshot
+
+    - name: Build and push Web UI Image
+      if: steps.changed_webui_files.outputs.any_changed == 'true'
+      uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      with:
+        context: webui
+        push: ${{ github.repository_owner == 'eclipse-openvsx' &&
+                  github.actor != 'dependabot[bot]'   &&
+                  (
+                     github.event_name == 'push' ||
+                     (
+                       contains(github.event.pull_request.labels.*.name, 'snapshot') &&
+                       github.event.pull_request.head.repo.full_name == github.repository
+                     )
+                  ) }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+
+  build-and-push-server:
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    - name: Get all changed server files
+      id: changed_server_files
+      uses: tj-actions/changed-files@9426d40962ed5378910ee2e21d5f8c6fcbf2dd96 # v47.0.6
+      with:
+        files: server/**
+
+    - name: Set up JDK
+      if: steps.changed_server_files.outputs.any_changed == 'true'
+      uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+      with:
+        distribution: 'temurin'
+        java-version: 25
+
+    # Caches Gradle User Home (dependencies, build-output cache); avoid also using setup-java's own
+    # `cache: gradle`, the two can interfere. Only writes cache entries on the default branch - PR
+    # runs, forks included, only read. Does not cover server/.gradle/configuration-cache, see below.
+    - name: Setup Gradle
+      if: steps.changed_server_files.outputs.any_changed == 'true'
+      uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # zizmor: ignore[cache-poisoning] v6.3.0, PR-write-scoped, see comment above
+
+    # GRADLE_ENCRYPTION_KEY (set on the Run Server Tests step below) is what actually protects this;
+    # skipping the restore for fork PRs too is just an optimization, since they couldn't decrypt the
+    # entries anyway.
+    - name: Cache Gradle configuration cache
+      if: steps.changed_server_files.outputs.any_changed == 'true' &&
+          (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # zizmor: ignore[cache-poisoning] v6.1.0, see comment above
+      with:
+        path: server/.gradle/configuration-cache
+        key: gradle-configuration-cache-${{ runner.os }}-${{ hashFiles('server/**/*.gradle', 'server/gradle.properties', 'server/gradle/libs.versions.toml', 'server/gradle/wrapper/gradle-wrapper.properties', 'server/buildSrc/**') }}
+        restore-keys: |
+          gradle-configuration-cache-${{ runner.os }}-
+
+    - name: Run Server Tests
+      if: steps.changed_server_files.outputs.any_changed == 'true'
+      env:
+        # Gradle's own encryption for the configuration cache, keyed by a fixed secret rather than the
+        # per-machine key it generates by default (which wouldn't survive across separate CI runs
+        # anyway). This is the real boundary against a fork PR reading server/.gradle/configuration-cache
+        # above: GitHub never exposes secrets to fork pull_request runs, so a fork can restore the cache
+        # bytes but not decrypt them - unlike an `if:` in this file, which a fork PR can just edit away.
+        # Scoped to this step alone, not the whole job, so unrelated actions (checkout, Docker,
+        # changed-files) never see it.
+        GRADLE_ENCRYPTION_KEY: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+      run: server/gradlew --no-daemon -p server check
+
+    # Building (not just pushing) only when we're actually going to push: a plain build is otherwise
+    # wasted CI time on every PR that touches server/**, since only a push event or a same-repo PR
+    # labeled "snapshot" ever results in a push anyway. Login and metadata extraction are pointless
+    # work too when we're not going to push, so all three steps repeat the same condition (a YAML
+    # anchor would avoid the repetition, but zizmor's anchor support is beta and documented as prone
+    # to unexpected errors - not worth the fragility for three lines).
+    - name: Log in to the Container registry
+      if: steps.changed_server_files.outputs.any_changed == 'true' &&
+          github.repository_owner == 'eclipse-openvsx' &&
+          github.actor != 'dependabot[bot]' &&
+          (
+            github.event_name == 'push' ||
+            (
+              contains(github.event.pull_request.labels.*.name, 'snapshot') &&
+              github.event.pull_request.head.repo.full_name == github.repository
+            )
+          )
+      uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata (tags, labels) for Docker
+      if: steps.changed_server_files.outputs.any_changed == 'true' &&
+          github.repository_owner == 'eclipse-openvsx' &&
+          github.actor != 'dependabot[bot]' &&
+          (
+            github.event_name == 'push' ||
+            (
+              contains(github.event.pull_request.labels.*.name, 'snapshot') &&
+              github.event.pull_request.head.repo.full_name == github.repository
+            )
+          )
+      id: meta
+      uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+      with:
+        images: |
+          ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.SERVER_IMAGE }}
+        tags: |
+          type=raw,value=${{ github.head_ref }},enable={{is_not_default_branch}}
+          type=raw,value={{sha}},enable={{is_default_branch}}
+        labels: |
+          org.opencontainers.image.title=OpenVSX Server Snapshot
+
+    - name: Build and push Server Image
+      if: steps.changed_server_files.outputs.any_changed == 'true' &&
+          github.repository_owner == 'eclipse-openvsx' &&
+          github.actor != 'dependabot[bot]' &&
+          (
+            github.event_name == 'push' ||
+            (
+              contains(github.event.pull_request.labels.*.name, 'snapshot') &&
+              github.event.pull_request.head.repo.full_name == github.repository
+            )
+          )
+      uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      with:
+        context: server
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+
+  analyse:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.x
+
+      - name: Verify Yarn
+        working-directory: webui
+        # Yarn 1 on the runner must delegate to the release at .yarnrc.yml's yarnPath.
+        run: |
+          want=$(node -p "require('./package.json').packageManager.split('@')[1]")
+          got=$(yarn --version) || { echo "yarn not found on runner"; exit 1; }
+          [ "$got" = "$want" ] || { echo "yarn $got, expected $want"; exit 1; }
+
+      - name: Install dependencies
+        working-directory: webui
+        run: yarn install --immutable
+
+      - name: Set up JDK
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: 'temurin'
+          java-version: 25
+
+      - name: Set up JBang
+        uses: jbangdev/setup-jbang@2b1b465a7b75f4222b81426f23a01e013aa7b95c # v0.1.1
+
+      - uses: j178/prek-action@44924fe9ef4a6f88253c4b6b1bf11c689d3ce53d # v3.1.0
