@@ -1,0 +1,111 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [HIGH] Add npm dependency cache to "code-check" job
+# - [HIGH] Switch "pytest-macos" from macOS to ubuntu runner
+# Estimated savings: ~4 min/run
+#
+name: CI
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref }}
+  cancel-in-progress: true
+
+jobs:
+  code-check:
+    if: github.event.pull_request.draft == false
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Install uv and set up Python
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: false
+          python-version: "3.12"
+
+      - name: Run pre-commit hooks
+        uses: pre-commit/action@v3.0.1
+
+  pytest-linux:
+    if: github.event.pull_request.draft == false
+    permissions:
+      contents: read
+    strategy:
+        matrix:
+            python-version: ["3.12", "3.13"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv and set up Python
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: false
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Dependencies
+        run: uv sync --no-dev --all-extras
+
+      - name: Start Ollama server
+        run: curl -fsSL https://ollama.com/install.sh | sh && ollama serve &
+
+      - name: Test with pytest
+        run: uv run pytest
+        env:
+          HUGGINGFACE_API_KEY: ${{ secrets.HUGGINGFACE_API_KEY }}
+          HF_TOKEN: ${{ secrets.HUGGINGFACE_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+
+      - name: Delete EuroEval cache
+        run: rm -rf .euroeval_cache
+
+  pytest-macos:
+    if: github.event.pull_request.draft == false && contains(github.event.pull_request.labels.*.name, 'macos')
+    permissions:
+      contents: read
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv and set up Python
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: false
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Dependencies
+        run: uv sync --no-dev --all-extras
+
+      - name: Start Ollama server
+        run: curl -fsSL https://ollama.com/install.sh | sh && ollama serve &
+
+      - name: Test with pytest
+        run: uv run pytest -vvv
+        env:
+          HUGGINGFACE_API_KEY: ${{ secrets.HUGGINGFACE_API_KEY }}
+          HF_TOKEN: ${{ secrets.HUGGINGFACE_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+
+      - name: Delete EuroEval cache
+        run: rm -rf .euroeval_cache

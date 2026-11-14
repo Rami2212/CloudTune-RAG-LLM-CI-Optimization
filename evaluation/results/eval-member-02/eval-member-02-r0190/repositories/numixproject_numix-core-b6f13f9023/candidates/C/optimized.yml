@@ -1,0 +1,77 @@
+name: Test
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  # Checks relating to the linting of files
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt', '**/setup.py', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: pip3 install flake8
+
+      - name: Check PEP8 compliance
+        run: find . -name "*.py" | xargs flake8 $1
+
+      - name: Check mdl compliance
+        uses: articulate/actions-markdownlint@v1.1.0
+        with:
+          config: .github/workflows/markdownlint-config.json
+          ignore: LICENSE
+
+      - name: Check .editorconfig compliance
+        uses: editorconfig-checker/action-editorconfig-checker@v1
+
+  # Checks relating to the database
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt', '**/setup.py', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: pip3 install jsonschema
+
+      - name: Check database
+        run: |
+          python3 ./tests/schema.py
+          python3 ./tests/db_entry.py
+          python3 ./tests/icons_entry.py
+          python3 ./tests/ordered_db.py
+          python3 ./tests/icon_cache.py
+          python3 ./tests/duplicates.py

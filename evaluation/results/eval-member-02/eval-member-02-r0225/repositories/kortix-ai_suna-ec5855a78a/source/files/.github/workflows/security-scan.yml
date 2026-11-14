@@ -1,0 +1,222 @@
+name: Security Scan
+
+# Comprehensive DevSecOps scan suite. Runs weekly (catches newly-disclosed CVEs
+# in already-shipped images), on PRs that touch infra or a Dockerfile, and on demand.
+# Every scanner emits SARIF into the GitHub Security → Code scanning tab so
+# findings are centralized, triageable, and trend over time.
+#
+# This workflow is REPORT-oriented (it surfaces findings). The blocking gates
+# live in ci.yml (PR dependency scan) and deploy-*.yml (image scan before ship).
+
+on:
+  # A release merge into `prod` scans the prod tree so prod-ref alerts close
+  # when the fix ships (2026-10-23, SOC 2 CC7.1).
+  push:
+    branches: [prod]
+  schedule:
+    # Re-registered 2026-09-25: the schedule belonged to a user who left the org,
+    # and GitHub stopped dispatching it after 2026-08-03. See db-drift.yml.
+    - cron: "23 6 * * 1" # 06:23 UTC Mondays
+  # A pull request into `dev` or `staging` runs no CI. The release pull
+  # request into `prod` is the gate (2026-10-16).
+  pull_request:
+    branches: [prod]
+    paths:
+      - "infra/**"
+      - "apps/*/Dockerfile"
+      - "apps/kortix-app-runtime/**"
+      - ".github/workflows/security-scan.yml"
+      - ".gitleaks.toml"
+  workflow_dispatch:
+
+concurrency:
+  group: security-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  trivy-fs:
+    name: Trivy filesystem (vuln + secret + misconfig)
+    runs-on: ${{ vars.CI_RUNNER_S || 'ubuntu-24.04' }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install checksum-verified Trivy from GitHub Releases
+        run: |
+          bash infra/scripts/install-trivy.sh "$RUNNER_TEMP/trivy-bin"
+          echo "$RUNNER_TEMP/trivy-bin" >> "$GITHUB_PATH"
+      - name: Trivy fs scan → SARIF
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        with:
+          skip-setup-trivy: true
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: CRITICAL,HIGH
+          format: sarif
+          output: trivy-fs.sarif
+          exit-code: "0"
+        env:
+          TRIVY_SKIP_DB_UPDATE: "false"
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+  trivy-image:
+    name: Trivy image re-scan
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+    runs-on: ${{ vars.CI_RUNNER_S || 'ubuntu-24.04' }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - kortix/kortix-api
+          - kortix/kortix-frontend
+    steps:
+      # Push to prod scans the release images (:X.Y.Z, from the VERSION file
+      # at this commit). Every other trigger scans :dev-latest. deploy-prod.yml
+      # retags :X.Y.Z in parallel, so wait up to 30 min for the tag to exist.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Resolve image tag
+        id: tag
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/prod" ]; then
+            echo "tag=dev-latest" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          V="$(tr -d '[:space:]' < VERSION)"
+          for _ in $(seq 1 60); do
+            if docker manifest inspect "${{ matrix.image }}:$V" >/dev/null 2>&1; then
+              echo "tag=$V" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "::error::${{ matrix.image }}:$V not published after 30 min"
+          exit 1
+      - name: Install checksum-verified Trivy from GitHub Releases
+        run: |
+          bash infra/scripts/install-trivy.sh "$RUNNER_TEMP/trivy-bin"
+          echo "$RUNNER_TEMP/trivy-bin" >> "$GITHUB_PATH"
+      - name: Trivy image scan → SARIF
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        with:
+          skip-setup-trivy: true
+          scan-type: image
+          image-ref: ${{ matrix.image }}:${{ steps.tag.outputs.tag }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          format: sarif
+          output: trivy-image.sarif
+          exit-code: "0"
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image-${{ strategy.job-index }}
+
+  checkov:
+    name: Checkov (Terraform + K8s)
+    runs-on: ${{ vars.CI_RUNNER_S || 'ubuntu-24.04' }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Checkov scan → SARIF
+        uses: bridgecrewio/checkov-action@6f26dc90000b74feb589a906cdfae540f5119895
+        with:
+          directory: infra/
+          framework: terraform,kubernetes,helm,dockerfile
+          output_format: sarif
+          output_file_path: checkov.sarif
+          soft_fail: true
+      # checkov writes every #checkov:skip into the SARIF as a result with a
+      # `suppressions` entry, and code scanning opens an alert for it anyway
+      # (122 such alerts were open on 2026-10-22). The reviewed skip comment is
+      # the decision record, so upload unsuppressed failures only.
+      - name: Drop in-source suppressed results
+        run: >-
+          jq '.runs[].results |= map(select((.suppressions // []) | length == 0))'
+          checkov.sarif/results_sarif.sarif > checkov-findings.sarif
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee
+        with:
+          sarif_file: checkov-findings.sarif
+          category: checkov
+
+  hadolint:
+    name: Hadolint (Dockerfiles)
+    runs-on: ${{ vars.CI_RUNNER_S || 'ubuntu-24.04' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        dockerfile:
+          - apps/api/Dockerfile
+          - apps/web/Dockerfile
+          - apps/sandbox/Dockerfile
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Hadolint → SARIF
+        uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387
+        with:
+          dockerfile: ${{ matrix.dockerfile }}
+          format: sarif
+          output-file: hadolint.sarif
+          no-fail: true
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee
+        with:
+          sarif_file: hadolint.sarif
+          category: hadolint-${{ strategy.job-index }}
+
+  gitleaks-history:
+    name: Gitleaks (full history)
+    # Not on a pull request. It took 8-9 min of the release suite (run
+    # 38935179301) to print a report nobody gates on (exit-code 0, no SARIF).
+    # The blocking scan of the pull request's own commits is secret-scan.yml;
+    # the full history is rescanned weekly and on dispatch.
+    if: github.event_name != 'pull_request'
+    runs-on: ${{ vars.CI_RUNNER_S || 'ubuntu-24.04' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+        run: |
+          set -euo pipefail
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          # CWE-494: verify the release archive against the published
+          # checksums.txt before the binary runs (same as secret-scan.yml).
+          curl -sSfL "${base}/gitleaks_${GITLEAKS_VERSION}_checksums.txt" -o checksums.txt
+          grep -q " ${archive}$" checksums.txt
+          curl -sSfL "${base}/${archive}" -o "${archive}"
+          sha256sum -c --ignore-missing checksums.txt
+          tar -xzf "${archive}" -C /usr/local/bin gitleaks
+          gitleaks version
+      - name: Scan full history
+        run: |
+          # This workflow is report-oriented (see header). The blocking PR secret
+          # gate lives in secret-scan.yml and scans only the PR commit range.
+          gitleaks detect --source . --redact --no-banner --exit-code 0

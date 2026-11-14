@@ -1,0 +1,70 @@
+name: Formatting check
+permissions:
+  contents: read
+on:
+  merge_group:
+    types:
+      - checks_requested
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+  workflow_call:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  determine_runner:
+    if: github.event.pull_request.draft == false
+    name: Determine runner type to use
+    uses: ./.github/workflows/determine-workflow-runner.yml
+    with:
+      default_runner: ubuntu-latest
+      force_large_runner: ${{ github.event_name == 'merge_group' }}
+
+  black-pylint:
+    if: github.event.pull_request.draft == false
+    needs: [determine_runner]
+    runs-on: ${{ needs.determine_runner.outputs.runner_group }}
+    env:
+      UV_SYSTEM_PYTHON: 1
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: 0.9.17
+          enable-cache: true        
+        
+      - name: Install Python dependencies
+        run: uv pip install --group dev
+
+      - name: Run Black
+        run: |
+          black --config ./pyproject.toml pennylane/ --check
+          black --config ./pyproject.toml tests/ --check
+
+      - name: Run isort
+        run: |
+          isort --settings-path ./pyproject.toml ./pennylane --check
+          isort --settings-path ./pyproject.toml ./tests --check
+
+      - name: Run Pylint (source files)
+        if: always()
+        run: python -m pylint -rn -sn --rcfile=.pylintrc $(find pennylane -name "*.py" ! -path "pennylane/labs/tests/*")
+
+      - name: Run Pylint (test files)
+        if: always()
+        run: python -m pylint -rn -sn --rcfile=tests/.pylintrc $(find tests pennylane/labs/tests -name "*.py")

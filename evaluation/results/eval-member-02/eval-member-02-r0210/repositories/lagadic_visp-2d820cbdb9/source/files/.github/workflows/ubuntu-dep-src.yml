@@ -1,0 +1,379 @@
+name: Ubuntu-dep-src
+
+# https://www.jeffgeerling.com/blog/2020/running-github-actions-workflow-on-schedule-and-other-events
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+  schedule:
+    - cron: '0 2 * * SUN'
+
+# https://stackoverflow.com/questions/66335225/how-to-cancel-previous-runs-in-the-pr-when-you-push-new-commitsupdate-the-curre#comment133398800_72408109
+# https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#concurrency
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  # Function to get the most recent tag of a remote repository without having to clone it, excluding tag with 'pr' as in Pre Release
+  FUNCTION_GET_LATEST: 'git -c "versionsort.suffix=-" ls-remote --exit-code --refs --sort="version:refname" --tags ${GIT_ADDRESS} "*.*.*" | cut --delimiter="/" --fields=3 | grep -v -e pr -e rc | tail --lines=1'
+
+jobs:
+  # https://github.com/orgs/community/discussions/28474#discussioncomment-3350256
+  check_skip_flags:
+    name: Check skip flags
+    runs-on: ubuntu-latest
+    outputs:
+      head-commit-message: ${{ steps.get_head_commit_message.outputs.headCommitMsg }}
+    steps:
+      - name: Get repo
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Print head git commit message
+        id: get_head_commit_message
+        run: |
+          echo "headCommitMsg: $(git show -s --format=%s)"
+          echo "headCommitMsg=$(git show -s --format=%s)" >> $GITHUB_OUTPUT
+
+  build-ubuntu-dep-src:
+    runs-on: ${{ matrix.os }}
+    needs: check_skip_flags
+    if: >-
+      ${{
+        (!contains(needs.check_skip_flags.outputs.head-commit-message, '[SKIP-CI ALL]') &&
+        !contains(needs.check_skip_flags.outputs.head-commit-message, '[SKIP-CI UBUNTU-DEP-SRC]')) ||
+        contains(needs.check_skip_flags.outputs.head-commit-message, '[ENABLE-CI UBUNTU-DEP-SRC]')
+      }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-latest]
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v7
+
+    # https://github.com/hendrikmuhs/ccache-action
+    - name: ccache
+      uses: hendrikmuhs/ccache-action@v1.2.19
+      with:
+        key: ${{ github.job }}-${{ matrix.os }}
+        append-timestamp: false
+        verbose: 2
+
+    - name: Print ccache-action key
+      run: echo "key=${{ github.job }}-${{ matrix.os }}"
+
+    - name: Print system information
+      run: lscpu
+
+    - name: Print OS information
+      run: lsb_release -a
+
+    - name: Install common dependencies for ubuntu
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libx11-dev libdc1394-dev libv4l-dev gfortran liblapack-dev libeigen3-dev
+        sudo apt-get install -y libssl-dev libusb-1.0-0-dev pkg-config libgtk-3-dev libglfw3-dev libgl1-mesa-dev libglu1-mesa-dev
+        sudo apt-get install -y mesa-common-dev mesa-utils freeglut3-dev libflann-dev libboost-all-dev
+        sudo apt-get install -y nlohmann-json3-dev libcjson-dev
+
+    - name: Install Ogre dependencies
+      run: |
+        sudo apt-get install -y libgles2-mesa-dev libvulkan-dev glslang-dev libxrandr-dev  libxaw7-dev libx11-dev libzzip-dev libsdl2-dev
+
+    - name: Build Ogre from source
+      run: |
+        pwd
+        GIT_ADDRESS="https://github.com/OGRECave/ogre"
+        LATEST_TAG=`eval ${FUNCTION_GET_LATEST}`
+        echo "Newest tag is ${LATEST_TAG}"
+        git clone --depth 1 --branch ${LATEST_TAG} ${GIT_ADDRESS} ${HOME}/ogre
+        cd ${HOME}/ogre
+        mkdir build && cd build && mkdir install
+        cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$(pwd)/install -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+        make -j$(nproc) install
+        echo "OGRE_DIR=$(pwd)/install" >> $GITHUB_ENV
+        echo $OGRE_DIR
+
+    - name: Build OpenBLAS from source
+      run: |
+        pwd
+        echo $GITHUB_WORKSPACE
+        GIT_ADDRESS=https://github.com/xianyi/OpenBLAS.git
+        LATEST_TAG=`eval ${FUNCTION_GET_LATEST}`
+        echo "Newest tag is ${LATEST_TAG}"
+        git clone --depth 1 --branch ${LATEST_TAG} ${GIT_ADDRESS} ${HOME}/OpenBLAS
+        cd ${HOME}/OpenBLAS
+        mkdir install
+        make -j$(nproc)
+        make -j$(nproc) install PREFIX=$(pwd)/install
+        echo "OpenBLAS_HOME=$(pwd)/install" >> $GITHUB_ENV
+        echo $OpenBLAS_HOME
+
+    - name: Build VTK from source
+      # We set GIT_CLONE_PROTECTION_ACTIVE=false to avoid the issue described in
+      # https://github.com/git-lfs/git-lfs/issues/5749
+      run: |
+        pwd
+        echo "GIT_CLONE_PROTECTION_ACTIVE=false" >> $GITHUB_ENV
+        export GIT_CLONE_PROTECTION_ACTIVE=false
+        GIT_ADDRESS="https://github.com/Kitware/VTK.git"
+        LATEST_TAG=`eval ${FUNCTION_GET_LATEST}`
+        echo "Newest tag is ${LATEST_TAG}"
+        git clone --recursive --depth 1 --branch ${LATEST_TAG} ${GIT_ADDRESS}  ${HOME}/VTK
+        cd ${HOME}/VTK
+        mkdir build && cd build && mkdir install
+        cmake .. -DVTK_ANDROID_BUILD=OFF -DVTK_BUILD_DOCUMENTATION=OFF -DVTK_BUILD_EXAMPLES=OFF -DVTK_BUILD_EXAMPLES=OFF -DCMAKE_BUILD_TYPE=Release \
+          -DVTK_GROUP_ENABLE_Imaging=DONT_WANT -DVTK_GROUP_ENABLE_MPI=DONT_WANT -DVTK_GROUP_ENABLE_Web=DONT_WANT -DCMAKE_INSTALL_PREFIX=$(pwd)/install \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+        make -j$(nproc) install
+        echo "VTK_DIR=$(pwd)/install" >> $GITHUB_ENV
+        echo $VTK_DIR
+        echo "VTK_REL=$LATEST_TAG" >> $GITHUB_ENV
+
+    - name: Build OpenCV from source
+      run: |
+        pwd
+        GIT_ADDRESS="https://github.com/opencv/opencv.git"
+        LATEST_TAG=`eval ${FUNCTION_GET_LATEST}`
+        echo "Newest tag is ${LATEST_TAG}"
+        git clone --depth 1 --branch ${LATEST_TAG} ${GIT_ADDRESS} ${HOME}/opencv
+        cd ${HOME}/opencv
+        mkdir build && cd build && mkdir install
+        cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_PERF_TESTS=OFF -DBUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$(pwd)/install \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+        make -j$(nproc) install
+        echo "OpenCV_DIR=$(pwd)/install" >> $GITHUB_ENV
+        echo $OpenCV_DIR
+
+    - name: Build librealsense2 from source
+      run: |
+        pwd
+        GIT_ADDRESS="https://github.com/IntelRealSense/librealsense.git"
+        LATEST_TAG=`eval ${FUNCTION_GET_LATEST}`
+        echo "Newest tag is ${LATEST_TAG}"
+        git clone --depth 1 --branch ${LATEST_TAG} ${GIT_ADDRESS} ${HOME}/librealsense
+        cd ${HOME}/librealsense
+        mkdir build && cd build && mkdir install
+        cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_GRAPHICAL_EXAMPLES=OFF -DBUILD_TOOLS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$(pwd)/install \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+        make -j$(nproc) install
+        echo "REALSENSE2_DIR=$(pwd)/install" >> $GITHUB_ENV
+        echo $REALSENSE2_DIR
+
+    - name: Build PCL from source
+      run: |
+        pwd
+        GIT_ADDRESS="https://github.com/PointCloudLibrary/pcl.git"
+        LATEST_TAG=`eval ${FUNCTION_GET_LATEST}`
+        echo "Newest tag is ${LATEST_TAG}"
+        # pcl-1.15.1 does not build with VTK >= 9.7 (e.g. vtkRenderer::RemoveActor2D was removed)
+        VTK_MIN_INCOMPATIBLE="v9.7.0"
+        VTK_LOWEST=`printf "%s\n%s\n" "${VTK_MIN_INCOMPATIBLE}" "${VTK_REL}" | sort -V | head -n 1`
+        if [[ "${LATEST_TAG}" == "pcl-1.15.1" && "${VTK_LOWEST}" == "${VTK_MIN_INCOMPATIBLE}" ]]
+        then
+          BRANCH=master
+          echo "Because it is not compatible with vtk ${VTK_REL} we will use the branch ${BRANCH} instead"
+        else
+          BRANCH=${LATEST_TAG}
+        fi
+        git clone --depth 1 --branch ${BRANCH} ${GIT_ADDRESS} ${HOME}/pcl
+        cd ${HOME}/pcl
+        mkdir build && cd build && mkdir install
+        # By default PCL is built with march=native
+        # https://github.com/PointCloudLibrary/pcl/blob/e5ce18fab8d4ff175eb44cc09ae24ae1a0a2e8eb/cmake/pcl_find_avx.cmake#L11
+        # Disable AVX512 to avoid issue with GHA and ccache action across possible different hardware specs runner
+        cmake .. -DBUILD_tools=OFF -DBUILD_global_tests=OFF -DPCL_DISABLE_GPU_TESTS=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$(pwd)/install \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_FLAGS=-mno-avx512f -DCMAKE_C_FLAGS=-mno-avx512f
+        make -j$(nproc) install
+        echo "PCL_DIR=$(pwd)/install" >> $GITHUB_ENV
+        echo $PCL_DIR
+
+    - name: Build qualisys_cpp_sdk from source
+      run: |
+        pwd
+        git clone https://github.com/qualisys/qualisys_cpp_sdk.git ${HOME}/qualisys_cpp_sdk
+        cd ${HOME}/qualisys_cpp_sdk
+        mkdir build && cd build && mkdir install
+        cmake .. qualisys_cpp_sdk_BUILD_EXAMPLE=OFF qualisys_cpp_sdk_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS=-fPIC \
+          -DCMAKE_INSTALL_PREFIX=$(pwd)/install -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+        make -j$(nproc) install
+        echo "QUALISYS_DIR=$(pwd)/install" >> $GITHUB_ENV
+        echo $QUALISYS_DIR
+
+    - name: Build libfranka from source
+      # Since libfranka version 0.14.0 or later, you will need to install pinocchio and some more dependencies
+      # libfranka 0.18.1 doesn't build on ubuntu-22.04 (see issue https://github.com/frankarobotics/libfranka/issues/215)
+      env:
+        LD_LIBRARY_PATH: /opt/openrobots/lib
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt-get install -y lsb-release curl
+        sudo mkdir -p /etc/apt/keyrings
+        curl -fsSL http://robotpkg.openrobots.org/packages/debian/robotpkg.asc | sudo tee /etc/apt/keyrings/robotpkg.asc
+        echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/robotpkg.asc] http://robotpkg.openrobots.org/packages/debian/pub $(lsb_release -cs) robotpkg" | sudo tee /etc/apt/sources.list.d/robotpkg.list
+        sudo apt-get update
+        sudo apt-get install -y robotpkg-pinocchio libpoco-dev libfmt-dev libtinyxml2-dev
+        pwd
+        GIT_ADDRESS="https://github.com/frankaemika/libfranka"
+        LATEST_TAG=`eval ${FUNCTION_GET_LATEST}`
+        echo "Newest tag is ${LATEST_TAG}"
+        git clone --recursive --branch ${LATEST_TAG} ${GIT_ADDRESS} ${HOME}/libfranka
+        cd ${HOME}/libfranka
+        mkdir build && cd build && mkdir install
+        cmake .. -DCMAKE_PREFIX_PATH=/opt/openrobots/lib/cmake -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX=$(pwd)/install -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+        make -j$(nproc) install
+        echo "Franka_DIR=$(pwd)/install" >> $GITHUB_ENV
+        echo $Franka_DIR
+
+    - name: Build Cerebellum Afma and Viper robots SDK from source
+      run: |
+        pwd
+        git clone https://gitlab.inria.fr/rainbow/platforms/adept_robots/cerebellum.git ${HOME}/cerebellum
+        git clone https://gitlab.inria.fr/rainbow/platforms/adept_robots/afma6 ${HOME}/afma6
+        git clone https://gitlab.inria.fr/rainbow/platforms/adept_robots/viper650 ${HOME}/viper650
+        git clone https://gitlab.inria.fr/rainbow/platforms/adept_robots/viper850 ${HOME}/viper850
+        cd ${HOME}/cerebellum/CALinux
+        make -j$(nproc)
+        sudo make install
+        cd ${HOME}/cerebellum/Irisa
+        cmake .
+        make -j$(nproc)
+        sudo make install
+        echo "AFMA6_DATA_DIR=${HOME}/afma6" >> $GITHUB_ENV
+        echo "VIPER650_DATA_DIR=${HOME}/viper650" >> $GITHUB_ENV
+        echo "VIPER850_DATA_DIR=${HOME}/viper850" >> $GITHUB_ENV
+        echo $AFMA6_DATA_DIR
+        echo $VIPER650_DATA_DIR
+        echo $VIPER850_DATA_DIR
+
+    - name: Build Universal Robots ur_rtde SDK from source
+      run: |
+        sudo apt-get update
+        sudo apt install -y libboost-system-dev libboost-thread-dev libboost-program-options-dev
+        pwd
+        GIT_ADDRESS="https://gitlab.com/sdurobotics/ur_rtde.git"
+        LATEST_TAG=`eval ${FUNCTION_GET_LATEST}`
+        echo "Newest tag is ${LATEST_TAG}"
+        # ur_rtde v1.6.0 doesn't build with Boost >= 1.87 (e.g. Boost 1.90 on Ubuntu 26.04) since it uses
+        # boost/asio/io_service.hpp that was removed, and requests boost_system component that no longer
+        # exists since Boost 1.89. Both are fixed in master branch.
+        if [[ "${LATEST_TAG}" == "v1.6.0" && ! -f /usr/include/boost/asio/io_service.hpp ]]
+        then
+          BRANCH=master
+          echo "Because it is not compatible with Boost installed version we will use the branch ${BRANCH} instead"
+        else
+          BRANCH=${LATEST_TAG}
+        fi
+        git clone --depth 1 --branch ${BRANCH} ${GIT_ADDRESS} ${HOME}/ur_rtde
+        cd ${HOME}/ur_rtde
+        mkdir build && cd build && mkdir install
+        cmake .. -DCMAKE_BUILD_TYPE=Release -DPYTHON_BINDINGS=OFF -DCMAKE_INSTALL_PREFIX=$(pwd)/install \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+        make -j$(nproc) install
+        echo "ur_rtde_DIR=$(pwd)/install" >> $GITHUB_ENV
+        echo $ur_rtde_DIR
+
+    - name: Clone visp-images
+      env:
+        BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
+      # https://remarkablemark.org/blog/2022/09/25/check-git-branch-exists-in-remote-repository/
+      run: |
+        git clone --depth 1 https://github.com/lagadic/visp-images ${HOME}/visp-images
+        echo "VISP_INPUT_IMAGE_PATH=$HOME/visp-images" >> $GITHUB_ENV
+        echo ${VISP_INPUT_IMAGE_PATH}
+
+    - name: Configure CMake
+      run: |
+        pwd
+        mkdir build && cd build && mkdir install
+        cmake .. -DCMAKE_INSTALL_PREFIX=$(pwd)/install \
+                 -DACTIVATE_WARNING_SHADOW=ON \
+                 -DACTIVATE_WARNING_FLOAT_EQUAL=ON \
+                 -DACTIVATE_WARNING_SIGN_CONVERSION=ON \
+                 -DACTIVATE_WARNING_STRICT_OVERFLOW=ON
+        cat ViSP-third-party.txt
+
+    - name: Build visp-config script
+      working-directory: build
+      run: |
+        make -j$(nproc) developer_scripts
+        ./bin/visp-config --cflags
+        ./bin/visp-config --libs
+
+    - name: Build and install ViSP
+      env:
+        LD_LIBRARY_PATH: /opt/openrobots/lib
+      working-directory: build
+      run: |
+        set -o pipefail
+        make -j$(nproc) install 2>&1 | tee make_install.log
+        echo "VISP_DIR=$(pwd)/install" >> $GITHUB_ENV
+        echo $VISP_DIR
+        # Filter and group warnings into a separate file
+        # grep exits with status 1 when no match is found: don't let that fail the step
+        grep -i "warning: " make_install.log > warnings.log || true
+        echo "Build output logged to make_install.log"
+        echo "Warnings logged to warnings.log"
+
+    - name: Show build logs
+      if: always()
+      working-directory: build
+      run: |
+        echo "=== Build logs ==="
+        cat make_install.log
+
+    - name: Show warnings
+      if: always()
+      working-directory: build
+      run: |
+        echo "=== WARNINGS ==="
+        if [ -f warnings.log ]; then
+          cat warnings.log
+        else
+          echo "warnings.log not found (build likely failed before it could be generated)"
+        fi
+
+    - name: Run unit tests
+      env:
+        LD_LIBRARY_PATH: /opt/openrobots/lib
+      working-directory: build
+      run: ctest -j$(nproc) --output-on-failure
+
+    - name: Clone camera_localization
+      run: |
+        git clone --depth 1 https://github.com/lagadic/camera_localization ${HOME}/camera_localization
+
+    - name: Build camera_localization with ViSP as 3rdparty
+      env:
+        LD_LIBRARY_PATH: /opt/openrobots/lib
+      run: |
+        cd ${HOME}/camera_localization
+        mkdir camera_localization-build
+        cd camera_localization-build
+        cmake ..
+        make -j$(nproc)
+
+    - name: Clone visp_started
+      run: |
+        git clone --depth 1 https://github.com/lagadic/visp_started ${HOME}/visp_started
+
+    - name: Build visp_started with ViSP as 3rdparty
+      env:
+        LD_LIBRARY_PATH: /opt/openrobots/lib
+      run: |
+        cd ${HOME}/visp_started
+        mkdir visp_started-build
+        cd visp_started-build
+        cmake ..
+        make -j$(nproc)
+
+    - name: Check ViSP build warnings
+      working-directory: build
+      run: |
+        if [ -s warnings.log ]; then
+          echo "ViSP build has produced warnings."
+          exit 1
+        fi

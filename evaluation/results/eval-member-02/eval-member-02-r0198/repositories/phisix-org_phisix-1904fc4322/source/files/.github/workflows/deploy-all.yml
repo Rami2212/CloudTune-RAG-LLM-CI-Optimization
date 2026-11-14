@@ -1,0 +1,29 @@
+# This workflow will build a Java project with Maven and deploy to multiple environments
+# For more information see: https://help.github.com/actions/language-and-framework-guides/building-and-testing-java-with-maven
+
+name: Deploy All Environments
+
+on:
+  push:
+    branches: [ "master" ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [2, 3]
+    
+    steps:
+    - uses: actions/checkout@v7
+    - name: Set up JDK 21
+      uses: actions/setup-java@v6
+      with:
+        java-version: '21'
+        distribution: 'temurin'
+        cache: maven
+    - uses: 'google-github-actions/auth@v3'
+      with:
+        credentials_json: ${{ secrets[format('PHISIX_{0}_KEY', matrix.environment)] }}
+    - name: Deploy to phisix-${{ matrix.environment }}
+      run: mvn -B clean package appengine:deploy -Pphisix-${{ matrix.environment }} --file pom.xml 

@@ -1,0 +1,199 @@
+name: Test
+
+on: pull_request
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt', 'constraints.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies with pip
+        run: pip install --no-warn-script-location --user -r requirements.txt -c constraints.txt
+
+      - name: Test doc8
+        run: make test
+
+      - name: Test doc tools
+        run: make test-tools
+
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt', 'constraints.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies with pip
+        run: pip install --no-warn-script-location --user -r requirements.txt -c constraints.txt
+
+      - name: Lint
+        run: make lint
+
+  spellcheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt', 'constraints.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies with pip
+        run: pip install --no-warn-script-location --user -r requirements.txt -c constraints.txt
+
+      - name: Spellcheck
+        run: make spellcheck
+
+  build:
+    needs: [test, lint, spellcheck]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt', 'constraints.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Setup Graphviz
+        uses: ts-graphviz/setup-graphviz@v2
+
+      - name: Install dependencies with pip
+        run: pip install --no-warn-script-location --user -r requirements.txt -c constraints.txt
+
+      - name: Setup Node.js (Pagefind)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Build the docs with Pagefind search
+        run: make html
+
+      - name: Upload document artifacts
+        uses: actions/upload-artifact@v4
+        id: artifact-upload-step
+        with:
+          name: html-artifacts-${{ github.event.pull_request.number }}
+          path: build/html
+          retention-days: 30 # default 90
+          compression-level: 9 # maximum compression, default 6
+          if-no-files-found: error # 'warn' or 'ignore' are also available, defaults to `warn`
+
+      - name: Find HTML artifacts link comment
+        uses: peter-evans/find-comment@v3
+        id: find-comment
+        # Skip if PR from fork
+        if: github.repository == github.event.pull_request.head.repo.full_name
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: "HTML artifacts:"
+
+      - name: Create or update HTML artifacts link comment
+        uses: peter-evans/create-or-update-comment@v4
+        # Skip if PR from fork
+        if: github.repository == github.event.pull_request.head.repo.full_name
+        with:
+          comment-id: ${{ steps.find-comment.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            HTML artifacts: ${{ steps.artifact-upload-step.outputs.artifact-url }}.
+
+            To view the resulting site:
+            1. Click on the above link to download the artifacts archive
+            2. Extract it
+            3. Open `html-artifacts-${{ github.event.pull_request.number }}/index.html` in your favorite browser
+          edit-mode: replace
+
+  multi-build:
+    needs: [test, lint, spellcheck]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Create a fake remote ref matching the target branch name
+      - name: Setup branch for multiversion
+        run: |
+          TARGET_BRANCH="${{ github.base_ref }}"
+          echo "PR target branch: $TARGET_BRANCH"
+
+          # Create a remote ref that sphinx-multiversion will find
+          git update-ref "refs/remotes/origin/$TARGET_BRANCH" HEAD
+
+          # Verify the ref was created
+          echo "Created refs:"
+          git show-ref | grep "$TARGET_BRANCH"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt', 'constraints.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Setup Graphviz
+        uses: ts-graphviz/setup-graphviz@v2
+
+      - name: Install dependencies with pip
+        run: pip install --no-warn-script-location --user -r requirements.txt -c constraints.txt
+
+      - name: Setup Node.js (Pagefind)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Build the docs with Pagefind search
+        run: make multiversion

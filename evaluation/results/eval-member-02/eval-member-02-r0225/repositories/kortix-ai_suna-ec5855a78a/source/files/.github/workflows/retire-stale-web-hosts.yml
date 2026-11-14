@@ -1,0 +1,58 @@
+name: Retire stale web hosts
+
+# KRTX-3365: new.kortix.com and prod-test.kortix.com are retired Vercel-era
+# hosts whose zone records keep serving expired certificates, because no
+# Vercel project claims the domains any more. This one-shot cleanup deletes
+# their stale CNAME records from the kortix.com zone, guarded by
+# infra/scripts/retire-stale-web-hosts.sh: a record is deleted only when it
+# still CNAMEs to the stale Vercel target. Extend the host list when another
+# Vercel-era host retires.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: retire-stale-web-hosts
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write # OIDC -> AWS Secrets Manager (.github/actions/aws-env)
+
+jobs:
+  retire:
+    name: Delete the stale kortix.com DNS records
+    runs-on: ${{ vars.CI_RUNNER_S || 'ubuntu-24.04' }}
+    timeout-minutes: 10
+    env:
+      CLOUDFLARE_ZONE_ID: ${{ vars.CLOUDFLARE_ZONE_ID }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # CLOUDFLARE_API_TOKEN — kortix.com zone: DNS Write and Zone Read, the
+      # scopes this run needs; the same token the edge workflows read.
+      - name: Check out the aws-env action
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .aws-env
+          sparse-checkout: .github/actions
+          persist-credentials: false
+      - name: Read credentials from AWS Secrets Manager
+        uses: ./.aws-env/.github/actions/aws-env
+        with:
+          keys: |
+            CLOUDFLARE_API_TOKEN=kortix-ci-env:CLOUDFLARE_APPS_EDGE_API_TOKEN
+
+      - name: Validate Cloudflare configuration
+        run: |
+          set -euo pipefail
+          for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ZONE_ID; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::${name} is not configured."
+              exit 1
+            fi
+          done
+
+      - name: Delete the stale Vercel-era records
+        run: bash infra/scripts/retire-stale-web-hosts.sh 'new.kortix.com' 'prod-test.kortix.com'

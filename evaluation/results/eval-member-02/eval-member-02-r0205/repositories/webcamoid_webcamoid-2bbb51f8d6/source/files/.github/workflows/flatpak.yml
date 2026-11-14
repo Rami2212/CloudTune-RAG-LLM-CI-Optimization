@@ -1,0 +1,61 @@
+name: Flatpak
+
+on: [push, pull_request]
+
+env:
+  RUNTIME_VERSION: 6.9
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: true
+        token: ${{ secrets.UPLOAD_TOKEN }}
+    - name: Install dependencies
+      run: |
+        chmod +x ports/ci/flatpak/install_deps.sh
+        ./ports/ci/flatpak/install_deps.sh
+    - name: Release Build
+      if: ${{ startsWith(github.ref, 'refs/tags/') }}
+      run: |
+        chmod +x ports/ci/flatpak/build.sh
+        ./ports/ci/flatpak/build.sh
+    - name: Release Deploy
+      if: ${{ startsWith(github.ref, 'refs/tags/') }}
+      run: |
+        chmod +x ports/ci/flatpak/deploy.sh
+        ./ports/ci/flatpak/deploy.sh
+    - name: Daily Build
+      if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      env:
+        DAILY_BUILD: 1
+      run: |
+        chmod +x ports/ci/flatpak/build.sh
+        ./ports/ci/flatpak/build.sh
+    - name: Daily Deploy
+      if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      env:
+        DAILY_BUILD: 1
+      run: |
+        chmod +x ports/ci/flatpak/deploy.sh
+        ./ports/ci/flatpak/deploy.sh
+    - name: Release Upload
+      uses: softprops/action-gh-release@v3
+      if: ${{ startsWith(github.ref, 'refs/tags/') }}
+      with:
+        repository: webcamoid/WebcamoidPrivate
+        files: webcamoid-packages/linux/*
+        token: ${{ secrets.UPLOAD_TOKEN }}
+    - name: Daily Build Upload
+      uses: softprops/action-gh-release@v3
+      if: ${{ !startsWith(github.ref, 'refs/tags/') && github.ref == 'refs/heads/master' }}
+      with:
+        repository: webcamoid/WebcamoidPrivate
+        body: "${{ github.event.head_commit.message }} (commit: [${{ github.sha }}](https://github.com/webcamoid/webcamoid/commit/${{ github.sha }}))<hr>**Note**: Ignore the commit information of the tag, the files in the release keep updating with every new build, these packages were built from [${{ github.sha }}](https://github.com/webcamoid/webcamoid/commit/${{ github.sha }}) commit."
+        prerelease: true
+        files: webcamoid-packages/linux/*
+        name: Daily Build
+        tag_name: daily-build
+        token: ${{ secrets.UPLOAD_TOKEN }}

@@ -1,0 +1,193 @@
+name: Build and Push Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        type: string
+        required: true
+        description: "Enter a SINGLE version number to build"
+
+jobs:
+  bake:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Create Bake File
+        run: python dev/baker.py --arm --file --version ${{ inputs.version }}
+
+      - name: Upload Bake File
+        uses: actions/upload-artifact@v7
+        with:
+          path: docker-bake.json
+          name: bake-file
+
+      # Splits the bake file into a build matrix based on the platforms
+      - name: Generate Build Matrix
+        id: generate
+        uses: docker/bake-action/subaction/matrix@v7
+        with:
+          target: webtrees
+          fields: platforms
+
+      # Generate some extra metadata for use in later steps
+      - name: Output Metadata
+        id: metadata
+        run: python dev/metadata.py --version ${{ inputs.version }}
+
+    outputs:
+      build-matrix: ${{ steps.generate.outputs.matrix }}
+      metadata: ${{ steps.metadata.outputs.metadata }}
+
+  build:
+    needs: bake
+    runs-on: ${{ startsWith(matrix.platforms, 'linux/arm') && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+
+    strategy:
+      matrix:
+        include: ${{ fromJson(needs.bake.outputs.build-matrix) }}
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Download Bake File
+        uses: actions/download-artifact@v8
+        with:
+          name: bake-file
+
+      # Pretty sure no longer necessary with ARM runners, but left in case
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: all
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          version: latest
+
+      - name: DockerHub Login
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+      - name: Github CR Login
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build
+        uses: docker/bake-action@v7
+        id: builder
+        with:
+          source: .
+          targets: ${{ matrix.target }}
+          # Since we're not pushing directly to the registry here, the tags
+          # need to just be the base image names with no ":latest" or similar tag.
+          # If the image is pushed in this step, the last tag built would overwrite
+          # any other tags and only get one platform in the registry manifest.
+          set: |
+            *.tags=${{ fromJSON(needs.bake.outputs.metadata).base_images[0] }}
+            *.tags=${{ fromJSON(needs.bake.outputs.metadata).base_images[1] }}
+            *.platform=${{ matrix.platforms }}
+
+      - name: Save Build Metadata
+        run: echo '${{ steps.builder.outputs.metadata }}' > build-metadata.json
+
+      # Upload metadata for reassembly later.
+      - name: Upload Build Metadata
+        uses: actions/upload-artifact@v7
+        with:
+          path: build-metadata.json
+          name: build-metadata-${{ hashFiles('build-metadata.json') }}
+
+  update-digest:
+    needs:
+      - build
+      - bake
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          version: latest
+
+      - name: DockerHub Login
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+      - name: Github CR Login
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download Build Metadata
+        uses: actions/download-artifact@v8
+        with:
+          pattern: build-metadata-*
+
+      # Update the registry with the tags to apply to the specific digest.
+      # This automatically reads from the downloaded files
+      - name: Upload Digest
+        run: python dev/imagetools.py ${{ fromJSON(needs.bake.outputs.metadata).tags }}
+
+  update-readme:
+    needs: build
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Update DockerHub README
+        uses: christian-korneck/update-container-description-action@v1
+        env:
+          DOCKER_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKER_PASS: ${{ secrets.DOCKERHUB_PASSWORD }}
+        with:
+          destination_container_repo: ${{ secrets.DOCKERHUB_USERNAME }}/webtrees
+          provider: dockerhub
+          short_description: ${{ github.event.repository.description }}
+
+  release:
+    needs:
+      - bake
+      - build
+
+    permissions:
+      contents: write
+
+    uses: NathanVaughn/reusable-actions/.github/workflows/create-release.yml@main
+    with:
+      tag: ${{ fromJSON(needs.bake.outputs.metadata).release_tag }}
+      body: ${{ fromJSON(needs.bake.outputs.metadata).release_body }}
+      prerelease: ${{ fromJSON(needs.bake.outputs.metadata).prerelease }}

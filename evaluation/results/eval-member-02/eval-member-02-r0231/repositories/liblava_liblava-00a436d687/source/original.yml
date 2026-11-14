@@ -1,0 +1,53 @@
+name: CMake
+
+on: [push, pull_request, repository_dispatch, workflow_dispatch]
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build:
+    runs-on: ${{matrix.os}}
+
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Set env
+      shell: bash
+      run: echo "SHORT_SHA=${GITHUB_SHA::7}" >> $GITHUB_ENV
+
+    - name: Prepare (ubuntu)
+      run: |
+           sudo apt-get update
+           sudo apt-get install -y libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxi-dev libxext-dev libwayland-dev libxkbcommon-dev
+      if: matrix.os == 'ubuntu-latest'
+
+    - name: Configure
+      run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_INSTALL_PREFIX=${{github.workspace}}/install -DCMAKE_VERBOSE_MAKEFILE=ON
+
+    - name: Build
+      run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}}
+
+    - name: Test
+      run: ctest -C ${{env.BUILD_TYPE}} --test-dir ${{github.workspace}}/build
+
+    - name: Install
+      run: |
+           mkdir install
+           cmake --install ${{github.workspace}}/build --strip
+
+    - name: Pack
+      run: |
+           cd ${{github.workspace}}/build
+           cpack -C ${{env.BUILD_TYPE}}
+
+    - name: Upload
+      uses: actions/upload-artifact@v4
+      with:
+        name: liblava-${{ env.SHORT_SHA }}-${{ matrix.os }}
+        path: ${{github.workspace}}/build/packages/

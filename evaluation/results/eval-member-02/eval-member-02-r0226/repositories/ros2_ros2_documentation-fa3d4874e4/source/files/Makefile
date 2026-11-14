@@ -1,0 +1,129 @@
+# Make file to generate documentation
+
+SOURCE     = source
+OUT        = build
+LINKCHECKDIR  = $(OUT)/linkcheck
+PYTHON := python3
+ifeq ($(OS),Windows_NT)
+    PYTHON := python
+endif
+BASH := bash
+BUILD      = $(PYTHON) -m sphinx
+JOBS       ?= auto
+# Attached form (-j<JOBS>, no space) so sphinx-multiversion forwards it to sphinx-build
+# instead of mistaking the value for a positional argument.
+OPTS       =-c . -W -j$(JOBS) # Treat warnings as errors, build in parallel ($(JOBS) workers)
+LIVE_HOST  ?= 0.0.0.0
+LIVE_PORT  ?= 2022
+
+TOOLS_DIR     ?= tools
+DIFF_BASE     ?=
+STATUS_FILE   ?=
+PR_NUMBER     ?=
+REPOSITORY    ?=
+
+DICTIONARIES := codespell_dictionary.txt codespell_whitelist.txt
+
+help:
+	@$(BUILD) -M help "$(SOURCE)" "$(OUT)" $(OPTS)
+	@echo "  multiversion to build documentation for all branches"
+
+# Pagefind static search index (requires Node.js / npx).
+# source/_static/pagefind-search.js hooks into this version's Component UI
+# internals. After changing the version, test search and filters by hand.
+PAGEFIND_VERSION ?= 1.5.2
+HAVE_NPX := $(shell command -v npx 2>/dev/null)
+# Without Node.js, build with Sphinx's built-in search instead of failing.
+ifeq ($(HAVE_NPX),)
+PAGEFIND_OPTS = -D pagefind_enabled=0
+endif
+
+pagefind:
+	@command -v npx >/dev/null || { echo "make pagefind needs Node.js 18+ (npx)"; exit 1; }
+	npx -y pagefind@$(PAGEFIND_VERSION) --site "$(OUT)/html"
+
+# Index the output with Pagefind when Node.js is available.
+pagefind-if-available:
+ifeq ($(HAVE_NPX),)
+	@echo "WARNING: Node.js (npx) not found. Built with Sphinx's built-in search instead of Pagefind."
+else
+	$(MAKE) pagefind
+endif
+
+html: Makefile
+	@$(BUILD) -M html "$(SOURCE)" "$(OUT)" $(OPTS) $(PAGEFIND_OPTS)
+	$(MAKE) pagefind-if-available
+
+multiversion: Makefile
+	sphinx-multiversion $(OPTS) $(PAGEFIND_OPTS) "$(SOURCE)" build/html
+	@echo "<html><head><meta http-equiv=\"refresh\" content=\"0; url=lyrical/index.html\" /></head></html>" > build/html/index.html
+	$(PYTHON) make_sitemapindex.py
+	$(MAKE) pagefind-if-available
+
+%: Makefile
+	@$(BUILD) -M $@ "$(SOURCE)" "$(OUT)" $(OPTS)
+
+lint:
+	./sphinx-lint-with-ros source
+
+test:
+	doc8 --ignore D001  --ignore-path $(OUT) -- $(SOURCE)
+
+test-tools:
+	$(PYTHON) -m pytest test/
+	PYTHONPATH=$(TOOLS_DIR) $(PYTHON) -m pytest $(TOOLS_DIR)/tests/
+
+spellcheck:
+	git ls-files '*.md' '*.rst' | xargs codespell --config codespell.cfg
+
+ensure-enhancements:
+ifndef DIFF_BASE
+	$(error DIFF_BASE is required)
+endif
+ifndef STATUS_FILE
+	$(error STATUS_FILE is required)
+endif
+	$(PYTHON) $(TOOLS_DIR)/ensure_enhancements.py \
+	  --config $(TOOLS_DIR)/enhance.yaml \
+	  --diff-base $(DIFF_BASE) \
+	  --status-file $(STATUS_FILE)
+
+supersede-enhancement-reviews:
+ifndef PR_NUMBER
+	$(error PR_NUMBER is required)
+endif
+ifndef REPOSITORY
+	$(error REPOSITORY is required)
+endif
+	$(BASH) $(TOOLS_DIR)/supersede_enhancement_reviews.sh
+
+check-dictionaries:
+	@echo "Checking dictionaries..."
+	@for dict in $(DICTIONARIES); do \
+		echo "Checking $$dict..."; \
+		if grep -E -n "^\s*$$|\s$$|^\s" $$dict; then \
+			echo "Dictionary $$dict contains empty lines or leading/trailing spaces, triming..."; \
+			sed -E -i.bak -e 's/^[[:space:]]+//; s/[[:space:]]+$$//; /^$$/d' $$dict && rm $$dict.bak; \
+		fi; \
+	done
+
+sort-dictionaries:
+	@echo "Sorting dictionaries..."
+	@for dict in $(DICTIONARIES); do \
+		echo "Sorting $$dict..."; \
+		if ! LC_ALL=C sort -f -b -c $$dict; then \
+			echo "Dictionary $$dict is not sorted, sorting..."; \
+			LC_ALL=C sort -f -b -o $$dict $$dict; \
+		fi; \
+	done
+
+linkcheck:
+	$(BUILD) -b linkcheck $(OPTS) $(SOURCE) $(LINKCHECKDIR)
+	@echo
+	@echo "Check finished. Report is in $(LINKCHECKDIR)."
+
+# Live preview keeps Sphinx search. Pagefind's index is not rebuilt on each save.
+serve:
+	sphinx-autobuild --host $(LIVE_HOST) --port $(LIVE_PORT) -c . -D pagefind_enabled=0 $(SOURCE) $(OUT)/html
+
+.PHONY: help Makefile html multiversion pagefind pagefind-if-available test test-tools linkcheck serve lint spellcheck check-dictionaries sort-dictionaries ensure-enhancements supersede-enhancement-reviews $(MAKEFILE_LIST)
