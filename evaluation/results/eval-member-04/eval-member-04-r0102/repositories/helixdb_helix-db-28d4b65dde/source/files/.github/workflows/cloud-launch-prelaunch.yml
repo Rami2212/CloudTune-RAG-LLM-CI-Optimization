@@ -1,0 +1,154 @@
+name: Cloud launch pre-launch
+
+on:
+  workflow_dispatch:
+    inputs:
+      metrics_artifact_run_id:
+        description: Same-repository run containing the fixed-runner cloud-launch-metrics artifact
+        required: true
+        type: string
+      metrics_artifact_name:
+        description: Artifact containing comparison.json with ten baseline and candidate runs
+        required: true
+        default: cloud-launch-metrics
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: cloud-launch-prelaunch-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Labels OSS telemetry from this workflow's Helix processes as internal.
+  HELIX_DEPLOYMENT_ID: helix-internal-ci
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  release-scale:
+    name: Release scale — ${{ matrix.name }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 370
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: secondary, text, and tenant 100k
+            target: production_index_lifecycle_scale
+            test: index_lifecycle_secondary_text_and_tenant_scale_contracts
+          - name: vector 100k
+            target: production_index_lifecycle_scale
+            test: index_lifecycle_vector_scale_contract
+          - name: vector migration 100k
+            target: production_vector_migration_scale
+            test: vector_migration_scale_100k
+          - name: blocked configured limits
+            target: production_index_lifecycle_scale
+            test: index_lifecycle_blocked_limit_scale_contracts
+          - name: text drop smoke
+            target: production_index_lifecycle_scale
+            test: index_lifecycle_text_drop_smoke
+          - name: text multi-split drop smoke
+            target: production_index_lifecycle_scale
+            test: index_lifecycle_text_drop_multi_split_smoke
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Run one independently bounded release-scale contract
+        run: >-
+          cargo test --release -p db --features production-scale
+          --test ${{ matrix.target }} ${{ matrix.test }}
+          -- --exact --nocapture --test-threads=1
+
+  release-contracts:
+    name: Stable failpoint and coordinator contracts
+    runs-on: ubuntu-24.04-arm
+    # Builds the library's release test binary before any contract runs.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Complete stable failpoint and coordinator contracts
+        run: >-
+          cargo test --release -p db --lib -- --nocapture --test-threads=1
+          index_lifecycle::acceptance_tests::
+          index_lifecycle::failpoints::
+          index_lifecycle::typed_boundary_tests::
+          index_lifecycle::text::active_preflight::contract_tests::
+          index_lifecycle::text::active_retirement::contract_tests::
+          index_lifecycle::text::serving::contract_tests::
+          migrations::lifecycle_contracts::writer_migration_requirements_are_typed
+
+  vector-diagnostic:
+    name: Vector recall and throughput diagnostic
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Vector kernel recall and throughput diagnostic
+        run: >-
+          cargo test --release -p db
+          vector_search_scale_gate_reports_recall_and_median_throughput
+          -- --ignored --nocapture --test-threads=1
+
+  sustained:
+    name: Ten-run LocalFileSystem matrix
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Ten stable real-LocalFileSystem runs
+        run: >-
+          cargo test --release -p helix-db-testkit --test sustained_local_disk
+          pre_launch_local_disk_matrix_completes_ten_stable_runs
+          -- --ignored --exact --nocapture
+
+  performance-decision:
+    name: Same-host performance, lag, and resource decision
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: actions/download-artifact@v5
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.metrics_artifact_run_id }}
+          name: ${{ inputs.metrics_artifact_name }}
+          path: target/cloud-launch-metrics
+      - name: Require exact ten-run comparison and enforce launch thresholds
+        run: >-
+          cargo run --release -p helix-db-testkit --example check_launch_metrics
+          -- target/cloud-launch-metrics/comparison.json
+
+  final-quality:
+    name: Final quality
+    runs-on: macos-15
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: sdks/typescript/package-lock.json
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+        working-directory: sdks/typescript
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace -- -D warnings
+      - run: cargo test --workspace --doc
+      - run: cargo test --workspace

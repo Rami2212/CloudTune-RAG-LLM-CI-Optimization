@@ -1,0 +1,81 @@
+name: Covector Version or Publish
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  version-or-publish:
+    if: ${{ !startsWith(github.head_ref, 'renovate/') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    timeout-minutes: 65
+    outputs:
+      change: ${{ steps.covector.outputs.change }}
+      commandRan: ${{ steps.covector.outputs.commandRan }}
+      successfulPublish: ${{ steps.covector.outputs.successfulPublish }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: cargo login
+        run: cargo login ${{ secrets.CRATES_IO_TOKEN  }}
+      - name: git config
+        run: |
+          git config --global user.name "${{ github.event.pusher.name }}"
+          git config --global user.email "${{ github.event.pusher.email }}"
+
+      - name: covector version or publish (publish when no change files present)
+        uses: jbolda/covector/packages/action@covector-v0
+        id: covector
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          command: "version-or-publish"
+          createRelease: true
+
+      - name: Create Pull Request With Versions Bumped
+        if: steps.covector.outputs.commandRan == 'version'
+        uses: peter-evans/create-pull-request@15733dbdfeedb4f7fdb73d13c6f5ac83b710fab8 # v8.1.2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: release/version-updates
+          title: "release: apply version updates from current changes"
+          commit-message: "release: apply version updates from current changes"
+          labels: "version updates"
+          body: ${{ steps.covector.outputs.change }}
+          sign-commits: true
+
+      - name: Trigger `@crabnebula/packager` publishing workflow
+        if: |
+          steps.covector.outputs.successfulPublish == 'true' &&
+          contains(steps.covector.outputs.packagesPublished, '@crabnebula/packager')
+        uses: peter-evans/repository-dispatch@v4
+        with:
+          event-type: publish-packager-nodejs
+          client-payload: >-
+            {"releaseId": "${{ steps.covector.outputs['-crabnebula-packager-releaseId'] }}" }
+
+      - name: Trigger `@crabnebula/updater` publishing workflow
+        if: |
+          steps.covector.outputs.successfulPublish == 'true' &&
+          contains(steps.covector.outputs.packagesPublished, '@crabnebula/updater')
+        uses: peter-evans/repository-dispatch@v4
+        with:
+          event-type: publish-updater-nodejs
+          client-payload: >-
+            {"releaseId": "${{ steps.covector.outputs['-crabnebula-updater-releaseId'] }}" }
+
+      - name: Trigger `@crabnebula/packager-resource-resolver` publishing workflow
+        if: |
+          steps.covector.outputs.successfulPublish == 'true' &&
+          contains(steps.covector.outputs.packagesPublished, '@crabnebula/packager-resource-resolver')
+        uses: peter-evans/repository-dispatch@v4
+        with:
+          event-type: publish-packager-resource-resolver-nodejs
+          client-payload: >-
+            {"releaseId": "${{ steps.covector.outputs['-crabnebula-packager-resource-resolver-releaseId'] }}" }

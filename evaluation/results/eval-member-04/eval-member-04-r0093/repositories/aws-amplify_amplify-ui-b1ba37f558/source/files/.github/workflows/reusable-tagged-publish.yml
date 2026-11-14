@@ -1,0 +1,78 @@
+# Description: this is a reusable workflow that runs unit and e2e tests.
+#
+# See `./test-prs.yml` to see an example usage.
+
+on:
+  workflow_call:
+    inputs:
+      dist-tag:
+        # commit to run tests against
+        required: true
+        type: string
+    outputs:
+      version:
+        description: 'Exact snapshot version published (e.g. 0.0.0-next-<sha>-<timestamp>), confirmed resolvable on npm'
+        value: ${{ jobs.publish.outputs.version }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: deployment
+    outputs:
+      version: ${{ steps.snapshot-version.outputs.version }}
+    # id-token is required for npm trusted publishing (OIDC)
+    permissions:
+      contents: read # This is required for actions/checkout
+      id-token: write
+    steps:
+      - name: fail this workflow if dist-tag is invalid
+        if: ${{ inputs.dist-tag == '' || inputs.dist-tag == 'latest' }}
+        run: exit 1
+      - name: Checkout repo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Setup Node.js 24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          # Exact pin keeps npm >= 11.5.1 (Node 24.22.1 bundles npm 11.19.1), required for npm trusted publishing
+          node-version: 24.22.1
+          cache: 'yarn'
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 2
+      - name: Install packages
+        uses: ./.github/actions/install-with-retries
+        with:
+          skip-cypress-binary: true # publishing doesn't need cypress
+          frozen-lockfile: true # publish from exactly what yarn.lock pins
+      - name: Build packages
+        run: yarn build
+      - name: Add changeset that bumps all public packages
+        # There needs to be a changeset for @aws-amplify/ui[-framework] to publish.
+        run: cp .github/changeset-presets/bump-versions.md .changeset
+      - name: Run changeset version to next tag
+        run: yarn changeset version --snapshot ${{ inputs.dist-tag }}-$(git rev-parse --short=7 HEAD) && yarn angular build
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Read snapshot version
+        id: snapshot-version
+        # The bump-versions preset always bumps @aws-amplify/ui, and `changeset version --snapshot`
+        # assigns one shared version to every bumped package, so its version identifies the release.
+        # Fail fast if it is not a snapshot for this dist-tag, so a real release version is never waited on or tested.
+        run: |
+          version="$(node -p "require('./packages/ui/package.json').version")"
+          if [[ "$version" != "0.0.0-${DIST_TAG}-"* ]]; then
+            echo "::error::Unexpected snapshot version '$version'; expected 0.0.0-${DIST_TAG}-*"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+        env:
+          DIST_TAG: ${{ inputs.dist-tag }}
+      - name: Publish to next tag
+        run: yarn changeset publish --tag ${{ inputs.dist-tag }}
+      - name: Wait for npm registry to serve published versions
+        # Downstream jobs install these exact versions right away; wait out registry/CDN propagation
+        # once here rather than having every build-system-test matrix job race it.
+        timeout-minutes: 20
+        run: ./.github/scripts/wait-for-npm-registry.sh "$VERSION"
+        env:
+          VERSION: ${{ steps.snapshot-version.outputs.version }}
+          WAIT_TIMEOUT_SECONDS: 900

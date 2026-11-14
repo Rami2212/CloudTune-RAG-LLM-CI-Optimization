@@ -1,0 +1,82 @@
+name: CLI tests
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/cli-tests.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/cli/**"
+      - "crates/metrics/**"
+      - "sdks/typescript/**"
+      - "docs/database/helix-db/start-here/quickstart.mdx"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/cli-tests.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/cli/**"
+      - "crates/metrics/**"
+      - "sdks/typescript/**"
+      - "docs/database/helix-db/start-here/quickstart.mdx"
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cli-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Labels OSS telemetry from this workflow's Helix processes as internal.
+  HELIX_DEPLOYMENT_ID: helix-internal-ci
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    if: github.event_name != 'schedule'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Rust CI runs the Linux tests, doctests, Clippy and formatting.
+        os:
+          - macos-latest
+          - windows-2025
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: sdks/typescript/package-lock.json
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+        working-directory: sdks/typescript
+      - name: Validate locked workspace metadata
+        run: cargo metadata --locked --format-version 1 --no-deps
+      - name: Unit and binary integration tests
+        run: cargo test --locked -p helix-metrics -p helix-cli --all-targets
+
+  registry-smoke:
+    name: Published TypeScript SDK registry smoke
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - name: Install and execute pinned TypeScript SDK read/write requests
+        run: >-
+          cargo test --locked -p helix-cli --test typescript_runtime
+          registry_smoke_executes_exact_sdk_read_and_write
+          -- --ignored --exact --nocapture

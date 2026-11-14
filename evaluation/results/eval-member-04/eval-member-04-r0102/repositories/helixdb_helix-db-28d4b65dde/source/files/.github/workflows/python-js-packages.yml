@@ -1,0 +1,232 @@
+name: Python and JavaScript packages
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/python-js-packages.yml"
+      - "bindings/uniffi/**"
+      - "bindings/uniffi-bindgen/**"
+      - "crates/**"
+      - "sdks/python/**"
+      - "sdks/typescript/**"
+      - "LICENSE"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/python-js-packages.yml"
+      - "bindings/uniffi/**"
+      - "bindings/uniffi-bindgen/**"
+      - "crates/**"
+      - "sdks/python/**"
+      - "sdks/typescript/**"
+      - "LICENSE"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: python-js-packages-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Labels OSS telemetry from this workflow's Helix processes as internal.
+  HELIX_DEPLOYMENT_ID: helix-internal-ci
+
+jobs:
+  python-sdk:
+    name: Python SDK
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Build and validate package
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build --sdist --wheel --outdir dist sdks/python
+          python -m twine check dist/*
+          python sdks/python/scripts/validate_package_license.py dist/*
+          python -m pip install --force-reinstall dist/*.whl
+          python -m unittest discover -s sdks/python/tests -v
+      - uses: actions/upload-artifact@v4
+        with:
+          name: helix-db-python
+          path: dist/*
+          if-no-files-found: error
+
+  python-embedded:
+    name: Python embedded (${{ matrix.name }})
+    needs: python-sdk
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: manylinux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            manylinux: "2_28"
+          - name: manylinux-aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            manylinux: "2_28"
+    steps: &embedded-wheel-steps
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@v5
+        with:
+          name: helix-db-python
+          path: sdk-dist
+      - name: Install UniFFI wheel generator
+        run: python -m pip install uniffi-bindgen==0.31.0
+      - name: Build embedded wheel
+        uses: PyO3/maturin-action@86b9d133d34bc1b40018696f782949dac11bd380
+        with:
+          maturin-version: v1.11.5
+          working-directory: bindings/uniffi
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          before-script-linux: |
+            /opt/python/cp313-cp313/bin/python -m pip install uniffi-bindgen==0.31.0
+            export PATH="/opt/python/cp313-cp313/bin:$PATH"
+          args: --release --locked --compatibility pypi --out dist
+      - name: Validate wheel metadata
+        shell: bash
+        run: |
+          python -m pip install --upgrade twine
+          python -m twine check bindings/uniffi/dist/* sdk-dist/*
+      - name: Smoke-test installed wheels
+        shell: bash
+        run: |
+          python -m pip install --force-reinstall sdk-dist/*.whl bindings/uniffi/dist/*.whl
+          python bindings/uniffi/smoke.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: helix-db-embedded-python-${{ matrix.name }}
+          path: bindings/uniffi/dist/*
+          if-no-files-found: error
+
+  # macOS and Windows wheels take ~20 min each, so pull requests build only the
+  # Linux wheels; main and manual runs build every platform.
+  python-embedded-other:
+    name: Python embedded (${{ matrix.name }})
+    if: github.event_name != 'pull_request'
+    needs: python-sdk
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-universal2
+            runner: macos-14
+            target: universal2-apple-darwin
+            manylinux: "off"
+          - name: windows-x86_64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            manylinux: "off"
+    steps: *embedded-wheel-steps
+
+  javascript:
+    name: JavaScript packages
+    needs: [python-embedded, python-embedded-other]
+    if: >-
+      !cancelled() && needs.python-embedded.result == 'success' &&
+      (needs.python-embedded-other.result == 'success' ||
+      (github.event_name == 'pull_request' && needs.python-embedded-other.result == 'skipped'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: sdks/typescript/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Download native wheels
+        uses: actions/download-artifact@v5
+        with:
+          pattern: helix-db-embedded-python-*
+          path: wheel-artifacts
+          merge-multiple: false
+      - name: Extract native libraries
+        shell: bash
+        run: |
+          mkdir -p \
+            native-libraries/linux-x64-gnu \
+            native-libraries/linux-arm64-gnu
+          unzip -p wheel-artifacts/helix-db-embedded-python-manylinux-x86_64/*.whl \
+            helixdb_uniffi/libhelixdb_uniffi.so \
+            > native-libraries/linux-x64-gnu/libhelixdb_uniffi.so
+          unzip -p wheel-artifacts/helix-db-embedded-python-manylinux-aarch64/*.whl \
+            helixdb_uniffi/libhelixdb_uniffi.so \
+            > native-libraries/linux-arm64-gnu/libhelixdb_uniffi.so
+          # Pull requests build Linux wheels only.
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            exit 0
+          fi
+          mkdir -p \
+            native-libraries/darwin-arm64 \
+            native-libraries/darwin-x64 \
+            native-libraries/win32-x64
+          unzip -p wheel-artifacts/helix-db-embedded-python-macos-universal2/*.whl \
+            helixdb_uniffi/libhelixdb_uniffi.dylib \
+            > native-libraries/darwin-arm64/libhelixdb_uniffi.dylib
+          cp \
+            native-libraries/darwin-arm64/libhelixdb_uniffi.dylib \
+            native-libraries/darwin-x64/libhelixdb_uniffi.dylib
+          unzip -p wheel-artifacts/helix-db-embedded-python-windows-x86_64/*.whl \
+            helixdb_uniffi/helixdb_uniffi.dll \
+            > native-libraries/win32-x64/helixdb_uniffi.dll
+      - name: Build Node binding generator
+        run: >-
+          cargo build --locked --release
+          --manifest-path bindings/uniffi-bindgen/Cargo.toml
+          --no-default-features --features node
+          --bin helixdb-uniffi-bindgen-node
+      - name: Generate embedded Node package
+        run: |
+          bindings/uniffi-bindgen/target/release/helixdb-uniffi-bindgen-node generate \
+            native-libraries/linux-x64-gnu/libhelixdb_uniffi.so \
+            --manifest-path bindings/uniffi/Cargo.toml \
+            --out-dir node-embedded \
+            --package-name @helix-db/helix-db-embedded \
+            --node-engine '>=20.0.0' \
+            --bundled-prebuilds
+          mkdir -p node-embedded/prebuilds
+          cp -R native-libraries/. node-embedded/prebuilds/
+          node bindings/uniffi/scripts/finalize-node-package.mjs node-embedded
+      - name: Build JavaScript SDK
+        working-directory: sdks/typescript
+        run: |
+          npm ci
+          npm run check
+      - name: Pack packages
+        run: |
+          mkdir -p npm-dist
+          npm pack ./sdks/typescript --pack-destination npm-dist
+          npm pack ./node-embedded --pack-destination npm-dist
+      - name: Smoke-test installed packages
+        run: |
+          mkdir npm-smoke
+          cd npm-smoke
+          npm init --yes
+          npm install ../npm-dist/*.tgz
+          cp ../bindings/uniffi/smoke-node.mjs .
+          node smoke-node.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: helix-db-javascript
+          path: npm-dist/*
+          if-no-files-found: error

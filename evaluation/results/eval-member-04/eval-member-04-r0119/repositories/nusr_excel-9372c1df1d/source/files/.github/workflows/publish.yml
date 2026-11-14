@@ -1,0 +1,45 @@
+name: Publish to NPM
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  release:
+    types:
+      - published
+  push:
+    tags:
+      - '*'
+
+concurrency:
+  group: 'publish'
+  cancel-in-progress: false
+
+env:
+  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Setup Yarn
+        run: npm install -g yarn
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Build packages
+        run: yarn build
+
+      - name: Publish to NPM
+        run: npx lerna publish from-package --no-private --yes
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

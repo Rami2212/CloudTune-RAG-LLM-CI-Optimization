@@ -1,0 +1,61 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [MEDIUM] Add concurrency group to "e2e.yaml"
+# Estimated savings: ~2 min/run
+#
+name: e2e
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: test
+
+jobs:
+  kubernetes:
+    runs-on: ubuntu-latest
+    services:
+      registry:
+        image: registry:3
+        ports:
+          - 5555:5000
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.x
+          check-latest: true
+          cache: true
+      - name: Setup staging cluster
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          cluster_name: timoni-staging
+      - name: Setup production cluster
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          cluster_name: timoni-production
+      - name: Build
+        working-directory: ${{ github.workspace }}
+        run: make build
+      - name: Push modules
+        run: make push
+      - name: Deploy
+        run: make fleet-deploy
+      - name: Check
+        run: make fleet-deploy-check
+      - name: Uninstall
+        run: make fleet-deploy-uninstall

@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches:
+    - main
+  pull_request:
+    branches:
+    - main
+
+jobs:
+  build:
+    name: Build and test repo
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - cc: gcc
+            cxx: g++
+          - cc: clang
+            cxx: clang++
+          - cc: clang
+            cxx: clang++
+            cxxflags: -fsanitize=address -g
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+      CXXFLAGS: ${{ matrix.cxxflags }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+      - name: Cache APT packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-apt-
+      - run: sudo apt-get update
+      - name: Install dependencies
+        run: >
+          sudo apt-get install
+          pkg-config
+          libsystemd-dev
+          libjsoncpp-dev
+          googletest
+          meson
+          g++
+      - run: meson build/
+      - run: ninja -C build/
+      - run: ninja -C build/ test

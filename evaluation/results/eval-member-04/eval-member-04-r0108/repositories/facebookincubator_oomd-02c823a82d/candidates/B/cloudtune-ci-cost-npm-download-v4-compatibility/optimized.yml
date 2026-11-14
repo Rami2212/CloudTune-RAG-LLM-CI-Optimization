@@ -1,0 +1,53 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [MEDIUM] Add concurrency group to "ci.yml"
+# Estimated savings: ~2 min/run
+#
+name: CI
+
+on:
+  push:
+    branches:
+    - main
+  pull_request:
+    branches:
+    - main
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    name: Build and test repo
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - cc: gcc
+            cxx: g++
+          - cc: clang
+            cxx: clang++
+          - cc: clang
+            cxx: clang++
+            cxxflags: -fsanitize=address -g
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+      CXXFLAGS: ${{ matrix.cxxflags }}
+    steps:
+      - run: sudo apt-get update
+      - name: Install dependencies
+        run: >
+          sudo apt-get install
+          pkg-config
+          libsystemd-dev
+          libjsoncpp-dev
+          googletest
+          meson
+          g++
+      - name: Checkout code
+        uses: actions/checkout@v2
+      - run: meson build/
+      - run: ninja -C build/
+      - run: ninja -C build/ test

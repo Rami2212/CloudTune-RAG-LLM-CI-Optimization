@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+  VITE_DEFAULT_EXCEL_ID: ${{ vars.VITE_DEFAULT_EXCEL_ID }}
+  ROOT_BASE_URL: ${{ vars.ROOT_BASE_URL }}
+  COMMIT_ID: ${{ github.sha }}
+
+jobs:
+  CI:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: yarn
+
+      - name: Install font
+        run: sudo npm run install-font
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Install Playwright browsers
+        run: yarn playwright install --with-deps
+
+      - name: Type check
+        run: yarn type-check
+
+      - name: Check dependencies
+        run: yarn check:dependencies
+
+      - name: Lint
+        run: yarn lint
+
+      - name: Format
+        run: yarn format
+
+      - name: Unit test
+        run: yarn coverage
+
+      - name: Upload coverage
+        if: ${{ github.ref == 'refs/heads/main' }}
+        uses: codecov/codecov-action@v7
+        with:
+          report_type: coverage
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: E2E tests
+        run: yarn e2e
+        env:
+          CI: true
+
+      - name: Build
+        run: yarn build
+
+      - name: Production build smoke tests
+        run: yarn e2e:preview input.test.ts import-export.test.ts
+        env:
+          CI: true
+
+      - name: Upload Playwright test report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 5
+
+      - name: Deploy to GitHub Pages
+        if: ${{ github.ref == 'refs/heads/main' }}
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./packages/demo/frontend/dist
+
+      - name: Verify deployment
+        if: ${{ github.ref == 'refs/heads/main' }}
+        run: |
+          echo "Checking if site is accessible..."
+          commit_id="${{ github.sha }}"
+          max_retries=5
+          retry_interval=5
+          for i in $(seq 1 $max_retries); do
+            echo "Attempt $i/$max_retries: Waiting ${retry_interval}s for deployment to propagate..."
+            sleep $retry_interval
+            response=$(curl -sL https://nusr.github.io/excel)
+            if echo "$response" | grep -q "$commit_id"; then
+              echo "✓ COMMIT_ID ($commit_id) successfully injected into HTML"
+              echo "✓ Deployment successful!"
+              exit 0
+            fi
+            echo "Commit ID ($commit_id) not found yet, retrying..."
+          done
+          echo "✗ COMMIT_ID ($commit_id) verification failed after $max_retries attempts - commit ID not found in HTML!"
+          exit 1
+
+      - name: production E2E tests
+        if: ${{ github.ref == 'refs/heads/main' }}
+        run: rm -rf playwright-report && yarn e2e
+        env:
+          CI: true
+          TEST_ENV: production
+
+      - name: Upload Playwright test report
+        if: ${{ github.ref == 'refs/heads/main' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-prod-report
+          path: playwright-report/
+          retention-days: 5

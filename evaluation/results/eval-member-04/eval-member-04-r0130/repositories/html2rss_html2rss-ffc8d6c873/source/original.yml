@@ -1,0 +1,65 @@
+name: lint and test
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        ruby-version: ["3.3", "3.4", "4.0"]
+    name: Ruby ${{ matrix.ruby-version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby-version }}
+          bundler-cache: true
+      - name: Run tests
+        run: make test
+        env:
+          COVERAGE: true
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+          bundler-cache: true
+      - name: Run linting
+        run: make lint
+      - name: Generate config schema
+        run: bundle exec rake config:schema
+      - name: Ensure config schema is committed
+        run: git diff --exit-code schema/html2rss-config.schema.json
+      - name: Validate fixture configs
+        run: |
+          bundle exec exe/html2rss validate spec/fixtures/single.test.yml
+          bundle exec exe/html2rss validate spec/fixtures/feeds.test.yml notitle
+          ! bundle exec exe/html2rss validate spec/fixtures/invalid_selectors.test.yml
+  yard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+          bundler-cache: true
+      - run: gem install redcarpet
+      - name: Run YARD lint
+        run: make lint-yard
+      - name: Generate documentation
+        run: make docs
+      - name: Upload documentation
+        uses: actions/upload-artifact@v7
+        with:
+          name: documentation
+          path: docs/

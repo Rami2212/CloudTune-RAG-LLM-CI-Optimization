@@ -1,0 +1,267 @@
+name: SDK query parity
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/sdk-query-parity.yml"
+      - "README.md"
+      - "bindings/uniffi/**"
+      - "bindings/uniffi-bindgen/**"
+      - "crates/ast/**"
+      - "crates/db/**"
+      - "crates/server/**"
+      - "docs/database/helix-db/start-here/sdk-setup/rust-project-setup.mdx"
+      - "docs/database/helix-db/core-concepts/overview.mdx"
+      - "docs/database/helix-db/query-guides/parameters.mdx"
+      - "sdks/**"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/sdk-query-parity.yml"
+      - "README.md"
+      - "bindings/uniffi/**"
+      - "bindings/uniffi-bindgen/**"
+      - "crates/ast/**"
+      - "crates/db/**"
+      - "crates/server/**"
+      - "docs/database/helix-db/start-here/sdk-setup/rust-project-setup.mdx"
+      - "docs/database/helix-db/core-concepts/overview.mdx"
+      - "docs/database/helix-db/query-guides/parameters.mdx"
+      - "sdks/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sdk-query-parity-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Labels OSS telemetry from this workflow's Helix processes as internal.
+  HELIX_DEPLOYMENT_ID: helix-internal-ci
+
+jobs:
+  contracts:
+    name: Contracts (Linux ARM)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: sdks/typescript/package-lock.json
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.24.x"
+          cache: false
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            bindings/uniffi-bindgen -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: npm ci
+        working-directory: sdks/typescript
+      - run: python -m pip install -e './sdks/python[dev]'
+      - name: Check changed Python SDK sources
+        working-directory: sdks/python
+        run: |
+          files=(
+            src/helixdb/_client_common.py
+            src/helixdb/async_client.py
+            src/helixdb/client.py
+            src/helixdb/__init__.py
+            tests/test_client.py
+            tests/test_async_client.py
+            scripts/run_embedded_parity.py
+            scripts/run_server_parity.py
+          )
+          ruff format --check "${files[@]}"
+          ruff check "${files[@]}"
+      - run: npm test
+        working-directory: sdks/typescript
+      - run: npm run parity:generate
+        working-directory: sdks/typescript
+      - run: npm run parity:compare-json
+        working-directory: sdks/typescript
+      - run: npm run parity:server-disk
+        working-directory: sdks/typescript
+      - run: python -m unittest discover -s sdks/python/tests -v
+        env:
+          PYTHONPATH: sdks/python/src
+      - name: Run Python doctests
+        working-directory: sdks/python
+        run: >-
+          python -c 'import doctest, helixdb.async_client as module;
+          raise SystemExit(doctest.testmod(module).failed)'
+      - run: go test ./...
+        working-directory: sdks/go
+      - run: cargo test --locked --manifest-path sdks/rust/Cargo.toml --lib
+      - run: cargo test --locked --manifest-path sdks/rust/Cargo.toml --doc
+      - name: Compile-test public #[query] README examples
+        run: |
+          cargo check --locked --manifest-path sdks/rust/Cargo.toml --example basic_query
+          cargo check --locked --manifest-path sdks/rust/Cargo.toml --example readme_sdk_query
+          cargo check --locked --manifest-path sdks/rust/Cargo.toml --example readme_macros_query
+      - run: cargo test --locked -p helixdb-uniffi
+
+  embedded-go-generator:
+    name: Go embedded binding generator (Linux ARM)
+    runs-on: ubuntu-24.04-arm
+    env:
+      CARGO_BUILD_JOBS: "1"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            bindings/uniffi-bindgen -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Add Linux compiler swap
+        if: runner.os == 'Linux'
+        run: |
+          swap_file="$RUNNER_TEMP/helix-uniffi-bindgen.swap"
+          sudo fallocate -l 4G "$swap_file"
+          sudo chmod 600 "$swap_file"
+          sudo mkswap "$swap_file"
+          sudo swapon "$swap_file"
+          free -h
+      - name: Fetch locked generator dependencies
+        run: cargo fetch --locked --manifest-path bindings/uniffi-bindgen/Cargo.toml
+      - name: Build Go embedded binding generator
+        run: >-
+          cargo build --locked
+          --manifest-path bindings/uniffi-bindgen/Cargo.toml
+          --no-default-features --features go
+          --bin helixdb-uniffi-bindgen-go
+      - name: Remove Linux compiler swap
+        if: always() && runner.os == 'Linux'
+        run: |
+          swap_file="$RUNNER_TEMP/helix-uniffi-bindgen.swap"
+          if sudo swapon --show=NAME --noheadings | grep -Fxq "$swap_file"; then
+            sudo swapoff "$swap_file"
+          fi
+          if test -f "$swap_file"; then
+            sudo unlink "$swap_file"
+          fi
+      - name: Package Go embedded binding generator
+        run: |
+          mkdir -p embedded-go-generator-artifact
+          cp bindings/uniffi-bindgen/target/debug/helixdb-uniffi-bindgen-go embedded-go-generator-artifact/
+          tar -czf embedded-go-generator.tar.gz -C embedded-go-generator-artifact .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: embedded-go-generator-linux-arm
+          path: embedded-go-generator.tar.gz
+          retention-days: 1
+
+  embedded:
+    name: Generated embedded bindings (Linux ARM)
+    needs: embedded-go-generator
+    runs-on: ubuntu-24.04-arm
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: sdks/typescript/package-lock.json
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.24.x"
+          cache: false
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            bindings/uniffi-bindgen -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/download-artifact@v5
+        with:
+          name: embedded-go-generator-linux-arm
+          path: embedded-go-generator-download
+      - name: Extract Go embedded binding generator
+        run: |
+          mkdir -p embedded-go-generator
+          tar -xzf embedded-go-generator-download/embedded-go-generator.tar.gz -C embedded-go-generator
+          chmod +x embedded-go-generator/helixdb-uniffi-bindgen-go
+      - name: Fetch locked Rust dependencies
+        run: |
+          cargo fetch --locked
+          cargo fetch --locked --manifest-path bindings/uniffi-bindgen/Cargo.toml
+      - name: Prebuild embedded binding generators
+        run: |
+          cargo build --locked -p helixdb-uniffi --features bindgen --bin helixdb-uniffi-bindgen
+          cargo build --locked --manifest-path bindings/uniffi-bindgen/Cargo.toml --no-default-features --features node --bin helixdb-uniffi-bindgen-node
+      - run: npm ci
+        working-directory: sdks/typescript
+      - run: python -m pip install -e './sdks/python[dev]'
+      - run: npm run parity:embedded
+        working-directory: sdks/typescript
+        env:
+          HELIXDB_UNIFFI_GO_BINDGEN: ${{ github.workspace }}/embedded-go-generator/helixdb-uniffi-bindgen-go
+
+  coverage:
+    name: SDK coverage
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: sdks/typescript/package-lock.json
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.24.x"
+          cache: false
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: clippy, rustfmt, llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            bindings/uniffi-bindgen -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: npm ci
+        working-directory: sdks/typescript
+      - run: npm run test:coverage
+        working-directory: sdks/typescript
+      - run: python -m pip install -e '.[dev]'
+        working-directory: sdks/python
+      - run: python -m coverage run --branch --source=helixdb -m unittest discover -s tests
+        working-directory: sdks/python
+        env:
+          PYTHONPATH: src
+      - run: python -m coverage report --fail-under=70
+        working-directory: sdks/python
+      - name: Go statement coverage
+        shell: bash
+        working-directory: sdks/go
+        run: |
+          go test . -coverprofile=coverage.out
+          coverage=$(go tool cover -func=coverage.out | awk '/total:/ { gsub("%", "", $3); print $3 }')
+          awk "BEGIN { if ($coverage < 45) exit 1 }"
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Rust line coverage
+        run: cargo llvm-cov --locked --manifest-path sdks/rust/Cargo.toml --features embedded --lib --ignore-filename-regex '(^|/)(crates|bindings)/' --fail-under-lines 65

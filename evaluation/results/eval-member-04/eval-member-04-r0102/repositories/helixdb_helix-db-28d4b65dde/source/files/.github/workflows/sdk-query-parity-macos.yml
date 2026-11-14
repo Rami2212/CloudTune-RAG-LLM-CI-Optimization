@@ -1,0 +1,81 @@
+name: SDK query parity macOS
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/sdk-query-parity-macos.yml"
+      - "bindings/uniffi/**"
+      - "bindings/uniffi-bindgen/**"
+      - "sdks/**"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/sdk-query-parity-macos.yml"
+      - "bindings/uniffi/**"
+      - "bindings/uniffi-bindgen/**"
+      - "sdks/**"
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sdk-query-parity-macos-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Labels OSS telemetry from this workflow's Helix processes as internal.
+  HELIX_DEPLOYMENT_ID: helix-internal-ci
+
+jobs:
+  embedded:
+    name: Generated embedded bindings (macOS)
+    runs-on: macos-latest
+    env:
+      CARGO_BUILD_JOBS: "1"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: sdks/typescript/package-lock.json
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.24.x"
+          cache: false
+      - uses: dtolnay/rust-toolchain@1.97.1
+      # The Go generator build is memory-bound at one job and takes ~30 min cold.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            bindings/uniffi-bindgen -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Fetch locked Rust dependencies
+        run: |
+          cargo fetch --locked
+          cargo fetch --locked --manifest-path bindings/uniffi-bindgen/Cargo.toml
+      - name: Build Go embedded binding generator
+        run: >-
+          cargo build --locked
+          --manifest-path bindings/uniffi-bindgen/Cargo.toml
+          --no-default-features --features go
+          --bin helixdb-uniffi-bindgen-go
+      - name: Prebuild embedded binding generators
+        run: |
+          cargo build --locked -p helixdb-uniffi --features bindgen --bin helixdb-uniffi-bindgen
+          cargo build --locked --manifest-path bindings/uniffi-bindgen/Cargo.toml --no-default-features --features node --bin helixdb-uniffi-bindgen-node
+      - run: npm ci
+        working-directory: sdks/typescript
+      - run: python -m pip install -e './sdks/python[dev]'
+      - run: npm run parity:embedded
+        working-directory: sdks/typescript
+        env:
+          HELIXDB_UNIFFI_GO_BINDGEN: ${{ github.workspace }}/bindings/uniffi-bindgen/target/debug/helixdb-uniffi-bindgen-go
