@@ -1,0 +1,420 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 4 optimizations:
+# - [HIGH] Add cargo dependency cache to "test" job
+# - [HIGH] Add cargo dependency cache to "compat" job
+# - [HIGH] Add cargo dependency cache to "musl" job
+# - [HIGH] Add cargo dependency cache to "wasm" job
+# Estimated savings: ~32 min/run
+#
+---
+name: Test
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  FORCE_COLOR: '1'
+  NEXTEST_PROFILE: ci
+  PACT_DO_NOT_TRACK: 'true'
+
+jobs:
+  # MARK: Sentinel
+
+  complete:
+    name: CI complete
+    if: always()
+    needs:
+      - test
+      - compat
+      - ffi
+      - musl
+      - features
+      - wasm
+      - clippy
+      - release-deps
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any job failed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+
+  # MARK: Cross-platform
+
+  test:
+    name: Test (${{ matrix.os }})
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      # Windows builds are dominated by filesystem overhead; ReFS Dev Drives
+      # avoid most of it.
+      - name: Set up Dev Drive
+        if: runner.os == 'Windows'
+        uses: samypr100/setup-dev-drive@562171fe8df7401fdf582d766cd3b6ab80d5b1a0  # v4.1.0
+        with:
+          drive-size: 12GB
+          workspace-copy: true
+          env-mapping: |
+            CARGO_HOME,{{ DEV_DRIVE }}/.cargo
+            RUSTUP_HOME,{{ DEV_DRIVE }}/.rustup
+
+      - name: Resolve workspace root
+        shell: bash
+        run: echo "WORKSPACE_ROOT=${DEV_DRIVE_WORKSPACE:-$GITHUB_WORKSPACE}" >> "$GITHUB_ENV"
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install shared-mime-info
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+        with:
+          build-warnings: warn
+          cache-workspaces: ${{ env.WORKSPACE_ROOT }}/rust -> target
+          cache-save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: Install tools
+        uses: jdx/mise-action@08ae2a091c038e1e05ec6f5115dc5c69d5a2a6b8  # v5.1.2
+        timeout-minutes: 3
+        with:
+          working_directory: ${{ env.WORKSPACE_ROOT }}
+          cache_save: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: Run tests
+        working-directory: ${{ env.WORKSPACE_ROOT }}/rust
+        env:
+          RUST_LOG: debug
+        run: cargo nextest run --workspace
+
+      # nextest does not run doctests. This step and the ones below run even
+      # when nextest fails, so one failure does not hide the rest.
+      - name: Run doctests
+        if: ${{ !cancelled() }}
+        working-directory: ${{ env.WORKSPACE_ROOT }}/rust
+        run: cargo test --workspace --doc --no-fail-fast
+
+      - name: Run mock server log test
+        if: ${{ !cancelled() }}
+        working-directory: ${{ env.WORKSPACE_ROOT }}/rust
+        run: cargo nextest run -p pact_ffi --run-ignored only -E 'test(=returns_mock_server_logs)'
+
+      - name: Run tests with the V2 matching engine
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        continue-on-error: true
+        working-directory: ${{ env.WORKSPACE_ROOT }}/rust
+        env:
+          RUST_LOG: debug
+          PACT_MATCHING_ENGINE: v2
+          PACT_V2_MATCHING_LOG_EXECUTED_PLAN: '1'
+        run: cargo nextest run --workspace
+
+  compat:
+    name: Compatibility suite (${{ matrix.os }})
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Dev Drive
+        if: runner.os == 'Windows'
+        uses: samypr100/setup-dev-drive@562171fe8df7401fdf582d766cd3b6ab80d5b1a0  # v4.1.0
+        with:
+          drive-size: 12GB
+          workspace-copy: true
+          env-mapping: |
+            CARGO_HOME,{{ DEV_DRIVE }}/.cargo
+            RUSTUP_HOME,{{ DEV_DRIVE }}/.rustup
+
+      - name: Resolve workspace root
+        shell: bash
+        run: echo "WORKSPACE_ROOT=${DEV_DRIVE_WORKSPACE:-$GITHUB_WORKSPACE}" >> "$GITHUB_ENV"
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+        with:
+          build-warnings: warn
+          cache-workspaces: ${{ env.WORKSPACE_ROOT }}/compatibility-suite -> target
+          cache-save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      # The cucumber binaries use `harness = false`, which nextest cannot drive.
+      - name: Run cucumber suites
+        working-directory: ${{ env.WORKSPACE_ROOT }}/compatibility-suite
+        run: cargo test --no-fail-fast
+
+  ffi:
+    name: FFI (${{ matrix.os }})
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Dev Drive
+        if: runner.os == 'Windows'
+        uses: samypr100/setup-dev-drive@562171fe8df7401fdf582d766cd3b6ab80d5b1a0  # v4.1.0
+        with:
+          drive-size: 12GB
+          workspace-copy: true
+          env-mapping: |
+            CARGO_HOME,{{ DEV_DRIVE }}/.cargo
+            RUSTUP_HOME,{{ DEV_DRIVE }}/.rustup
+
+      - name: Resolve workspace root
+        run: echo "WORKSPACE_ROOT=${DEV_DRIVE_WORKSPACE:-$GITHUB_WORKSPACE}" >> "$GITHUB_ENV"
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install shared-mime-info gettext
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+        with:
+          build-warnings: warn
+          cache-workspaces: ${{ env.WORKSPACE_ROOT }}/rust -> target
+          cache-save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      # cbindgen's macro expansion passes `-Zunpretty=expanded`, which only
+      # nightly accepts. The library itself builds with the pinned toolchain.
+      - name: Install nightly for cbindgen
+        run: rustup toolchain install nightly --profile minimal
+
+      - name: Install tools
+        uses: jdx/mise-action@08ae2a091c038e1e05ec6f5115dc5c69d5a2a6b8  # v5.1.2
+        timeout-minutes: 3
+        with:
+          working_directory: ${{ env.WORKSPACE_ROOT }}
+          cache_save: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: Install Conan
+        uses: conan-io/setup-conan@ed3942a6883243f4af84e13e49c972f9440fa1c2  # v1.4.0
+
+      - name: Restore Conan packages
+        id: conan-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.conan2/p
+          key: conan-${{ runner.os }}-${{ hashFiles('c/*/conanfile.txt') }}
+          restore-keys: conan-${{ runner.os }}-
+
+      - name: Check plugin log callback headers
+        if: runner.os == 'Linux'
+        working-directory: ${{ env.WORKSPACE_ROOT }}/rust/pact_ffi
+        run: bash tests/check-plugin-log-callback.sh
+
+      - name: Build pact_ffi and run its examples
+        working-directory: ${{ env.WORKSPACE_ROOT }}
+        run: .github/scripts/ffi-examples.sh
+
+      - name: Run C consumer example
+        working-directory: ${{ env.WORKSPACE_ROOT }}/c/consumer
+        run: PACT_FFI_PREBUILT_DIR="$WORKSPACE_ROOT/rust/pact_ffi/build/install" just run
+
+      - name: Run C provider example
+        working-directory: ${{ env.WORKSPACE_ROOT }}/c/provider
+        run: PACT_FFI_PREBUILT_DIR="$WORKSPACE_ROOT/rust/pact_ffi/build/install" just run
+
+      - name: Save Conan packages
+        if: github.ref == 'refs/heads/master' && steps.conan-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.conan2/p
+          key: conan-${{ runner.os }}-${{ hashFiles('c/*/conanfile.txt') }}
+
+  # MARK: Linux-only
+
+  musl:
+    name: Test (musl)
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    # Cross-compiles with the glibc-hosted rustc: the musl-hosted rustc that
+    # rustup installs on Alpine compiles markedly slower.
+    env:
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      # mold links faster than GNU ld, the default.
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+    steps:
+      - name: Install build dependencies
+        run: >-
+          sudo apt-get update -q && sudo apt-get install -y -q
+          --no-install-recommends libprotobuf-dev mold musl-tools
+          protobuf-compiler
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+        with:
+          build-warnings: warn
+          components: rustfmt
+          target: x86_64-unknown-linux-musl
+          cache-workspaces: rust -> target
+          cache-save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: Install tools
+        uses: jdx/mise-action@08ae2a091c038e1e05ec6f5115dc5c69d5a2a6b8  # v5.1.2
+        timeout-minutes: 3
+        with:
+          cache_save: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: Run tests
+        working-directory: rust
+        env:
+          TZ: UTC
+        run: cargo nextest run --workspace --target x86_64-unknown-linux-musl
+
+      - name: Run doctests
+        if: ${{ !cancelled() }}
+        working-directory: rust
+        env:
+          TZ: UTC
+        run: cargo test --workspace --doc --no-fail-fast --target x86_64-unknown-linux-musl
+
+  features:
+    name: Feature combinations
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+        with:
+          build-warnings: warn
+          cache-workspaces: rust -> target
+          cache-save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: Install tools
+        uses: jdx/mise-action@08ae2a091c038e1e05ec6f5115dc5c69d5a2a6b8  # v5.1.2
+        timeout-minutes: 3
+        with:
+          cache_save: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: Check each feature
+        working-directory: rust
+        run: cargo hack check --workspace --each-feature --no-dev-deps
+
+  wasm:
+    name: WASM
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+        with:
+          build-warnings: warn
+          target: wasm32-wasip2
+          cache-workspaces: rust -> target
+          cache-save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: Build pact_models
+        working-directory: rust/pact_models
+        run: cargo build --target wasm32-wasip2
+
+      - name: Build pact_matching
+        working-directory: rust/pact_matching
+        run: cargo build --target wasm32-wasip2
+
+  clippy:
+    name: Clippy
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+        with:
+          build-warnings: warn
+          components: clippy
+          cache-workspaces: rust -> target
+          cache-save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      # No `-D warnings`: only deny-by-default lints fail the job.
+      - name: Run clippy
+        working-directory: rust
+        run: cargo clippy
+
+  # MARK: Release PRs
+
+  release-deps:
+    name: Release dependencies
+    if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'release/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+        with:
+          build-warnings: warn
+          cache: false
+
+      # Packaging resolves the crate's siblings on crates.io, without the
+      # workspace's path and patch overrides, so a requirement on an
+      # unreleased sibling version fails here, in seconds, before any build.
+      - name: Check workspace dependencies are released
+        working-directory: rust
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: cargo package -p "${HEAD_REF#release/}" --locked --no-verify
+
+      # Builds the crate as crates.io will, against those released versions.
+      # A crate using a sibling's unreleased code fails here, not after its
+      # tag.
+      - name: Package against released dependencies
+        if: ${{ !github.event.pull_request.draft }}
+        working-directory: rust
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: cargo package -p "${HEAD_REF#release/}" --locked

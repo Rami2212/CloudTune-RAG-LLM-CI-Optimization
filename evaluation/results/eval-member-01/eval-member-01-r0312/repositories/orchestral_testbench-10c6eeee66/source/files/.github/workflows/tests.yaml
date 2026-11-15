@@ -1,0 +1,74 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests-on-phpunit-10:
+    runs-on: "ubuntu-latest"
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      matrix:
+        php:
+          - 8.3
+          - 8.4
+          - 8.5
+        phpunit:
+          - "~11.5.50"
+          - "~12.5.8"
+          - "~13.0.0"
+          - "~13.1.0"
+          - "~13.2.0"
+          - "~13.3.0"
+          - "~13.4.0"
+        dependencies:
+          - "highest"
+          - "lowest"
+        experimental:
+          - false
+        exclude:
+          - php: 8.3
+            phpunit: "~13.0.0"
+          - php: 8.3
+            phpunit: "~13.1.0"
+          - php: 8.3
+            phpunit: "~13.2.0"
+          - php: 8.3
+            phpunit: "~13.3.0"
+          - php: 8.3
+            phpunit: "~13.4.0"
+
+    name: PHP:${{ matrix.php }} / PHPUnit:${{ matrix.phpunit }} ${{ matrix.dependencies == 'highest' && '⬆️' || '⬇️' }}
+
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v7
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: dom, curl, libxml, mbstring, zip, pcntl, pdo, sqlite, pdo_sqlite, mysql, mysqli, pdo_mysql, bcmath, intl, fileinfo
+          coverage: none
+
+      - name: Install dependencies
+        uses: ramsey/composer-install@v4
+        with:
+          dependency-versions: "${{ matrix.dependencies }}"
+          composer-options: "--no-cache --with=phpunit/phpunit:${{ matrix.phpunit }}"
+
+      - name: Installed dependencies
+        run: |
+          composer show -D
+
+      - name: Execute tests
+        run: composer run test
+        env:
+          RAY_ENABLED: false

@@ -1,0 +1,235 @@
+name: Release
+on:
+  push:
+    tags:
+      - "v*.*.*"
+env:
+  MACOSX_DEPLOYMENT_TARGET: 10.7
+
+jobs:
+  create-release:
+    name: Create Release
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    outputs:
+      nixpacks_version: ${{ env.NIXPACKS_VERSION }}
+
+    steps:
+      - name: Get the release version from the tag
+        shell: bash
+        if: env.NIXPACKS_VERSION == ''
+        run: |
+          # Apparently, this is the right way to get a tag name. Really?
+          #
+          # See: https://github.community/t5/GitHub-Actions/How-to-get-just-the-tag-name/m-p/32167/highlight/true#M1027
+          echo "NIXPACKS_VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+          echo "version is: ${NIXPACKS_VERSION}"
+        env:
+          NIXPACKS_VERSION: ${{ env.NIXPACKS_VERSION }}
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Build Changelog
+        id: build_changelog
+        uses: mikepenz/release-changelog-builder-action@v5
+        with:
+          configuration: ".github/changelog-configuration.json"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create GitHub release
+        id: release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ env.NIXPACKS_VERSION }}
+          release_name: ${{ env.NIXPACKS_VERSION }}
+          body: ${{steps.build_changelog.outputs.changelog}}
+
+  build-release:
+    name: Build Release Assets
+    permissions:
+      contents: write
+    needs: ['create-release']
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags || '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+
+          - target: i686-unknown-linux-musl
+            os: ubuntu-latest
+
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+
+          - target: arm-unknown-linux-musleabihf
+            os: ubuntu-latest
+
+          - target: x86_64-apple-darwin
+            os: macOS-latest
+
+          - target: aarch64-apple-darwin
+            os: macOS-latest
+
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            rustflags: -C target-feature=+crt-static
+
+          - target: i686-pc-windows-msvc
+            os: windows-latest
+            rustflags: -C target-feature=+crt-static
+
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            rustflags: -C target-feature=+crt-static
+
+          # - target: x86_64-unknown-freebsd
+          #   os: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+        persist-credentials: false
+
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        target: ${{ matrix.target }}
+        profile: minimal
+        override: true
+
+    - name: Build release binary
+      uses: actions-rs/cargo@v1
+      with:
+        command: build
+        args: --release --locked --target ${{ matrix.target }}
+        use-cross: ${{ matrix.os == 'ubuntu-latest' }}
+
+    - name: Prepare binaries [Windows]
+      if: matrix.os == 'windows-latest'
+      run: |
+        cd target/${{ matrix.target }}/release
+        strip nixpacks.exe
+        7z a ../../../nixpacks-${NEEDS_CREATE_RELEASE_OUTPUTS_NIXPACKS_VERSION}-${{ matrix.target }}.zip nixpacks.exe
+        cd -
+      env:
+        NEEDS_CREATE_RELEASE_OUTPUTS_NIXPACKS_VERSION: ${{ needs.create-release.outputs.nixpacks_version }}
+
+    - name: Prepare binaries [-linux]
+      if: matrix.os != 'windows-latest'
+      run: |
+        cd target/${{ matrix.target }}/release
+        strip nixpacks || true
+        tar czvf ../../../nixpacks-${NEEDS_CREATE_RELEASE_OUTPUTS_NIXPACKS_VERSION}-${{ matrix.target }}.tar.gz nixpacks
+        cd -
+      env:
+        NEEDS_CREATE_RELEASE_OUTPUTS_NIXPACKS_VERSION: ${{ needs.create-release.outputs.nixpacks_version }}
+
+    # - name: Add Checksums
+    #   run: for file in nixpacks-*/nixpacks-*; do openssl dgst -sha256 -r "$file" | awk '{print $1}' > "${file}.sha256"; done
+
+    - name: Upload release archive
+      uses: softprops/action-gh-release@v2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ needs.create-release.outputs.nixpacks_version }}
+        files: nixpacks-${{ needs.create-release.outputs.nixpacks_version }}-${{ matrix.target }}*
+
+    - name: Install cargo-deb
+      if: matrix.target == 'x86_64-unknown-linux-gnu'
+      run: cargo install cargo-deb
+
+    - name: Generate .deb package file
+      if: matrix.target == 'x86_64-unknown-linux-gnu'
+      run: cargo deb --target ${{ matrix.target }} --output nixpacks-${NEEDS_CREATE_RELEASE_OUTPUTS_NIXPACKS_VERSION}-amd64.deb
+      env:
+        NEEDS_CREATE_RELEASE_OUTPUTS_NIXPACKS_VERSION: ${{ needs.create-release.outputs.nixpacks_version }}
+
+    - name: Upload .deb package file
+      if: matrix.target == 'x86_64-unknown-linux-gnu'
+      uses: svenstaro/upload-release-action@v2
+      with:
+        tag: ${{ needs.create-release.outputs.nixpacks_version }}
+        file: nixpacks-${{ needs.create-release.outputs.nixpacks_version }}-amd64.deb
+
+    - name: Install cargo-wix
+      continue-on-error: true
+      # aarch64 is not supported by cargo-wix since it requires wix v4
+      # see https://github.com/volks73/cargo-wix/issues/174
+      if: matrix.os == 'windows-latest' && matrix.target != 'aarch64-pc-windows-msvc'
+      run: cargo install cargo-wix
+      env:
+        # cargo-wix does not require static crt
+        RUSTFLAGS: ""
+
+    - name: Create windows installers
+      continue-on-error: true
+      if: matrix.os == 'windows-latest' && matrix.target != 'aarch64-pc-windows-msvc'
+      run: >
+        cargo wix -v --no-build --nocapture
+        --target ${{ matrix.target }}
+        --output nixpacks-${NEEDS_CREATE_RELEASE_OUTPUTS_NIXPACKS_VERSION}-${{ matrix.target }}.msi
+      env:
+        NEEDS_CREATE_RELEASE_OUTPUTS_NIXPACKS_VERSION: ${{ needs.create-release.outputs.nixpacks_version }}
+
+    - name: Upload windows installers
+      continue-on-error: true
+      if: matrix.os == 'windows-latest' && matrix.target != 'aarch64-pc-windows-msvc'
+      uses: svenstaro/upload-release-action@v2
+      with:
+        tag: ${{ needs.create-release.outputs.nixpacks_version }}
+        file: nixpacks-${{ needs.create-release.outputs.nixpacks_version }}-${{ matrix.target }}.msi
+
+    - name: Set SHA
+      if: matrix.config.os == 'macos-latest'
+      id: shasum
+      run: |
+        echo "sha=\"$(shasum -a 256 ./release/gitui-mac.tar.gz | awk '{printf $1}')\"" >> $GITHUB_OUTPUT
+
+    - name: Update homebrew tap
+      uses: mislav/bump-homebrew-formula-action@v3
+      if: "matrix.target == 'x86_64-apple-darwin' && !contains(github.ref, '-')"
+      with:
+        formula-name: nixpacks
+        formula-path: nixpacks.rb
+        homebrew-tap: railwayapp/homebrew-tap
+        download-url: ${{ github.server_url }}/${{ github.repository }}/releases/latest/download/nixpacks-${{ needs.create-release.outputs.nixpacks_version }}-x86_64-apple-darwin.tar.gz
+      env:
+        COMMITTER_TOKEN: ${{ secrets.COMMITTER_TOKEN }}
+
+  notify-release:
+    name: Notify Release
+    runs-on: ubuntu-latest
+    needs: ['create-release', 'build-release']
+
+    steps:
+      - name: Discord Deployment Status Notification
+        uses: sarisia/actions-status-discord@v1
+        with:
+          webhook: ${{ secrets.PUBLISH_WEBHOOK }}
+          status: ${{ job.status }}
+          nodetail: true
+          username: Nixpacks Releases
+          avatar_url: https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png
+          title: Published version ${{ needs.create-release.outputs.nixpacks_version }} of Nixpacks
+          description: |
+            [View Changelog](${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.create-release.outputs.nixpacks_version }})

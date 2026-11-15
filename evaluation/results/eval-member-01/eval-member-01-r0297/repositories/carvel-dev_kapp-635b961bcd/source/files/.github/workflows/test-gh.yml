@@ -1,0 +1,99 @@
+name: Run All Tests
+
+on:
+  push:
+    branches:
+      - develop
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+jobs:
+  test-all:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        k8s-version: [v1.28.0, latest]
+    steps:
+    - name: install kind
+      uses: helm/kind-action@v1
+      with:
+        install_only: true
+        version: v0.33.0
+    - name: Resolve Kubernetes version
+      id: resolve-k8s-version
+      run: |
+        k8s_version=${{ matrix.k8s-version }}
+        if [ "${k8s_version}" = "latest" ]; then
+          # Resolve to the latest kindest/node tag available on Docker Hub (not kubernetes/kubernetes releases,
+          # which may lag behind kind image availability)
+          k8s_version=$(curl -fsSL "https://hub.docker.com/v2/repositories/kindest/node/tags?page_size=100&ordering=last_updated" \
+            | jq -r '.results[].name' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V | tail -1)
+          if [ -z "$k8s_version" ]; then
+            echo "Failed to resolve latest kindest/node version from Docker Hub" >&2
+            exit 1
+          fi
+          echo "Resolved latest kindest/node version to: $k8s_version"
+
+          # Warn if kind's latest minor version lags behind the latest upstream Kubernetes minor version
+          k8s_latest=$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/kubernetes/kubernetes/releases/latest \
+            | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+')
+          if [ -z "$k8s_latest" ]; then
+            echo "Failed to resolve latest Kubernetes version from GitHub" >&2
+            exit 1
+          fi
+          kind_minor=$(echo "$k8s_version" | cut -d'.' -f2)
+          k8s_minor=$(echo "$k8s_latest" | cut -d'.' -f2)
+          if [ "$kind_minor" -lt "$k8s_minor" ]; then
+            echo "::warning::kindest/node latest is $k8s_version (minor=$kind_minor) but upstream Kubernetes latest is $k8s_latest (minor=$k8s_minor). kind has not yet published an image for the newest minor version."
+          fi
+        fi
+        echo "k8s_version=${k8s_version}" >> $GITHUB_ENV
+        echo "k8s_version=${k8s_version}" >> $GITHUB_OUTPUT
+    - name: Create Kind Cluster (k8s version ${{ steps.resolve-k8s-version.outputs.k8s_version }})
+      run: |
+        echo "Creating kind cluster with kindest/node:${{ env.k8s_version }}"
+        kind create cluster --image kindest/node:${{ env.k8s_version }}
+    - name: Verify kind and k8s version
+      run: |
+        kind version
+        kubectl version
+    - name: Check out code into the Go module directory
+      uses: actions/checkout@v4
+      with:
+        path: src/github.com/${{ github.repository }}
+        fetch-depth: 0
+    - name: Set up go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: src/github.com/${{ github.repository }}/go.mod
+    - name: Verify go version
+      run: |
+        go version
+    - name: Run tests
+      run: |
+        set -e -x
+
+        export GOPATH=$(pwd)
+        pushd src/github.com/${{ github.repository }}
+
+        # Install ytt for build
+        mkdir -p /tmp/bin
+        export PATH=/tmp/bin:$PATH
+
+        ./hack/verify-no-dirty-files.sh
+
+        wget -O- https://carvel.dev/install.sh | K14SIO_INSTALL_BIN_DIR=/tmp/bin bash
+
+        # Ensure that there is no existing kapp installed
+        rm -f /tmp/bin/kapp
+
+        ./hack/build-binaries.sh
+
+        export KAPP_E2E_NAMESPACE=kapp-test
+        kubectl create ns $KAPP_E2E_NAMESPACE
+
+        ./hack/test-all.sh

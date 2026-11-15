@@ -1,0 +1,110 @@
+name: Documentation
+
+on:
+  push:
+    branches: [ main, 'devnet_*', 'testnet_*' ]
+    paths-ignore:
+      - '*.md'
+      - 'docker/**'
+      - 'docker_scylla/**'
+      - 'configuration/**'
+      - 'kubernetes/**'
+      - 'scripts/**'
+  workflow_dispatch:
+
+# This allows a subsequently queued workflow run to interrupt previous runs on pull requests
+concurrency:
+  group: '${{ github.workflow }} ${{ github.ref }}'
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: short
+  RUSTFLAGS: "-D warnings"
+  RUSTUP_MAX_RETRIES: 10
+  LINERA_PACKAGES: "packages.txt"
+
+permissions:
+  contents: read
+
+jobs:
+
+  publish-docs:
+    runs-on: ubuntu-latest
+    # `cargo doc --all-features` documents ~565 crates and has been creeping up
+    # on this budget: the last success took 36m37s against a 40m limit, and the
+    # next run hit the wall at 40m15s. A timeout here is quiet — the job reports
+    # `cancelled` (indistinguishable at a glance from a concurrency cancellation)
+    # and `Deploy` is simply skipped, so the published docs go stale without
+    # anything going red. Caching is not the lever: rust-cache already reports a
+    # full hit and restores ~718 MB in 17s.
+    timeout-minutes: 75
+
+    # We only publish docs for the main branch.
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+    - uses: actions/checkout@v6.0.2
+    - uses: actions-rust-lang/setup-rust-toolchain@v1
+    - name: Install Protoc
+      uses: ./.github/actions/install-protoc
+    - name: Compute docs
+      run: |
+        cargo doc --all-features
+    - name: Deploy
+      uses: peaceiris/actions-gh-pages@v3
+      with:
+        deploy_key: ${{ secrets.ACTIONS_DEPLOY_KEY }}
+        publish_branch: gh-pages
+        publish_dir: ./target/doc
+        force_orphan: true
+
+  test-crates-and-docrs:
+    runs-on: linera-io-self-hosted-ci
+    timeout-minutes: 90
+
+    steps:
+    - uses: actions/checkout@v6.0.2
+    - uses: actions-rust-lang/setup-rust-toolchain@v1
+    - name: Install Protoc
+      uses: ./.github/actions/install-protoc
+    - name: Install cargo tools
+      run: |
+        cargo install --locked cargo-index
+        cargo install --locked --git https://github.com/ma2bd/cargo-local-registry.git --rev 8e5b9517f2963569afb9dd1262212f4dcac24b2e
+    - name: Setup git committer information
+      run: |
+        git config --global user.email "ci@linera.io"
+        git config --global user.name "CI"
+    - name: Generate packages
+      run: |
+        scripts/test_publish.sh "$LINERA_PACKAGES" ${{ runner.temp }}/registry
+    # TODO(#2593): fix docs.rs CI test
+    # - name: Extract packaged crates
+    #   run: |
+    #     cd "${{ runner.temp }}/registry"
+    #     grep -v '^#' "$LINERA_PACKAGES" | while read LINE; do
+    #         CRATE="${LINE%% *}"
+    #         tar -xzvf "${CRATE}-*.crate"
+    #     done
+    # - name: Checkout docs.rs tool repository
+    #   run: |
+    #     cd ${{ runner.temp }}
+    #     git clone https://github.com/rust-lang/docs.rs docsrs
+    #     cd docsrs
+    #     git submodule update --init
+    # - name: Build documentation using docs.rs
+    #   run: |
+    #     cd ${{ runner.temp }}/docsrs
+    #     cp .env.sample .env
+    #     mkdir -p ignored/cratesfyi-prefix/crates.io-index
+    #     . .env
+    #     SQLX_OFFLINE=1 cargo build
+    #     docker compose up -d db s3
+    #     cargo run -- database migrate
+    #     grep -v ^# "$LINERA_PACKAGES" | while read LINE; do
+    #         CRATE="${LINE%% *}"
+    #         cargo run -- build crate --local "${{ runner.temp }}/registry/${CRATE}-*/"
+    #     done

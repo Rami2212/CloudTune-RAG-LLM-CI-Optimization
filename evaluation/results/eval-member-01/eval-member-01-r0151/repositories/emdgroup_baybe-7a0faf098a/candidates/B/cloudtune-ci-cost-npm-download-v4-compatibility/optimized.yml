@@ -1,0 +1,238 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 4 optimizations:
+# - [HIGH] Add pip dependency cache to "lint" job
+# - [HIGH] Add pip dependency cache to "build-docs" job
+# - [HIGH] Add pip dependency cache to "typecheck" job
+# - [HIGH] Add pip dependency cache to "audit" job
+# Estimated savings: ~12 min/run
+#
+name: Continuous Integration
+on:
+  push:
+    branches:
+      - main
+      - 'dev/**'
+  pull_request:
+    branches:
+      - main
+      - 'dev/**'
+  workflow_dispatch:
+
+env:
+  COVERAGE_OVERALL_THRESH: 70      # threshold for overall coverage check
+  COVERAGE_INDIVIDUAL_THRESH: 45   # threshold for individual coverage check
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changelog:
+    name: "Changelog"
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'pull_request' }}
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Assert Changelog Edit
+        run: |
+          git fetch origin main:main
+          NUM_ADDED=`git diff --numstat main HEAD CHANGELOG.md | cut -d$'\t' -f1`
+          echo "Changelog differences: $NUM_ADDED"
+          if [ "$NUM_ADDED" -gt "0" ]; then
+            echo "SUCCESS"
+            exit 0
+          else
+            echo "ERROR - Nothing has been added to CHANGELOG.md"
+            exit 1
+          fi
+
+  reminder:
+    runs-on: ubuntu-latest
+    name: "Reminder"
+    continue-on-error: true
+    permissions:
+      issues: write  # Required for reminder-action to post issue comments
+    steps:
+      - name: check reminders and notify
+        uses: agrc/reminder-action@ab1f38534c17a1c16ba96eaf5fb9c0015d509301 # v1
+
+  lint:
+    strategy:
+      matrix:
+        py-version: [ {semantic: '3.14', tox: 'py314'} ]
+    name: Lint ${{ matrix.py-version.semantic }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v6
+        id: setup-python
+        with:
+          python-version: ${{ matrix.py-version.semantic }}
+      - name: Run linting
+        run: |
+          pip install tox-uv
+          tox -e lint-${{ matrix.py-version.tox }}
+
+  lychee:
+    name: "Link Check"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: -vv --root-dir ${{ github.workspace }} --config lychee.toml baybe docs examples README.md CONTRIBUTING.md CONTRIBUTORS.md CHANGELOG.md
+
+  build-docs:
+    name: "Build Docs"
+    runs-on: ubuntu-latest
+    needs: [lint, lychee]
+    permissions:
+      contents: read
+      pages: write     # Required to deploy to GitHub Pages
+      id-token: write  # Required for OIDC authentication to GitHub Pages
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v6
+        with: {python-version: "3.10"}
+      - name: Build Docs
+        run: |
+          pip install tox-uv
+          tox -e docs-py310 -- -r
+          
+  typecheck:
+    needs: [lint]
+    strategy:
+      matrix:
+        py-version: [ {semantic: '3.14', tox: 'py314'} ]
+    name: Type Check ${{ matrix.py-version.semantic }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v6
+        id: setup-python
+        with:
+          python-version: ${{ matrix.py-version.semantic }}
+      - name: Run type check
+        run: |
+          pip install tox-uv
+          tox -e typecheck-${{ matrix.py-version.tox }}
+
+  audit:
+    needs: [lint]
+    strategy:
+      matrix:
+        py-version: [ {semantic: '3.14', tox: 'py314'} ]
+    name: Audit ${{ matrix.py-version.semantic }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v6
+        id: setup-python
+        with:
+          python-version: ${{ matrix.py-version.semantic }}
+      - name: Run pip-audit
+        run: |
+          pip install tox-uv
+          tox -e audit-${{ matrix.py-version.tox }}
+
+  coretest:
+    needs: [typecheck]
+    strategy:
+      matrix:
+        py-version: [ {semantic: '3.10', tox: 'py310'}, {semantic: '3.14', tox: 'py314'} ]
+    name: Core Tests ${{ matrix.py-version.semantic }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v6
+        id: setup-python
+        with:
+          python-version: ${{ matrix.py-version.semantic }}
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v5
+        with:
+          path: .tox/coretest-${{ matrix.py-version.tox }}
+          key: coretest-${{ matrix.py-version.tox }}-${{ hashFiles('pyproject.toml') }}-${{ hashFiles('tox.ini') }}
+      - name: Run core tests
+        run: |
+          pip install tox-uv
+          tox -e coretest-${{ matrix.py-version.tox }}
+
+  fulltest:
+    needs: [typecheck]
+    strategy:
+      fail-fast: false  # Remove once we have solved the regular "LinAlgErrors"
+      matrix:
+        py-version: [ {semantic: '3.10', tox: 'py310'}, {semantic: '3.13', tox: 'py313'} ]
+    name: Full Tests ${{ matrix.py-version.semantic }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v6
+        id: setup-python
+        with:
+          python-version: ${{ matrix.py-version.semantic }}
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v5
+        with:
+          path: .tox/fulltest-${{ matrix.py-version.tox }}
+          key: fulltest-${{ matrix.py-version.tox }}-${{ hashFiles('pyproject.toml') }}-${{ hashFiles('tox.ini') }}
+      - name: Run full tests
+        run: |
+          pip install tox-uv
+          tox -e fulltest-${{ matrix.py-version.tox }} -- --cov-report=xml
+      - name: "Assert Overall Coverage"
+        run: |
+          pip install coverage
+          coverage report --fail-under=${{ env.COVERAGE_OVERALL_THRESH }}
+      - name: "Assert Individual Coverage"
+        shell: bash
+        run: |
+          coverage report |
+          grep -E -o '[0-9]+%' |
+          tr -d '%' |
+          sed '$d' |
+          awk '{if ( $1<${{ env.COVERAGE_INDIVIDUAL_THRESH }} ) exit 1 }'
+
+  gputest:
+    needs: [typecheck]
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    strategy:
+      matrix:
+        py-version: [ {semantic: '3.10', tox: 'py310'} ]
+    name: GPU Tests ${{ matrix.py-version.semantic }}
+    runs-on: XS-GPU
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v6
+        id: setup-python
+        with:
+          python-version: ${{ matrix.py-version.semantic }}
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v5
+        with:
+          path: .tox/gputest-${{ matrix.py-version.tox }}
+          key: gputest-${{ matrix.py-version.tox }}-${{ hashFiles('pyproject.toml') }}-${{ hashFiles('tox.ini') }}
+      - name: Run GPU tests
+        run: |
+          pip install tox-uv
+          tox -e gputest-${{ matrix.py-version.tox }}

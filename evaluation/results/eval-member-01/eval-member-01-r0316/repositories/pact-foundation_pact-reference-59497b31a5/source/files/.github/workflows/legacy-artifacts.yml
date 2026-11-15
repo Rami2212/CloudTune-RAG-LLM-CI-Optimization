@@ -1,0 +1,80 @@
+---
+# Republishes pre-dist asset names for downstream installers that still
+# hard-code them. pact_ffi assets also go to a `libpact_ffi-v<version>`
+# release, the URL those installers build.
+#
+# Delete this file after the legacy cut-off date set in
+# .github/scripts/legacy-artifacts.sh, which lists everything else to
+# remove. The script publishes nothing from that date.
+name: Legacy artifacts
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        type: string
+        required: true
+  # Runs the scripts from master: the recovery path when a fix to them
+  # must reach a release whose own run failed.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: dist release tag to publish legacy assets for (e.g. pact_ffi-v0.5.12)
+        type: string
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  legacy-artifacts:
+    name: Publish legacy-named assets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        env:
+          PLAN: ${{ inputs.plan }}
+          MANUAL_TAG: ${{ inputs.tag }}
+        run: |
+          if [[ -n "$PLAN" ]]; then
+            echo "tag=$(jq -r '.announcement_tag' <<<"$PLAN")" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=$MANUAL_TAG" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Build legacy assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: .github/scripts/legacy-artifacts.sh "$TAG" "$RUNNER_TEMP/legacy"
+
+      - name: Upload legacy assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          shopt -s nullglob
+          files=("$RUNNER_TEMP"/legacy/*)
+          (( ${#files[@]} )) || exit 0
+          case "$TAG" in
+            pact_ffi-v*)
+              version=${TAG##*-v}
+              legacy="libpact_ffi-v$version"
+              # The legacy tag points at the release tag's commit.
+              sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)
+              cutoff=$(sed -n 's/^CUTOFF=//p' .github/scripts/legacy-artifacts.sh)
+              gh api "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/$legacy" -f "sha=$sha" >/dev/null 2>&1 || true
+              gh release view "$legacy" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+                gh release create "$legacy" --repo "$GITHUB_REPOSITORY" --target "$sha" --latest=false \
+                  --title "pact_ffi $version (legacy asset names)" \
+                  --notes "Legacy-named assets for [pact_ffi-v$version](https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG). These names are published until $cutoff."
+              gh release upload "$legacy" --repo "$GITHUB_REPOSITORY" --clobber "${files[@]}"
+              ;;
+            *)
+              gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "${files[@]}"
+              ;;
+          esac

@@ -1,0 +1,122 @@
+name: Reusable Integration Tests
+
+on:
+  workflow_call:
+    inputs:
+      platformVersion:
+        required: false
+        default: 2022.1.4
+        type: string
+      testName:
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  integrationTests:
+    name: Gradle ${{ matrix.gradleVersion }} @ ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        gradleVersion:
+          - "9.0.0"
+          - "9.8.2"
+          - "nightly"
+        os:
+          - windows-latest
+          - ubuntu-latest
+          - macos-latest
+
+    steps:
+
+      # Free GitHub Actions Environment Disk Space
+      - name: Maximize Build Space
+        if: runner.os == 'Linux'
+        uses: jlumbroso/free-disk-space@v2.0.0
+        with:
+          preinstalled-runtimes: false
+          large-packages: false
+
+      - name: Fetch Sources
+        uses: actions/checkout@v7
+
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: zulu
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6.4.1
+        with:
+          cache-read-only: true
+
+      - name: Restore IntelliJ Platform test cache
+        id: intellij-platform-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: .gradle/testGradleHome/.intellijPlatform
+          key: test-gradle-home-v5-intellij-platform-${{ runner.os }}-${{ hashFiles('gradle.properties', 'build.gradle.kts', 'gradle/libs.versions.toml', 'src/test/**/*.kt', 'src/test/resources/**', 'src/testFixtures/**/*.kt', 'src/integrationTest/**/*.kt', 'src/integrationTest/resources/**') }}
+          restore-keys: |
+            test-gradle-home-v5-intellij-platform-${{ runner.os }}-
+
+      - name: Restore Gradle TestKit cache
+        uses: actions/cache/restore@v6
+        with:
+          path: .gradle/testGradleHome/.testKit
+          key: test-gradle-home-v2-testkit-${{ runner.os }}-${{ matrix.gradleVersion }}-${{ hashFiles('gradle.properties', 'build.gradle.kts', 'gradle/libs.versions.toml') }}
+          restore-keys: |
+            test-gradle-home-v2-testkit-${{ runner.os }}-
+
+      # The macOS runners have 7 GB of memory, less than half of the Linux and Windows runners.
+      # Compile in a separate single-use build so that no compiler daemon stays resident while the tests run.
+      - name: Compile Tests
+        if: runner.os == 'macOS'
+        env:
+          DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+        run: |
+          ./gradlew integrationTestClasses \
+            -Pkotlin.compiler.execution.strategy=in-process \
+            --no-daemon \
+            --console=plain \
+            --no-build-cache
+
+      - name: Run Tests
+        env:
+          DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+          TEST_NAME: ${{ inputs.testName }}
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            TEST_GRADLE_USER_HOME="$(pwd -W)\\.gradle\\testGradleHome"
+          else
+            TEST_GRADLE_USER_HOME="$PWD/.gradle/testGradleHome"
+          fi
+          TESTS=()
+          if [ -n "$TEST_NAME" ]; then
+            TESTS+=(--tests "$TEST_NAME")
+          fi
+          # Nested TestKit daemons grow toward their heap limit over hundreds of builds; keep them within the macOS runner memory.
+          MEMORY=()
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            MEMORY+=("-PtestGradleArguments=-Dorg.gradle.jvmargs=-Xmx2G")
+          fi
+
+          ./gradlew integrationTest \
+            -PtestGradleVersion="${{ matrix.gradleVersion }}" \
+            -PtestGradleUserHome="$TEST_GRADLE_USER_HOME" \
+            "${TESTS[@]}" \
+            "${MEMORY[@]}" \
+            --console=plain \
+            --no-build-cache
+
+      - name: Upload Failure Reports
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: integration-test-reports-${{ matrix.os }}-${{ matrix.gradleVersion }}
+          path: |
+            build/diagnostics/
+            build/test-results/integrationTest/
+            build/reports/tests/integrationTest/

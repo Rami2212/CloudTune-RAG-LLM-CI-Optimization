@@ -1,0 +1,35 @@
+name: Upload to R2
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - "packages/@ourworldindata/grapher/src/schema/**"
+      - "devTools/schema/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: $/.github/actions/setup-node-yarn-deps
+
+      - name: Build schema artefacts
+        run: yarn buildGrapherSchema --publish-dir "$RUNNER_TEMP/schemas" --latest
+
+      # Now upload all files in that folder to Cloudflare R2.
+      - name: Upload to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
+        run: |
+          aws s3 sync "$RUNNER_TEMP/schemas" s3://owid-public/schemas \
+            --endpoint-url https://${{ secrets.CLOUDFLARE_R2_ACCOUNT_ID }}.r2.cloudflarestorage.com

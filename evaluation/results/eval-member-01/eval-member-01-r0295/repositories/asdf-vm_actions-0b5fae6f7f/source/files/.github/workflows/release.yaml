@@ -1,0 +1,41 @@
+name: release
+
+on:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: google-github-actions/release-please-action@db8f2c60ee802b3748b512940dde88eabd7b7e01 # v3.7.13
+        id: release
+        with:
+          release-type: node
+          changelog-types: |
+            [
+              { "type": "feat", "section": "Features", "hidden": false },
+              { "type": "fix", "section": "Patches", "hidden": false },
+              { "type": "docs", "section": "Documentation", "hidden": false }
+            ]
+          extra-files: |
+            README.md
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      # if there was a release, move the git tag for the major version to the same SHA as the new GitHub Release
+      - name: tag major version
+        env:
+          RELEASE_MESSAGE: ${{ github.event.head_commit.message }}
+        if: ${{ steps.release.outputs.release_created }}
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git remote add gh-token "https://${{ secrets.GITHUB_TOKEN }}@github.com/google-github-actions/release-please-action.git"
+          git tag --delete v${{ steps.release.outputs.major }} || true
+          git push origin :v${{ steps.release.outputs.major }} || true
+          git tag --annotate v${{ steps.release.outputs.major }} --message "$RELEASE_MESSAGE"
+          git push origin v${{ steps.release.outputs.major }}

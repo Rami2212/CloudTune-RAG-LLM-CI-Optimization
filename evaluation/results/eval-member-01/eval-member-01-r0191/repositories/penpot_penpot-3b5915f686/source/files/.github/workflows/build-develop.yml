@@ -1,0 +1,67 @@
+name: _DEVELOP
+
+run-name: >-
+  _DEVELOP (develop @ ${{ github.sha }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Rebuild and overwrite even if already built/promoted'
+        type: boolean
+        required: false
+        default: false
+  schedule:
+    - cron: '16 5-20 * * 1-5'
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  build-bundle:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-bundle.yml
+    secrets:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      MATTERMOST_WEBHOOK: ${{ secrets.MATTERMOST_WEBHOOK }}
+      S3_BUCKET: ${{ secrets.S3_BUCKET }}
+    with:
+      gh_ref: "develop"
+      force: ${{ inputs.force || false }}
+
+  build-docker:
+    needs: build-bundle
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-docker.yml
+    secrets:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+      DOCKER_REGISTRY: ${{ secrets.DOCKER_REGISTRY }}
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      MATTERMOST_WEBHOOK: ${{ secrets.MATTERMOST_WEBHOOK }}
+      PUB_DOCKER_PASSWORD: ${{ secrets.PUB_DOCKER_PASSWORD }}
+      PUB_DOCKER_USERNAME: ${{ secrets.PUB_DOCKER_USERNAME }}
+      S3_BUCKET: ${{ secrets.S3_BUCKET }}
+    with:
+      gh_ref: "develop"
+      # Pin build-docker to the commit build-bundle actually bundled.
+      sha: ${{ needs.build-bundle.outputs.sha }}
+      force: ${{ inputs.force || false }}
+
+  build-docker-admin-console:
+    permissions: {}
+    uses: ./.github/workflows/build-docker-admin-console.yml
+    secrets:
+      ORG_WORKFLOW_TOKEN: ${{ secrets.ORG_WORKFLOW_TOKEN }}
+    with:
+      gh_ref: "develop"
+      force: ${{ inputs.force || false }}

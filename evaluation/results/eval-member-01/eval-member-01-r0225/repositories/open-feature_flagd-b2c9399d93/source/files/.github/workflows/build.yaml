@@ -1,0 +1,195 @@
+name: build
+
+on:
+  push:
+    branches:
+      - feature/workflows
+      - main
+    paths-ignore:
+      - "README.md"
+      - "docs/**"
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - "README.md"
+      - "docs/**"
+
+env:
+  # The toolchain determines which FIPS snapshots exist, so pin it.
+  GOTOOLCHAIN: local
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    env:
+      GOPATH: /home/runner/work/open-feature/flagd
+      GOBIN: /home/runner/work/open-feature/flagd/bin
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4
+      - name: Setup go
+        uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5
+        with:
+          go-version-file: 'flagd/go.mod'
+      - run: make workspace-init
+      - run: make lint
+
+  docs-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4
+      - name: Setup go
+        uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5
+        with:
+          go-version-file: 'flagd/go.mod'
+      - run: make workspace-init
+      - run: make generate-docs
+      - name: Check no diff
+        run: |
+          if [ ! -z "$(git status --porcelain)" ]; then echo "Doc generation produced diff. Run 'make generate-docs' and commit results."; exit 1; fi
+
+  test:
+    runs-on: ubuntu-latest
+    env:
+      GOPATH: /home/runner/work/open-feature/flagd
+      GOBIN: /home/runner/work/open-feature/flagd/bin
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4
+      - name: Setup go
+        uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5
+        with:
+          go-version-file: 'flagd/go.mod'
+      - run: make workspace-init
+      - run: make test
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@e0b68c6749509c5f83f984dd99a76a1c1a231044 # v4
+
+  fips:
+    name: FIPS 140-3
+    runs-on: ubuntu-latest
+    env:
+      GOPATH: /home/runner/work/open-feature/flagd
+      GOBIN: /home/runner/work/open-feature/flagd/bin
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4
+      - name: Setup go
+        uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5
+        with:
+          go-version-file: 'flagd/go.mod'
+      - run: make workspace-init
+
+      # Fails if any tested code path reaches a non-approved algorithm.
+      - name: Test the FIPS variant with strict enforcement
+        run: make test-fips
+
+      - name: Build both variants
+        run: |
+          set -euo pipefail
+          make build-flagd
+          make build-flagd-fips
+
+      - name: The standard build must not claim FIPS
+        run: |
+          set -euo pipefail
+          version_output=$(./bin/flagd version)
+          grep -q 'build variant: standard' <<<"$version_output"
+          grep -q 'FIPS 140-3 mode: disabled' <<<"$version_output"
+          # The standard build must still run with FIPS mode forced off.
+          GODEBUG=fips140=off ./bin/flagd version >/dev/null
+
+      - name: The FIPS build must carry and require the certified module
+        run: |
+          set -euo pipefail
+          build_info=$(go version -m ./bin/flagd-fips)
+          grep -q 'GOFIPS140=v1\.0\.0' <<<"$build_info"
+          grep -q 'DefaultGODEBUG=fips140=on' <<<"$build_info"
+          grep -q -- '-tags=fips140' <<<"$build_info"
+          version_output=$(./bin/flagd-fips version)
+          grep -q 'build variant: fips' <<<"$version_output"
+          grep -q 'FIPS 140-3 mode: enabled' <<<"$version_output"
+          # Enforcement is unconditional: no flag can turn it off.
+          if GODEBUG=fips140=off ./bin/flagd-fips start -f file:./config/samples/example_flags.flagd.json; then
+            echo "::error::the FIPS build started with FIPS mode disabled"; exit 1
+          fi
+
+      - name: A fips140-tagged build without GOFIPS140 must refuse to start
+        run: |
+          set -euo pipefail
+          go build -tags fips140 -o /tmp/flagd-mismatch ./flagd
+          if /tmp/flagd-mismatch start -f file:./config/samples/example_flags.flagd.json; then
+            echo "::error::a mislabelled FIPS build started"; exit 1
+          fi
+
+      - name: Check the cryptographic dependency closure has not drifted
+        run: |
+          make fips-closure
+          git diff --exit-code docs/reference/fips-crypto-closure.txt \
+            || { echo "::error::cryptographic dependency closure changed; review docs/reference/fips-140-3.md and commit the regenerated closure"; exit 1; }
+
+  docker-local:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4
+        with:
+          submodules: recursive
+
+      - name: Setup go
+        uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5
+        with:
+          go-version-file: 'flagd/go.mod'
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: all
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build
+        uses: docker/build-push-action@4a13e500e55cf31b7a5d59a38ab2040ab0f42f56 # v5
+        with:
+          context: .
+          file: ./flagd/build.Dockerfile
+          outputs: type=docker,dest=${{ github.workspace }}/flagd-local.tar
+          tags: flagd-local:test
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          input: ${{ github.workspace }}/flagd-local.tar
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH"
+        env:
+          # use an alternative trivvy db to avoid rate limits
+          TRIVY_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-db:2,ghcr.io/aquasecurity/trivy-db:2
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@e8893c57a1f3a2b659b6b55564fdfdbbd2982911 # v3
+        with:
+          sarif_file: "trivy-results.sarif"
+
+  integration-test: # caching tests are disabled due to slow file I/O in github actions
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4
+        with:
+          submodules: recursive
+
+      - name: Setup go
+        uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5
+        with:
+          go-version-file: 'flagd/go.mod'
+
+      - name: Run test suite
+        run: make workspace-clean && cd test/integration && go clean -testcache && go test -cover

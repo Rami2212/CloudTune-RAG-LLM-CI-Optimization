@@ -1,0 +1,41 @@
+name: Publish
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    env:
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+      CI: true
+    permissions:
+      contents: write # release commits, tags and GitHub releases
+      issues: write # comment on released issues
+      pull-requests: write # comment on released pull requests
+      id-token: write # npm trusted publishing (OIDC) and provenance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          cache: 'npm'
+          node-version: 24
+      - name: Install dependencies
+        env:
+          CI: true
+        run: npm install
+      - name: Test
+        run: npm test
+      - name: Build
+        run: npm run build
+      - name: Check demo language files
+        run: test -f dist/demo/assets/lang/en-US.lang && test -f dist/demo/assets/lang/de-DE.lang
+      - name: Test built package
+        run: npm run test:dist
+      - name: Publish
+        if: success()
+        run: npx semantic-release

@@ -1,0 +1,292 @@
+[build-system]
+# Build Python requirements, keep Cython in sync with
+# "Prerequisites" in User's Guide,
+# build jobs in `.github/workflows/*.yml`.
+requires = [
+    "setuptools >= 77.0.0",
+    "numpy >= 2",
+    "packaging",
+    "py-cpuinfo",
+    "Cython >= 3.2",
+    # Included here for seamless wheel builds.
+    # Packagers can choose to replace it by externally provided
+    # c-blosc2 library and headers
+    "blosc2 >= 3.2.0",
+]
+build-backend = "setuptools.build_meta"
+# build-backend = "mesonpy"  # and replace ``setuptools`` above
+
+
+[project]
+name = "tables"
+dynamic = [ "version" ]
+description = "Hierarchical datasets for Python"
+# Keep Python versions in sync with
+# `classifiers` below,
+# `min_python_version` in `setup.py`.
+requires-python = ">=3.11"
+license = "BSD-3-Clause"
+license-files = [
+    "LICENSE.txt",
+    "LICENSES/*.txt",
+]
+keywords = [ "hdf5" ]
+authors = [
+    { name = "Francesc Alted" },
+    { name = "Ivan Vilata" },
+    { name = "Antonio Valentino" },
+    { name = "Anthony Scopatz" },
+    { name = "et al." },
+    { email = "pytables@pytables.org" },
+]
+maintainers = [
+    { name = "PyTables maintainers", email = "pytables@pytables.org" },
+]
+# Keep Python versions in sync with
+# `requires_python` above,
+# "Prerequisites" in User's Guide,
+# `jobs.build.strategy.matrix.python` in `.github/workflows/ci.yml`,
+# `jobs.build_wheels.env.CIBW_SKIP` in `.github/workflows/wheels.yml`.
+# `jobs.build_wheels_windows.env.CIBW_BUILD` in `.github/workflows/wheels.yml`.
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: Science/Research",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: Unix",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+# Runtime Python requirements, keep in sync with
+# "Prerequisites" in User's Guide,
+# ``requirements.txt``,
+# `jobs.build.steps` in `.github/workflows/ubuntu.yml`.
+dependencies = [
+    "numpy >= 2",
+    "numexpr >= 2.6.2",
+    "packaging",
+    "py-cpuinfo",
+    "blosc2 >= 2.3.0",
+]
+
+
+[project.readme]
+text = """
+PyTables is a package for managing hierarchical datasets and
+designed to efficiently cope with extremely large amounts of
+data. PyTables is built on top of the HDF5 library and the
+NumPy package and features an object-oriented interface
+that, combined with C-code generated from Cython sources,
+makes of it a fast, yet extremely easy to use tool for
+interactively save and retrieve large amounts of data.
+"""
+content-type = "text/x-rst"
+
+
+[project.urls]
+homepage = "http://www.pytables.org"
+documentation = "http://www.pytables.org"
+repository = "https://github.com/PyTables/PyTables"
+changelog = "http://www.pytables.org/release_notes.html"
+tracker = "https://github.com/PyTables/PyTables/issues"
+
+
+[project.scripts]
+ptdump = "tables.scripts.ptdump:main"
+ptrepack = "tables.scripts.ptrepack:main"
+pt2to3 = "tables.scripts.pt2to3:main"
+pttree = "tables.scripts.pttree:main"
+
+
+[tool.setuptools.dynamic]
+version = { attr = "tables._version.__version__" }
+
+
+[tool.setuptools]
+packages = [
+    "tables",
+    "tables.scripts",
+    "tables.nodes",
+    "tables.misc",
+]
+
+
+[tool.setuptools.package-data]
+tables = [ "*.dll", "*.so*", "*.dylib" ]
+
+
+[tool.cibuildwheel]
+skip = "*-musllinux_*"
+archs = "native"
+build = "cp311-* cp314t-*"
+build-verbosity = 1
+test-sources = ["tests"]
+test-command = [
+    "python -c \"import tables; keys = 'zlib bzip2 blosc blosc2'.split(); missing = [key for key in keys if tables.which_lib_version(key) is None]; assert missing == [], missing\"",
+    "env PYTHONPATH=. python tests/test_all.py",
+]
+test-skip = "*_aarch64"
+# Keep in sync with ``build-system.requires`` above
+before-build = [
+    "python -m pip install -q --require-hashes -r .github/workflows/requirements/build-requirements.txt -r requirements.txt",
+    "python -m pip install abi3audit",
+]
+
+[tool.cibuildwheel.linux]
+before-all = [
+    "cp -r `pwd`/hdf5_build /tmp/hdf5",
+    "rpm --import https://repo.almalinux.org/almalinux/RPM-GPG-KEY-AlmaLinux",
+    "yum -y install epel-release",
+    "yum -y update",
+    "yum install -y zlib-devel bzip2-devel",
+]
+repair-wheel-command = [
+    "auditwheel repair -w {dest_dir} {wheel}",
+    # Free-threaded Python 3.14 doesn't support the stable ABI, so skip abi3audit
+    "if [[ {wheel} != *-cp314-cp314t-* ]]; then pipx run abi3audit --strict --report {wheel}; fi",
+]
+
+[tool.cibuildwheel.linux.environment]
+HDF5_DIR = "/tmp/hdf5"
+DISABLE_AVX2 = "true"
+CFLAGS = "-g0"
+LD_LIBRARY_PATH = "/tmp/hdf5/lib:${LD_LIBRARY_PATH}"
+PKG_CONFIG_PATH = "/tmp/hdf5/lib/pkgconfig:${PKG_CONFIG_PATH}"
+
+[tool.cibuildwheel.macos]
+before-all = [
+    "cp -r `pwd`/hdf5_build /tmp/hdf5",
+]
+repair-wheel-command = [
+    "DYLD_LIBRARY_PATH=/tmp/hdf5/lib delocate-listdeps {wheel}",
+    "DYLD_LIBRARY_PATH=/tmp/hdf5/lib delocate-wheel --require-archs {delocate_archs} -w {dest_dir} {wheel}",
+    # Free-threaded Python 3.14 doesn't support the stable ABI, so skip abi3audit
+    "if [[ {wheel} != *-cp314-cp314t-* ]]; then pipx run abi3audit --strict --report {wheel}; fi",
+]
+
+[tool.cibuildwheel.macos.environment]
+CC = "/usr/bin/clang"
+CXX = "/usr/bin/clang"
+LZO_DIR = "/tmp/hdf5"
+BZIP2_DIR = "/tmp/hdf5"
+HDF5_DIR = "/tmp/hdf5"
+DISABLE_AVX2 = "true"
+CFLAGS = "-g0"
+LD_LIBRARY_PATH = "/tmp/hdf5/lib:${LD_LIBRARY_PATH}"
+PKG_CONFIG_PATH = "/tmp/hdf5/lib/pkgconfig:${PKG_CONFIG_PATH}"
+
+[tool.cibuildwheel.windows]
+before-build = [
+    "python -m pip install -q --require-hashes -r requirements.txt",
+    "python -m pip install abi3audit delvewheel",
+]
+# We check for "libblosc2.dll" so don't let delvewheel mangle it
+repair-wheel-command = [
+    "delvewheel repair --no-mangle libblosc2.dll -v -w {dest_dir} {wheel}",
+    # Free-threaded Python 3.14 doesn't support the stable ABI, so skip abi3audit
+    "echo {wheel} | findstr /C:\"cp314t\">nul && call || pipx run abi3audit --strict --report {wheel}",
+]
+
+[tool.cibuildwheel.windows.environment]
+DISABLE_AVX2 = "TRUE"
+
+[tool.black]
+line-length = 79
+# preview = true
+# enable-unstable-feature = [
+#     "hug_parens_with_braces_and_square_brackets",
+#     "string_processing",
+#     "wrap_long_dict_values_in_parens",
+# ]
+target-version = ['py311']
+extend-exclude = "(^/c-blosc|^/hdf5-blosc|^/hdf5-blosc2)"
+
+
+[tool.isort]
+profile = "black"
+length_sort = true
+multi_line_output = 3
+no_inline_sort = true
+include_trailing_comma = true
+use_parentheses = true
+line_length = 79
+# force_grid_wrap = 0
+# ensure_newline_before_comments = true
+known_first_party = ["tables", "tables.nodes"]
+# skip_glob = ["packagename/parse/*"]
+
+
+[tool.pydocstyle]
+add-ignore = ["D105", "D107"]
+match="(?!(test_|conf)).*\\.py"
+match-dir="(?!(tests|doc))"
+
+
+[tool.codespell]
+count = true
+quiet-level = 3
+skip = [
+    "./c-blosc",
+    "./hdf5-blosc2",
+    "./doc/build",
+    "./doc/html",
+    "./tables/*.c",
+    "./dist",
+]
+ignore-words = "./doc/source/spelling_wordlist.txt"
+ignore-words-list = [
+    "Collet",
+    "ded",
+    "fOf",
+    "FOM",
+]
+
+
+[tool.cython-lint]
+max-line-length = 80
+ignore = ["E111", "E114", "E221", "E222", "E266"]
+
+
+[tool.ruff]
+line-length = 79
+# indent-width = 4
+target-version = "py311"
+extend-exclude = ["docs/conf.py", "c-blosc", "hdf5-blosc", "hdf5-blosc2"]
+
+
+[tool.ruff.lint]
+extend-ignore = [
+    "BLE001",  # Do not catch blind exception: `Exception`
+    "EXE001",  # Shebang is present but file is not executable
+    "RUF100",  # Unused `noqa` directive (non-enabled: ...)
+]
+
+
+[tool.ruff.format]
+# preview = true
+docstring-code-format = true
+
+
+[tool.ruff.lint.per-file-ignores]
+"**/{tests}/*" = ["D", "RUF012"]
+"**/{notebooks}/*.ipynb" = ["D","T201"]
+"docs/conf.py" = ["D"]
+"setup.py" = ["RUF012"]  # RUF012: Mutable default value for class attribute
+"tables/__init__.py" = ["RUF022"]  # unsorted-dunder-all
+"tables/idxutils.py" = ["PYI041"]  # redundant-numeric-union
+"tables/utils.py" = ["PYI041"]     # redundant-numeric-union
+# F811: redefined-while-unused
+"examples/Single_Table-vs-EArray_Table.ipynb" = ["F811"]
+
+
+[tool.ruff.lint.isort]
+length-sort = true
+known-first-party = ["tables", "tables.nodes"]

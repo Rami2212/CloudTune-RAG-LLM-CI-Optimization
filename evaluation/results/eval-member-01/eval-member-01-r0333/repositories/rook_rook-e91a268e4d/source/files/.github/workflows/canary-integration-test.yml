@@ -1,0 +1,605 @@
+name: Reusable canary integration tests
+on:
+  # ONLY on.workflow_call ; call this from other files if needed
+  workflow_call:
+    inputs:
+      ceph_images:
+        description: "JSON list of Ceph images for creating Ceph cluster"
+        required: true
+        type: string
+      kubernetes-version:
+        description: kubernetes version to use for the workflow
+        default: '["v1.37.0"]'
+        type: string
+      rook_image_artifact:
+        description: name of a prebuilt rook image artifact to import; empty builds rook in-job
+        default: ""
+        type: string
+
+defaults:
+  run:
+    # reference: https://docs.github.com/en/actions/reference/workflow-syntax-for-github-actions#using-a-specific-shell
+    shell: bash --noprofile --norc -eo pipefail -x {0}
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    runs-on: ubuntu-22.04
+    if: "!contains(github.event.pull_request.labels.*.name, 'skip-ci')"
+    strategy:
+      matrix:
+        ceph-image: ${{ fromJson(inputs.ceph_images) }}
+        kubernetes-version: ${{ fromJson(inputs.kubernetes-version) }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: consider (pre-job) debugging
+        uses: ./.github/workflows/upterm_debug
+        with:
+          debug-ci: ${{ contains(github.event.pull_request.labels.*.name, 'debug-ci') }}
+
+      - name: canary
+        uses: ./.github/workflows/canary-tests/canary
+        with:
+          ceph-image: ${{ matrix.ceph-image }}
+          kubernetes-version: ${{ matrix.kubernetes-version }}
+          rook-image-artifact: ${{ inputs.rook_image_artifact }}
+          artifact-name: ${{ github.job }}-${{ matrix.ceph-image }}-${{ matrix.kubernetes-version }}
+
+  raw-disk-with-object:
+    runs-on: ubuntu-22.04
+    if: "!contains(github.event.pull_request.labels.*.name, 'skip-ci')"
+    strategy:
+      matrix:
+        ceph-image: ${{ fromJson(inputs.ceph_images) }}
+        kubernetes-version: ${{ fromJson(inputs.kubernetes-version) }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: consider (pre-job) debugging
+        uses: ./.github/workflows/upterm_debug
+        with:
+          debug-ci: ${{ contains(github.event.pull_request.labels.*.name, 'debug-ci') }}
+
+      - name: raw-disk-with-object
+        uses: ./.github/workflows/canary-tests/raw-disk-with-object
+        with:
+          ceph-image: ${{ matrix.ceph-image }}
+          kubernetes-version: ${{ matrix.kubernetes-version }}
+          rook-image-artifact: ${{ inputs.rook_image_artifact }}
+          artifact-name: ${{ github.job }}-${{ matrix.ceph-image }}-${{ matrix.kubernetes-version }}
+
+  two-osds-in-device:
+    runs-on: ubuntu-22.04
+    if: "!contains(github.event.pull_request.labels.*.name, 'skip-ci')"
+    strategy:
+      matrix:
+        ceph-image: ${{ fromJson(inputs.ceph_images) }}
+        kubernetes-version: ${{ fromJson(inputs.kubernetes-version) }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: consider (pre-job) debugging
+        uses: ./.github/workflows/upterm_debug
+        with:
+          debug-ci: ${{ contains(github.event.pull_request.labels.*.name, 'debug-ci') }}
+
+      - name: two-osds-in-device
+        uses: ./.github/workflows/canary-tests/two-osds-in-device
+        with:
+          ceph-image: ${{ matrix.ceph-image }}
+          kubernetes-version: ${{ matrix.kubernetes-version }}
+          rook-image-artifact: ${{ inputs.rook_image_artifact }}
+          artifact-name: ${{ github.job }}-${{ matrix.ceph-image }}-${{ matrix.kubernetes-version }}
+
+  osd-with-metadata-partition-device:
+    runs-on: ubuntu-22.04
+    if: "!contains(github.event.pull_request.labels.*.name, 'skip-ci')"
+    strategy:
+      matrix:
+        # this test fails consistently on v20, still needs investigation
+        ceph-image: ["quay.io/ceph/ceph:v19"]
+        kubernetes-version: ${{ fromJson(inputs.kubernetes-version) }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: consider (pre-job) debugging
+        uses: ./.github/workflows/upterm_debug
+        with:
+          debug-ci: ${{ contains(github.event.pull_request.labels.*.name, 'debug-ci') }}
+
+      - name: osd-with-metadata-partition-device
+        uses: ./.github/workflows/canary-tests/osd-with-metadata-partition-device
+        with:
+          ceph-image: ${{ matrix.ceph-image }}
+          kubernetes-version: ${{ matrix.kubernetes-version }}
+          rook-image-artifact: ${{ inputs.rook_image_artifact }}
+          artifact-name: ${{ github.job }}-${{ matrix.ceph-image }}-${{ matrix.kubernetes-version }}
+
+  osd-with-metadata-device:
+    runs-on: ubuntu-22.04
+    if: "!contains(github.event.pull_request.labels.*.name, 'skip-ci')"
+    strategy:
+      matrix:
+        ceph-image: ${{ fromJson(inputs.ceph_images) }}
+        kubernetes-version: ${{ fromJson(inputs.kubernetes-version) }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: consider (pre-job) debugging
+        uses: ./.github/workflows/upterm_debug
+        with:
+          debug-ci: ${{ contains(github.event.pull_request.labels.*.name, 'debug-ci') }}
+
+      - name: osd-with-metadata-device
+        uses: ./.github/workflows/canary-tests/osd-with-metadata-device
+        with:
+          ceph-image: ${{ matrix.ceph-image }}
+          kubernetes-version: ${{ matrix.kubernetes-version }}
+          rook-image-artifact: ${{ inputs.rook_image_artifact }}
+          artifact-name: ${{ github.job }}-${{ matrix.ceph-image }}-${{ matrix.kubernetes-version }}
+
+  encryption:
+    runs-on: ubuntu-22.04
+    if: "!contains(github.event.pull_request.labels.*.name, 'skip-ci')"
+    strategy:
+      matrix:
+        ceph-image: ${{ fromJson(inputs.ceph_images) }}
+        kubernetes-version: ${{ fromJson(inputs.kubernetes-version) }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: consider (pre-job) debugging
+        uses: ./.github/workflows/upterm_debug
+        with:
+          debug-ci: ${{ contains(github.event.pull_request.labels.*.name, 'debug-ci') }}
+
+      - name: encryption
+        uses: ./.github/workflows/canary-tests/encryption
+        with:
+          ceph-image: ${{ matrix.ceph-image }}
+          kubernetes-version: ${{ matrix.kubernetes-version }}
+          rook-image-artifact: ${{ inputs.rook_image_artifact }}
+          artifact-name: ${{ github.job }}-${{ matrix.ceph-image }}-${{ matrix.kubernetes-version }}
+
+  lvm:
+    runs-on: ubuntu-22.04
+    if: "!contains(github.event.pull_request.labels.*.name, 'skip-ci')"
+    strategy:
+      matrix:
+        ceph-image: ${{ fromJson(inputs.ceph_images) }}
+        kubernetes-version: ${{ fromJson(inputs.kubernetes-version) }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: consider (pre-job) debugging
+        uses: ./.github/workflows/upterm_debug
+        with:
+          debug-ci: ${{ contains(github.event.pull_request.labels.*.name, 'debug-ci') }}
+
+      - name: lvm
+        uses: ./.github/workflows/canary-tests/lvm
+        with:
+          ceph-image: ${{ matrix.ceph-image }}
+          kubernetes-version: ${{ matrix.kubernetes-version }}
+          rook-image-artifact: ${{ inputs.rook_image_artifact }}
+          artifact-name: ${{ github.job }}-${{ matrix.ceph-image }}-${{ matrix.kubernetes-version }}
+
+  pvc:
+    runs-on: ubuntu-22.04
+    if: "!contains(github.event.pull_request.labels.*.name, 'skip-ci')"
+    strategy:
+      matrix:
+        ceph-image: ${{ fromJson(inputs.ceph_images) }}
+        kubernetes-version: ${{ fromJson(inputs.kubernetes-version) }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: consider (pre-job) debugging
+        uses: ./.github/workflows/upterm_debug
+        with:
+          debug-ci: ${{ contains(github.event.pull_request.labels.*.name, 'debug-ci') }}
+
+      - name: pvc
+        uses: ./.github/workflows/canary-tests/pvc
+        with:
+          ceph-image: ${{ matrix.ceph-image }}
+          kubernetes-version: ${{ matrix.kubernetes-version }}
+          rook-image-artifact: ${{ inputs.rook_image_artifact }}
+          artifact-name: ${{ github.job }}-${{ matrix.ceph-image }}-${{ matrix.kubernetes-version }}
+
+  pvc-db:
+    runs-on: ubuntu-22.04
+    if: "!contains(github.event.pull_request.labels.*.name, 'skip-ci')"
+    strategy:
+      matrix:
+        ceph-image: ${{ fromJson(inputs.ceph_images) }}
+        kubernetes-version: ${{ fromJson(inputs.kubernetes-version) }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: consider (pre-job) debugging
+        uses: ./.github/workflows/upterm_debug
+        with:
+          debug-ci: ${{ contains(github.event.pull_request.labels.*.name, 'debug-ci') }}
+
+      - name: pvc-db
+        uses: ./.github/workflows/canary-tests/pvc-db
+        with:
+          ceph-image: ${{ matrix.ceph-image }}
+          kubernetes-version: ${{ matrix.kubernetes-version }}
+          rook-image-artifact: ${{ inputs.rook_image_artifact }}
+          artifact-name: ${{ github.job }}-${{ matrix.ceph-image }}-${{ matrix.kubernetes-version }}
+
+  pvc-db-wal:
+    runs-on: ubuntu-22.04
+    if: "!contains(github.event.pull_request.labels.*.name, 'skip-ci')"
+    strategy:
+      matrix:
+        ceph-image: ${{ fromJson(inputs.ceph_images) }}
+        kubernetes-version: ${{ fromJson(inputs.kubernetes-version) }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: consider (pre-job) debugging
+        uses: ./.github/workflows/upterm_debug
+        with:
+          debug-ci: ${{ contains(github.event.pull_request.labels.*.name, 'debug-ci') }}
+
+      - name: pvc-db-wal
+        uses: ./.github/workflows/canary-tests/pvc-db-wal
+        with:
+          ceph-image: ${{ matrix.ceph-image }}
+          kubernetes-version: ${{ matrix.kubernetes-version }}
+          rook-image-artifact: ${{ inputs.rook_image_artifact }}
+          artifact-name: ${{ github.job }}-${{ matrix.ceph-image }}-${{ matrix.kubernetes-version }}
+
+  encryption-pvc:
+    runs-on: ubuntu-22.04
+    if: "!contains(github.event.pull_request.labels.*.name, 'skip-ci')"
+    strategy:
+      matrix:
+        ceph-image: ${{ fromJson(inputs.ceph_images) }}
+        kubernetes-version: ${{ fromJson(inputs.kubernetes-version) }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: consider (pre-job) debugging
+        uses: ./.github/workflows/upterm_debug
+        with:
+          debug-ci: ${{ contains(github.event.pull_request.labels.*.name, 'debug-ci') }}
+
+      - name: encryption-pvc
+        uses: ./.github/workflows/canary-tests/encryption-pvc
+        with:
+          ceph-image: ${{ matrix.ceph-image }}
+          kubernetes-version: ${{ matrix.kubernetes-version }}
+          rook-image-artifact: ${{ inputs.rook_image_artifact }}
+          artifact-name: ${{ github.job }}-${{ matrix.ceph-image }}-${{ matrix.kubernetes-version }}
+
+  encryption-pvc-db:
+    runs-on: ubuntu-22.04
+    if: "!contains(github.event.pull_request.labels.*.name, 'skip-ci')"
+    strategy:
+      matrix:
+        ceph-image: ${{ fromJson(inputs.ceph_images) }}
+        kubernetes-version: ${{ fromJson(inputs.kubernetes-version) }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: consider (pre-job) debugging
+        uses: ./.github/workflows/upterm_debug
+        with:
+          debug-ci: ${{ contains(github.event.pull_request.labels.*.name, 'debug-ci') }}
+
+      - name: encryption-pvc-db
+        uses: ./.github/workflows/canary-tests/encryption-pvc-db
+        with:
+          ceph-image: ${{ matrix.ceph-image }}
+          kubernetes-version: ${{ matrix.kubernetes-version }}
+          rook-image-artifact: ${{ inputs.rook_image_artifact }}
+          artifact-name: ${{ github.job }}-${{ matrix.ceph-image }}-${{ matrix.kubernetes-version }}
+
+  encryption-pvc-db-wal:
+    runs-on: ubuntu-22.04
+    if: "!contains(github.event.pull_request.labels.*.name, 'skip-ci')"
+    strategy:
+      matrix:
+        ceph-image: ${{ fromJson(inputs.ceph_images) }}
+        kubernetes-version: ${{ fromJson(inputs.kubernetes-version) }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: consider (pre-job) debugging
+        uses: ./.github/workflows/upterm_debug
+        with:
+          debug-ci: ${{ contains(github.event.pull_request.labels.*.name, 'debug-ci') }}
+
+      - name: encryption-pvc-db-wal
+        uses: ./.github/workflows/canary-tests/encryption-pvc-db-wal
+        with:
+          ceph-image: ${{ matrix.ceph-image }}
+          kubernetes-version: ${{ matrix.kubernetes-version }}
+          rook-image-artifact: ${{ inputs.rook_image_artifact }}
+          artifact-name: ${{ github.job }}-${{ matrix.ceph-image }}-${{ matrix.kubernetes-version }}
+
+  encryption-pvc-kms-vault-token-auth:
+    runs-on: ubuntu-22.04
+    if: "!contains(github.event.pull_request.labels.*.name, 'skip-ci')"
+    strategy:
+      matrix:
+        ceph-image: ${{ fromJson(inputs.ceph_images) }}
+        kubernetes-version: ${{ fromJson(inputs.kubernetes-version) }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: consider (pre-job) debugging
+        uses: ./.github/workflows/upterm_debug
+        with:
+          debug-ci: ${{ contains(github.event.pull_request.labels.*.name, 'debug-ci') }}
+
+      - name: encryption-pvc-kms-vault-token-auth
+        uses: ./.github/workflows/canary-tests/encryption-pvc-kms-vault-token-auth
+        with:
+          ceph-image: ${{ matrix.ceph-image }}
+          kubernetes-version: ${{ matrix.kubernetes-version }}
+          rook-image-artifact: ${{ inputs.rook_image_artifact }}
+          artifact-name: ${{ github.job }}-${{ matrix.ceph-image }}-${{ matrix.kubernetes-version }}
+
+  encryption-pvc-kms-vault-k8s-auth:
+    runs-on: ubuntu-22.04
+    if: "!contains(github.event.pull_request.labels.*.name, 'skip-ci')"
+    strategy:
+      matrix:
+        ceph-image: ${{ fromJson(inputs.ceph_images) }}
+        kubernetes-version: ${{ fromJson(inputs.kubernetes-version) }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: consider (pre-job) debugging
+        uses: ./.github/workflows/upterm_debug
+        with:
+          debug-ci: ${{ contains(github.event.pull_request.labels.*.name, 'debug-ci') }}
+
+      - name: encryption-pvc-kms-vault-k8s-auth
+        uses: ./.github/workflows/canary-tests/encryption-pvc-kms-vault-k8s-auth
+        with:
+          ceph-image: ${{ matrix.ceph-image }}
+          kubernetes-version: ${{ matrix.kubernetes-version }}
+          rook-image-artifact: ${{ inputs.rook_image_artifact }}
+          artifact-name: ${{ github.job }}-${{ matrix.ceph-image }}-${{ matrix.kubernetes-version }}
+
+  lvm-pvc:
+    runs-on: ubuntu-22.04
+    if: "!contains(github.event.pull_request.labels.*.name, 'skip-ci')"
+    strategy:
+      matrix:
+        ceph-image: ${{ fromJson(inputs.ceph_images) }}
+        kubernetes-version: ${{ fromJson(inputs.kubernetes-version) }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: consider (pre-job) debugging
+        uses: ./.github/workflows/upterm_debug
+        with:
+          debug-ci: ${{ contains(github.event.pull_request.labels.*.name, 'debug-ci') }}
+
+      - name: lvm-pvc
+        uses: ./.github/workflows/canary-tests/lvm-pvc
+        with:
+          ceph-image: ${{ matrix.ceph-image }}
+          kubernetes-version: ${{ matrix.kubernetes-version }}
+          rook-image-artifact: ${{ inputs.rook_image_artifact }}
+          artifact-name: ${{ github.job }}-${{ matrix.ceph-image }}-${{ matrix.kubernetes-version }}
+
+  multi-cluster-mirroring:
+    runs-on: ubuntu-22.04
+    if: "!contains(github.event.pull_request.labels.*.name, 'skip-ci')"
+    strategy:
+      matrix:
+        ceph-image: ${{ fromJson(inputs.ceph_images) }}
+        kubernetes-version: ${{ fromJson(inputs.kubernetes-version) }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: consider (pre-job) debugging
+        uses: ./.github/workflows/upterm_debug
+        with:
+          debug-ci: ${{ contains(github.event.pull_request.labels.*.name, 'debug-ci') }}
+
+      - name: multi-cluster-mirroring
+        uses: ./.github/workflows/canary-tests/multi-cluster-mirroring
+        with:
+          ceph-image: ${{ matrix.ceph-image }}
+          kubernetes-version: ${{ matrix.kubernetes-version }}
+          rook-image-artifact: ${{ inputs.rook_image_artifact }}
+          artifact-name: ${{ github.job }}-${{ matrix.ceph-image }}-${{ matrix.kubernetes-version }}
+
+  rgw-multisite-testing:
+    runs-on: ubuntu-22.04
+    if: "!contains(github.event.pull_request.labels.*.name, 'skip-ci')"
+    strategy:
+      matrix:
+        ceph-image: ${{ fromJson(inputs.ceph_images) }}
+        kubernetes-version: ${{ fromJson(inputs.kubernetes-version) }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: consider (pre-job) debugging
+        uses: ./.github/workflows/upterm_debug
+        with:
+          debug-ci: ${{ contains(github.event.pull_request.labels.*.name, 'debug-ci') }}
+
+      - name: rgw-multisite-testing
+        uses: ./.github/workflows/canary-tests/rgw-multisite-testing
+        with:
+          ceph-image: ${{ matrix.ceph-image }}
+          kubernetes-version: ${{ matrix.kubernetes-version }}
+          rook-image-artifact: ${{ inputs.rook_image_artifact }}
+          artifact-name: ${{ github.job }}-${{ matrix.ceph-image }}-${{ matrix.kubernetes-version }}
+
+  nvmeof-protocol:
+    runs-on: ubuntu-22.04
+    if: "!contains(github.event.pull_request.labels.*.name, 'skip-ci')"
+    strategy:
+      matrix:
+        ceph-image: ["quay.io/ceph/ceph:v20"]
+        kubernetes-version: ${{ fromJson(inputs.kubernetes-version) }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: consider (pre-job) debugging
+        uses: ./.github/workflows/upterm_debug
+        with:
+          debug-ci: ${{ contains(github.event.pull_request.labels.*.name, 'debug-ci') }}
+
+      - name: nvmeof-protocol
+        uses: ./.github/workflows/canary-tests/nvmeof-protocol
+        with:
+          ceph-image: ${{ matrix.ceph-image }}
+          kubernetes-version: ${{ matrix.kubernetes-version }}
+          rook-image-artifact: ${{ inputs.rook_image_artifact }}
+          artifact-name: ${{ github.job }}-${{ matrix.ceph-image }}-${{ matrix.kubernetes-version }}
+
+  encryption-pvc-kms-ibm-kp:
+    runs-on: ubuntu-22.04
+    if: "!contains(github.event.pull_request.labels.*.name, 'skip-ci')"
+    strategy:
+      matrix:
+        ceph-image: ${{ fromJson(inputs.ceph_images) }}
+        kubernetes-version: ${{ fromJson(inputs.kubernetes-version) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: consider (pre-job) debugging
+        uses: ./.github/workflows/upterm_debug
+        with:
+          debug-ci: ${{ contains(github.event.pull_request.labels.*.name, 'debug-ci') }}
+
+      - name: run encryption KMS IBM Key Protect
+        uses: ./.github/workflows/encryption-pvc-kms-ibm-kp
+        if: "env.IBM_KP_SERVICE_INSTANCE_ID != '' && env.IBM_KP_SERVICE_API_KEY != ''"
+        env:
+          IBM_KP_SERVICE_INSTANCE_ID: ${{ secrets.IBM_INSTANCE_ID }}
+          IBM_KP_SERVICE_API_KEY: ${{ secrets.IBM_SERVICE_API_KEY }}
+        with:
+          ibm-instance-id: ${{ secrets.IBM_INSTANCE_ID }}
+          ibm-service-api-key: ${{ secrets.IBM_SERVICE_API_KEY }}
+          artifact-name: ${{ github.job }}-${{ matrix.ceph-image }}-${{ matrix.kubernetes-version }}
+          ceph-image: ${{ matrix.ceph-image }}
+          kubernetes-version: ${{ matrix.kubernetes-version }}
+          rook-image-artifact: ${{ inputs.rook_image_artifact }}
+
+
+  multus-public-and-cluster:
+    runs-on: ubuntu-22.04
+    if: "!contains(github.event.pull_request.labels.*.name, 'skip-ci')"
+    strategy:
+      matrix:
+        ceph-image: ${{ fromJson(inputs.ceph_images) }}
+        kubernetes-version: ${{ fromJson(inputs.kubernetes-version) }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: consider (pre-job) debugging
+        uses: ./.github/workflows/upterm_debug
+        with:
+          debug-ci: ${{ contains(github.event.pull_request.labels.*.name, 'debug-ci') }}
+
+      - name: multus-public-and-cluster
+        uses: ./.github/workflows/canary-tests/multus-public-and-cluster
+        with:
+          ceph-image: ${{ matrix.ceph-image }}
+          kubernetes-version: ${{ matrix.kubernetes-version }}
+          rook-image-artifact: ${{ inputs.rook_image_artifact }}
+          artifact-name: ${{ github.job }}-${{ matrix.ceph-image }}-${{ matrix.kubernetes-version }}
+
+  two-object-one-zone:
+    runs-on: ubuntu-22.04
+    if: "!contains(github.event.pull_request.labels.*.name, 'skip-ci')"
+    strategy:
+      matrix:
+        ceph-image: ${{ fromJson(inputs.ceph_images) }}
+        kubernetes-version: ${{ fromJson(inputs.kubernetes-version) }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: consider (pre-job) debugging
+        uses: ./.github/workflows/upterm_debug
+        with:
+          debug-ci: ${{ contains(github.event.pull_request.labels.*.name, 'debug-ci') }}
+
+      - name: two-object-one-zone
+        uses: ./.github/workflows/canary-tests/two-object-one-zone
+        with:
+          ceph-image: ${{ matrix.ceph-image }}
+          kubernetes-version: ${{ matrix.kubernetes-version }}
+          rook-image-artifact: ${{ inputs.rook_image_artifact }}
+          artifact-name: ${{ github.job }}-${{ matrix.ceph-image }}-${{ matrix.kubernetes-version }}

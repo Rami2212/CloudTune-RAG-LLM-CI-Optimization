@@ -1,0 +1,218 @@
+name: Test Both Bundlers
+
+on:
+  pull_request:
+    paths:
+      - "spec/dummy/**"
+      - "lib/**"
+      - "**.rb"
+      - "**.js"
+      - "**.ts"
+      - "package.json"
+      - "packages/**/package.json"
+      - "yarn.lock"
+      - ".github/workflows/test-bundlers.yml"
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+
+concurrency:
+  # Pushing new changes to a branch will cancel any in-progress CI runs
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-webpack:
+    name: Test with Webpack
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: spec/dummy
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.2"
+          bundler-cache: true
+          working-directory: spec/dummy
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.19.x"
+          cache: "yarn"
+          cache-dependency-path: spec/dummy/yarn.lock
+
+      - name: Install yalc
+        run: npm install -g yalc
+
+      - name: Build TypeScript
+        run: |
+          cd ../..
+          yarn install --frozen-lockfile --production=false
+          yarn build
+
+      - name: Publish shakapacker to yalc
+        run: |
+          cd ../..
+          yalc publish
+          cd packages/shakapacker-webpack
+          yalc publish
+
+      - name: Install dependencies
+        run: |
+          yarn install
+          yalc add shakapacker
+          yalc add shakapacker-webpack
+          yarn install
+          yalc link shakapacker
+          yalc link shakapacker-webpack
+
+      - name: Switch to Webpack
+        run: bin/test-bundler webpack
+
+      - name: Build with Webpack
+        run: bin/shakapacker
+        env:
+          SHAKAPACKER_SUPPLEMENTAL_ENTRYPOINT: "1"
+
+      - name: Run tests with Webpack
+        run: |
+          bundle exec rspec
+        env:
+          SHAKAPACKER_SUPPLEMENTAL_ENTRYPOINT: "1"
+
+  test-rspack:
+    name: Test with RSpack
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: spec/dummy
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.2"
+          bundler-cache: true
+          working-directory: spec/dummy
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.19.x"
+          cache: "yarn"
+          cache-dependency-path: spec/dummy/yarn.lock
+
+      - name: Install yalc
+        run: npm install -g yalc
+
+      - name: Build TypeScript
+        run: |
+          cd ../..
+          yarn install --frozen-lockfile --production=false
+          yarn build
+
+      - name: Publish shakapacker to yalc
+        run: |
+          cd ../..
+          yalc publish
+          cd packages/shakapacker-rspack
+          yalc publish
+
+      - name: Install dependencies
+        run: |
+          yarn install
+          yalc add shakapacker
+          yalc add shakapacker-rspack
+          yarn install
+          yalc link shakapacker
+          yalc link shakapacker-rspack
+
+      - name: Switch to RSpack
+        run: bin/test-bundler rspack
+
+      - name: Build with RSpack
+        run: bin/shakapacker
+        env:
+          SHAKAPACKER_SUPPLEMENTAL_ENTRYPOINT: "1"
+
+      - name: Run tests with RSpack
+        run: |
+          bundle exec rspec
+        env:
+          SHAKAPACKER_SUPPLEMENTAL_ENTRYPOINT: "1"
+
+  test-switching:
+    name: Test Bundler Switching
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: spec/dummy
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.2"
+          bundler-cache: true
+          working-directory: spec/dummy
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.19.x"
+          cache: "yarn"
+          cache-dependency-path: spec/dummy/yarn.lock
+
+      - name: Install yalc
+        run: npm install -g yalc
+
+      - name: Build TypeScript
+        run: |
+          cd ../..
+          yarn install --frozen-lockfile --production=false
+          yarn build
+
+      - name: Publish shakapacker to yalc
+        run: |
+          cd ../..
+          yalc publish
+          cd packages/shakapacker-webpack
+          yalc publish
+          cd ../shakapacker-rspack
+          yalc publish
+
+      - name: Install dependencies
+        run: |
+          yarn install
+          yalc add shakapacker
+          yalc add shakapacker-webpack
+          yalc add shakapacker-rspack
+          yarn install
+          yalc link shakapacker
+          yalc link shakapacker-webpack
+          yalc link shakapacker-rspack
+
+      - name: Test switching between bundlers
+        run: |
+          # Start with webpack
+          bin/test-bundler webpack
+          bin/shakapacker
+
+          # Switch to rspack
+          bin/test-bundler rspack
+          bin/shakapacker
+
+          # Switch back to webpack
+          bin/test-bundler webpack
+          bin/shakapacker
+        env:
+          SHAKAPACKER_SUPPLEMENTAL_ENTRYPOINT: "1"

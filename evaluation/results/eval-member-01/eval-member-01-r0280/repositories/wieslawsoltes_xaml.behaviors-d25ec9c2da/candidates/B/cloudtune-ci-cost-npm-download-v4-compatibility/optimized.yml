@@ -1,0 +1,66 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [MEDIUM] Add concurrency group to "build.yml"
+# Estimated savings: ~2 min/run
+#
+name: CI
+permissions:
+  contents: read
+  pull-requests: write
+
+on:
+  push:
+    branches:
+    - master
+    - release/*
+  pull_request:
+    branches:
+    - master
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    name: Build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup .NET SDKs
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: |
+          10.0.x
+          8.0.x
+          6.0.x
+
+    - name: Build Release
+      run: dotnet build --configuration Release
+
+    - name: Test Release
+      run: dotnet test --configuration Release
+
+    - name: Check Documentation
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        chmod +x ./check-docs.sh
+        ./check-docs.sh
+
+    - name: Pack NuGet
+      if: matrix.os == 'ubuntu-latest'
+      run: dotnet run --project build/build/_build.csproj --target Pack --configuration Release
+
+    - name: Upload NuGet artifacts
+      if: matrix.os == 'ubuntu-latest'
+      uses: actions/upload-artifact@v4
+      with:
+        name: nuget-packages
+        path: artifacts/NuGet
+        if-no-files-found: error

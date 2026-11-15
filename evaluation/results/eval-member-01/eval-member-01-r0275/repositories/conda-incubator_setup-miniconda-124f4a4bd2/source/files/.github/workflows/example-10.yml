@@ -1,0 +1,82 @@
+name: "Example 10: Miniforge, etc"
+
+on:
+  pull_request:
+    branches:
+      - "*"
+  push:
+    branches:
+      - "develop"
+      - "main"
+      - "master"
+  schedule:
+    # Note that cronjobs run on master/main by default
+    - cron: "0 0 * * *"
+
+concurrency:
+  group:
+    ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  example-10-miniforge:
+    # prevent cronjobs from running on forks
+    if:
+      (github.event_name == 'schedule' && github.repository ==
+      'conda-incubator/setup-miniconda') || (github.event_name != 'schedule')
+    name: Ex10 (${{ matrix.os }}, Miniforge)
+    runs-on: ${{ matrix.os }}-latest
+    defaults:
+      run:
+        shell: bash -el {0}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["ubuntu", "macos", "windows"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./
+        id: setup-miniconda
+        with:
+          environment-file: etc/example-environment.yml
+          miniforge-version: latest
+      - run: |
+          conda info
+          conda list
+          python -VV
+          printenv | sort
+
+  example-10-miniforge-installation-dir:
+    # prevent cronjobs from running on forks
+    if:
+      (github.event_name == 'schedule' && github.repository ==
+      'conda-incubator/setup-miniconda') || (github.event_name != 'schedule')
+    name: Ex10 (${{ matrix.os }}, Miniforge)
+    runs-on: ${{ matrix.os }}-latest
+    defaults:
+      run:
+        shell: bash -el {0}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["ubuntu", "macos", "windows"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./
+        id: setup-miniconda
+        with:
+          environment-file: etc/example-environment.yml
+          miniforge-version: latest
+          installation-dir: ${{ github.workspace }}/miniforge-latest
+      - run: |
+          conda info
+          conda list
+          python -VV
+          printenv | sort

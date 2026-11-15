@@ -1,0 +1,57 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [MEDIUM] Add concurrency group to "linux.yaml"
+# - [LOW] Use shallow clone in "test" job
+# Estimated savings: ~2 min/run
+#
+name: CI
+
+on:
+  push:
+    branches: [ '*' ]
+  pull_request:
+    branches: [ master ]
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 1
+
+      - name: Update packages repository
+        run: |
+          sudo apt-get update
+
+      - name: Install libyaml-libyaml-perl
+        run: |
+          sudo apt-get install libyaml-libyaml-perl
+
+      - name: Install debdiff for debtransform test
+        run: |
+          sudo apt-get install devscripts
+
+      - name: Install dependencies for pbuild run
+        run: |
+          sudo apt-get install perl tar psmisc libwww-perl libxml-parser-perl libarchive-tools zstd
+
+      - name: Test debtransform
+        run: |
+          export LC_ALL=C
+          make test test-debtransform
+
+      - name: Test pbuild myself
+        run: |
+          export BUILD_DIR=$PWD
+          export PATH=$PWD:$PATH
+          cd dist
+          # always use latest branch during CI
+          sed -i 's,#%{version},,' build.spec
+          # --no-checks since chroot build inside of docker is not working
+          pbuild --dist=tumbleweed --orphan --vm-type=podman --no-checks

@@ -1,0 +1,45 @@
+name: Build & package
+
+on:
+  push:
+    branches: [ "main", "release-candidate" ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v1.0.2
+
+    - name: Setup vcpkg
+      run: |
+        bootstrap-vcpkg
+        vcpkg integrate install
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+        
+    - name: Build
+      working-directory: .
+      run: "./build_package.bat"
+      shell: cmd
+
+    - name: Upload a Build Artifact
+      uses: actions/upload-artifact@v4.6.1
+      with:
+        name: development_build_not_a_release
+        path: ./package
+
+    - name: Upload a Build Artifact
+      uses: actions/upload-artifact@v4.6.1
+      with:
+        name: zip_only_package
+        path: ./zip
+        include-hidden-files: true 

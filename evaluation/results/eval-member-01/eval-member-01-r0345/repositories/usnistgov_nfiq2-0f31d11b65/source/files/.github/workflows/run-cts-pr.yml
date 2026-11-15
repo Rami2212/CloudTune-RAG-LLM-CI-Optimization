@@ -1,0 +1,360 @@
+name: Run CTS on PR
+
+on:
+  workflow_run:
+    workflows: ["Build PR"]
+    types:
+      - completed
+
+permissions: {}
+
+jobs:
+  runcts:
+    permissions:
+      contents: read
+      actions: read
+    name: Run CTS
+
+    runs-on: ${{ matrix.config.gh_runner }}
+    if: ${{ github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.pull_requests[0].base.ref != 'ad-hoc-group' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          # https://github.com/actions/virtual-environments
+          - { gh_runner: macOS-26,         os: macOS-26,     arch: arm64, embed_rf: OFF }
+          - { gh_runner: macOS-15,         os: macOS-15,     arch: arm64, embed_rf: OFF }
+          - { gh_runner: ubuntu-26.04-arm, os: ubuntu-26.04, arch: arm64, embed_rf: OFF }
+          - { gh_runner: ubuntu-26.04,     os: ubuntu-26.04, arch: x64,   embed_rf: ON }
+          - { gh_runner: ubuntu-26.04,     os: ubuntu-26.04, arch: x64,   embed_rf: OFF }
+          - { gh_runner: ubuntu-24.04,     os: ubuntu-24.04, arch: x64,   embed_rf: ON }
+          - { gh_runner: ubuntu-24.04,     os: ubuntu-24.04, arch: x64,   embed_rf: OFF }
+          - { gh_runner: windows-2025,     os: windows-2025, arch: x64,   embed_rf: OFF }
+          - { gh_runner: windows-2022,     os: windows-2022, arch: x64,   embed_rf: OFF }
+          - { gh_runner: windows-2022,     os: windows-2022, arch: x86,   embed_rf: OFF }
+
+    steps:
+    - name: Checkout Conformance Test Script
+      uses: actions/checkout@v7
+      with:
+        submodules: false
+        persist-credentials: false
+
+    # The Mono framework on macOS GitHub Runners provides some really old and
+    # conflicting libraries at high precedence, so remove it.
+    - name: Remove Mono Framework (macOS)
+      if: ${{ runner.os == 'macOS' }}
+      shell: bash
+      run: sudo rm -rf /Library/Frameworks/Mono.framework
+
+    - name: Download install_staging artifact
+      uses: actions/download-artifact@v8
+      with:
+        name: install_staging-${{ matrix.config.os }}-${{ matrix.config.arch }}-embedded_${{ matrix.config.embed_rf }}
+        path: install_staging
+        run-id: ${{ github.event.workflow_run.id }}
+        github-token: ${{ github.token }}
+
+    - name: Show Dependencies (Linux)
+      if: ${{ runner.os == 'Linux' }}
+      shell: bash
+      run: ldd install_staging/nfiq2/bin/nfiq2
+
+    - name: Show Dependencies (macOS)
+      if: ${{ runner.os == 'macOS' }}
+      shell: bash
+      run: otool -L install_staging/nfiq2/bin/nfiq2
+
+    - name: Install Packages (Linux)
+      if: ${{ runner.os == 'Linux' }}
+      shell: bash
+      run: |
+        sudo apt -y update
+        sudo apt -y install \
+            libdb5.3++-dev \
+            libhwloc-dev \
+            libjbig-dev \
+            libjpeg-dev \
+            liblzma-dev \
+            libopenjp2-7-dev \
+            libpng-dev \
+            libsqlite3-dev \
+            libssl-dev \
+            libtiff-dev \
+            libwebp-dev \
+            libzstd-dev \
+            zlib1g-dev
+
+    - name: Install Packages (macOS)
+      if: ${{ runner.os == 'macOS' }}
+      shell: bash
+      run: |
+        HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_AUTO_UPDATE=1 \
+            HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 brew install --quiet \
+            berkeley-db \
+            hwloc \
+            jpeg-turbo \
+            libpng \
+            libtiff \
+            openjpeg \
+            openssl \
+            sqlite \
+            zlib \
+            zstd
+
+    - name: Download Conformance Test
+      shell: bash
+      env:
+        DATASET_URL: ${{ secrets.NFIQ2_CONFORMANCE_DATASET_URL }}
+      run: curl -o nfiq2_conformance.zip -fsSL --retry 3 "${DATASET_URL}"
+
+    - name: Set up Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.x'
+
+    - name: Set up external model argument (Windows)
+      if: matrix.config.embed_rf == 'OFF' && runner.os == 'Windows'
+      shell: bash
+      run: echo "NFIQ2_CLI_MODEL_ARGUMENT=-m install_staging/nfiq2/bin/nist_plain_tir-ink.txt" >> $GITHUB_ENV
+
+    - name: Set up external model argument (Linux/macOS)
+      if: matrix.config.embed_rf == 'OFF' && runner.os != 'Windows'
+      shell: bash
+      run: echo "NFIQ2_CLI_MODEL_ARGUMENT=-m install_staging/nfiq2/share/nist_plain_tir-ink.txt" >> $GITHUB_ENV
+
+    - name: Set up embedded model argument
+      if: ${{ matrix.config.embed_rf == 'ON' }}
+      shell: bash
+      run: echo "NFIQ2_CLI_MODEL_ARGUMENT=" >> $GITHUB_ENV
+
+    - name: Run Conformance Test (Windows)
+      timeout-minutes: 15
+      if: ${{ runner.os == 'Windows' }}
+      shell: bash
+      run: |
+        unzip -q nfiq2_conformance.zip
+        install_staging/nfiq2/bin/nfiq2 ${{ env.NFIQ2_CLI_MODEL_ARGUMENT }} -i nfiq2_conformance/images -a -v -q -o github.csv
+
+    - name: Run Conformance Test (Linux)
+      timeout-minutes: 15
+      if: ${{ runner.os != 'Windows' }}
+      shell: bash
+      run: |
+        unzip -q nfiq2_conformance.zip
+        chmod +x install_staging/nfiq2/bin/nfiq2
+        install_staging/nfiq2/bin/nfiq2 ${{ env.NFIQ2_CLI_MODEL_ARGUMENT }} -i nfiq2_conformance/images -a -v -q -o github.csv
+
+    - name: Diff Conformance Test
+      shell: bash
+      run: |
+        python -m pip install pandas
+        python conformance/diff.py -o conformance/conformance_expected_output-v2.3.0.csv github.csv
+
+    - name: Upload conformance output artifact
+      uses: actions/upload-artifact@v7
+      if: always()  # Upload even if test failed
+      with:
+        name: conformance_output-${{ matrix.config.os }}-${{ matrix.config.arch }}-embedded_${{ matrix.config.embed_rf }}
+        path: github.csv
+        retention-days: 7
+        if-no-files-found: error
+        overwrite: true
+
+    - name: Write test result summary
+      shell: bash
+      run: |
+        echo '{"os": "${{ matrix.config.os }}", "arch": "${{ matrix.config.arch }}", "embed_rf": "${{ matrix.config.embed_rf }}", "status": "PASS", "job_total": ${{ strategy.job-total }}}' > cts_status.json
+      if: ${{ success() }}
+
+    - name: Write test result summary (failure)
+      shell: bash
+      run: |
+        echo '{"os": "${{ matrix.config.os }}", "arch": "${{ matrix.config.arch }}", "embed_rf": "${{ matrix.config.embed_rf }}", "status": "FAIL", "job_total": ${{ strategy.job-total }}}' > cts_status.json
+      if: ${{ failure() }}
+
+    - name: Upload test result summary
+      uses: actions/upload-artifact@v7
+      if: always()  # Upload even if test failed
+      with:
+        name: cts_status-${{ matrix.config.os }}-${{ matrix.config.arch }}-embedded_${{ matrix.config.embed_rf }}
+        path: cts_status.json
+        retention-days: 3
+
+  comment_on_pr:
+    name: Comment on PR
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: write
+    needs: runcts
+    if: ${{ always() && needs.runcts.result != 'skipped' }}  # Run even if some matrix jobs failed
+    steps:
+
+      - name: Download PR number artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: pr_number
+          path: pr
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - name: Read PR number from downloaded artifact
+        id: get_pr_number
+        shell: bash
+        run: |
+          n=$(tr -d '[:space:]' < pr/pr_number)
+          [[ $n =~ ^[1-9][0-9]{0,9}$ ]] || \
+              { echo "::error ::Invalid PR number"; exit 1; }
+          echo "pr_number=$n" >> "$GITHUB_OUTPUT"
+
+      - name: Verify PR matches triggering commit
+        uses: actions/github-script@v9
+        env:
+          PR_NUMBER: ${{ steps.get_pr_number.outputs.pr_number }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        with:
+          script: |
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: Number(process.env.PR_NUMBER),
+            });
+            if (pr.head.sha !== process.env.HEAD_SHA) {
+              core.setFailed(`PR #${pr.number} head (${pr.head.sha}) does not match tested commit (${process.env.HEAD_SHA})`);
+            }
+
+      - name: Download all CTS status JSON files
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts/
+          pattern: cts_status-*
+
+      - name: Collect test results and generate comment
+        id: generate_comment
+        run: |
+          echo "Aggregating test results..."
+          results=""
+          pass_count=0
+          fail_count=0
+          total_count=0
+
+          # Create summary file
+          echo "## Conformance Test Results" > summary.md
+          echo "" >> summary.md
+
+          # Check if any status files exist
+          if ! ls artifacts/cts_status-*/cts_status.json 1> /dev/null 2>&1; then
+            echo "No test result files found!" >> summary.md
+            fail_count=1
+            echo "fail_count=${fail_count}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          for f in artifacts/cts_status-*/cts_status.json; do
+            total_count=$((total_count + 1))
+
+            if [ ! -s "$f" ]; then
+              echo "⚠️ Warning: $f is empty or missing. Counting as FAIL."
+              echo "- ❌ **UNKNOWN** (Missing result file)" >> summary.md
+              fail_count=$((fail_count + 1))
+              continue
+            fi
+
+            # Parse JSON more safely
+            if ! os=$(jq -r '.os // "UNKNOWN"' "$f" 2>/dev/null); then
+              os="UNKNOWN"
+            fi
+            if ! arch=$(jq -r '.arch // "UNKNOWN"' "$f" 2>/dev/null); then
+              arch="UNKNOWN"
+            fi
+            if ! embed_rf=$(jq -r '.embed_rf // "UNKNOWN"' "$f" 2>/dev/null); then
+              embed_rf="UNKNOWN"
+            fi
+            if ! status=$(jq -r '.status // empty' "$f" 2>/dev/null); then
+              status=""
+            fi
+
+            echo "DEBUG: status='$status', os='$os', arch='$arch', embed_rf='$embed_rf'"
+
+            if [ -z "$status" ]; then
+              echo "⚠️ Warning: $f has missing 'status' field. Counting as FAIL."
+              emoji="❌"
+              fail_count=$((fail_count + 1))
+              status="FAIL"
+            elif [ "$status" = "PASS" ]; then
+              emoji="✅"
+              pass_count=$((pass_count + 1))
+            else
+              emoji="❌"
+              fail_count=$((fail_count + 1))
+            fi
+
+            if [ "$embed_rf" = "ON" ]; then
+              model_label=" (Embedded Model)"
+            else
+              model_label=""
+            fi
+
+            echo "- ${emoji} **${os} ${arch}**${model_label} - ${status}" >> summary.md
+          done
+
+          expected=$(jq -s 'map(.job_total // 0) | max' artifacts/cts_status-*/cts_status.json 2>/dev/null || echo 0)
+          missing=$(( expected - total_count ))
+          if (( missing > 0 )); then
+            echo "- ❌ **${missing} configuration(s) produced no result**" >> summary.md
+            fail_count=$(( fail_count + missing ))
+            total_count=$expected
+          fi
+
+          echo "" >> summary.md
+          echo "**Summary:** ${pass_count} passed, ${fail_count} failed (${total_count} total)" >> summary.md
+
+          echo "fail_count=${fail_count}" >> $GITHUB_OUTPUT
+          echo "pass_count=${pass_count}" >> $GITHUB_OUTPUT
+          echo "total_count=${total_count}" >> $GITHUB_OUTPUT
+
+      - name: Comment on PR with results
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const prNumber = "${{ steps.get_pr_number.outputs.pr_number }}";
+            const summary = fs.readFileSync('summary.md', 'utf-8');
+
+            const failCount = parseInt("${{ steps.generate_comment.outputs.fail_count }}") || 0;
+            const passCount = parseInt("${{ steps.generate_comment.outputs.pass_count }}") || 0;
+
+            let header;
+            if (failCount > 0) {
+              header = "❌ **Conformance tests failed**";
+            } else if (passCount > 0) {
+              header = "✅ **All conformance tests passed**";
+            } else {
+              header = "⚠️ **No conformance test results found**";
+            }
+
+            const body = `${header}
+
+            ${summary}
+
+            <details>
+            <summary>About this test</summary>
+
+            This workflow runs conformance regression tests across multiple operating systems and architectures to ensure consistent behavior of the NFIQ2 library.
+            </details>`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: parseInt(prNumber),
+              body: body
+            });
+
+      - name: Fail if any config failed
+        if: ${{ steps.generate_comment.outputs.fail_count != '0' }}
+        run: |
+          echo "❌ ${{ steps.generate_comment.outputs.fail_count }} configuration(s) failed"
+          exit 1

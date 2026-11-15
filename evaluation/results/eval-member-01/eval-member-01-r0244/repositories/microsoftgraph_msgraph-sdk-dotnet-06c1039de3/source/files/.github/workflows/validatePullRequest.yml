@@ -1,0 +1,37 @@
+name: Validate Pull Request
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ 'feature/*', 'main' ]
+  pull_request:
+    branches: [ 'feature/*', 'main' ]
+    
+permissions:
+  contents: read #those permissions are required to run the codeql analysis
+  actions: read
+  security-events: write
+  
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      solutionName: Microsoft.Graph.sln
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup .NET
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          dotnet-version: 8.x
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          languages: csharp
+      - name: Restore dependencies
+        run: dotnet restore ${{ env.solutionName }}
+      - name: Build
+        run: dotnet build ${{ env.solutionName }} --no-restore -c Release /p:UseSharedCompilation=false -m:1
+      - name: Test
+        run: dotnet test ${{ env.solutionName }} --no-build --verbosity normal -c Release /p:CollectCoverage=true /p:CoverletOutput=TestResults/ /p:CoverletOutputFormat=opencover
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2

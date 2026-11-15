@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright Contributors to the rawtoaces project.
+
+name: Code Coverage
+permissions:
+  contents: read
+
+on:
+  push:
+    # branches: [ main, develop ]
+  pull_request:
+    # branches: [ main, develop ]
+
+jobs:
+  coverage:
+    runs-on: macos-latest
+    
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      with:
+        fetch-depth: 0  # Needed for lcov
+    
+    - name: Install OS dependencies
+      shell: bash
+      env:
+        RTA_ENABLE_LENSFUN: 'ON'
+        RTA_ENABLE_EIGEN: 'ON'
+        RTA_ENABLE_CERES: 'ON'
+      run: |
+        bash build_scripts/install_deps_macos.bash
+    
+    - name: Install coverage dependencies
+      run: |
+        brew install lcov
+    
+    - name: Configure CMake
+      run: |
+        mkdir build-coverage
+        cd build-coverage
+        cmake \
+          -DCMAKE_BUILD_TYPE=Debug \
+          -DENABLE_COVERAGE=ON \
+          -DCMAKE_CXX_STANDARD=17 \
+          -DCMAKE_CXX_FLAGS="-g -O0" \
+          ..
+    
+    - name: Build
+      run: |
+        cd build-coverage
+        make -j$(sysctl -n hw.ncpu)
+    
+    - name: Run tests
+      run: |
+        cd build-coverage
+        ctest --output-on-failure
+    
+    - name: Generate coverage report
+      run: |
+        cd build-coverage
+        make coverage
+    
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6
+      with:
+        token: ${{ secrets.CODECOV_TOKEN || '' }}
+        files: build-coverage/coverage/coverage_filtered.info
+        flags: unittests
+        name: codecov-umbrella
+        fail_ci_if_error: false
+    
+    - name: Upload coverage report as artifact
+      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+      with:
+        name: coverage-report
+        path: build-coverage/coverage/
+        retention-days: 30

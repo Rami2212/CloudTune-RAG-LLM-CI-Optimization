@@ -1,0 +1,42 @@
+name: Publish to pub.dev
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+
+jobs:
+  publish:
+    environment: 'pub.dev'
+    permissions:
+      id-token: write # Required for authentication using OIDC
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📚 Git Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: 🐦 Setup Flutter
+        uses: subosito/flutter-action@v2
+
+      - name: 📦 Install Melos
+        run: dart pub global activate melos 7.5.1
+
+      - name: 📦 Bootstrap workspace
+        run: melos bootstrap
+
+      - name: 🔎 Verify version sync
+        run: dart tools/sync_version.dart --check
+
+      - name: 🔎 Verify symlinks
+        run: melos run symlinks:check
+
+      - name: 🚀 Publish fluwx
+        uses: ./.github/actions/publish_flutter_package
+        with:
+          working-directory: packages/fluwx
+
+      - name: 🚀 Publish fluwx_no_pay
+        uses: ./.github/actions/publish_flutter_package
+        with:
+          working-directory: packages/fluwx_no_pay

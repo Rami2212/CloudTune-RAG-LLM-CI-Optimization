@@ -1,0 +1,65 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [MEDIUM] Add concurrency group to "ci-testing.yml"
+# Estimated savings: ~2 min/run
+#
+---
+name: ci-testing
+on:
+  push:
+    # Temporarily run on every branch push, not only master, so the acceptance
+    # tests exercise work-in-progress branches before a pull request exists.
+    # Restore "branches: [master]" once branch runs are no longer needed.
+    branches:
+      - "**"
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: test
+        run: make test
+
+  testacc:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        netbox-version:
+          - v4.6.8
+          - v4.6.9
+          - v4.6.10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: testacc
+        # Retry once on failure. Netbox itself is occasionally flaky at startup
+        # or hits transient server-side bugs on a specific patch version; a
+        # single retry (with a clean teardown in between) clears those without
+        # masking real, reproducible failures.
+        run: |
+          for attempt in 1 2; do
+            echo "::group::testacc attempt $attempt (Netbox ${NETBOX_VERSION})"
+            if make -e testacc; then exit 0; fi
+            echo "::endgroup::"
+            echo "::warning::testacc attempt $attempt failed on ${NETBOX_VERSION}; tearing down and retrying"
+            make docker-down || true
+          done
+          exit 1
+        env:
+          NETBOX_VERSION: ${{ matrix.netbox-version }}

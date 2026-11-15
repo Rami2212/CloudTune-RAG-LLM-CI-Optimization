@@ -1,0 +1,125 @@
+name: Verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A second push to the same branch makes the first run's answer worthless, so it is cancelled rather
+# than left to finish. `schedule` already competes for hosted runners here (see
+# check-obsidian-package-update.yml); this keeps `verify` from adding queue pressure of its own.
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # The ROOT `npm ci` runs a `prepare` that installs husky. A runner has no commits to hook.
+      # (`docs`' own `prepare` runs `astro sync` and is not affected by this.)
+      HUSKY: '0'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            workflow-scripts/package-lock.json
+            docs/package-lock.json
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Install workflow-scripts dependencies
+        run: npm ci
+        working-directory: ./workflow-scripts
+
+      # `npm run lint` at the root reaches `docs/` too: that tree has no `eslint.config.mts` of its
+      # own, so the nearest config to its files is the root one, which names `docs/**/*.ts` and
+      # carries three dedicated override blocks. Typed linting there resolves through this install.
+      #
+      # It also GENERATES the types every gate below needs, which is why it carries the `id` they
+      # read: `docs/package.json` has a `prepare` script running `astro sync`, and npm runs `prepare`
+      # on `npm ci`. `docs/src/env.d.ts` imports `docs/.astro/types.d.ts`, which Astro generates and
+      # `.gitignore` hides. Without it the root `lint` fails with 12 errors on a clean checkout -- one
+      # `import-x/no-unresolved`, then 11 `no-unsafe-*` in `route-middleware.ts`, which loses its
+      # types and degrades to `any`. `astro sync` is `astro build`'s implicit first step run on its
+      # own (~20 s of this install's ~80): the full docs build needs ~21 GB and OOM-kills this runner
+      # size (see build-pages.yml). A dedicated step here would run it a second time and leave a
+      # contributor's fresh clone -- which gets it from the same install -- with nothing to copy.
+      - name: Install docs dependencies
+        id: prepare
+        run: npm ci
+        working-directory: ./docs
+
+      # Every gate runs even after an earlier one fails, so one push reports every problem it has
+      # rather than one per fix. They are skipped only when the setup above failed, where a red gate
+      # would say nothing about the code.
+      - name: Typecheck
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: npm run typecheck
+
+      - name: Lint
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: npm run lint
+
+      - name: Lint markdown
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: npm run lint:md
+
+      - name: Check formatting
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: npm run format:check
+
+      - name: Spellcheck
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: npm run spellcheck
+
+      # The unit tests of `workflow-scripts/` and `docs/scripts/`, run from the root install (see
+      # `scripts/vitest-config.ts`).
+      - name: Test
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: npm test
+
+      # A separate npm package with its own tsconfig and its own dependency tree. The root
+      # `typecheck` does `include` these files, but resolves them against the root's deps, `lib` and
+      # `target`, so it is a near-miss rather than a substitute. Its `lint` needs no second
+      # invocation -- the root one already gates it through workflow-scripts/eslint.config.mts.
+      - name: Typecheck workflow-scripts
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: npm run typecheck
+        working-directory: ./workflow-scripts
+
+      # The third package, and the only one the root `typecheck` cannot reach at all: the root
+      # `tsconfig.json` names `docs` in its `exclude`. This is `astro check`, not `tsc --noEmit` --
+      # it resolves `.astro` imports, checks the `.astro` components themselves, and stays quiet
+      # about Starlight's own `.ts` sources, which `skipLibCheck` does not cover. It re-runs the
+      # sync the install above performed, as its own first step: it costs seconds and keeps the
+      # script usable on its own.
+      - name: Typecheck docs
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: npm run typecheck
+        working-directory: ./docs
+
+      # `docs/src/starlight-virtual-modules.d.ts` declares the `virtual:starlight/*` modules the three
+      # Starlight component overrides import, because 0.42 stopped shipping the declarations that used
+      # to type them. Every type in it is referenced from a public entry point, so the typecheck above
+      # already catches a rename there -- what it cannot catch is a virtual module being renamed or
+      # dropped, which leaves the declaration valid and fails first in the Pages build. This asserts
+      # the specifiers against Starlight's installed plugin source instead.
+      - name: Check Starlight virtual modules
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: npm run check:starlight-virtual-modules
+        working-directory: ./docs

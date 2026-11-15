@@ -1,0 +1,597 @@
+name: Code Checks
+
+on:
+    pull_request:
+    merge_group:
+        types: [checks_requested]
+
+permissions: {}
+
+env:
+    php-extensions: gd, gmp, redis, mailparse
+    php-extensions-key: ext-cache-20250820
+    php-version: '8.4'
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    prep-and-code-consistency:
+        name: Prep and Code Consistency
+        runs-on: ubuntu-24.04
+
+        permissions:
+            contents: read
+
+        timeout-minutes: 15
+
+        steps:
+            - name: Generate GitHub App Token
+              id: app-token
+              if: ${{ github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' }}
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+              with:
+                  client-id: ${{ secrets.CGBS_AUTOMATION_APP_CLIENT_ID }} # zizmor: ignore[secrets-outside-env]
+                  private-key: ${{ secrets.CGBS_AUTOMATION_APP_PRIVATE_KEY }} # zizmor: ignore[secrets-outside-env]
+                  permission-contents: write
+
+            - name: Checkout code | Internal
+              if: ${{ github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' }}
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  ref: ${{ github.head_ref }}
+                  persist-credentials: false
+
+            - name: Checkout code | External
+              if: ${{ github.event_name != 'merge_group' && github.event.pull_request.head.repo.full_name != github.repository || github.event.pull_request.user.login == 'dependabot[bot]' }}
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  ref: ${{ github.head_ref }}
+                  persist-credentials: false
+
+            - name: Setup cache environment
+              id: extcache
+              uses: shivammathur/cache-extensions@c33688ce81fd884ddd70d51cadeb62b6fb974750 #1.15.8
+              with:
+                  php-version: ${{ env.php-version }}
+                  extensions: ${{ env.php-extensions }}
+                  key: ${{ env.php-extensions-key }}
+
+            - name: Cache extensions
+              uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+              with:
+                  path: ${{ steps.extcache.outputs.dir }}
+                  key: ${{ runner.os }}-24.04-phpext-${{ env.php-version }}-${{ env.php-extensions-key }}
+                  restore-keys: ${{ runner.os }}-24.04-phpext-${{ env.php-version }}
+
+            - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 #2.40.0
+              with:
+                  php-version: ${{ env.php-version }}
+                  coverage: none
+                  extensions: ${{ env.php-extensions }}
+
+            - name: Validate Composer JSON
+              run: composer validate --strict --no-check-all
+
+            - name: Cache dependencies
+              id: cache-composer
+              uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+              with:
+                  path: vendor
+                  key: ${{ runner.os }}-composer-${{ hashFiles('composer.lock', 'app-modules/**/composer.lock') }}
+
+            - if: ${{ steps.cache-composer.outputs.cache-hit != 'true' }}
+              name: Install Dependencies
+              run: composer install -q --no-ansi --no-interaction --no-scripts --no-progress --prefer-dist --optimize-autoloader
+              shell: bash
+
+            # Local path-repo packages (e.g. app-modules/**) can add/remove classes without changing
+            # composer.lock, leaving a cache hit's autoloader stale. Regenerating is fast and network-free.
+            - if: ${{ steps.cache-composer.outputs.cache-hit == 'true' }}
+              name: Refresh autoloader for local path repositories
+              run: composer dump-autoload -q --no-ansi --no-interaction --optimize
+              shell: bash
+
+            - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+              with:
+                  node-version-file: '.nvmrc'
+                  cache: 'npm'
+            - run: npm install
+
+            - name: Set up Ruby
+              uses: ruby/setup-ruby@7f797815d8adceb1c412e7abefdd1ab4abc47a5f # v1.335.0
+
+            - name: Run Ruby Script
+              run: ruby ./copyright.rb
+
+            - name: Cache PHP CS Fixer
+              uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+              with:
+                  path: .cache/php-cs-fixer/.php-cs-fixer.cache
+                  key: ${{ runner.OS }}-${{ github.repository }}-phpcsfixer-${{ github.run_id }}
+                  restore-keys: |
+                      ${{ runner.OS }}-${{ github.repository }}-phpcsfixer-
+
+            - name: Cache Prettier
+              uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+              with:
+                  path: .cache/prettier
+                  key: ${{ runner.OS }}-${{ github.repository }}-prettier-${{ github.run_id }}
+                  restore-keys: |
+                      ${{ runner.OS }}-${{ github.repository }}-prettier-
+
+            - name: Run Formatters
+              run: composer format
+
+            - name: Get GitHub App User ID
+              id: get-user-id
+              if: ${{ github.event_name != 'merge_group' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' }}
+              env:
+                  APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+                  GH_TOKEN: ${{ steps.app-token.outputs.token }}
+              run: echo "user-id=$(gh api "/users/${APP_SLUG}[bot]" --jq .id)" >> "$GITHUB_OUTPUT"
+
+            - name: Commit changes
+              if: ${{ github.event_name != 'merge_group' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' }}
+              env:
+                  APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+                  APP_USER_ID: ${{ steps.get-user-id.outputs.user-id }}
+                  APP_TOKEN: ${{ steps.app-token.outputs.token }}
+                  GH_REPOSITORY: ${{ github.repository }}
+              run: |
+                  git config user.name "${APP_SLUG}[bot]"
+                  git config user.email "${APP_USER_ID}+${APP_SLUG}[bot]@users.noreply.github.com"
+                  git remote set-url origin "https://x-access-token:${APP_TOKEN}@github.com/${GH_REPOSITORY}.git"
+                  git add -A
+                  git diff --cached --quiet || (git commit -m "Update code formatting and copyright headers" && git push)
+
+            - name: Check for changes
+              if: ${{ github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name != github.repository || github.event.pull_request.user.login == 'dependabot[bot]' }}
+              run: |
+                  git add -A
+                  if ! git diff --cached --quiet; then
+                      echo "::error::Formatting changes were detected. Run 'composer format' locally and commit the changes."
+                      echo "::group::Diff"
+                      git --no-pager diff --cached --color
+                      echo "::endgroup::"
+                      exit 1
+                  fi
+
+    shard-timings:
+        name: Resolve Shard Timings
+        runs-on: ubuntu-24.04
+
+        permissions: {}
+
+        timeout-minutes: 5
+
+        # Resolved once so every shard splits the suite with the same timings, even if newer ones are saved mid-run.
+        outputs:
+            cache-key: ${{ steps.lookup.outputs.cache-matched-key }}
+
+        steps:
+            - name: Find the latest Tenant shard timings
+              id: lookup
+              uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+              with:
+                  path: tests/.pest/shards.json
+                  key: tenant-shard-timings-
+                  restore-keys: tenant-shard-timings-
+                  lookup-only: true
+
+    test:
+        name: Test
+        needs: [shard-timings]
+        strategy:
+            matrix:
+                include:
+                    - testsuite: Landlord
+                    - testsuite: Tenant
+                      shard: 1/4
+                    - testsuite: Tenant
+                      shard: 2/4
+                    - testsuite: Tenant
+                      shard: 3/4
+                    - testsuite: Tenant
+                      shard: 4/4
+
+        runs-on: ubuntu-24.04
+
+        permissions:
+            contents: read
+
+        env:
+            DB_PORT: 5432
+            DB_HOST: 127.0.0.1
+            DB_USERNAME: root
+            DB_PASSWORD: root
+            DB_DATABASE: testing_landlord
+            REDIS_HOST: 127.0.0.1
+            REDIS_PORT: '7000'
+
+        timeout-minutes: 15
+
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  fetch-depth: 0
+                  fetch-tags: true
+                  persist-credentials: false
+
+            - uses: ./.github/actions/setup-test-environment # zizmor: ignore[self-repository]
+              with:
+                  php-version: ${{ env.php-version }}
+                  php-extensions: ${{ env.php-extensions }}
+                  php-extensions-key: ${{ env.php-extensions-key }}
+
+            - name: Restore Tenant shard timings
+              if: ${{ matrix.shard && needs.shard-timings.outputs.cache-key }}
+              uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+              with:
+                  path: tests/.pest/shards.json
+                  key: ${{ needs.shard-timings.outputs.cache-key }}
+                  fail-on-cache-miss: true
+
+            - name: Execute tests (Unit and Feature tests) via PHPUnit
+              env:
+                  TESTSUITE: ${{ matrix.testsuite }}
+                  SHARD: ${{ matrix.shard }}
+              run: |
+                  args=(--configuration phpunit-ci.xml --parallel --testsuite="${TESTSUITE}")
+                  if [[ -n "${SHARD}" ]]; then
+                      args+=(--shard="${SHARD}")
+                  fi
+                  # Called directly as `artisan test` breaks `--shard` by forwarding its `--runner` to Pest's test listing.
+                  vendor/bin/pest "${args[@]}"
+
+    shard-coverage:
+        name: Shard Coverage
+        needs: [shard-timings]
+        runs-on: ubuntu-24.04
+
+        permissions:
+            contents: read
+
+        env:
+            # Keep in sync with the Tenant shards in the test matrix.
+            TENANT_SHARDS: 4
+
+        timeout-minutes: 10
+
+        steps:
+            - name: Setup cache environment
+              id: extcache
+              uses: shivammathur/cache-extensions@c33688ce81fd884ddd70d51cadeb62b6fb974750 #1.15.8
+              with:
+                  php-version: ${{ env.php-version }}
+                  extensions: ${{ env.php-extensions }}
+                  key: ${{ env.php-extensions-key }}
+
+            - name: Cache extensions
+              uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+              with:
+                  path: ${{ steps.extcache.outputs.dir }}
+                  key: ${{ runner.os }}-24.04-phpext-${{ env.php-version }}-${{ env.php-extensions-key }}
+                  restore-keys: ${{ runner.os }}-24.04-phpext-${{ env.php-version }}
+
+            - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 #2.40.0
+              with:
+                  php-version: ${{ env.php-version }}
+                  coverage: none
+                  extensions: ${{ env.php-extensions }}
+
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  persist-credentials: false
+
+            - name: Restore Tenant shard timings
+              if: ${{ needs.shard-timings.outputs.cache-key }}
+              uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+              with:
+                  path: tests/.pest/shards.json
+                  key: ${{ needs.shard-timings.outputs.cache-key }}
+                  fail-on-cache-miss: true
+
+            - name: Copy .env
+              run: php -r "file_exists('.env') || copy('.env.example', '.env');"
+
+            - name: Cache dependencies
+              id: cache-composer
+              uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+              with:
+                  path: vendor
+                  key: ${{ runner.os }}-composer-${{ hashFiles('composer.lock', 'app-modules/**/composer.lock') }}
+
+            - if: ${{ steps.cache-composer.outputs.cache-hit != 'true' }}
+              name: Install Dependencies
+              run: composer install -q --no-ansi --no-interaction --no-scripts --no-progress --prefer-dist --optimize-autoloader
+              shell: bash
+
+            # Local path-repo packages (e.g. app-modules/**) can add/remove classes without changing
+            # composer.lock, leaving a cache hit's autoloader stale. Regenerating is fast and network-free.
+            - if: ${{ steps.cache-composer.outputs.cache-hit == 'true' }}
+              name: Refresh autoloader for local path repositories
+              run: composer dump-autoload -q --no-ansi --no-interaction --optimize
+              shell: bash
+
+            - name: Check the Tenant shards run every Tenant test exactly once
+              shell: bash
+              run: |
+                  list_tests() {
+                      vendor/bin/pest --configuration phpunit-ci.xml --testsuite=Tenant --list-tests "$@" \
+                          | grep -E '^ - ' | sed -E 's/[. ]+$//' | sort
+                  }
+
+                  list_tests > all.txt
+                  : > sharded.txt
+                  for shard in $(seq 1 "${TENANT_SHARDS}"); do
+                      list_tests --shard="${shard}/${TENANT_SHARDS}" >> sharded.txt
+                  done
+                  sort -o sharded.txt sharded.txt
+
+                  missing=$(comm -23 all.txt sharded.txt)
+                  duplicated=$(uniq -d sharded.txt)
+
+                  echo "Tenant suite: $(wc -l < all.txt) tests; across ${TENANT_SHARDS} shards: $(wc -l < sharded.txt)."
+
+                  # Pest can also miss whole files (e.g. `<file>./...</file>` entries), so compare against the files on disk too.
+                  # shellcheck disable=SC2016
+                  suite_files=$(php -r '
+                      $files = [];
+                      $suite = simplexml_load_file("phpunit-ci.xml")->xpath("//testsuite[@name=\"Tenant\"]")[0];
+                      foreach ($suite->directory as $directory) {
+                          foreach (glob((string) $directory, GLOB_ONLYDIR) as $path) {
+                              foreach (new RecursiveIteratorIterator(new RecursiveDirectoryIterator($path, FilesystemIterator::SKIP_DOTS)) as $file) {
+                                  if (str_ends_with($file->getPathname(), (string) ($directory["suffix"] ?? "Test.php"))) {
+                                      $files[$file->getRealPath()] = true;
+                                  }
+                              }
+                          }
+                      }
+                      foreach ($suite->file as $file) {
+                          $files[realpath((string) $file)] = true;
+                      }
+                      echo count($files);
+                  ')
+                  listed_classes=$(sed -E 's/^ - (P\\)?([^:]+)::.*/\2/' all.txt | sort -u | wc -l)
+
+                  echo "Tenant test files on disk: ${suite_files}; test classes listed by Pest: ${listed_classes}."
+
+                  if [[ "${suite_files}" -ne "${listed_classes}" ]]; then
+                      echo "::error::Pest lists ${listed_classes} Tenant test classes but the Tenant suite has ${suite_files} test files, so some files' tests run in no shard."
+                      exit 1
+                  fi
+
+                  if [[ -n "${missing}" || -n "${duplicated}" ]]; then
+                      echo "::error::The Tenant shards do not run every Tenant test exactly once."
+                      echo "Missing from every shard:"
+                      echo "${missing}"
+                      echo "Run by more than one shard:"
+                      echo "${duplicated}"
+                      exit 1
+                  fi
+
+    lint:
+        name: Lint
+        runs-on: ubuntu-24.04
+
+        permissions:
+            contents: read
+
+        env:
+            DB_PORT: 5432
+            DB_HOST: 127.0.0.1
+            DB_USERNAME: root
+            DB_PASSWORD: root
+            DB_DATABASE: testing_landlord
+            CACHE_DRIVER: array
+            QUEUE_CONNECTION: sync
+            AUDIT_QUEUE_CONNECTION: sync
+            SESSION_DRIVER: array
+            REDIS_HOST: 127.0.0.1
+            REDIS_PORT: '7000'
+
+        timeout-minutes: 15
+
+        services:
+            postgres:
+                # Docker Hub image
+                image: postgres:15@sha256:6eb0add3b77c081df18aa518ce43df58fdcc40f2e6d868a6fd08038dc7acd425
+                ports:
+                    - 5432:5432
+                # Provide the password for postgres
+                env:
+                    PGPASSWORD: ${{ env.DB_PASSWORD }}
+                    POSTGRES_DB: ${{ env.DB_DATABASE }}
+                    POSTGRES_USER: ${{ env.DB_USERNAME }}
+                    POSTGRES_PASSWORD: ${{ env.DB_PASSWORD }}
+                # Set health checks to wait until postgres has started
+                options: >-
+                    --health-cmd pg_isready
+                    --health-interval 10s
+                    --health-timeout 5s
+                    --health-retries 5
+
+        steps:
+            # The landlord cache stores are always Redis, so setting up a tenant needs the cluster too.
+            - name: Start Redis (3-master cluster)
+              run: |
+                  docker run -d --name redis --network host \
+                    redis:7.4.12@sha256:bd28fff4b665fdf1b73e8b5b73ec05d2f858f4fa3c8ea0d7c9bc09f7f6bf7039 \
+                    sh -c '
+                      for port in 7000 7001 7002; do
+                        redis-server --daemonize yes --port "$port" --appendonly no --save "" \
+                          --cluster-enabled yes --cluster-config-file "nodes-$port.conf" --cluster-node-timeout 5000
+                      done
+                      for port in 7000 7001 7002; do
+                        until redis-cli -p "$port" ping | grep -q PONG; do sleep 1; done
+                      done
+                      redis-cli --cluster create 127.0.0.1:7000 127.0.0.1:7001 127.0.0.1:7002 --cluster-replicas 0 --cluster-yes
+                      tail -f /dev/null
+                    '
+
+                  for port in 7000 7001 7002; do
+                    until docker exec redis redis-cli -p "$port" cluster info | grep -q 'cluster_state:ok'; do sleep 1; done
+                  done
+
+            - name: Setup cache environment
+              id: extcache
+              uses: shivammathur/cache-extensions@c33688ce81fd884ddd70d51cadeb62b6fb974750 #1.15.8
+              with:
+                  php-version: ${{ env.php-version }}
+                  extensions: ${{ env.php-extensions }}
+                  key: ${{ env.php-extensions-key }}
+
+            - name: Cache extensions
+              uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+              with:
+                  path: ${{ steps.extcache.outputs.dir }}
+                  key: ${{ runner.os }}-24.04-phpext-${{ env.php-version }}-${{ env.php-extensions-key }}
+                  restore-keys: ${{ runner.os }}-24.04-phpext-${{ env.php-version }}
+
+            - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 #2.40.0
+              with:
+                  php-version: ${{ env.php-version }}
+                  coverage: none
+                  extensions: ${{ env.php-extensions }}
+
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  fetch-depth: 0
+                  fetch-tags: true
+                  persist-credentials: false
+
+            - name: Copy .env
+              run: php -r "file_exists('.env') || copy('.env.example', '.env');"
+
+            - name: Cache dependencies
+              id: cache-composer
+              uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+              with:
+                  path: vendor
+                  key: ${{ runner.os }}-composer-${{ hashFiles('composer.lock', 'app-modules/**/composer.lock') }}
+
+            - if: ${{ steps.cache-composer.outputs.cache-hit != 'true' }}
+              name: Install Dependencies
+              run: composer install -q --no-ansi --no-interaction --no-scripts --no-progress --prefer-dist --optimize-autoloader
+              shell: bash
+
+            # Local path-repo packages (e.g. app-modules/**) can add/remove classes without changing
+            # composer.lock, leaving a cache hit's autoloader stale. Regenerating is fast and network-free.
+            - if: ${{ steps.cache-composer.outputs.cache-hit == 'true' }}
+              name: Refresh autoloader for local path repositories
+              run: composer dump-autoload -q --no-ansi --no-interaction --optimize
+              shell: bash
+
+            - name: Generate key
+              run: php artisan key:generate
+
+            - name: Migrate Landlord Database
+              run: php artisan migrate --database=landlord --path=database/landlord --force
+
+            - name: Set up Tenant
+              run: php artisan tenants:create test test.advisingapp.local -y
+
+            - name: Generate Helper Files
+              run: php artisan app:generate-helper-files
+
+            - name: 'Restore result cache'
+              uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+              with:
+                  path: .cache/phpstan
+                  key: 'linting-result-cache-${{ github.run_id }}'
+                  restore-keys: |
+                      linting-result-cache-
+
+            - name: Run PHPStan
+              run: ./vendor/bin/phpstan analyse --configuration phpstan-ci.neon --no-progress
+
+            - name: 'Save result cache'
+              uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+              if: ${{ !cancelled() }}
+              with:
+                  path: .cache/phpstan
+                  key: 'linting-result-cache-${{ github.run_id }}'
+
+    request-copilot-review:
+        name: Request Copilot Review
+        runs-on: ubuntu-24.04
+
+        permissions: {}
+
+        # Only request a review once the code is known to be green, so Copilot never reviews
+        # code that is failing tests or linting. Automatic review must be disabled in the repo
+        # settings so this gated job is the only path that requests Copilot.
+        needs: [prep-and-code-consistency, test, lint]
+
+        # Release branches merging back into main were already reviewed via their own PRs.
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' && !(startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.base.ref == 'main') }}
+
+        timeout-minutes: 5
+
+        steps:
+            # The default GITHUB_TOKEN cannot reliably request Copilot as a reviewer, so act as the
+            # GitHub App instead. App tokens are exempt from the "GITHUB_TOKEN can't trigger further
+            # automation" rule, which lets Copilot's review actually start.
+            - name: Generate GitHub App Token
+              id: app-token
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+              with:
+                  client-id: ${{ secrets.CGBS_AUTOMATION_APP_CLIENT_ID }} # zizmor: ignore[secrets-outside-env]
+                  private-key: ${{ secrets.CGBS_AUTOMATION_APP_PRIVATE_KEY }} # zizmor: ignore[secrets-outside-env]
+                  permission-pull-requests: write
+
+            - name: Request review from Copilot
+              env:
+                  GH_TOKEN: ${{ steps.app-token.outputs.token }}
+                  GH_REPOSITORY: ${{ github.repository }}
+                  PR_NUMBER: ${{ github.event.pull_request.number }}
+              run: |
+                  # Request Copilot at most once per PR. It is removed from requested_reviewers once
+                  # it finishes, so a pending-request check alone would re-request on every push.
+                  # Skip if Copilot has already submitted a review (diminishing returns on re-reviews);
+                  # a maintainer can still manually re-request from the PR UI when needed.
+                  reviewed=$(gh api "/repos/${GH_REPOSITORY}/pulls/${PR_NUMBER}/reviews" --paginate \
+                      --jq '.[].user.login')
+                  if echo "$reviewed" | grep -q 'copilot-pull-request-reviewer'; then
+                      echo 'Copilot has already reviewed this PR; not requesting again.'
+                      exit 0
+                  fi
+                  existing=$(gh api "/repos/${GH_REPOSITORY}/pulls/${PR_NUMBER}/requested_reviewers" --jq '.users[].login')
+                  if echo "$existing" | grep -q 'copilot-pull-request-reviewer'; then
+                      echo 'Copilot review already requested.'
+                      exit 0
+                  fi
+                  if ! output=$(gh api \
+                      --method POST \
+                      -H 'Accept: application/vnd.github+json' \
+                      "/repos/${GH_REPOSITORY}/pulls/${PR_NUMBER}/requested_reviewers" \
+                      -f 'reviewers[]=copilot-pull-request-reviewer[bot]' 2>&1); then
+                      echo "$output"
+                      # Tolerate the reviewer already being assigned; fail on anything else.
+                      echo "$output" | grep -qiE 'already|not a collaborator|review cannot be requested' || exit 1
+                  fi
+
+    renovate-config-validator:
+        name: Renovate Config Validator
+        runs-on: ubuntu-24.04
+
+        permissions:
+            contents: read
+
+        timeout-minutes: 15
+        container:
+            image: ghcr.io/renovatebot/renovate:43.191.3@sha256:56bf1df9d2437f8bae5b96c211d44f55c772fcce0e1f0db5153d816c7f804da7
+            # github hosted runners are running as `1001:127` (ubuntu:docker)
+            options: -u 1001:0 --group-add 1000 --group-add 12021 --group-add 127
+
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  show-progress: false
+                  persist-credentials: false
+
+            - name: Validate Renovate configuration
+              run: |
+                  renovate-config-validator renovate-config.json

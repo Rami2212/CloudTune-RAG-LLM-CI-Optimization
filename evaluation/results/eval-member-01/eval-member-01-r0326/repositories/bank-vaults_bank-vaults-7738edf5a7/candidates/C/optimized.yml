@@ -1,0 +1,118 @@
+name: E2E tests
+
+on:
+  workflow_call:
+  workflow_dispatch:
+    inputs:
+      log-level:
+        description: 'Set log level for verbosity'
+        required: false
+        default: 'info'
+        type: choice
+        options:
+          - 'info'
+          - 'debug'
+
+jobs:
+  validate-config-crud:
+    name: Validate Config CRUD
+    runs-on: ubuntu-latest
+
+    services:
+      vault:
+        image: hashicorp/vault:2.0.1
+        options: >-
+          --name=vault
+          --cap-add=IPC_LOCK
+        env:
+          VAULT_DEV_ROOT_TOKEN_ID: 227e1cce-6bf7-30bb-2d2a-acc854318caf
+        ports:
+          - 8200:8200
+
+    env:
+      VAULT_ADDR: http://0.0.0.0:8200
+      VAULT_TOKEN: 227e1cce-6bf7-30bb-2d2a-acc854318caf
+      VAULT_LOG_FILE: vault.log
+      BANK_VAULTS_LOG_FILE: bank-vaults.log
+      BANK_VAULTS_CONFIG_FILE: /tmp/vault-config.yaml
+
+      # The input value changes according to the workflow context.
+      LOG_LEVEL: "${{ github.event.inputs.log-level || inputs.log-level }}"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('go.mod', 'go.sum') }}
+
+      - name: Install Dependencies
+        run: |
+          wget -O - https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+          sudo apt update && sudo apt install vault
+          sudo wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Build Bank-vaults
+        run: |
+          make build
+          echo "${{ github.workspace }}/build" >> $GITHUB_PATH
+
+      - name: Run bank-vaults
+        run: |
+          touch "${{ env.BANK_VAULTS_CONFIG_FILE }}"
+          bank-vaults configure \
+            --mode dev \
+            --vault-config-file "${{ env.BANK_VAULTS_CONFIG_FILE }}" \
+            &> "${{ env.BANK_VAULTS_LOG_FILE }}" & disown
+
+      - name: Test group - Audit
+        if: always()
+        run: bash e2e/validate-config-crud/test.sh "audit"
+
+      - name: Test group - Auth
+        if: always()
+        run: bash e2e/validate-config-crud/test.sh "auth"
+
+      - name: Test group - Groups
+        if: always()
+        run: bash e2e/validate-config-crud/test.sh "groups"
+
+      - name: Test group - Group-Aliases
+        if: always()
+        run: bash e2e/validate-config-crud/test.sh "group-aliases"
+
+      - name: Test group - Policies
+        if: always()
+        run: bash e2e/validate-config-crud/test.sh "policies"
+
+      - name: Test group - StartupSecrets
+        if: always()
+        run: bash e2e/validate-config-crud/test.sh "startupSecrets"
+
+      - name: Test group - Secrets
+        if: always()
+        run: bash e2e/validate-config-crud/test.sh "secrets"
+
+      - name: Print logs
+        if: always()
+        run: |
+          echo -e "\nVaults logs ..."
+          docker logs vault &> "${{ env.VAULT_LOG_FILE }}"
+          cat "${{ env.VAULT_LOG_FILE }}"
+
+          echo -e "\nBank-Vaults logs ..."
+          cat "${{ env.BANK_VAULTS_LOG_FILE }}"
+
+      - name: Store log files
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: "[${{ github.job }}] logs"
+          path: |
+            ${{ env.VAULT_LOG_FILE }}
+            ${{ env.BANK_VAULTS_LOG_FILE }}

@@ -1,0 +1,187 @@
+---
+name: CI build and test
+# Schema: https://json.schemastore.org/github-action.json
+
+on:
+  workflow_call:
+    inputs:
+      container:
+        type: boolean
+        description: "Running in docker container"
+        default: false
+      os:
+        type: string
+        description: "The operating system of the runner"
+        default: 'ubuntu-24.04'  # Default used for container
+      gcc:
+        type: string
+        description: "The GCC version to use"
+        required: true
+      python-version:
+        type: string
+        description: "The Python version to use"
+        required: false  # Only needed if not in container
+      upload-app:
+        type: boolean
+        description: 'Upload the standalone application'
+        default: false
+      tag:
+        type: string
+        description: "The tag to apply"
+        required: true
+      tag_message:
+        type: string
+        description: "The tag message to use"
+        required: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  gcovr-ci-job:
+    runs-on: ${{ inputs.container && 'ubuntu-24.04' || inputs.os }}
+    permissions:
+      contents: read
+    env:
+      SPHINX_SKIP_CHECK_LINKS: "True"
+      FORCE_COLOR: "1"
+      NOX_CONTAINER_ARGUMENTS: >-
+        ${{ inputs.container && format(' --session docker_run_compiler({0}) --', inputs.gcc) || '' }}
+      GENERATE_DOCUMENTATION: >-
+        ${{ inputs.container && contains(fromJSON('["gcc-5", "gcc-6", "gcc-7", "gcc-8", "gcc-9", "clang-10"]'), inputs.gcc) }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 75
+          persist-credentials: false
+
+      - name: Prepare package version
+        uses: "$/.github/actions/prepare-package-version"
+        with:
+          tag: ${{ inputs.tag }}
+          tag_message: ${{ inputs.tag_message }}
+
+      - name: Set up runner
+        uses: "$/.github/actions/setup-runner"
+        with:
+          os: ${{ inputs.os }}
+          gcc: ${{ (!inputs.container && inputs.gcc) || '' }}
+          python-version: ${{ inputs.python-version }}
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Set up environment
+        run: |
+          # Enable coverage for specific target configurations
+          if [ "${{ inputs.container }}" == "true" ] ; then
+            case "${INPUTS_GCC}" in
+              gcc-5)    USE_COVERAGE=true ;;
+              gcc-8)    USE_COVERAGE=true ;;
+              gcc-14)   USE_COVERAGE=true ;;
+              gcc-15)   USE_COVERAGE=true ;;
+              clang-10) USE_COVERAGE=true ;;
+              clang-20) USE_COVERAGE=true ;;
+              *)        USE_COVERAGE=false ;;
+            esac
+          else
+            case "${INPUTS_OS}/${INPUTS_GCC}/${INPUTS_PYTHON_VERSION}" in
+              ubuntu-24.04/gcc-11/3.14) USE_COVERAGE=true ;;
+              windows-2025/gcc/3.14)    USE_COVERAGE=true ;;
+              macos-15/gcc/3.10)        USE_COVERAGE=true ;;
+              macos-26/gcc-15/3.14)     USE_COVERAGE=true ;;
+              *)                        USE_COVERAGE=false ;;
+            esac
+          fi
+          echo "USE_COVERAGE=$USE_COVERAGE" >> $GITHUB_ENV
+
+          # Set the CC environment
+          echo "CC=${INPUTS_GCC}" >> $GITHUB_ENV
+        env:
+          INPUTS_GCC: ${{ inputs.gcc }}
+          INPUTS_OS: ${{ inputs.os }}
+          INPUTS_PYTHON_VERSION: ${{ inputs.python-version }}
+
+      - name: Expose GitHub Runtime for Docker cache
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487  # v4.0.0
+
+      - name: Build Docker
+        if: ${{ inputs.container }}
+        run: |
+          nox --non-interactive --session "docker_build_compiler(${INPUTS_GCC})"
+        env:
+          INPUTS_GCC: ${{ inputs.gcc }}
+
+      - name: Lint files
+        run: |
+          nox --non-interactive $NOX_CONTAINER_ARGUMENTS --session lint
+
+      - name: Test with pytest
+        run: |
+          nox --non-interactive $NOX_CONTAINER_ARGUMENTS --session tests --  --archive-differences
+          # There must not be any modifications to get the correct versions later
+          if [ -n "$(git status --porcelain)" ] ; then
+            git status
+            git diff
+            exit 1
+          fi
+
+      - name: Upload pytest test results
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: >-
+            diffs-${{
+              inputs.container && format('docker-{0}', inputs.gcc)
+              || format('{0}-{1}-{2}', inputs.os, inputs.gcc, inputs.python-version)
+            }}
+          path: tests/diff.zip
+
+      - name: Upload coverage
+        if: ${{ env.USE_COVERAGE == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: >-
+            coverage-pytest-${{
+              inputs.container && format('docker-{0}', inputs.gcc)
+              || format('{0}-{1}-{2}', inputs.os, inputs.gcc, inputs.python-version)
+            }}
+          path: .coverage_*
+          include-hidden-files: true
+
+      - name: Generate documentation
+        if: ${{ env.GENERATE_DOCUMENTATION == 'true' }}
+        run: |
+          nox --non-interactive $NOX_CONTAINER_ARGUMENTS --session doc || exit 1
+
+          # Check if files are modified (outdated screenshots)
+          if [ -n "$(git status --porcelain)" ] ; then
+            git diff
+
+            echo "Please regenerate the screenshots!"
+            exit 1
+          fi
+          exit 0
+
+      - name: Build and check the wheel
+        run: |
+          nox --non-interactive $NOX_CONTAINER_ARGUMENTS --session build_distribution
+
+      - name: Build and check standalone application
+        if: ${{ !startsWith(inputs.python-version,'pypy') }}
+        run: |
+          nox --non-interactive $NOX_CONTAINER_ARGUMENTS --session bundle_app
+
+      - name: Upload app bundle artifacts
+        if: ${{ inputs.upload-app == true }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: app-${{ inputs.os }}
+          path: build/gcovr*

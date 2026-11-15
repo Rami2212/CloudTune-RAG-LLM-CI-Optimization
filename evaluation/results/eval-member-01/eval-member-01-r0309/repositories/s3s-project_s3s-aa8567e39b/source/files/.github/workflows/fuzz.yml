@@ -1,0 +1,137 @@
+name: Fuzz
+
+on:
+  pull_request:
+    branches:
+      - main
+      - 'feat/**'
+    paths:
+      - 'fuzz/**'
+      - '.github/workflows/fuzz.yml'
+      # The fuzz workspace depends on the in-repo crates by path, and those
+      # crates depend on each other (s3s pulls in s3s-rfc2047, s3s-sigv2,
+      # s3s-sigv4, s3s-multipart), so any crate can break a target without
+      # touching fuzz/.
+      - 'crates/**'
+  schedule:
+    - cron: '0 0 * * *' # daily at 00:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  # Lightweight fmt + clippy gate for PRs that touch fuzz/. The fuzz/ tree is a
+  # separate cargo workspace not covered by the root ci.yml, so without this a
+  # malformed fuzz target could land without any CI signal.
+  fuzz-check:
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      actions: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: taiki-e/install-action@just
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+
+      - name: Format and lint
+        run: just -f fuzz/justfile ci-check
+
+  # Daily actual fuzzing (schedule / manual dispatch only).
+  fuzz-run:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: taiki-e/install-action@just
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: llvm-tools, clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The scheduled step runs the `xtask` binary, so the root workspace is
+          # built as well and belongs in the cache next to the fuzz workspace.
+          workspaces: |
+            fuzz -> target
+            . -> target
+
+      # Installs the latest cargo-fuzz release: `tool` is left unpinned on
+      # purpose so it never goes stale. `with: tool:` keeps the name explicit,
+      # so a Dependabot bump of the action ref (e.g. @cargo-fuzz -> @v2.x)
+      # cannot drop it.
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@cargo-fuzz
+        with:
+          tool: cargo-fuzz
+
+      - name: Format and lint
+        run: just ci-check
+        working-directory: fuzz
+
+      - name: Find previous run carrying the corpus
+        id: previous-run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Crashes fail the job (strict policy), so runs are usually red; the
+          # corpus artifact is uploaded with if: always(), so pick the latest
+          # completed run regardless of its conclusion. Restrict to the
+          # default branch: manual dispatches on feature branches would
+          # otherwise contaminate the corpus across code versions.
+          run_id="$(
+            gh api "repos/${{ github.repository }}/actions/workflows/fuzz.yml/runs" \
+              --jq '[.workflow_runs[] | select(.status == "completed" and .head_branch == "${{ github.event.repository.default_branch || 'main' }}") | .id][0]'
+          )"
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Restore accumulated corpus
+        uses: actions/download-artifact@v8
+        with:
+          name: fuzz-corpus
+          path: fuzz/corpus
+          run-id: ${{ steps.previous-run.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Build fuzz targets
+        run: cargo +nightly fuzz build --target x86_64-unknown-linux-gnu
+        working-directory: fuzz
+
+      - name: Fuzz the target of the day
+        run: cargo run -q -p xtask -- fuzz run
+
+      - name: Upload corpus
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: fuzz-corpus
+          path: fuzz/corpus
+          # Only the latest corpus matters (next run restores it); 30-day
+          # retention bounds storage: one artifact per run, ~30 at steady
+          # state with the daily schedule.
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Upload crashes and other artifacts
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          retention-days: 90
+          if-no-files-found: ignore

@@ -1,0 +1,302 @@
+name: build
+
+on:
+  workflow_dispatch: {}
+  push:
+    # Avoid duplicate push and pull_request runs on PR branches.
+    branches: [main]
+  pull_request: {}
+  schedule:
+    - cron: "30 0 * * *"
+
+permissions: {} # Default to no permissions. Enable as needed for specific jobs.
+
+jobs:
+  # Avoid running unrelated test suites for narrowly scoped PRs.
+  changes:
+    permissions:
+      pull-requests: read
+    runs-on: ubuntu-latest
+    outputs:
+      zavod: ${{ steps.changed.outputs.zavod }}
+      datasets: ${{ steps.changed.outputs.datasets }}
+    steps:
+      # Changes outside datasets, UI, Claude config, and Markdown may affect zavod.
+      - name: Determine which halves of the build are affected
+        id: changed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # Include old rename paths so removals and moves trigger the affected suite.
+          if [ -n "${PR:-}" ]; then
+            gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" \
+              --jq '.[] | (.previous_filename // empty), .filename' > changed.txt
+          else
+            : > changed.txt
+          fi
+          cat changed.txt
+          zavod=false
+          datasets=false
+          if grep -qvE '^(datasets|ui|\.claude)/|\.md$' changed.txt; then zavod=true; fi
+          if grep -qE '^datasets/' changed.txt; then datasets=true; fi
+          echo "zavod=$zavod" >> "$GITHUB_OUTPUT"
+          echo "datasets=$datasets" >> "$GITHUB_OUTPUT"
+
+  zavod:
+    # Main must run both suites because the docker job depends on them.
+    if: >-
+      needs.changes.outputs.zavod == 'true'
+      || github.ref == 'refs/heads/main'
+      || github.event_name == 'schedule'
+      || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    env:
+      OPENSSL_CONF: "contrib/openssl.cnf"
+      FTM_USER_AGENT: "Mozilla/5.0 (compatible; github-actions-zavod/0.8; tech@opensanctions.org)"
+
+    runs-on: ubuntu-latest
+    needs: [changes]
+    services:
+      # Only for the migration check; the tests use SQLite.
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_DB: migrations
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d migrations" --health-interval=5s --health-timeout=5s --health-retries=10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: "pip"
+          # The default requirements glob only finds unrelated contrib files.
+          cache-dependency-path: zavod/pyproject.toml
+      - name: Install system dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          # Python 3.13 requires building pyicu and plyvel from source.
+          sudo apt-get install -y -qq libicu-dev libleveldb-dev poppler-utils
+      - name: Install zavod dependencies
+        working-directory: zavod
+        run: |
+          python -m pip install --upgrade pip wheel
+          # Retain locally built wheels for source-only dependencies.
+          pip install -q -e ".[dev]"
+          pip freeze
+
+      # Apply all migrations to the empty database, then run `alembic check`
+      # to diff the resulting schema against the SQLAlchemy models. Exits
+      # non-zero if the models were changed without a matching migration.
+      - name: Check alembic migrations against models
+        continue-on-error: true
+        working-directory: zavod
+        env:
+          ZAVOD_DATABASE_URI: "postgresql://postgres:password@localhost:5432/migrations"
+        run: |
+          alembic upgrade head
+          alembic check
+
+      - name: Check zavod type annotations (strict)
+        working-directory: zavod
+        run: |
+          make typecheck
+      - name: Check zavod ruff lint
+        working-directory: zavod
+        run: |
+          make lint
+
+      # TODO: Replace mypy and ruff once prek provides equivalent coverage.
+      - name: Run prek pre-commit hooks on zavod/
+        run: |
+          set -euxo pipefail
+          # Batch tracked files to stay within shell argument limits.
+          git ls-files -z zavod | xargs -0 -n 30 prek run --files
+
+      - name: Run zavod tests
+        working-directory: zavod
+        run: |
+          make test
+      - name: Build a zavod distribution
+        working-directory: zavod
+        run: |
+          python3 -m build --wheel
+
+  datasets:
+    # Dataset tests also guard against zavod regressions.
+    if: >-
+      needs.changes.outputs.datasets == 'true'
+      || needs.changes.outputs.zavod == 'true'
+      || github.ref == 'refs/heads/main'
+      || github.event_name == 'schedule'
+      || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      OPENSSL_CONF: "contrib/openssl.cnf"
+      FTM_USER_AGENT: "Mozilla/5.0 (compatible; github-actions-zavod/0.8; tech@opensanctions.org)"
+
+    runs-on: ubuntu-latest
+    needs: [changes]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: "pip"
+          # The default requirements glob only finds unrelated contrib files.
+          cache-dependency-path: zavod/pyproject.toml
+      - name: Install system dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          # Python 3.13 requires building pyicu and plyvel from source.
+          sudo apt-get install -y -qq libicu-dev libleveldb-dev poppler-utils
+      - name: Install zavod dependencies
+        working-directory: zavod
+        run: |
+          python -m pip install --upgrade pip wheel
+          # Retain locally built wheels for source-only dependencies.
+          pip install -q -e ".[dev]"
+          pip freeze
+      # Only migrations create zavod's tables. The crawls below use the default
+      # SQLite database in data/, relative to the repository root, so create
+      # it there.
+      - name: Set up the zavod database
+        run: alembic -c zavod/alembic.ini upgrade head
+      - name: Test crawlers with tests
+        run: pytest datasets
+
+      # Pass only existing paths through a file to avoid interpolating PR filenames.
+      - name: Get any modified dataset files
+        id: changed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [ -n "${PR:-}" ]; then
+            gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" \
+              --jq '.[] | select(.status != "removed") | .filename' \
+              | { grep -E '^datasets/' || true; } > datasets.txt
+          else
+            : > datasets.txt
+          fi
+          cat datasets.txt
+          if [ -s datasets.txt ]; then
+            echo "any=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "any=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Crawl modified datasets
+        if: ${{ steps.changed.outputs.any == 'true' && github.ref != 'refs/heads/main'}}
+        run: |
+          set -euo pipefail
+          # Preserve each filename as a quoted argument.
+          mapfile -t files < datasets.txt
+          datasets=$(python contrib/ci_datasets.py "${files[@]}")
+          echo "$datasets"
+          for dataset in $datasets
+          do
+              echo Crawling $dataset
+              zavod crawl --clear-data $dataset
+          done
+      - name: Export and validate modified datasets
+        if: ${{ steps.changed.outputs.any == 'true' && github.ref != 'refs/heads/main'}}
+        run: |
+          set -euo pipefail
+          mapfile -t files < datasets.txt
+          datasets=$(python contrib/ci_datasets.py "${files[@]}")
+          for dataset in $datasets
+          do
+              echo Exporting $dataset
+              zavod export --rebuild-store $dataset
+          done
+
+  docker:
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    needs: [zavod, datasets]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set build date
+        run: echo "BUILD_DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Login to Github Container Registry
+        uses: docker/login-action@v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push release
+        uses: docker/build-push-action@v7
+        env:
+          BUILD_DATE: ${{ env.BUILD_DATE }}
+        with:
+          context: .
+          pull: true
+          push: true
+          tags: ghcr.io/opensanctions/opensanctions:latest
+          build-args: |
+            BUILD_DATE=${{ env.BUILD_DATE }}
+          cache-from: type=gha
+          # Keep intermediate layers from exhausting the shared cache budget.
+          cache-to: type=gha,mode=min
+
+  # GitHub App requirements for workflow dispatch to trigger ETL deploy in operations repo:
+  # App name: opensanctions-operations-deployer (or similar)
+  # Installed on: opensanctions/operations
+  # Permissions: Actions - 'write'
+  # Secrets required in this repo:
+  #   OPERATIONS_DEPLOY_APP_ID  — numeric GitHub App ID
+  #   OPERATIONS_DEPLOY_APP_KEY — PEM private key
+  trigger-deploy:
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    permissions:
+      pull-requests: read
+    runs-on: ubuntu-latest
+    needs: [docker]
+    steps:
+      - name: Resolve source revision and pull request
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pull_request=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
+            --jq 'map(select(.merged_at != null and .base.ref == "main")) | .[0].number // empty')
+          echo "revision=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "pull_request=${pull_request}" >> "$GITHUB_OUTPUT"
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.OPERATIONS_DEPLOY_APP_ID }}
+          private-key: ${{ secrets.OPERATIONS_DEPLOY_APP_KEY }}
+          owner: opensanctions
+          repositories: operations
+      - name: Trigger ETL deploy
+        run: |
+          curl --fail --silent --show-error --location -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ steps.app-token.outputs.token }}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/opensanctions/operations/actions/workflows/build-etl.yml/dispatches \
+            -d '{"ref":"main","inputs":{"opensanctions_revision":"${{ steps.source.outputs.revision }}","opensanctions_pull_request":"${{ steps.source.outputs.pull_request }}"}}'

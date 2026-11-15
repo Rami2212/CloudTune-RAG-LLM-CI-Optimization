@@ -1,0 +1,69 @@
+name: Update Yearly Copyright
+
+on:
+    workflow_dispatch:
+    schedule: # Run every year on January 1st
+        - cron: '0 0 1 1 *' # UTC time
+
+permissions: {}
+
+concurrency:
+    group: ${{ github.workflow }}
+    cancel-in-progress: true
+
+jobs:
+    update-copyright:
+        name: Update Copyright
+        runs-on: ubuntu-24.04
+
+        timeout-minutes: 10
+
+        steps:
+            - name: Generate GitHub App Token
+              id: app-token
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+              with:
+                  client-id: ${{ secrets.CGBS_AUTOMATION_APP_CLIENT_ID }} # zizmor: ignore[secrets-outside-env]
+                  private-key: ${{ secrets.CGBS_AUTOMATION_APP_PRIVATE_KEY }} # zizmor: ignore[secrets-outside-env]
+                  permission-contents: write
+                  permission-pull-requests: write
+
+            - name: Checkout `main` Branch
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  persist-credentials: false
+
+            - name: Set up Ruby
+              uses: ruby/setup-ruby@7f797815d8adceb1c412e7abefdd1ab4abc47a5f # v1.335.0
+
+            - name: Run copyright script
+              run: ruby ./copyright.rb
+
+            - name: Get GitHub App User ID
+              id: get-user-id
+              env:
+                  APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+                  GH_TOKEN: ${{ steps.app-token.outputs.token }}
+              run: echo "user-id=$(gh api "/users/${APP_SLUG}[bot]" --jq .id)" >> "$GITHUB_OUTPUT"
+
+            - name: Create Pull Request
+              env:
+                  APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+                  APP_USER_ID: ${{ steps.get-user-id.outputs.user-id }}
+                  APP_TOKEN: ${{ steps.app-token.outputs.token }}
+                  GH_REPOSITORY: ${{ github.repository }}
+                  GH_TOKEN: ${{ steps.app-token.outputs.token }}
+              run: |
+                  BRANCH="update-yearly-copyright-$(date +%s)"
+                  git config user.name "${APP_SLUG}[bot]"
+                  git config user.email "${APP_USER_ID}+${APP_SLUG}[bot]@users.noreply.github.com"
+                  git remote set-url origin "https://x-access-token:${APP_TOKEN}@github.com/${GH_REPOSITORY}.git"
+                  git checkout -b "${BRANCH}"
+                  git add -A
+                  git diff --cached --quiet && echo "No changes" && exit 0
+                  git commit -m "chore: update yearly copyright"
+                  git push origin "${BRANCH}"
+                  gh pr create \
+                    --title "Update yearly copyright" \
+                    --body "This is an automated pull request to update the yearly copyright." \
+                    --head "${BRANCH}"

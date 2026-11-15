@@ -1,0 +1,152 @@
+name: Reusable Ceph suite integration tests
+on:
+  # ONLY on.workflow_call ; call this from other files if needed
+  workflow_call:
+    inputs:
+      ceph_suite_versions:
+        description: "JSON list of Ceph suite versions such as squid-devel, tentacle-devel, umbrella-devel, main"
+        required: true
+        type: string
+      upgrade_suite_tests:
+        description: "JSON list of upgrade suite subtests such as TestUpgradeCephToSquidDevel, TestUpgradeCephToTentacleDevel, TestUpgradeCephToUmbrellaDevel"
+        default: '["TestUpgradeCephToSquidDevel", "TestUpgradeCephToTentacleDevel", "TestUpgradeCephToUmbrellaDevel"]'
+        type: string
+      object_suite_tests:
+        description: "JSON list of object suite subtests such as TestWithoutTLS, TestWithTLS"
+        default: '["TestWithoutTLS", "TestWithTLS"]'
+        type: string
+      rook_image_artifact:
+        description: name of a prebuilt rook image artifact to import; empty builds rook in-job
+        default: ""
+        type: string
+
+defaults:
+  run:
+    # reference: https://docs.github.com/en/actions/reference/workflow-syntax-for-github-actions#using-a-specific-shell
+    shell: bash --noprofile --norc -eo pipefail -x {0}
+
+permissions:
+  contents: read
+
+env:
+  # Required for go-ceph rgw/admin account APIs.
+  GOFLAGS: "-tags=ceph_preview"
+
+jobs:
+  smoke-suite:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        ceph-suite-version: ${{ fromJson(inputs.ceph_suite_versions) }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: setup cluster resources
+        uses: ./.github/workflows/integration-test-setup-cluster-resources
+        with:
+          kubernetes-version: "v1.37.0"
+          rook-image-artifact: ${{ inputs.rook_image_artifact }}
+
+      - name: TestCephSmokeSuite
+        run: |
+          DEVICE_FILTER=$(tests/scripts/github-action-helper.sh find_extra_block_dev)
+          export DEVICE_FILTER
+          SKIP_CLEANUP_POLICY=false CEPH_SUITE_VERSION="${{ matrix.ceph-suite-version }}" go test -v -timeout 1800s -run TestCephSmokeSuite github.com/rook/rook/tests/integration
+
+      - name: collect common logs
+        if: always()
+        run: |
+          export LOG_DIR="/home/runner/work/rook/rook/tests/integration/_output/tests/"
+          export CLUSTER_NAMESPACE="smoke-ns"
+          export OPERATOR_NAMESPACE="smoke-ns-system"
+          tests/scripts/collect-logs.sh
+
+      - name: Artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: ceph-smoke-suite-${{ matrix.ceph-suite-version }}-artifact
+          path: /home/runner/work/rook/rook/tests/integration/_output/tests/
+
+  upgrade-suite:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        upgrade-test: ${{ fromJson(inputs.upgrade_suite_tests) }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: setup cluster resources
+        uses: ./.github/workflows/integration-test-setup-cluster-resources
+        with:
+          kubernetes-version: "v1.37.0"
+          rook-image-artifact: ${{ inputs.rook_image_artifact }}
+
+      - name: TestCephUpgradeSuite
+        run: |
+          DEVICE_FILTER=$(tests/scripts/github-action-helper.sh find_extra_block_dev)
+          export DEVICE_FILTER
+          go test -v -timeout 1800s -failfast -run "TestCephUpgradeSuite/${{ matrix.upgrade-test }}" github.com/rook/rook/tests/integration
+
+      - name: collect common logs
+        if: always()
+        run: |
+          export LOG_DIR="/home/runner/work/rook/rook/tests/integration/_output/tests/"
+          export CLUSTER_NAMESPACE="upgrade"
+          export OPERATOR_NAMESPACE="upgrade-system"
+          tests/scripts/collect-logs.sh
+
+      - name: Artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: ceph-upgrade-suite-${{ matrix.upgrade-test }}-artifact
+          path: /home/runner/work/rook/rook/tests/integration/_output/tests/
+
+  object-suite:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        ceph-suite-version: ${{ fromJson(inputs.ceph_suite_versions) }}
+        object-test: ${{ fromJson(inputs.object_suite_tests) }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: setup cluster resources
+        uses: ./.github/workflows/integration-test-setup-cluster-resources
+        with:
+          kubernetes-version: "v1.37.0"
+          rook-image-artifact: ${{ inputs.rook_image_artifact }}
+
+      - name: TestCephObjectSuite
+        run: |
+          DEVICE_FILTER=$(tests/scripts/github-action-helper.sh find_extra_block_dev)
+          export DEVICE_FILTER
+          SKIP_CLEANUP_POLICY=false CEPH_SUITE_VERSION="${{ matrix.ceph-suite-version }}" go test -v -timeout 1800s -failfast -run "CephObjectSuite/${{ matrix.object-test }}" github.com/rook/rook/tests/integration
+
+      - name: collect common logs
+        if: always()
+        run: |
+          export LOG_DIR="/home/runner/work/rook/rook/tests/integration/_output/tests/"
+          export CLUSTER_NAMESPACE="object-ns"
+          export OPERATOR_NAMESPACE="object-ns-system"
+          tests/scripts/collect-logs.sh
+
+      - name: Artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: ceph-object-suite-${{ matrix.ceph-suite-version }}-${{ matrix.object-test }}-artifact
+          path: /home/runner/work/rook/rook/tests/integration/_output/tests/

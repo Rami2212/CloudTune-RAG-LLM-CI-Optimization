@@ -1,0 +1,85 @@
+name: lint_crawlers
+permissions:
+  contents: read
+  pull-requests: read
+
+on:
+  push:
+    # Avoid duplicate push and pull_request runs on PR branches.
+    branches: [main]
+  pull_request: {}
+  workflow_dispatch: {}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Pass only existing paths through files to avoid interpolating PR filenames.
+      - name: Get modified dataset files
+        id: changed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [ -n "${PR:-}" ]; then
+            gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" \
+              --jq '.[] | select(.status != "removed") | .filename' \
+              | { grep -E '^datasets/' || true; } > dataset_files.txt
+          else
+            : > dataset_files.txt
+          fi
+          { grep -E '\.ya?ml$' dataset_files.txt || true; } > dataset_yamls.txt
+          { grep -E '\.py$'    dataset_files.txt || true; } > dataset_python.txt
+          wc -l dataset_files.txt dataset_yamls.txt dataset_python.txt
+          for f in files yamls python; do
+            if [ -s "dataset_$f.txt" ]; then
+              echo "$f=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "$f=false" >> "$GITHUB_OUTPUT"
+            fi
+          done
+      - name: Lint modified dataset yamls
+        if: ${{ steps.changed.outputs.yamls == 'true' }}
+        run: |
+          set -euo pipefail
+          # Preserve each filename as a quoted argument.
+          mapfile -t files < dataset_yamls.txt
+          yamllint "${files[@]}"
+      - name: Install system dependencies
+        if: ${{ steps.changed.outputs.files == 'true' }}
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          # Python 3.13 requires building pyicu and plyvel from source.
+          sudo apt-get install -y -qq libicu-dev libleveldb-dev
+      - uses: actions/setup-python@v7
+        if: ${{ steps.changed.outputs.files == 'true' }}
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+          # The default requirements glob only finds unrelated contrib files.
+          cache-dependency-path: zavod/pyproject.toml
+      - name: Install python linting dependencies
+        if: ${{ steps.changed.outputs.files == 'true' }}
+        working-directory: zavod
+        run: |
+          pip install -q -e ".[dev]"
+      - name: Lint modified dataset python
+        if: ${{ steps.changed.outputs.python == 'true' }}
+        run: |
+          set -euxo pipefail
+          while IFS= read -r dataset; do
+            echo Linting "$dataset"
+            ruff check --config zavod/pyproject.toml "$dataset"
+            ruff format --check --diff --config zavod/pyproject.toml "$dataset"
+          done < dataset_python.txt
+      - name: Run prek pre-commit hooks on modified files
+        # Include non-Python files handled by pre-commit hooks.
+        if: ${{ steps.changed.outputs.files == 'true' }}
+        run: |
+          set -euxo pipefail
+          mapfile -t files < dataset_files.txt
+          prek run --files "${files[@]}"

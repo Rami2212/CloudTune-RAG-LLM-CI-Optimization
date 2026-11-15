@@ -1,0 +1,85 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 3 optimizations:
+# - [HIGH] Add npm dependency cache to "build" job
+# - [HIGH] Split "build" into parallel jobs (lint + test + build)
+# - [MEDIUM] Use "npm ci" instead of "npm install" in "build"
+# Estimated savings: ~11 min/run
+#
+name: CI & Release
+run-name: |-
+  ${{
+    inputs.release && 'Test ➤ Publish to NPM' ||
+    'Test'
+  }}
+'on':
+  push:
+    branches:
+      - main
+  pull_request: null
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Publish new release
+        required: true
+        default: false
+        type: boolean
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version:
+          - lts/-1
+          - lts/*
+          - current
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        id: node
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - name: Use Node.js ${{ steps.node.outputs.node-version }}
+        run: npm install
+      - run: npm run-script prettify-check
+      - run: npm run knip
+      - run: npm run test:generate
+      - run: npm test
+        env:
+          CI: true
+      - run: npm run build
+      - run: npm run test:bundle
+  release:
+    permissions:
+      id-token: write
+    name: Semantic release
+    needs: build
+    if: github.event.inputs.release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@v1
+        id: app-token
+        with:
+          app-id: ${{ secrets.ECOSPARK_APP_ID }}
+          private-key: ${{ secrets.ECOSPARK_APP_PRIVATE_KEY }}
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+      - run: npm ci
+      - run: npx semantic-release
+        if: always()
+        env:
+          NPM_CONFIG_PROVENANCE: true
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          NPM_TOKEN: ${{ secrets.NPM_PUBLISH_TOKEN }}

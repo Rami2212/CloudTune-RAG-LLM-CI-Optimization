@@ -1,0 +1,38 @@
+name: Mutation testing
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  mutation-testing:
+    if: contains(github.event.head_commit.message, 'Releasing version') != true && contains(github.event.head_commit.message, 'Prepare next version') != true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7.0.1
+        with:
+          # Disabling shallow clone is recommended for improving relevancy of reporting
+          fetch-depth: 0
+
+      - name: Cache Maven packages
+        uses: actions/cache@v6.1.0
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+
+      - name: Set up JDK
+        uses: actions/setup-java@v6.0.1
+        with:
+          java-version: 25
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Run Pitest
+        run: ./mvnw -B test-compile org.pitest:pitest-maven:mutationCoverage
+        env:
+          STRYKER_DASHBOARD_API_KEY: ${{ secrets.STRYKER_DASHBOARD_API_KEY }}

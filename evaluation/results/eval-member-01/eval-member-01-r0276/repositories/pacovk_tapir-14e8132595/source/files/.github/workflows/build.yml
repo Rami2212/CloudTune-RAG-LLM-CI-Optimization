@@ -1,0 +1,53 @@
+name: Build
+
+on:
+  push:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: fake
+      AWS_SECRET_ACCESS_KEY: fake
+      AWS_ENDPOINT: http://localhost:4566
+      AWS_REGION: eu-central-1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Start containers
+        run: docker compose -f "docker-compose.yml" up -d localstack opensearch-node1 azurite keycloak
+      - name: Wait for Keycloak
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8089/realms/tapir/.well-known/openid-configuration > /dev/null 2>&1 && break
+            sleep 2
+          done
+      - name: Setup JDK
+        uses: actions/setup-java@v5
+        with:
+          java-version: '17'
+          distribution: 'adopt'
+          cache: maven
+      - name: Build and test backend
+        run: ./mvnw install
+      - name: Upload production artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tapir
+          path: |
+            target/quarkus-app/
+          retention-days: 3
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src/main/webui
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: install
+        run: yarn install
+      - name: lint
+        run: yarn lint
+      - name: test
+        run: yarn test

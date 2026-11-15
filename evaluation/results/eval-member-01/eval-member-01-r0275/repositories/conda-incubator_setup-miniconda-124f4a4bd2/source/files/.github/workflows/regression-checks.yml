@@ -1,0 +1,123 @@
+name: "Regression checks"
+
+on:
+  pull_request:
+    branches:
+      - "*"
+  push:
+    branches:
+      - "develop"
+      - "main"
+      - "master"
+  schedule:
+    # Note that cronjobs run on master/main by default
+    - cron: "0 0 * * *"
+
+concurrency:
+  group:
+    ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  issue-114:
+    # prevent cronjobs from running on forks
+    if:
+      (github.event_name == 'schedule' && github.repository ==
+      'conda-incubator/setup-miniconda') || (github.event_name != 'schedule')
+    name: Issue 114 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}-latest
+    defaults:
+      run:
+        shell: bash -el {0}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["ubuntu", "macos", "windows"]
+        python-version: ["3.9"]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./
+        id: setup-miniconda
+        with:
+          environment-file: etc/example-environment-explicit.yml
+          python-version: ${{ matrix.python-version }}
+      - run: |
+          conda info
+          conda list
+          printenv | sort
+      - run: |
+          set -x
+          python -c "import sys; assert f'{sys.version_info.major}.{sys.version_info.minor}' == '${{ matrix.python-version }}'"
+
+  issue-324:
+    # prevent cronjobs from running on forks
+    if:
+      (github.event_name == 'schedule' && github.repository ==
+      'conda-incubator/setup-miniconda') || (github.event_name != 'schedule')
+    runs-on: windows-latest
+    name: Issue 324
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./
+        with:
+          activate-environment: test-env
+          miniforge-version: latest
+          auto-update-conda: true
+          conda-solver: libmamba
+      - name: windows debug
+        shell: cmd /C CALL {0}
+        run: >-
+          conda info && conda list && set
+
+      - name: test for correct environment being activated
+        shell: cmd /C CALL {0}
+        run: >-
+          if "%CONDA_DEFAULT_ENV%" == "test-env" (
+            echo "test-env activated"
+          ) else (
+            echo "test-env not activated"
+            exit 1
+          )
+
+  issue-261:
+    # prevent version number normalization from causing issues
+    if:
+      (github.event_name == 'schedule' && github.repository ==
+      'conda-incubator/setup-miniconda') || (github.event_name != 'schedule')
+    name: Issue 261 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}-latest
+    defaults:
+      run:
+        shell: bash -el {0}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["ubuntu", "macos", "windows"]
+        python-version: ["3.12"]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./
+        id: setup-miniconda
+        with:
+          miniconda-version: "py312_25.3.1-1"
+          python-version: "3.12"
+          activate-environment: true
+          architecture: "x64"
+      - run: |
+          conda info
+          conda list
+          printenv | sort
+      - run: |
+          set -x
+          python -c "import sys; assert f'{sys.version_info.major}.{sys.version_info.minor}' == '${{ matrix.python-version }}'"

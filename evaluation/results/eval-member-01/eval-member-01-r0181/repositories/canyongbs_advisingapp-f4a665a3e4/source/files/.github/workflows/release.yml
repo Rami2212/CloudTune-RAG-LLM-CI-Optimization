@@ -1,0 +1,523 @@
+name: Deploy to Production Environment
+
+on:
+    release:
+        types: [released]
+
+permissions: {}
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.event.release.tag_name }}
+    cancel-in-progress: false
+
+env:
+    AWS_REGION: 'us-west-2'
+
+jobs:
+    build-web:
+        name: Build Web Image
+        runs-on: ubuntu-24.04
+        environment: production
+        outputs:
+            image: ${{ steps.build-image.outputs.image }}
+
+        steps:
+            - name: Generate GitHub App Token
+              id: app-token
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+              with:
+                  client-id: ${{ secrets.CGBS_AUTOMATION_APP_CLIENT_ID }} # zizmor: ignore[secrets-outside-env]
+                  private-key: ${{ secrets.CGBS_AUTOMATION_APP_PRIVATE_KEY }} # zizmor: ignore[secrets-outside-env]
+                  owner: canyongbs
+                  repositories: |
+                      advisingapp
+                      devops
+                  permission-contents: read
+
+            - name: Checkout
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  submodules: true
+                  ref: ${{ github.head_ref }}
+                  token: ${{ steps.app-token.outputs.token }}
+                  persist-credentials: false
+
+            - name: Login to Docker Hub
+              uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+              with:
+                  username: ${{ secrets.DOCKERHUB_USERNAME }}
+                  password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+            - name: Configure AWS credentials
+              uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+              with:
+                  aws-access-key-id: ${{ secrets.PROD_AWS_ACCESS_KEY_ID }}
+                  aws-secret-access-key: ${{ secrets.PROD_AWS_SECRET_ACCESS_KEY }}
+                  aws-region: ${{ env.AWS_REGION }}
+
+            - name: Login to Amazon ECR
+              id: login-ecr
+              uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+            - name: Login to Amazon ECR Public
+              uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+              with:
+                  registry-type: public
+
+            - name: Build, tag, and push image to Amazon ECR
+              id: build-image
+              env:
+                  ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+                  IMAGE_TAG: ${{ github.event.release.tag_name }}
+                  ECR_REPOSITORY: 'advisingapp'
+              run: |
+                  # Build a docker container and
+                  # push it to ECR so that it can
+                  # be deployed to ECS.
+                  docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG --target web-deploy --platform linux/amd64 .
+                  docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+                  echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+    deploy-web:
+        name: Deploy Web Service
+        runs-on: ubuntu-24.04
+        needs: [build-web, deploy-worker]
+        environment: production
+
+        steps:
+            - name: Generate GitHub App Token
+              id: app-token
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+              with:
+                  client-id: ${{ secrets.CGBS_AUTOMATION_APP_CLIENT_ID }} # zizmor: ignore[secrets-outside-env]
+                  private-key: ${{ secrets.CGBS_AUTOMATION_APP_PRIVATE_KEY }} # zizmor: ignore[secrets-outside-env]
+                  owner: canyongbs
+                  repositories: |
+                      advisingapp
+                      devops
+                  permission-contents: read
+
+            - name: Checkout
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  submodules: true
+                  ref: ${{ github.head_ref }}
+                  token: ${{ steps.app-token.outputs.token }}
+                  persist-credentials: false
+
+            - name: Configure AWS credentials
+              uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+              with:
+                  aws-access-key-id: ${{ secrets.PROD_AWS_ACCESS_KEY_ID }}
+                  aws-secret-access-key: ${{ secrets.PROD_AWS_SECRET_ACCESS_KEY }}
+                  aws-region: ${{ env.AWS_REGION }}
+
+            - name: Fill in the new image ID in the Amazon ECS task definition
+              id: task-def
+              uses: aws-actions/amazon-ecs-render-task-definition@8d79160660ad39c402a16e5fc7cd2a32e8f7d6b7 # v1.9.1
+              with:
+                  task-definition: 'docker/devops/ecs/advisingapp/advisingapp-prod-task-definition.json'
+                  container-name: 'app'
+                  image: ${{ needs.build-web.outputs.image }}
+
+            - name: Deploy Amazon ECS task definition
+              id: task-deploy
+              uses: aws-actions/amazon-ecs-deploy-task-definition@a00d4d57ac0de1a99b39fe469f3d898d38717c2b # v2.6.4
+              with:
+                  task-definition: ${{ steps.task-def.outputs.task-definition }}
+                  service: 'advisingapp-p-crm-ecs-service'
+                  cluster: 'advisingapp-prod'
+                  wait-for-service-stability: true
+
+            - name: Check if deployment was successful
+              id: check-deployment
+              run: |
+                  CURRENT_TASK_DEF_ARN=$(aws ecs describe-services --cluster advisingapp-prod --services advisingapp-p-crm-ecs-service --query services[0].deployments[0].taskDefinition | jq -r ".")
+                  NEW_TASK_DEF_ARN=${STEPS_TASK_DEPLOY_OUTPUTS_TASK_DEFINITION_ARN}
+                  echo "Current task arn: $CURRENT_TASK_DEF_ARN"
+                  echo "New task arn: $NEW_TASK_DEF_ARN"
+                  if [ "$CURRENT_TASK_DEF_ARN" != "$NEW_TASK_DEF_ARN" ]; then
+                    echo "Deployment failed."
+                    exit 1
+                  fi
+              env:
+                  STEPS_TASK_DEPLOY_OUTPUTS_TASK_DEFINITION_ARN: ${{ steps.task-deploy.outputs.task-definition-arn }}
+
+    build-worker:
+        name: Build Worker Image
+        runs-on: ubuntu-24.04
+        environment: production
+        outputs:
+            image: ${{ steps.build-image.outputs.image }}
+
+        steps:
+            - name: Generate GitHub App Token
+              id: app-token
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+              with:
+                  client-id: ${{ secrets.CGBS_AUTOMATION_APP_CLIENT_ID }} # zizmor: ignore[secrets-outside-env]
+                  private-key: ${{ secrets.CGBS_AUTOMATION_APP_PRIVATE_KEY }} # zizmor: ignore[secrets-outside-env]
+                  owner: canyongbs
+                  repositories: |
+                      advisingapp
+                      devops
+                  permission-contents: read
+
+            - name: Checkout
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  submodules: true
+                  ref: ${{ github.head_ref }}
+                  token: ${{ steps.app-token.outputs.token }}
+                  persist-credentials: false
+
+            - name: Login to Docker Hub
+              uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+              with:
+                  username: ${{ secrets.DOCKERHUB_USERNAME }}
+                  password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+            - name: Configure AWS credentials
+              uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+              with:
+                  aws-access-key-id: ${{ secrets.PROD_AWS_ACCESS_KEY_ID }}
+                  aws-secret-access-key: ${{ secrets.PROD_AWS_SECRET_ACCESS_KEY }}
+                  aws-region: ${{ env.AWS_REGION }}
+
+            - name: Login to Amazon ECR
+              id: login-ecr
+              uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+            - name: Login to Amazon ECR Public
+              uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+              with:
+                  registry-type: public
+
+            - name: Build, tag, and push image to Amazon ECR
+              id: build-image
+              env:
+                  ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+                  IMAGE_TAG: ${{ github.event.release.tag_name }}
+                  ECR_REPOSITORY: 'advisingapp/worker'
+              run: |
+                  # Build a docker container and
+                  # push it to ECR so that it can
+                  # be deployed to ECS.
+                  docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG --target worker-deploy --platform linux/amd64 .
+                  docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+                  echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+    deploy-worker:
+        name: Deploy Worker Service
+        runs-on: ubuntu-24.04
+        needs: [build-worker]
+        environment: production
+
+        steps:
+            - name: Generate GitHub App Token
+              id: app-token
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+              with:
+                  client-id: ${{ secrets.CGBS_AUTOMATION_APP_CLIENT_ID }} # zizmor: ignore[secrets-outside-env]
+                  private-key: ${{ secrets.CGBS_AUTOMATION_APP_PRIVATE_KEY }} # zizmor: ignore[secrets-outside-env]
+                  owner: canyongbs
+                  repositories: |
+                      advisingapp
+                      devops
+                  permission-contents: read
+
+            - name: Checkout
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  submodules: true
+                  ref: ${{ github.head_ref }}
+                  token: ${{ steps.app-token.outputs.token }}
+                  persist-credentials: false
+
+            - name: Configure AWS credentials
+              uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+              with:
+                  aws-access-key-id: ${{ secrets.PROD_AWS_ACCESS_KEY_ID }}
+                  aws-secret-access-key: ${{ secrets.PROD_AWS_SECRET_ACCESS_KEY }}
+                  aws-region: ${{ env.AWS_REGION }}
+
+            - name: Fill in the new image ID in the Amazon ECS task definition
+              id: task-def
+              uses: aws-actions/amazon-ecs-render-task-definition@8d79160660ad39c402a16e5fc7cd2a32e8f7d6b7 # v1.9.1
+              with:
+                  task-definition: 'docker/devops/ecs/advisingapp/advisingapp-worker-prod-task-definition.json'
+                  container-name: 'worker'
+                  image: ${{ needs.build-worker.outputs.image }}
+
+            - name: Deploy Amazon ECS task definition
+              id: task-deploy
+              uses: aws-actions/amazon-ecs-deploy-task-definition@a00d4d57ac0de1a99b39fe469f3d898d38717c2b # v2.6.4
+              with:
+                  task-definition: ${{ steps.task-def.outputs.task-definition }}
+                  service: 'advisingapp-worker-prod-service'
+                  cluster: 'advisingapp-prod'
+                  wait-for-service-stability: true
+                  # Old tasks finish their running jobs (up to about 20 minutes) before they stop.
+                  wait-for-minutes: 45
+
+            - name: Check if deployment was successful
+              id: check-deployment
+              run: |
+                  CURRENT_TASK_DEF_ARN=$(aws ecs describe-services --cluster advisingapp-prod --services advisingapp-worker-prod-service --query services[0].deployments[0].taskDefinition | jq -r ".")
+                  NEW_TASK_DEF_ARN=${STEPS_TASK_DEPLOY_OUTPUTS_TASK_DEFINITION_ARN}
+                  echo "Current task arn: $CURRENT_TASK_DEF_ARN"
+                  echo "New task arn: $NEW_TASK_DEF_ARN"
+                  if [ "$CURRENT_TASK_DEF_ARN" != "$NEW_TASK_DEF_ARN" ]; then
+                    echo "Deployment failed."
+                    exit 1
+                  fi
+              env:
+                  STEPS_TASK_DEPLOY_OUTPUTS_TASK_DEFINITION_ARN: ${{ steps.task-deploy.outputs.task-definition-arn }}
+
+    build-scheduler:
+        name: Build Scheduler Image
+        runs-on: ubuntu-24.04
+        outputs:
+            image: ${{ steps.build-image.outputs.image }}
+        environment: production
+
+        steps:
+            - name: Generate GitHub App Token
+              id: app-token
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+              with:
+                  client-id: ${{ secrets.CGBS_AUTOMATION_APP_CLIENT_ID }} # zizmor: ignore[secrets-outside-env]
+                  private-key: ${{ secrets.CGBS_AUTOMATION_APP_PRIVATE_KEY }} # zizmor: ignore[secrets-outside-env]
+                  owner: canyongbs
+                  repositories: |
+                      advisingapp
+                      devops
+                  permission-contents: read
+
+            - name: Checkout
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  submodules: true
+                  ref: ${{ github.head_ref }}
+                  token: ${{ steps.app-token.outputs.token }}
+                  persist-credentials: false
+
+            - name: Login to Docker Hub
+              uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+              with:
+                  username: ${{ secrets.DOCKERHUB_USERNAME }}
+                  password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+            - name: Configure AWS credentials
+              uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+              with:
+                  aws-access-key-id: ${{ secrets.PROD_AWS_ACCESS_KEY_ID }}
+                  aws-secret-access-key: ${{ secrets.PROD_AWS_SECRET_ACCESS_KEY }}
+                  aws-region: ${{ env.AWS_REGION }}
+
+            - name: Login to Amazon ECR
+              id: login-ecr
+              uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+            - name: Login to Amazon ECR Public
+              uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+              with:
+                  registry-type: public
+
+            - name: Build, tag, and push image to Amazon ECR
+              id: build-image
+              env:
+                  ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+                  IMAGE_TAG: ${{ github.event.release.tag_name }}
+                  ECR_REPOSITORY: 'advisingapp/scheduler'
+              run: |
+                  # Build a docker container and
+                  # push it to ECR so that it can
+                  # be deployed to ECS.
+                  docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG --target scheduler-deploy --platform linux/amd64 .
+                  docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+                  echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+    deploy-scheduler:
+        name: Deploy Scheduler Service
+        runs-on: ubuntu-24.04
+        needs: [build-scheduler, deploy-worker]
+        environment: production
+
+        steps:
+            - name: Generate GitHub App Token
+              id: app-token
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+              with:
+                  client-id: ${{ secrets.CGBS_AUTOMATION_APP_CLIENT_ID }} # zizmor: ignore[secrets-outside-env]
+                  private-key: ${{ secrets.CGBS_AUTOMATION_APP_PRIVATE_KEY }} # zizmor: ignore[secrets-outside-env]
+                  owner: canyongbs
+                  repositories: |
+                      advisingapp
+                      devops
+                  permission-contents: read
+
+            - name: Checkout
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  submodules: true
+                  ref: ${{ github.head_ref }}
+                  token: ${{ steps.app-token.outputs.token }}
+                  persist-credentials: false
+
+            - name: Configure AWS credentials
+              uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+              with:
+                  aws-access-key-id: ${{ secrets.PROD_AWS_ACCESS_KEY_ID }}
+                  aws-secret-access-key: ${{ secrets.PROD_AWS_SECRET_ACCESS_KEY }}
+                  aws-region: ${{ env.AWS_REGION }}
+
+            - name: Fill in the new image ID in the Amazon ECS task definition
+              id: task-def
+              uses: aws-actions/amazon-ecs-render-task-definition@8d79160660ad39c402a16e5fc7cd2a32e8f7d6b7 # v1.9.1
+              with:
+                  task-definition: 'docker/devops/ecs/advisingapp/advisingapp-scheduler-prod-task-definition.json'
+                  container-name: 'scheduler'
+                  image: ${{ needs.build-scheduler.outputs.image }}
+
+            - name: Deploy Amazon ECS task definition
+              id: task-deploy
+              uses: aws-actions/amazon-ecs-deploy-task-definition@a00d4d57ac0de1a99b39fe469f3d898d38717c2b # v2.6.4
+              with:
+                  task-definition: ${{ steps.task-def.outputs.task-definition }}
+                  service: 'advisingapp-scheduler-prod-service'
+                  cluster: 'advisingapp-prod'
+                  wait-for-service-stability: true
+
+            - name: Check if deployment was successful
+              id: check-deployment
+              run: |
+                  CURRENT_TASK_DEF_ARN=$(aws ecs describe-services --cluster advisingapp-prod --services advisingapp-scheduler-prod-service --query services[0].deployments[0].taskDefinition | jq -r ".")
+                  NEW_TASK_DEF_ARN=${STEPS_TASK_DEPLOY_OUTPUTS_TASK_DEFINITION_ARN}
+                  echo "Current task arn: $CURRENT_TASK_DEF_ARN"
+                  echo "New task arn: $NEW_TASK_DEF_ARN"
+                  if [ "$CURRENT_TASK_DEF_ARN" != "$NEW_TASK_DEF_ARN" ]; then
+                    echo "Deployment failed."
+                    exit 1
+                  fi
+              env:
+                  STEPS_TASK_DEPLOY_OUTPUTS_TASK_DEFINITION_ARN: ${{ steps.task-deploy.outputs.task-definition-arn }}
+
+    build-release-automation:
+        name: Build Release Automation Image
+        runs-on: ubuntu-24.04
+        outputs:
+            image: ${{ steps.build-image.outputs.image }}
+        environment: production
+
+        steps:
+            - name: Generate GitHub App Token
+              id: app-token
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+              with:
+                  client-id: ${{ secrets.CGBS_AUTOMATION_APP_CLIENT_ID }} # zizmor: ignore[secrets-outside-env]
+                  private-key: ${{ secrets.CGBS_AUTOMATION_APP_PRIVATE_KEY }} # zizmor: ignore[secrets-outside-env]
+                  owner: canyongbs
+                  repositories: |
+                      advisingapp
+                      devops
+                  permission-contents: read
+
+            - name: Checkout
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  submodules: true
+                  ref: ${{ github.head_ref }}
+                  token: ${{ steps.app-token.outputs.token }}
+                  persist-credentials: false
+
+            - name: Login to Docker Hub
+              uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+              with:
+                  username: ${{ secrets.DOCKERHUB_USERNAME }}
+                  password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+            - name: Configure AWS credentials
+              uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+              with:
+                  aws-access-key-id: ${{ secrets.PROD_AWS_ACCESS_KEY_ID }}
+                  aws-secret-access-key: ${{ secrets.PROD_AWS_SECRET_ACCESS_KEY }}
+                  aws-region: ${{ env.AWS_REGION }}
+
+            - name: Login to Amazon ECR
+              id: login-ecr
+              uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+            - name: Login to Amazon ECR Public
+              uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+              with:
+                  registry-type: public
+
+            - name: Build, tag, and push image to Amazon ECR
+              id: build-image
+              env:
+                  ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+                  IMAGE_TAG: ${{ github.event.release.tag_name }}
+                  ECR_REPOSITORY: 'advisingapp/release-automation'
+              run: |
+                  # Build a docker container and
+                  # push it to ECR so that it can
+                  # be deployed to ECS.
+                  docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG --target release-automation --platform linux/amd64 .
+                  docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+                  echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+    deploy-release-automation:
+        name: Deploy and Run Release Automation Service
+        needs: [deploy-web, deploy-worker, deploy-scheduler, build-release-automation]
+        runs-on: ubuntu-24.04
+        environment: production
+
+        steps:
+            - name: Generate GitHub App Token
+              id: app-token
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+              with:
+                  client-id: ${{ secrets.CGBS_AUTOMATION_APP_CLIENT_ID }} # zizmor: ignore[secrets-outside-env]
+                  private-key: ${{ secrets.CGBS_AUTOMATION_APP_PRIVATE_KEY }} # zizmor: ignore[secrets-outside-env]
+                  owner: canyongbs
+                  repositories: |
+                      advisingapp
+                      devops
+                  permission-contents: read
+
+            - name: Checkout
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  submodules: true
+                  ref: ${{ github.head_ref }}
+                  token: ${{ steps.app-token.outputs.token }}
+                  persist-credentials: false
+
+            - name: Configure AWS credentials
+              uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+              with:
+                  aws-access-key-id: ${{ secrets.PROD_AWS_ACCESS_KEY_ID }}
+                  aws-secret-access-key: ${{ secrets.PROD_AWS_SECRET_ACCESS_KEY }}
+                  aws-region: ${{ env.AWS_REGION }}
+
+            - name: Fill in the new image ID in the Amazon ECS task definition
+              id: task-def
+              uses: aws-actions/amazon-ecs-render-task-definition@8d79160660ad39c402a16e5fc7cd2a32e8f7d6b7 # v1.9.1
+              with:
+                  task-definition: 'docker/devops/ecs/advisingapp/advisingapp-release-automation-prod-task-definition.json'
+                  container-name: 'release-automation'
+                  image: ${{ needs.build-release-automation.outputs.image }}
+
+            - name: Deploy Amazon ECS task definition
+              uses: aws-actions/amazon-ecs-deploy-task-definition@a00d4d57ac0de1a99b39fe469f3d898d38717c2b # v2.6.4
+              with:
+                  task-definition: ${{ steps.task-def.outputs.task-definition }}
+                  cluster: 'advisingapp-prod'
+                  desired-count: 1
+                  run-task: true
+                  run-task-security-groups: ${{ secrets.RELEASE_AUTOMATION_SECURITY_GROUPS }}
+                  run-task-subnets: ${{ secrets.RELEASE_AUTOMATION_SUBNETS }}
+                  run-task-assign-public-IP: 'DISABLED'
+                  run-task-launch-type: 'FARGATE'
+                  wait-for-task-stopped: true

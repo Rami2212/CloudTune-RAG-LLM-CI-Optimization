@@ -1,0 +1,234 @@
+name: Wheels
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.number }}-${{ github.event.ref }}
+  cancel-in-progress: true
+
+# Publish when a (published) GitHub Release is created.
+on:
+  push:
+    branches:
+      - master
+      - 'releases/**'
+      - 'ci/**'
+    tags:
+      - v*
+  pull_request:
+    branches:
+      - master
+      - 'releases/**'
+      - 'ci/**'
+  release:
+    types:
+      - published
+  # TODO:
+  # The scheduled version of this job should really download and install NumPy
+  # from scientific-python-nightly-wheels
+  schedule:
+    - cron:  '12 13 * * 0'
+  # Allow manual triggering of the workflow (which will release the wheels to nightly)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build_sdist:
+    name: Build source distribution
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          submodules: true
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        name: Install Python
+        with:
+          python-version: 3.x
+
+      - name: Install APT packages
+        run: |
+          sudo apt update
+          # Keep in sync with "Prerequisites" in User's Guide.
+          sudo apt install libbz2-dev libhdf5-serial-dev
+          sudo apt install latexmk texlive-fonts-recommended texlive-latex-recommended texlive-latex-extra texlive-plain-generic
+
+      - name: Install dependencies
+        run: |
+          # Keep in sync with ``build-system.requires`` in ``pyproject.toml``.
+          python -m pip install --require-hashes -r .github/workflows/requirements/build-requirements.txt
+          python -m pip install --require-hashes -r requirements.txt
+          python -m pip install --require-hashes -r requirements-docs.txt
+
+      - name: Build dist (sdist and docs)
+        run: make PYTHON=python dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: dist/*
+          name: dist
+
+  build_wheels:
+    name: Build ${{ matrix.os }} wheels
+    timeout-minutes: 120
+    runs-on: ${{ matrix.os }}
+    env:
+      # Keep in sync with "Prerequisites" in User's Guide.
+      HDF5_VERSION: 2.2.0  # H5Dchunk_iter needs at least 1.14.1
+      MACOSX_DEPLOYMENT_TARGET: "10.9"
+      VCPKG_COMMIT: 3d33b7f7a8121da6e4fa80b35618fc8e960be686
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ['ubuntu-latest', 'ubuntu-24.04-arm', 'macos-latest', 'windows-latest', 'windows-11-arm', 'macos-15-intel']
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          submodules: true
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        name: Install Python
+        with:
+          python-version: '3.14'
+
+      - name: Bootstrap vcpkg
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          git clone -q https://github.com/microsoft/vcpkg.git "$env:RUNNER_TEMP\vcpkg"
+          git -C "$env:RUNNER_TEMP\vcpkg" checkout -q --detach $env:VCPKG_COMMIT
+          & "$env:RUNNER_TEMP\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
+          "VCPKG_ROOT=$env:RUNNER_TEMP\vcpkg" | Add-Content -Path $env:GITHUB_ENV
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: vcpkg-cache
+        with:
+          path: vcpkg_cache
+          key: ${{ matrix.os }}-vcpkg-cache-${{ hashFiles('ci/github/get_deps.ps1', 'ci/github/vcpkg-triplets/*.cmake') }}-${{ env.VCPKG_COMMIT }}
+        if: runner.os == 'Windows'
+
+      - name: Build dependencies on Windows
+        # This holds vcpkg's prebuilt archives rather than the install tree, so vcpkg
+        # still needs to run to unpack them on a cache hit.
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}\vcpkg_cache,readwrite'
+        run: ./ci/github/get_deps.ps1
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: deps-cache
+        with:
+          path: hdf5_build
+          # Instead of a hashFiles('**/wheels.yml') appended here, just use a counter.
+          # It allows us to modify this file without having to constantly rebuild HDF5
+          key: ${{ matrix.os }}-native-deps-cache-${{ hashFiles('**/get_hdf5.sh') }}-${{ env.HDF5_VERSION }}
+        if: runner.os != 'Windows'
+
+      - name: Build dependencies
+        env:
+          CFLAGS: -g0
+          HDF5_DIR: ${{ github.workspace }}/hdf5_build
+          MACOSX_DEPLOYMENT_TARGET: "10.9"
+        if: runner.os != 'Windows' && steps.deps-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir hdf5_build
+          if [[ "${{ runner.os }}" = 'Linux' ]]; then
+            ARCH=$(uname -m)
+            docker run --rm -e HDF5_DIR=/io/hdf5_build -e CFLAGS="$CFLAGS" -e HDF5_VERSION="$HDF5_VERSION" -v `pwd`:/io:rw quay.io/pypa/manylinux2014_${ARCH} /io/ci/github/get_hdf5.sh
+          else
+            HDF5_DIR=`pwd`/hdf5_build ci/github/get_hdf5.sh
+          fi
+
+      - name: Install patchelf
+        if: runner.os != 'Windows'
+        run: |
+          python -m pip install patchelf
+
+      - name: Install cibuildwheel
+        run: |
+          python -m pip install --require-hashes -r ./.github/workflows/requirements/wheels-requirements.txt
+
+      - name: Build wheels
+        run: |
+          python -m cibuildwheel --output-dir wheelhouse
+
+      - name: Copy requirements.txt
+        run: |
+          cp requirements.txt ./wheelhouse/
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: |
+            ./wheelhouse/*.whl
+            ./wheelhouse/*.txt
+          name: cibw-wheels-${{ matrix.os }}-${{ strategy.job-index }}
+
+  twine_check:
+    needs: [ build_sdist, build_wheels ]
+    name: Twine check
+    timeout-minutes: 15
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          submodules: true
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: '*'
+          merge-multiple: true
+          path: wheelhouse
+
+      - name: List downloaded artifacts
+        run: ls -alR ./wheelhouse/
+
+      - name: Install Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.x'
+
+      - name: Install patchelf
+        if: runner.os != 'Windows'
+        run: |
+          python -m pip install patchelf
+
+      - name: Install twine
+        run: |
+          python -m pip install --require-hashes -r ./.github/workflows/requirements/wheels-requirements.txt
+
+      - name: Check sdist and wheels
+        run: |
+          python -m twine check *.whl tables-*.tar.gz
+        working-directory: wheelhouse
+
+      - name: Attest wheels and source distribution
+        if: >-
+          github.repository == 'PyTables/PyTables' &&
+          (github.event_name == 'release' || github.event_name == 'schedule' ||
+          github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v'))
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            wheelhouse/*.whl
+            wheelhouse/tables-*.tar.gz
+
+      - name: Upload wheel
+        uses: scientific-python/upload-nightly-action@5a74a2a4ec19d7ab8b5317c1cdd356c150d92cd0 # 0.6.6
+        if: github.repository == 'PyTables/PyTables' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        with:
+          artifacts_path: wheelhouse
+          anaconda_nightly_upload_token: ${{secrets.ANACONDA_ORG_UPLOAD_TOKEN}}

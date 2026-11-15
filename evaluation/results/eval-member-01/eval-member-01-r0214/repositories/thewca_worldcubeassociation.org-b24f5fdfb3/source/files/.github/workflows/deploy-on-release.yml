@@ -1,0 +1,39 @@
+name: Deploy Image on GitHub Release
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::285938427530:role/wca-on-rails-github-deploy-production
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Get the SHA of the current branch/fork
+        shell: bash
+        run: |
+          echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+      - name: Build production images
+        uses: ./.github/actions/build-environment
+        with:
+          environment: production
+          build_tag: ${{ env.SHORT_SHA }}
+          registry: ${{ steps.login-ecr.outputs.registry }}/wca-on-rails
+      - name: Deploy new Services
+        run: |
+          aws ecs update-service --cluster wca-on-rails --service wca-on-rails-prod --force-new-deployment
+          aws ecs update-service --cluster wca-on-rails --service wca-on-rails-prod-auxiliary-services --force-new-deployment
+          aws ecs update-service --cluster wca-on-rails --service wca-on-rails-prod-sqs-worker --force-new-deployment

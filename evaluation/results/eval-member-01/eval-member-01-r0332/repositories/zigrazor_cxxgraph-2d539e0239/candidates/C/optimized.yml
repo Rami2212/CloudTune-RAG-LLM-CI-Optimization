@@ -1,0 +1,40 @@
+name: Deploy Site
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["WebSite"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: [ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache Yarn dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/yarn
+          key: ${{ runner.os }}-yarn-${{ hashFiles('docusaurus/yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - name: Configure Yarn
+        working-directory: ${{github.workspace}}/docusaurus
+        # Configure CMake in a 'build' subdirectory. `CMAKE_BUILD_TYPE` is only required if you are using a single-configuration generator such as make.
+        # See https://cmake.org/cmake/help/latest/variable/CMAKE_BUILD_TYPE.html?highlight=cmake_build_type
+        run: yarn
+
+      - name: Build
+        working-directory: ${{github.workspace}}/docusaurus
+        # Build your program with the given configuration
+        run: yarn build
+
+      - name: Deploy to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.PERSONAL_TOKEN }}
+          publish_dir: ./docusaurus/build

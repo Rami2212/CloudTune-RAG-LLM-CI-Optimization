@@ -1,0 +1,140 @@
+name: Nightly Release
+on:
+  workflow_dispatch:
+    inputs:
+      skipTests:
+        description: 'Skip tests'
+        required: false
+        default: false
+        type: boolean
+  workflow_call:
+
+jobs:
+
+  gradleValidation:
+    name: Gradle Validation
+    uses: ./.github/workflows/reusable-gradleValidation.yml
+
+  primeUbuntuIntellijPlatformTestCache:
+    if: ${{ !inputs.skipTests }}
+    name: Prime IntelliJ Platform test cache @ ubuntu-latest
+    needs: gradleValidation
+    uses: ./.github/workflows/reusable-prime-intellij-platform-test-cache.yml
+    secrets: inherit
+    with:
+      gradleVersion: "9.8.2"
+      os: ubuntu-latest
+
+  primeWindowsIntellijPlatformTestCache:
+    if: ${{ !inputs.skipTests }}
+    name: Prime IntelliJ Platform test cache @ windows-latest
+    needs: gradleValidation
+    uses: ./.github/workflows/reusable-prime-intellij-platform-test-cache.yml
+    secrets: inherit
+    with:
+      gradleVersion: "9.8.2"
+      os: windows-latest
+
+  primeMacosIntellijPlatformTestCache:
+    if: ${{ !inputs.skipTests }}
+    name: Prime IntelliJ Platform test cache @ macos-latest
+    needs: gradleValidation
+    uses: ./.github/workflows/reusable-prime-intellij-platform-test-cache.yml
+    secrets: inherit
+    with:
+      gradleVersion: "9.8.2"
+      os: macos-latest
+
+  unitTests:
+    if: ${{ !inputs.skipTests }}
+    name: Unit Tests
+    needs:
+      - gradleValidation
+      - primeUbuntuIntellijPlatformTestCache
+      - primeWindowsIntellijPlatformTestCache
+      - primeMacosIntellijPlatformTestCache
+    uses: ./.github/workflows/reusable-unitTests.yml
+    secrets: inherit
+
+  integrationTests:
+    if: ${{ !inputs.skipTests }}
+    name: Integration Tests
+    needs:
+      - gradleValidation
+      - primeUbuntuIntellijPlatformTestCache
+      - primeWindowsIntellijPlatformTestCache
+      - primeMacosIntellijPlatformTestCache
+    uses: ./.github/workflows/reusable-integrationTests.yml
+    secrets: inherit
+
+  #  integrationTestsEAP:
+  #    name: Integration Tests EAP
+  #    needs: gradleValidation
+  #    uses: ./.github/workflows/reusable-integrationTests.yml
+  #    secrets: inherit
+  #    with:
+  #      platformVersion: 222-EAP-SNAPSHOT
+
+  codeInspection:
+    if: ${{ !inputs.skipTests }}
+    name: Code Inspection
+    needs: gradleValidation
+    uses: ./.github/workflows/reusable-codeInspection.yml
+
+  # Prepare and publish the Gradle Plugins repository
+  release:
+    name: Release to Gradle Plugins
+    needs:
+      - primeUbuntuIntellijPlatformTestCache
+      - primeWindowsIntellijPlatformTestCache
+      - primeMacosIntellijPlatformTestCache
+      - unitTests
+      - integrationTests
+      #      - integrationTestsEAP
+      - codeInspection
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+
+      # Fail if the conditional job failed
+      - name: Safety Check
+        if: ${{ contains(needs.*.result, 'failure') }}
+        run: exit 1
+
+      # Free GitHub Actions Environment Disk Space
+      - name: Maximize Build Space
+        uses: jlumbroso/free-disk-space@v2.0.0
+        with:
+          preinstalled-runtimes: false
+          large-packages: false
+
+      # Check out current repository
+      - name: Fetch Sources
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: zulu
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6.4.1
+        with:
+          cache-read-only: true
+
+      # Publish the plugin to the Gradle Plugins
+      - name: Publish Plugin
+        env:
+          DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+          OSSRH_USERNAME: ${{ secrets.OSSRH_USERNAME }}
+          OSSRH_PASSWORD: ${{ secrets.OSSRH_PASSWORD }}
+        run: ./gradlew publish -Psnapshot=true -PossrhUsername=$OSSRH_USERNAME -PossrhPassword=$OSSRH_PASSWORD
+
+      # Store already-built plugin as an artifact for downloading
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          path: ./build/libs/*-SNAPSHOT.jar

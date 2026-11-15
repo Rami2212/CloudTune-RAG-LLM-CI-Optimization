@@ -1,0 +1,80 @@
+name: Ubuntu 
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+    secrets:
+      CODECOV_TOKEN:
+        required: false
+    outputs:
+      verified-sha:
+        value: ${{ jobs.ubuntu_test.outputs.sha }}
+  push:
+    branches: [main]
+    paths:
+      - 'Sources/**'
+      - 'Tests/**'
+      - 'Package.swift'
+      - '.github/workflows/ubuntu.yml'
+  pull_request:
+    paths:
+      - 'Sources/**'
+      - 'Tests/**'
+      - 'Package.swift'
+      - '.github/workflows/ubuntu.yml'
+
+jobs:
+  ubuntu_test:
+    name: Execute tests on Ubuntu (${{ matrix.backend }}, Swift ${{ matrix.swift_version }})
+    outputs:
+      sha: ${{ steps.checkout.outputs.commit }}
+    strategy:
+      fail-fast: false
+      matrix:
+        swift_version: ["6.3.3"]
+        backend: ["OAG", "IAG"]
+    runs-on: ubuntu-22.04
+    env:
+      OPENSWIFTUI_WERROR: 0 # Disable it to avoid enable OAG's werror and hit conflicts
+      OPENSWIFTUI_OPENATTRIBUTESHIMS_ATTRIBUTEGRAPH: 0
+      OPENSWIFTUI_OPENATTRIBUTESHIMS_COMPUTE: ${{ matrix.backend == 'IAG' && '1' || '0' }}
+      OPENSWIFTUI_OPENATTRIBUTESHIMS_COMPUTE_BINARY: 0
+      OPENSWIFTUI_OPENATTRIBUTESHIMS_COMPUTE_SOURCE_VERSION: "0.6.4-bugfix.2"
+      OPENSWIFTUI_COMPATIBILITY_TEST: 0
+      OPENSWIFTUI_SWIFT_LOG: 1
+      OPENSWIFTUI_SWIFT_CRYPTO: 1
+      OPENSWIFTUI_LINK_TESTING: 1
+      OPENSWIFTUI_ENABLE_PRIVATE_IMPORTS: 1
+    container: swift:${{ matrix.swift_version }}-jammy
+    steps:
+      - uses: actions/checkout@v4
+        id: checkout
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - name: Install Codecov dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends curl
+      - name: Install Compute dependencies
+        if: matrix.backend == 'IAG'
+        run: apt-get install -y --no-install-recommends libssl-dev uuid-dev
+      - name: Building and running tests in debug mode with coverage
+        run: |
+          swift test \
+            -c debug \
+            --filter OpenSwiftUITests \
+            --filter OpenSwiftUICoreTests \
+            --enable-code-coverage \
+            --build-path .build-test-debug
+          llvm-cov show \
+            -instr-profile=.build-test-debug/debug/codecov/default.profdata \
+            .build-test-debug/debug/OpenSwiftUIPackageTests.xctest \
+            > coverage.txt
+        id: debug-test
+      - uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          verbose: true

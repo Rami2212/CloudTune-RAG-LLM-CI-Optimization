@@ -1,0 +1,146 @@
+name: Build Github Pages
+# Triggers:
+#   - push to main under docs/** (docs source changed)
+#   - manual dispatch
+#   - the release workflow ("Publish Release") dispatches this explicitly as its
+#     final step (`gh workflow run build-pages.yml`) so the site rebuilds after a release.
+#
+# There is intentionally NO `workflow_run` trigger on "Publish Release". The release
+# workflow is started via workflow_dispatch from the release scripts, and in CI that
+# dispatch runs under GITHUB_TOKEN. Runs initiated by GITHUB_TOKEN do not cascade to
+# `workflow_run` triggers, so such a trigger would never fire. The explicit dispatch
+# from the release workflow is used instead (workflow_dispatch is exempt from that guard).
+on:
+  push:
+    branches: [main]
+    paths: [docs/**]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild both channels even when their caches are current
+        type: boolean
+        default: false
+# Two releases two minutes apart dispatched two full builds that raced each other for the same
+# Pages deployment. Queue them instead of cancelling: the later one carries the newer release.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+jobs:
+  # One job per channel. Both channels in a single job put two full ~1700-page Astro builds on one
+  # VM, and a cold cache -- which is the normal state, they expire after a week without a hit --
+  # made that the rule rather than the exception. Split, each channel gets a whole machine.
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        # Kept in step with CHANNELS in workflow-scripts/helpers/branch-spec.ts.
+        channel: [public, catalyst]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Checkout scripts from main branch
+        run: |
+          git fetch origin main
+          git restore --source=origin/main --worktree -- ./workflow-scripts
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Install script deps
+        run: npm ci
+        working-directory: ./workflow-scripts
+      - name: Restore ${{ matrix.channel }} docs cache
+        uses: actions/cache@v5
+        with:
+          path: ./cache/${{ matrix.channel }}
+          key: docs-${{ matrix.channel }}-${{ github.run_id }}
+          restore-keys: docs-${{ matrix.channel }}-
+      # Astro's SSR bundle spikes ~11 GB in under ten seconds and overruns the 16 GB runner, which
+      # is why the VM kept dying with nothing in the log. The runner's own 3 GB swapfile is nowhere
+      # near that. Swap is what turns "the kernel kills the machine" into "the spike pages out and
+      # the build finishes slower", and the temp disk has 87 GB going spare.
+      - name: Enlarge swap
+        run: |
+          sudo swapoff -a
+          sudo rm -f /swapfile
+          sudo fallocate -l 24G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -m
+      # The sampler writes to the step's stdout, which streams to the live log, so the last reading
+      # before a VM death survives the death -- that is how the spike above was caught at all.
+      - name: Build docs
+        run: |
+          echo "CPUs: $(nproc)"
+          free -m
+          df -h /
+          TOTAL_MEMORY_IN_MB=$(free -m | awk '/^Mem:/ { print $2 }')
+          export NODE_OPTIONS="--max-old-space-size=$((TOTAL_MEMORY_IN_MB * 3 / 4))"
+          echo "NODE_OPTIONS=$NODE_OPTIONS"
+          while true; do
+            sleep 5
+            echo "[mem] $(free -m | awk '/^Mem:/ { printf "%s/%s MB", $3, $2 } /^Swap:/ { printf "  swap %s/%s MB", $3, $2 }')  top: $(ps -eo rss=,comm= --sort=-rss | head -3 | awk '{ printf "%s=%.1fGB ", $2, $1 / 1048576 }')"
+          done &
+          MEMORY_SAMPLER_PID=$!
+          trap 'kill "$MEMORY_SAMPLER_PID" 2>/dev/null || true' EXIT
+          npx -y jiti ./workflow-scripts/build-pages.ts
+        env:
+          CHANNEL: ${{ matrix.channel }}
+          OUTPUT_DIR: ./site
+          CACHE_DIR: ./cache
+          FORCE: ${{ inputs.force }}
+      - name: Upload ${{ matrix.channel }} site
+        uses: actions/upload-artifact@v7
+        with:
+          name: site-${{ matrix.channel }}
+          path: ./site/${{ matrix.channel }}
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 1
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Install script deps
+        run: npm ci
+        working-directory: ./workflow-scripts
+      - name: Download public site
+        uses: actions/download-artifact@v8
+        with:
+          name: site-public
+          path: ./site/public
+      - name: Download catalyst site
+        uses: actions/download-artifact@v8
+        with:
+          name: site-catalyst
+          path: ./site/catalyst
+      - name: Assemble site
+        run: npx -y jiti ./workflow-scripts/assemble-pages.ts
+        env:
+          OUTPUT_DIR: ./site
+      - name: Upload pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: ./site
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

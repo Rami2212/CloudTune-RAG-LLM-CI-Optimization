@@ -1,0 +1,177 @@
+name: Package Workflow
+
+on:
+  workflow_call:
+    inputs:
+      working_directory:
+        required: true
+        type: string
+      min_flutter_version:
+        required: true
+        type: string
+
+jobs:
+  # Although pana is now checking for pub downgrade, but the check
+  # does not validate the backwards compatibility of Flutter itself,
+  # but only the compatibility of the dependencies.
+  # This job installs the minimum Flutter version and checks if the
+  # dependencies are compatible with it.
+  check-min-version:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ inputs.min_flutter_version }}
+          cache: true
+
+      - name: Check Dependencies Compatibility
+        run: dart pub downgrade
+
+      - name: Check Analysis issues
+        run: dart analyze lib
+
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install Melos
+        run: dart pub global activate melos
+
+      - name: Bootstrap Package
+        run: |
+          PACKAGE_NAME=$(head -1 pubspec.yaml | cut -c7-)
+          melos bootstrap --scope=$PACKAGE_NAME --include-dependencies
+
+      - name: Run Tests
+        run: |
+          if grep -q "sdk: flutter" pubspec.yaml; then
+            flutter test
+          else
+            dart test
+          fi
+
+  lint:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install Melos
+        run: dart pub global activate melos
+
+      - name: Bootstrap Package
+        run: |
+          PACKAGE_NAME=$(head -1 pubspec.yaml | cut -c7-)
+          melos bootstrap --scope=$PACKAGE_NAME --include-dependencies
+
+      - name: Check Formatting
+        run: dart format --set-exit-if-changed .
+
+      - name: Analyze
+        run: dart analyze . --fatal-infos
+
+  pana:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install Melos
+        run: flutter pub global activate melos
+
+      - name: Bootstrap Package
+        run: |
+          PACKAGE_NAME=$(head -1 pubspec.yaml | cut -c7-)
+          melos bootstrap --scope=$PACKAGE_NAME --include-dependencies
+
+      # To speed up the pana checks, we will bypass the screenshots validation
+      # As it requires installing libwebp which can take up to 1.5 minute,
+      # and other seconds are spent in actually reading and checking the images.
+      # Since we are sure that our screenshots are valid, we can skip this step.
+      - name: Remove screenshots entry
+        run: yq eval 'del(.screenshots)' -i pubspec.yaml
+
+      - name: Install pana
+        run: dart pub global activate pana
+
+      - name: Check Package Score
+        run: pana . --no-warning --exit-code-threshold 0 --no-dartdoc
+
+  publish:
+    if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    environment: pub.dev
+
+    permissions:
+      id-token: write
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # Sets the GitHub-signed OIDC token
+      - name: Setup Dart
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install Melos
+        run: dart pub global activate melos
+
+      - name: Bootstrap Package
+        run: |
+          PACKAGE_NAME=$(head -1 pubspec.yaml | cut -c7-)
+          melos bootstrap --scope=$PACKAGE_NAME --include-dependencies
+
+      - name: Publish
+        run: dart pub publish --force

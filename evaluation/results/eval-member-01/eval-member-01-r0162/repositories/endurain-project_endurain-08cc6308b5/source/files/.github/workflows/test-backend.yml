@@ -1,0 +1,69 @@
+name: Test Backend
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    paths:
+      - backend/**
+      - .github/workflows/test-backend.yml
+  pull_request:
+    branches:
+      - master
+    paths:
+      - backend/**
+      - .github/workflows/test-backend.yml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+
+  test-backend:
+    name: Backend (pytest)
+    runs-on: ubuntu-latest
+    # Disposable database for the tests marked ``postgres``: per-session
+    # connections, row locks and unique indexes that SQLite cannot reproduce.
+    services:
+      postgres:
+        image: postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_USER: endurain
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: endurain_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U endurain -d endurain_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          working-directory: backend
+
+      - name: Sync dependencies
+        working-directory: backend
+        run: uv sync --frozen --no-dev --group test --no-install-project
+
+      - name: Check auth import boundaries
+        working-directory: backend
+        run: PYTHONPATH=app uv run --no-sync lint-imports
+
+      - name: Run tests
+        working-directory: backend
+        env:
+          TEST_DATABASE_URL: postgresql+psycopg://endurain:test@localhost:5432/endurain_test
+        run: uv run --no-sync pytest

@@ -1,0 +1,140 @@
+# Copyright (c) 2025 HIGH CODE LLC
+#
+# TentacleOS is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# TentacleOS is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with TentacleOS. If not, see <https://www.gnu.org/licenses/>.
+
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    outputs:
+      new_release: ${{ steps.check.outputs.new_release }}
+      version: ${{ steps.check.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Get latest tag before release
+        id: before
+        run: echo "tag=$(git tag -l 'v*' --sort=-v:refname | head -1)" >> $GITHUB_OUTPUT
+
+      - name: Install dependencies
+        run: |
+          npm install \
+            semantic-release@24 \
+            conventional-changelog-conventionalcommits@8 \
+            @semantic-release/commit-analyzer \
+            @semantic-release/release-notes-generator@14 \
+            @semantic-release/changelog \
+            @semantic-release/exec \
+            @semantic-release/git \
+            @semantic-release/github
+
+      - name: Run semantic-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx semantic-release
+
+      - name: Check if new release was created
+        id: check
+        run: |
+          git fetch --tags
+          LATEST_TAG=$(git tag -l 'v*' --sort=-v:refname | head -1)
+          BEFORE_TAG="${{ steps.before.outputs.tag }}"
+          if [ "$LATEST_TAG" != "$BEFORE_TAG" ] && [ -n "$LATEST_TAG" ]; then
+            VERSION="${LATEST_TAG#v}"
+            echo "new_release=true" >> $GITHUB_OUTPUT
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+            echo "New release: $VERSION"
+          else
+            echo "new_release=false" >> $GITHUB_OUTPUT
+            echo "No new release"
+          fi
+
+  build:
+    name: Build & Upload
+    needs: release
+    if: needs.release.outputs.new_release == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v6.1
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/v${{ needs.release.outputs.version }}
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Trust the checkout in the build container
+        shell: bash
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git rev-parse --verify HEAD
+
+      - name: Build
+        run: bash tools/build.sh
+        shell: bash
+
+      - name: Prepare app-only release assets
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir release-assets
+          for target in p4 c5; do
+            chip="$(printf '%s' "$target" | tr '[:lower:]' '[:upper:]')"
+            build="firmware_${target}/build_highboy"
+            python tools/highboy/build_evidence.py --target "$target" \
+              --build "$build" --out "release-assets/${chip}-build-evidence.json"
+            cp "$build/TentacleOS_${chip}.bin" \
+              "release-assets/TentacleOS-${chip}-${RELEASE_VERSION}-app-only.bin"
+          done
+          cp docs/highboy/APP_UPDATE.md release-assets/APP_UPDATE.md
+          cd release-assets
+          sha256sum ./*.bin ./*-build-evidence.json APP_UPDATE.md > SHA256SUMS
+
+      - name: Upload binaries to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ needs.release.outputs.version }}"
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

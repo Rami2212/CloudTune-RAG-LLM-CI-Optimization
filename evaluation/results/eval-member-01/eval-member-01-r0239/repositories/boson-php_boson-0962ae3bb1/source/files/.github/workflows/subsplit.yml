@@ -1,0 +1,116 @@
+name: Subsplit Libraries
+
+on:
+  push:
+    tags:
+      - '*'
+    branches:
+      - '*'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  subsplit:
+    name: Split Packages (${{ matrix.package.local_path }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          # Bridges
+          - local_path: 'bridge/http-bridge'
+            split_repository: 'http-bridge'
+          - local_path: 'bridge/laravel-http-bridge'
+            split_repository: 'laravel-http-bridge'
+          - local_path: 'bridge/laravel-provider'
+            split_repository: 'laravel-provider'
+          - local_path: 'bridge/psr-http-bridge'
+            split_repository: 'psr-http-bridge'
+          - local_path: 'bridge/spiral-bridge'
+            split_repository: 'spiral-bridge'
+          - local_path: 'bridge/symfony-bundle'
+            split_repository: 'symfony-bundle'
+          - local_path: 'bridge/symfony-http-bridge'
+            split_repository: 'symfony-http-bridge'
+          # Components
+          - local_path: 'component/compiler'
+            split_repository: 'compiler'
+          - local_path: 'component/cpu-info'
+            split_repository: 'cpu-info'
+          - local_path: 'component/globals-provider'
+            split_repository: 'globals-provider'
+          - local_path: 'component/http'
+            split_repository: 'http'
+          - local_path: 'component/http-body-decoder'
+            split_repository: 'http-body-decoder'
+          - local_path: 'component/http-static-provider'
+            split_repository: 'http-static-provider'
+          - local_path: 'component/os-info'
+            split_repository: 'os-info'
+          - local_path: 'component/pasm'
+            split_repository: 'pasm'
+          - local_path: 'component/runtime'
+            split_repository: 'runtime'
+          - local_path: 'component/saucer'
+            split_repository: 'saucer'
+          - local_path: 'component/uri'
+            split_repository: 'uri'
+          - local_path: 'component/uri-factory'
+            split_repository: 'uri-factory'
+          - local_path: 'component/weak-types'
+            split_repository: 'weak-types'
+          # Contracts
+          - local_path: 'contracts/event-listener-contracts'
+            split_repository: 'event-listener-contracts'
+          - local_path: 'contracts/http-contracts'
+            split_repository: 'http-contracts'
+          - local_path: 'contracts/id-contracts'
+            split_repository: 'id-contracts'
+          - local_path: 'contracts/uri-contracts'
+            split_repository: 'uri-contracts'
+          - local_path: 'contracts/uri-factory-contracts'
+            split_repository: 'uri-factory-contracts'
+          - local_path: 'contracts/value-object-contracts'
+            split_repository: 'value-object-contracts'
+          # Extensions
+          - local_path: 'extension/app-ext-alert'
+            split_repository: 'app-ext-alert'
+          - local_path: 'extension/webview-ext-battery'
+            split_repository: 'webview-ext-battery'
+          - local_path: 'extension/webview-ext-network'
+            split_repository: 'webview-ext-network'
+          - local_path: 'extension/webview-ext-web-components'
+            split_repository: 'webview-ext-web-components'
+    steps:
+      - uses: actions/checkout@v4
+
+      # no tag
+      - if: "!startsWith(github.ref, 'refs/tags/')"
+        name: Monorepo Split of ${{ matrix.package.split_repository }}
+        uses: danharrin/monorepo-split-github-action@v2.3.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+        with:
+          branch: "master"
+          package_directory: 'libs/${{ matrix.package.local_path }}'
+          repository_organization: 'boson-php'
+          repository_name: '${{ matrix.package.split_repository }}'
+          user_name: "SerafimArts"
+          user_email: "nesk@xakep.ru"
+
+      # with tag
+      - if: "startsWith(github.ref, 'refs/tags/')"
+        name: Monorepo Tagged Split of ${{ matrix.package }}
+        uses: danharrin/monorepo-split-github-action@v2.3.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+        with:
+          tag: ${GITHUB_REF#refs/tags/}
+          branch: "master"
+          package_directory: 'libs/${{ matrix.package.local_path }}'
+          repository_organization: 'boson-php'
+          repository_name: '${{ matrix.package.split_repository }}'
+          user_name: "SerafimArts"
+          user_email: "nesk@xakep.ru"

@@ -1,0 +1,290 @@
+name: Nightly Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+    paths-ignore:
+      - "*.md"
+      - "docs/**"
+      - "fastlane/**"
+      - ".github/workflows/website.yml"
+      - ".github/workflows/release.yml"
+
+env:
+  FLUTTER_CHANNEL: "stable"
+
+jobs:
+  # Extract version modification to a reusable job
+  prepare-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      commit-hash: ${{ steps.version.outputs.commit-hash }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate version with commit hash
+        id: version
+        run: |
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          CURRENT_VERSION=$(grep '^version:' pubspec.yaml | sed 's/version: //')
+          NEW_VERSION=$(echo $CURRENT_VERSION | sed "s/+/-$COMMIT_HASH+/")
+          echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "commit-hash=$COMMIT_HASH" >> $GITHUB_OUTPUT
+          echo "Generated version: $NEW_VERSION"
+
+  run-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          flutter-version-file: pubspec.yaml
+          cache: true
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Run tests
+        run: |
+          echo '### 🔬Test Results' >> $GITHUB_STEP_SUMMARY
+          flutter test -r github >> $GITHUB_STEP_SUMMARY
+
+  build-android:
+    runs-on: ubuntu-latest
+    needs: [ prepare-version, run-tests ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          flutter-version-file: pubspec.yaml
+          cache: true
+
+      - name: Update version in pubspec.yaml
+        run: |
+          sed -i "s/^version: .*/version: ${{ needs.prepare-version.outputs.version }}/" pubspec.yaml
+          echo "Updated version to: $(grep '^version:' pubspec.yaml)"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "zulu"
+          java-version: "17"
+          cache: gradle
+
+      - name: Get dependencies and generate code
+        run: |
+          flutter pub get
+          dart run build_runner build --delete-conflicting-outputs
+
+      - name: Decode Release Key
+        run: |
+          echo "$TUBESYNC_JKS" > syncara.b64
+          base64 --decode syncara.b64 > syncara.jks
+        env:
+          TUBESYNC_JKS: ${{ secrets.TUBESYNC_JKS }}
+
+      - name: Build Android Profile APK
+        run: flutter build apk --profile
+        env:
+          TUBESYNC_KEY_PASSWORD: ${{ secrets.TUBESYNC_KEY_PASSWORD }}
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: syncara_android_nightly_${{ needs.prepare-version.outputs.commit-hash }}
+          path: build/app/outputs/flutter-apk/app-profile.apk
+          compression-level: 9
+
+  build-linux:
+    runs-on: ubuntu-latest
+    needs: [ prepare-version, run-tests ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          flutter-version-file: pubspec.yaml
+          cache: true
+
+      - name: Update version in pubspec.yaml
+        run: |
+          sed -i "s/^version: .*/version: ${{ needs.prepare-version.outputs.version }}/" pubspec.yaml
+          echo "Updated version to: $(grep '^version:' pubspec.yaml)"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libmpv-dev libgtk-3-dev liblzma-dev libstdc++-12-dev
+
+      - name: Get dependencies and generate code
+        run: |
+          flutter pub get
+          dart run build_runner build --delete-conflicting-outputs
+
+      - name: Build Linux Release
+        run: flutter build linux --release
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: syncara_linux_nightly_${{ needs.prepare-version.outputs.commit-hash }}
+          path: build/linux/x64/release/bundle/
+          compression-level: 9
+
+  build-ios:
+    runs-on: macOS-latest
+    needs: [ prepare-version, run-tests ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          flutter-version-file: pubspec.yaml
+          cache: true
+
+      - name: Update version in pubspec.yaml
+        run: |
+          sed -i '' "s/^version: .*/version: ${{ needs.prepare-version.outputs.version }}/" pubspec.yaml
+          echo "Updated version to: $(grep '^version:' pubspec.yaml)"
+
+      - name: Install dependencies
+        run: |
+          flutter pub get
+          cd ios && pod install --repo-update
+
+      - name: Generate code and build
+        run: |
+          dart run build_runner build --delete-conflicting-outputs
+          flutter build ios --release --no-codesign
+
+      - name: Create IPA
+        run: |
+          mkdir Payload
+          mv build/ios/iphoneos/Runner.app/ Payload
+          zip -qq -r -9 syncara_unsigned.ipa Payload
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: syncara_ios_nightly_${{ needs.prepare-version.outputs.commit-hash }}
+          path: syncara_unsigned.ipa
+          compression-level: 9
+
+  build-mac:
+    runs-on: macOS-latest
+    needs: [ prepare-version, run-tests ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          flutter-version-file: pubspec.yaml
+          cache: true
+
+      - name: Update version in pubspec.yaml
+        run: |
+          sed -i '' "s/^version: .*/version: ${{ needs.prepare-version.outputs.version }}/" pubspec.yaml
+          echo "Updated version to: $(grep '^version:' pubspec.yaml)"
+
+      - name: Get dependencies and build
+        run: |
+          flutter pub get
+          dart run build_runner build --delete-conflicting-outputs
+          flutter build macos --release
+
+      - name: Create bundle
+        run: |
+          mv build/macos/Build/Products/Release/*.app ./
+          zip -r syncara_macos.zip *.app
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: syncara_macos_nightly_${{ needs.prepare-version.outputs.commit-hash }}
+          path: syncara_macos.zip
+          compression-level: 9
+
+  build-windows:
+    runs-on: windows-latest
+    needs: [ prepare-version, run-tests ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          flutter-version-file: pubspec.yaml
+          cache: true
+
+      - name: Update version in pubspec.yaml
+        shell: bash
+        run: |
+          sed -i "s/^version: .*/version: ${{ needs.prepare-version.outputs.version }}/" pubspec.yaml
+          echo "Updated version to: $(grep '^version:' pubspec.yaml)"
+
+      - name: Get dependencies and build
+        run: |
+          flutter pub get
+          dart run build_runner build --delete-conflicting-outputs
+          flutter build windows --release
+          dart run msix:create
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: syncara_windows_nightly_${{ needs.prepare-version.outputs.commit-hash }}
+          path: build/windows/x64/runner/Release
+          compression-level: 9
+
+  build-android-legacy:
+    runs-on: ubuntu-latest
+    needs: [ prepare-version, run-tests ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Downgrade to flutter 3.32.8
+        run: git apply .github/android-23.patch --3way
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          flutter-version-file: pubspec.yaml
+          cache: true
+
+      - name: Update version in pubspec.yaml
+        run: |
+          sed -i "s/^version: .*/version: ${{ needs.prepare-version.outputs.version }}/" pubspec.yaml
+          echo "Updated version to: $(grep '^version:' pubspec.yaml)"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "zulu"
+          java-version: "17"
+          cache: gradle
+
+      - name: Get dependencies and generate code
+        run: |
+          flutter pub get
+          dart run build_runner build --delete-conflicting-outputs
+
+      - name: Decode Release Key
+        run: |
+          echo "$TUBESYNC_JKS" > syncara.b64
+          base64 --decode syncara.b64 > syncara.jks
+        env:
+          TUBESYNC_JKS: ${{ secrets.TUBESYNC_JKS }}
+
+      - name: Build Android Profile APK
+        run: flutter build apk --profile
+        env:
+          TUBESYNC_KEY_PASSWORD: ${{ secrets.TUBESYNC_KEY_PASSWORD }}
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: syncara_android_min23_nightly_${{ needs.prepare-version.outputs.commit-hash }}
+          path: build/app/outputs/flutter-apk/app-profile.apk
+          compression-level: 9

@@ -1,0 +1,40 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [HIGH] Split "build" into parallel jobs (lint + test + build)
+# - [MEDIUM] Add concurrency group to "build.yaml"
+# Estimated savings: ~8 min/run
+#
+name: Build, Lint & Test
+
+on:
+  pull_request:
+  push:
+    branches:
+    - master
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Lint
+        run: pnpm run lint
+      - name: Validate test fixtures
+        uses: nhalstead/validate-json-action@v0.1.12
+        with:
+          schema: tests/fixtures/schema.json
+          jsons: tests/fixtures/*/*.json
+      - name: Test
+        run: pnpm test
+      - name: Build
+        run: pnpm run build

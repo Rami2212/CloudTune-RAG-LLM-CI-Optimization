@@ -1,0 +1,104 @@
+name: CI - Data Layer
+
+on:
+  workflow_dispatch:
+
+  pull_request:
+    branches:
+      - develop
+      - master
+      - release/**
+    paths:
+      - "forms-flow-data-layer/**"
+
+defaults:
+  run:
+    shell: bash
+    working-directory: ./forms-flow-data-layer
+
+jobs:
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+
+    strategy:
+      matrix:
+        python-version:
+          - "3.12.10"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 #v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: forms-flow-data-layer/requirements/dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements/dev.txt
+
+      - name: Pylint
+        run: |
+          pylint --rcfile=setup.cfg src
+
+      - name: Flake8
+        run: |
+          flake8 src tests
+
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    
+    strategy:
+      matrix:
+        python-version:
+          - "3.13.16"
+
+    env:
+      JWT_OIDC_JWKS_URI: "http://localhost:8081/auth/realms/forms-flow-ai/protocol/openid-connect/certs"
+      JWT_OIDC_ISSUER: "http://localhost:8081/auth/realms/forms-flow-ai"
+      JWT_OIDC_AUDIENCE: "forms-flow-web"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 #v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: forms-flow-data-layer/requirements/dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements/dev.txt
+
+      - name: Run tests
+        run: |
+          pytest
+
+  build:
+    name: Build
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --tag forms-flow-data-layer:ci \
+            .
+
+      - name: Verify Docker image
+        run: |
+          docker image inspect forms-flow-data-layer:ci

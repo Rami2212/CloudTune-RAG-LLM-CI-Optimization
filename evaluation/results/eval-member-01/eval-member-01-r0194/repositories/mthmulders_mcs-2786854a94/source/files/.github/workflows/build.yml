@@ -1,0 +1,53 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    if: contains(github.event.head_commit.message, 'Releasing version') != true && contains(github.event.head_commit.message, 'Prepare next version') != true
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Check out repository
+      uses: actions/checkout@v7.0.1
+      with:
+        # Disabling shallow clone is recommended for improving relevancy of reporting
+        fetch-depth: 0
+    - name: Set up JDK
+      uses: actions/setup-java@v6.0.1
+      with:
+        java-version: 25
+        distribution: 'temurin'
+        cache: maven
+    - name: Cache Maven packages
+      id: restore-maven-package-cache
+      uses: actions/cache/restore@v6.1.0
+      with:
+        path: ~/.m2
+        key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+        restore-keys: ${{ runner.os }}-m2
+    - name: Build with Maven
+      run: ./mvnw -B verify
+    - name: Save downloaded Maven packages
+      uses: actions/cache/save@v6.1.0
+      with:
+        path: ~/.m2
+        key: ${{ steps.restore-maven-package-cache.outputs.cache-primary-key }}
+      if: github.event_name != 'pull_request'
+    - name: Upload build artifact
+      uses: actions/upload-artifact@v7.0.2
+      with:
+        name: artifacts-generic
+        path: |
+          target/mcs-*.jar
+
+  native-build:
+    uses: ./.github/workflows/build-native.yml
+    with:
+      head_sha: ${{ github.sha }}
+    secrets: inherit
+    needs: build

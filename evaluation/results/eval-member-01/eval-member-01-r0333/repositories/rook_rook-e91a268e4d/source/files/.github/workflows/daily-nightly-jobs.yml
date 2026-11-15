@@ -1,0 +1,132 @@
+name: Daily nightly jobs
+on:
+  schedule:
+    - cron: "0 0 * * *" # every day at midnight
+  workflow_dispatch: {}
+
+defaults:
+  run:
+    # reference: https://docs.github.com/en/actions/reference/workflow-syntax-for-github-actions#using-a-specific-shell
+    shell: bash --noprofile --norc -eo pipefail -x {0}
+
+permissions:
+  contents: read
+
+env:
+  # Required for go-ceph rgw/admin account APIs which are gated behind
+  # the ceph_preview build tag. Can be removed when go-ceph promotes
+  # the account API out of preview.
+  GOFLAGS: "-tags=ceph_preview"
+
+jobs:
+  build-rook-image-amd64:
+    if: github.repository == 'rook/rook'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
+        with:
+          tool-cache: true # removes old golang version but saves ~6GB
+          large-packages: false # takes a long time to run b/c package mgr
+          android: false # takes a long time to run b/c package mgr
+          dotnet: false # takes a long time to run b/c package mgr
+          haskell: false # takes a long time to run b/c package mgr
+
+      - name: setup golang
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26"
+
+      - name: build rook image
+        run: tests/scripts/github-action-helper.sh build_rook_image_artifact
+
+      - name: upload rook image
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rook-image-amd64
+          path: _output/ci-image
+          retention-days: 7
+          # the payload is already zstd-compressed
+          compression-level: 0
+          overwrite: true
+
+  build-rook-image-arm64:
+    if: github.repository == 'rook/rook'
+    runs-on: [ubuntu-22.04-arm]
+    timeout-minutes: 40
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
+        with:
+          tool-cache: true # removes old golang version but saves ~6GB
+          large-packages: false # takes a long time to run b/c package mgr
+          android: false # takes a long time to run b/c package mgr
+          dotnet: false # takes a long time to run b/c package mgr
+          haskell: false # takes a long time to run b/c package mgr
+
+      - name: setup golang
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26"
+
+      - name: build rook image
+        run: tests/scripts/github-action-helper.sh build_rook_image_artifact
+
+      - name: upload rook image
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rook-image-arm64
+          path: _output/ci-image
+          retention-days: 7
+          # the payload is already zstd-compressed
+          compression-level: 0
+          overwrite: true
+
+  canary-arm64:
+    if: github.repository == 'rook/rook'
+    needs: build-rook-image-arm64
+    uses: ./.github/workflows/ceph-arm64-suite-test.yml
+    with:
+      rook_image_artifact: rook-image-arm64
+      ceph_images: '["quay.io/ceph/ceph:v19", "quay.io/ceph/ceph:v20", "quay.io/ceph/ceph:v21", "quay.ceph.io/ceph-ci/ceph:main-arm64", "quay.ceph.io/ceph-ci/ceph:squid-release-arm64", "quay.ceph.io/ceph-ci/ceph:tentacle-arm64", "quay.ceph.io/ceph-ci/ceph:umbrella-release-arm64"]'
+    secrets: inherit
+
+  ceph-suite-tests:
+    if: github.repository == 'rook/rook'
+    needs: build-rook-image-amd64
+    uses: ./.github/workflows/ceph-suite-integration-test.yml
+    with:
+      ceph_suite_versions: '["squid", "squid-devel", "tentacle", "tentacle-devel", "umbrella", "umbrella-devel", "main"]'
+      object_suite_tests: '["TestWithoutTLS", "TestWithTLS"]'
+      rook_image_artifact: rook-image-amd64
+    secrets: inherit
+
+  canary-tests:
+    if: github.repository == 'rook/rook'
+    needs: build-rook-image-amd64
+    uses: ./.github/workflows/canary-integration-test.yml
+    with:
+      rook_image_artifact: rook-image-amd64
+      ceph_images: '["quay.io/ceph/ceph:v19", "quay.io/ceph/ceph:v20", "quay.io/ceph/ceph:v21", "quay.ceph.io/ceph-ci/ceph:main", "quay.ceph.io/ceph-ci/ceph:squid", "quay.ceph.io/ceph-ci/ceph:tentacle", "quay.ceph.io/ceph-ci/ceph:umbrella"]'
+    secrets: inherit
+
+  check-markdown-links:
+    if: github.repository == 'rook/rook'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Check markdown links
+        run: make lint.markdown-links

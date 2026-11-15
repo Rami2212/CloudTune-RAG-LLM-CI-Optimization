@@ -1,0 +1,35 @@
+name: Build XCFramework
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build_xcframework:
+    name: Build XCFrameworks
+    runs-on:
+      - self-hosted
+      - macos-15
+      - xcode-26.6
+      - visionos-simulator-2.5
+    env:
+      OPENSWIFTUI_OPENATTRIBUTESHIMS_ATTRIBUTEGRAPH: 1
+      OPENSWIFTUI_USE_LOCAL_DEPS: 1
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build XCFrameworks
+        uses: ./.github/actions/build-xcframework
+        with:
+          signing-certificate-base64: ${{ secrets.SIGNING_CERTIFICATE_BASE_64 }}
+          signing-certificate-password: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
+      - name: Zip XCFrameworks
+        run: cd build && zip -ry xcframeworks.zip *.xcframework
+      - name: Upload XCFrameworks
+        uses: actions/upload-artifact@v7
+        with:
+          path: build/xcframeworks.zip
+          archive: false

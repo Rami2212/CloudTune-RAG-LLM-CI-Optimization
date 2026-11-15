@@ -1,0 +1,39 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [HIGH] Add gradle dependency cache to "build" job
+# - [MEDIUM] Add concurrency group to "test-and-build.yml"
+# Estimated savings: ~7 min/run
+#
+name: Test and build
+
+on:
+  pull_request:
+    branches: [ master ]
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+
+    - name: Build Docker image for building
+      run: docker build -f DockerfileForBuild -t plantuml-service-builder .
+
+    - name: Run tests
+      run: docker run --rm -v $(pwd):/app -e GRADLE_USER_HOME=/app/.gradle plantuml-service-builder ./gradlew test
+
+    - name: Run build
+      run: docker run --rm -v $(pwd):/app -e GRADLE_USER_HOME=/app/.gradle plantuml-service-builder ./gradlew stage
+
+    - name: Check build artifacts
+      run: |
+        if [ ! -f "./bin/plantuml-service.jar" ]; then
+          echo "Build failed: JAR file not found"
+          exit 1
+        fi
+        echo "Build successful: JAR file created"

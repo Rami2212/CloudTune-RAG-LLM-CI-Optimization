@@ -1,0 +1,163 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CXXGraph – Code Coverage
+#
+# Generates an LCOV / gcovr HTML report and uploads to Codecov.
+# Runs on: Ubuntu 24.04 + GCC 14 (latest stable toolchain with best gcov support)
+#
+# Two modes:
+#   • push   → upload to Codecov (requires CODECOV_TOKEN secret)
+#   • PR     → generate report & attach as artifact (no token needed)
+# ─────────────────────────────────────────────────────────────────────────────
+name: Code Coverage
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CPM_SOURCE_CACHE: ~/.cache/cpm
+
+jobs:
+  coverage:
+    name: "Coverage · GCC 14 · C++17"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      # ── Toolchain ─────────────────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            gcc-14 g++-14 lcov gcovr ninja-build
+
+      - name: Install Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v6
+
+      # ── CPM cache ─────────────────────────────────────────────────────
+      - name: Cache CPM packages
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/cpm
+          key: cpm-ubuntu-coverage-${{ hashFiles('**/CMakeLists.txt') }}
+          restore-keys: cpm-ubuntu-coverage-
+
+      # ── Configure ─────────────────────────────────────────────────────
+      - name: Configure CMake
+        env:
+          CC:  gcc-14
+          CXX: g++-14
+        run: |
+          cmake -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_STANDARD=17 \
+            -DCMAKE_CXX_STANDARD_REQUIRED=ON \
+            -DCMAKE_CXX_EXTENSIONS=OFF \
+            -DTEST=ON \
+            -DCODE_COVERAGE=ON
+
+      # ── Build & run tests ─────────────────────────────────────────────
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Run tests
+        working-directory: build/test
+        run: ./test_exe
+
+      # ── Generate LCOV report ──────────────────────────────────────────
+      - name: Capture coverage data
+        working-directory: build
+        run: |
+          lcov \
+            --capture \
+            --directory . \
+            --output-file coverage_raw.info \
+            --ignore-errors mismatch \
+            --gcov-tool gcov-14
+
+      - name: Remove noise (system / third-party headers)
+        working-directory: build
+        run: |
+          lcov \
+            --remove coverage_raw.info \
+              '/usr/*' \
+              '*/googletest/*' \
+              '*/googlemock/*' \
+              '*/zlib/*' \
+              '*/test/*' \
+              '*/benchmark/*' \
+              '*/CPM_packages/*' \
+            --output-file coverage.info \
+            --ignore-errors unused
+
+      - name: Show coverage summary
+        working-directory: build
+        run: lcov --summary coverage.info
+
+      # ── Generate browsable HTML report ────────────────────────────────
+      - name: Generate HTML report
+        working-directory: build
+        run: |
+          genhtml coverage.info \
+            --output-directory coverage_html \
+            --title "CXXGraph Coverage" \
+            --legend \
+            --show-details \
+            --highlight
+
+      # ── Also generate gcovr XML (for tooling / IDE integrations) ──────
+      - name: Generate gcovr XML
+        working-directory: build
+        run: |
+          gcovr \
+            --root .. \
+            --exclude '.*googletest.*' \
+            --exclude '.*googlemock.*' \
+            --exclude '.*zlib.*' \
+            --exclude '.*test.*' \
+            --exclude '.*CPM_packages.*' \
+            --xml coverage.xml \
+            --xml-pretty
+
+      # ── Upload to Codecov ─────────────────────────────────────────────
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v7
+        with:
+          token:            ${{ secrets.CODECOV_TOKEN }}
+          files:            build/coverage.info
+          flags:            unittests
+          name:             codecov-umbrella
+          fail_ci_if_error: true
+
+      # ── Attach HTML report as artifact (always, useful on PRs) ────────
+      - name: Upload HTML coverage report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-report-html
+          path: build/coverage_html/
+          retention-days: 14
+
+      - name: Upload LCOV file
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-lcov
+          path: build/coverage.info
+          retention-days: 14
