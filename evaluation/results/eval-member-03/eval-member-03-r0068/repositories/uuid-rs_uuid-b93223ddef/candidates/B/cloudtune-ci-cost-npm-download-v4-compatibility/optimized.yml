@@ -1,0 +1,319 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 9 optimizations:
+# - [HIGH] Add cargo dependency cache to "os_tests" job
+# - [HIGH] Add cargo dependency cache to "stable" job
+# - [HIGH] Add cargo dependency cache to "examples" job
+# - [HIGH] Add cargo dependency cache to "wasm_bindgen" job
+# - [HIGH] Add cargo dependency cache to "wasi" job
+# - [HIGH] Add cargo dependency cache to "nodeps" job
+# - [HIGH] Add cargo dependency cache to "fuzz" job
+# - [MEDIUM] Add concurrency group to "ci.yml"
+# - [LOW] Explicitly set fail-fast for large matrix job "os_tests" (135 combinations)
+# Estimated savings: ~60 min/run
+#
+name: Continuous integration
+
+env:
+  VERSION_FEATURES: "v1 v3 v4 v5 v6 v7 v8"
+  DEP_FEATURES: "slog serde arbitrary zerocopy bytemuck"
+
+on:
+  pull_request:
+  push:
+      branches:
+      - main
+  schedule:
+    - cron: '0 0 * * *'
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  os_tests:
+    name: "Tests / OS: ${{ matrix.os }} - ${{ matrix.channel }}-${{ matrix.rust_target }}"
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: "--cfg uuid_unstable"
+      RUSTDOCFLAGS: "--cfg uuid_unstable"
+    strategy:
+      matrix:
+        exclude:
+        - os: macos-latest
+          rust_target: x86_64-gnu
+        - os: macos-latest
+          rust_target: x86_64-msvc
+        - os: windows-latest
+          rust_target: aarch64-apple-darwin
+        - os: ubuntu-latest
+          rust_target: x86_64-msvc
+        - os: ubuntu-latest
+          rust_target: aarch64-apple-darwin
+        channel:
+        - stable
+        - beta
+        - nightly
+        os:
+        - macos-latest
+        - ubuntu-latest
+        - windows-latest
+        rust_target:
+        - x86_64-gnu
+        - x86_64-msvc
+        - aarch64-apple-darwin
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab
+
+    - name: Install Rust Toolchain
+      run: rustup update ${{ matrix.channel }}-${{ matrix.rust_target }} && rustup default ${{ matrix.channel }}-${{ matrix.rust_target }}
+
+    - name: Install cargo-hack
+      run: cargo install cargo-hack
+
+    - name: Docs
+      run: cargo test --all-features --doc
+
+    - name: Examples
+      run: cargo test --all-features --examples
+
+    - name: Each version feature
+      run: cargo hack test --lib --each-feature
+
+    - name: All features
+      run: cargo hack test --lib --all-features
+
+  stable:
+    name: Tests / Stable
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout sources
+      uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab
+
+    - name: Install Rust Toolchain
+      run: rustup update stable
+
+    - name: All features
+      run: cargo test --all-features
+
+  msrv:
+    name: Build / MSRV
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout sources
+      uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab
+
+    - name: Install Rust toolchain
+      run: rustup update 1.89.0
+
+    - name: Version features
+      run: cargo +1.89.0 build --manifest-path tests/smoke-test/Cargo.toml
+
+  examples:
+    name: Tests / Examples
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout sources
+      uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab
+
+    - name: Install Rust Toolchain
+      run: rustup update stable
+
+    - name: Examples
+      run: cargo test --manifest-path examples/Cargo.toml
+
+  wasm_bindgen:
+    name: Tests / WebAssembly (wasm-bindgen)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab
+
+      - name: Install node
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af
+        with:
+          node-version: '20'
+
+      - name: Install Rust Toolchain
+        run: rustup update stable
+
+      - name: Install
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Default features
+        run: wasm-pack test --node
+
+      - name: Version features
+        run: wasm-pack test --node -- --features "$VERSION_FEATURES $DEP_FEATURES js"
+
+      - name: Fast RNG
+        run: wasm-pack test --node -- --features "js v4 fast-rng"
+
+      - name: +atomics
+        env:
+          RUSTFLAGS: '-C target-feature=+atomics'
+        run: cargo check --target wasm32-unknown-unknown --features "$VERSION_FEATURES $DEP_FEATURES js"
+
+      - name: rng-getrandom
+        env:
+          RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
+        working-directory: ./tests/wasm32-getrandom-test
+        run: wasm-pack test --node
+
+      - name: rng-rand
+        env:
+          RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
+        working-directory: ./tests/wasm32-getrandom-test
+        run: wasm-pack test --node -- --features "rand"
+
+  wasm64-unknown-unknown:
+    name: Build / wasm64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab
+
+      - name: Install Rust toolchain
+        run: rustup update nightly && rustup component add --toolchain nightly rust-src
+
+      - name: Default features
+        run: cargo +nightly build -Z avoid-dev-deps -Z build-std=std,panic_abort --target wasm64-unknown-unknown
+
+      - name: Version features
+        run: cargo +nightly build -Z avoid-dev-deps -Z build-std=std,panic_abort --target wasm64-unknown-unknown --features "js v1 v3 v4 v5 v6 v7 v8 serde"
+
+  wasi:
+    name: Tests / WebAssembly (WASI)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab
+
+      - name: Install Wasmtime
+        run: curl https://wasmtime.dev/install.sh -sSf | bash
+
+      - name: Add Wasmtime to path
+        run: echo "$HOME/.wasmtime/bin" >> $GITHUB_PATH
+
+      - name: Install Rust Toolchain
+        run: rustup update nightly && rustup default nightly
+
+      - name: Install wasm32-wasip1 target
+        run: rustup target add wasm32-wasip1
+
+      - name: Default features
+        run: cargo test --target wasm32-wasip1
+
+      - name: Version features
+        run: cargo test --target wasm32-wasip1 --features "$VERSION_FEATURES $DEP_FEATURES"
+
+      - name: Fast RNG
+        run: cargo test --target wasm32-wasip1 --features "v4 fast-rng"
+
+  miri:
+    name: Tests / Miri
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab
+
+      - name: Install Rust Toolchain
+        run: rustup update nightly-2026-08-25
+
+      - name: Install Miri
+        run: |
+          rustup toolchain install nightly-2026-08-25 --component miri
+          cargo +nightly-2026-08-25 miri setup
+
+      - name: Default features
+        run: cargo +nightly-2026-08-25 miri test --lib --all-features
+
+      - name: BE
+        run: cargo +nightly-2026-08-25 miri test --target s390x-unknown-linux-gnu --lib --all-features
+
+  clippy:
+    name: Build / Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab
+
+      - name: Install Rust Toolchain
+        run: rustup update beta
+
+      - name: Install Clippy
+        run: |
+          rustup update beta
+          rustup component add clippy --toolchain beta
+
+      - name: Default features
+        run: cargo +beta clippy --all-features
+
+  embedded:
+    name: Build / Embedded
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab
+
+      - name: Install Rust toolchain
+        run: rustup update nightly && rustup target add --toolchain nightly thumbv6m-none-eabi
+
+      - name: No features
+        run: cargo +nightly build -Z avoid-dev-deps --target thumbv6m-none-eabi --no-default-features
+
+      - name: Version features
+        run: cargo +nightly build -Z avoid-dev-deps --target thumbv6m-none-eabi --no-default-features --features "v1 v3 v5 v6 serde"
+
+  nodeps:
+    name: Build / No deps
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "--cfg uuid_unstable"
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab
+
+      - name: Install Rust toolchain
+        run: rustup update nightly && rustup default nightly
+
+      - name: Install cargo-hack
+        run: cargo install cargo-hack
+
+      - name: Powerset
+        run: cargo hack check --each-feature -Z avoid-dev-deps
+
+  wasm32v1-none:
+    name: Build / MVP Web
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab
+
+      - name: Install Rust toolchain
+        run: rustup update nightly && rustup target add --toolchain nightly wasm32v1-none
+
+      - name: No features
+        run: cargo +nightly build -Z avoid-dev-deps --target wasm32v1-none --no-default-features
+
+      - name: Version features
+        run: cargo +nightly build -Z avoid-dev-deps --target wasm32v1-none --no-default-features --features "js v1 v3 v4 v5 v6 v7 v8 serde"
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab
+
+      - name: Install Rust toolchain
+        run: rustup default nightly
+
+      - name: Install cargo-afl
+        run: cargo install cargo-afl
+
+      - name: Configure AFL
+        run: cargo afl config --build --force && cargo afl system-config
+
+      - name: Canary
+        run: fuzz/canary.sh

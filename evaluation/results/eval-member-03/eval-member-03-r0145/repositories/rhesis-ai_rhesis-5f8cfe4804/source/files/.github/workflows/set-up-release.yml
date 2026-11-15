@@ -1,0 +1,98 @@
+name: "[Release] 1. Set up release config"
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform_bump:
+        description: 'Platform version bump (backend and frontend follow it)'
+        required: false
+        type: choice
+        options:
+          - "none"
+          - patch
+          - minor
+          - major
+
+      sdk_bump:
+        description: 'SDK version bump'
+        required: false
+        type: choice
+        options:
+          - "none"
+          - patch
+          - minor
+          - major
+
+      polyphemus_bump:
+        description: 'Polyphemus version bump'
+        required: false
+        type: choice
+        options:
+          - "none"
+          - patch
+          - minor
+          - major
+
+jobs:
+  update-release-config:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate a token
+        id: generate-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.RHEO_APP_ID }}
+          private-key: ${{ secrets.RHEO_APP_PRIVATE_KEY }}
+
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: true  # the version-bump push below needs the app token on disk
+          token: ${{ steps.generate-token.outputs.token }}
+
+      - name: Set up Git
+        run: |
+            git config user.name "rheo[bot]"
+            git config user.email "237771051+rheo-app[bot]@users.noreply.github.com"
+
+
+
+      - name: Update release config
+        run: |
+          # Create JSON using jq 
+          jq -n \
+            --arg platform "${{ github.event.inputs.platform_bump }}" \
+            --arg sdk "${{ github.event.inputs.sdk_bump }}" \
+            --arg polyphemus "${{ github.event.inputs.polyphemus_bump }}" \
+            '{
+              platform: $platform,
+              sdk: $sdk,
+              polyphemus: $polyphemus
+            } | with_entries(select(.value != "" and .value != "none"))' > release_config.json
+          
+          # Generate dynamic commit message
+          COMMIT_PARTS=()
+          if [ -n "${{ github.event.inputs.platform_bump }}" ] && [ "${{ github.event.inputs.platform_bump }}" != "none" ]; then
+            COMMIT_PARTS+=("platform - ${{ github.event.inputs.platform_bump }}")
+          fi
+          if [ -n "${{ github.event.inputs.sdk_bump }}" ] && [ "${{ github.event.inputs.sdk_bump }}" != "none" ]; then
+            COMMIT_PARTS+=("sdk - ${{ github.event.inputs.sdk_bump }}")
+          fi
+          if [ -n "${{ github.event.inputs.polyphemus_bump }}" ] && [ "${{ github.event.inputs.polyphemus_bump }}" != "none" ]; then
+            COMMIT_PARTS+=("polyphemus - ${{ github.event.inputs.polyphemus_bump }}")
+          fi
+          
+        
+          COMMIT_MSG="Update release config: $(printf '%s, ' "${COMMIT_PARTS[@]}" | sed 's/, $//')"
+          PR_TITLE_MSG="$(printf '%s, ' "${COMMIT_PARTS[@]}" | sed 's/, $//')"
+      
+          echo "COMMIT_MESSAGE=$COMMIT_MSG" >> $GITHUB_ENV
+          echo "PR_TITLE_MESSAGE=$PR_TITLE_MSG" >> $GITHUB_ENV
+          
+          echo "Generated release_config.json:"
+          cat release_config.json
+          echo "Commit message: $COMMIT_MSG"
+
+          git add release_config.json
+          git commit -m "Update release config: $COMMIT_MSG"
+          git push

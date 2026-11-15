@@ -1,0 +1,63 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [HIGH] Add pip dependency cache to "deploy" job
+# - [MEDIUM] Add concurrency group to "python-publish-test.yml"
+# Estimated savings: ~5 min/run
+#
+# This workflow will upload a Python package using Twine when the test-pypi branch is modified
+# For more information see: https://help.github.com/en/actions/language-and-framework-guides/using-python-with-github-actions#publishing-to-package-registries
+
+name: Upload Python package to TestPyPI
+
+# uncomment the following to upload to TestPyPI
+# on:
+#   workflow_run: 
+#     workflows: ["snnTorch CD"]
+#     # branches: [main] 
+#     types:
+#       - completed
+on:
+  push:
+    branches: [ test-pypi ]
+  pull_request:
+    branches: [ test-pypi ]
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v7
+
+    - name: Set up Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.x'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install setuptools wheel twine
+    
+    # Upload to TestPyPI
+    - name: Build and upload to TestPyPI
+      run: |
+        python3 setup.py sdist bdist_wheel
+        python3 -m twine upload dist/*
+      env:
+        TWINE_USERNAME: __token__
+        TWINE_PASSWORD: ${{ secrets.TWINE_TEST_TOKEN }}
+        TWINE_REPOSITORY: testpypi
+
+    # - name: Build and publish
+    #   env:
+    #     TWINE_USERNAME: ${{ secrets.PYPI_USERNAME }}
+    #     TWINE_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
+    #   run: |
+    #     python setup.py sdist bdist_wheel
+    #     twine upload dist/*

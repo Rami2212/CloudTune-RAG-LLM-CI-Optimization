@@ -1,0 +1,51 @@
+name: Tests and build
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: '[Prepare] Checkout'
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: '[Prepare] Setup CI (mise + dependencies)'
+        uses: ./.github/actions/ci-setup
+
+      - name: '[Code quality] Check commit message'
+        if: github.event_name == 'pull_request'
+        run: node ./node_modules/@commitlint/cli/cli.js --from ${{ github.event.pull_request.base.sha }} --to ${{ github.event.pull_request.head.sha }} --verbose
+      - name: '[Code quality] Check ESLint'
+        run: pnpm run lint
+      - name: '[Code quality] Check Lit'
+        run: pnpm run components:check-lit
+      - name: '[Code quality] Check types'
+        run: pnpm run typecheck
+      - name: '[Code quality] Check Stylelint'
+        run: pnpm run stylelint
+      - name: '[Code quality] Check Prettier (formatting)'
+        run: pnpm run format:check
+      - name: '[Code quality] Check i18n'
+        run: pnpm run components:check-i18n
+
+      - name: '[Code Generation] Check global events map'
+        run: pnpm run components:events-map-check
+
+      - name: '[Unit tests] Clever components'
+        run: pnpm run test
+      - name: '[Unit tests] Node tests (CEM & ESLint custom rules)'
+        run: pnpm run test:node
+
+      - name: '[Build] Clever components'
+        run: pnpm run components:build
+      - name: '[Build] Documentation'
+        run: pnpm run components:docs
+      - name: '[Build] CDN'
+        run: VERSION=0.0.0 pnpm run cdn-release:build

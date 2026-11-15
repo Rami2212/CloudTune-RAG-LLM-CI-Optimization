@@ -1,0 +1,61 @@
+name: Browserslist Database Update
+
+on:
+  schedule:
+    - cron: '0 0 1 * *'
+
+  workflow_dispatch:
+
+concurrency:
+  group: browserslist-db-update
+  cancel-in-progress: false
+
+jobs:
+  update-browserslist:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: '[Prepare] Checkout'
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.CI_TOKEN }}
+      - name: '[Prepare] Setup CI (mise + dependencies)'
+        uses: ./.github/actions/ci-setup
+
+      - name: '[Update] browserslist database'
+        run: pnpm dlx update-browserslist-db@latest
+
+      - name: '[Check] Detect pnpm-lock.yaml changes'
+        id: check
+        run: |
+          if git diff --quiet -- pnpm-lock.yaml; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: '[Check] No changes detected'
+        if: steps.check.outputs.has_changes == 'false'
+        run: echo "browserslist-db is already up to date"
+      - name: '[Check] Display detected changes'
+        if: steps.check.outputs.has_changes == 'true'
+        run: |
+          echo "Changes detected in pnpm-lock.yaml:"
+          git diff --stat -- pnpm-lock.yaml
+
+      - name: '[Check] Detect existing remote branch'
+        id: branch
+        if: steps.check.outputs.has_changes == 'true'
+        run: |
+          BRANCH_NAME=chore/update-browserslist-db-$(date -u +%Y-%m)
+          if git ls-remote --exit-code --heads origin "$BRANCH_NAME" >/dev/null 2>&1; then
+            echo "::notice::Remote branch $BRANCH_NAME already exists — skipping PR creation."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 'Create Pull Request'
+        if: steps.check.outputs.has_changes == 'true' && steps.branch.outputs.exists == 'false'
+        uses: ./.github/actions/pr-creation
+        with:
+          ci-token: ${{ secrets.CI_TOKEN }}

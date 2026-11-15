@@ -1,0 +1,64 @@
+name: Verify (Reusable Workflow)
+
+on:
+  workflow_call:
+    inputs:
+      maven_properties:
+        type: string
+        default: ''
+        description: 'Properties to pass to Maven command line, e.g. -Djpa.vendor=hibernate'
+
+permissions:
+  contents: read
+
+jobs:
+  reusable_workflow_verify:
+    runs-on: ubuntu-latest
+
+    services:
+      rabbitmq:
+        image: rabbitmq:3-management-alpine
+        env:
+          RABBITMQ_DEFAULT_VHOST: /
+          RABBITMQ_DEFAULT_USER: guest
+          RABBITMQ_DEFAULT_PASS: guest
+        ports:
+          - 15672:15672
+          - 5672:5672
+      postgresql:
+        image: postgres:16.5
+        env:
+          POSTGRES_DB: hawkbit
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: admin
+        options: >-
+          --health-cmd "pg_isready -d hawkbit -U postgres"
+          --health-interval 20s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          # the build runs PR code - don't leave the GITHUB_TOKEN in .git/config
+          persist-credentials: false
+
+      - name: Set up JDK
+        uses: actions/setup-java@v6.2.0
+        with:
+          distribution: 'temurin'
+          java-version: '25'
+
+      - name: Cache maven repository
+        uses: ./.github/actions/maven-cache
+
+      - name: Check file license headers
+        run: mvn license:check -PcheckLicense --batch-mode
+
+      - name: Run tests & javadoc
+        env:
+          MAVEN_PROPERTIES: ${{ inputs.maven_properties }}
+        # intentionally unquoted: the input holds several -D options; word splitting doesn't execute $(...) or ;
+        run: mvn clean verify javadoc:javadoc -DdetectOfflineLinks=false -PgenerateTestReport $MAVEN_PROPERTIES --batch-mode

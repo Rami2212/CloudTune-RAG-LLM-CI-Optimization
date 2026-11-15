@@ -1,0 +1,117 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [MEDIUM] Add concurrency group to "style_check.yaml"
+# Estimated savings: ~2 min/run
+#
+name: Style Check
+
+on:
+  # push on master also saves the IntelliJ IDEA cache in the master scope - PR runs can restore only caches of
+  # their own ref or of the base branch, so without it every new PR would download IDEA again
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - '.3rd-party/**'
+  pull_request:
+    paths-ignore:
+      - '.3rd-party/**'
+  workflow_dispatch:
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+
+env:
+  # keep in sync with the IntelliJ IDEA version used locally for formatting (see CONTRIBUTING.md)
+  IDEA_VERSION: '2026.2.3'
+  IDEA_SHA256: '68751c8ae4d49407251cd197df795fbed91b6fdc85d10c73c4649a99e496ab37'
+
+jobs:
+  style_check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          # runs PR code - don't leave the GITHUB_TOKEN in .git/config (fetches below work anonymously, public repo)
+          persist-credentials: false
+
+      # scripts/IdeaFormat is a java single-file program (JDK 25, no maven needed)
+      - name: Set up JDK
+        uses: actions/setup-java@v6.2.0
+        with:
+          distribution: 'temurin'
+          java-version: '25'
+
+      # scripts/IdeaFormat formats with IntelliJ IDEA, so a pinned IDEA is installed (and cached).
+      # 'idea format' runs headless with its own config/system dirs under target/.
+      # restore / save are separate steps - actions/cache saves only when the job succeeds, but the job fails on
+      # style violations and IDEA shall be cached anyway
+      - name: Restore IntelliJ IDEA
+        id: cache-idea
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: ${{ runner.temp }}/idea
+          key: idea-${{ env.IDEA_VERSION }}-linux
+
+      - name: Install IntelliJ IDEA
+        if: steps.cache-idea.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/idea"
+          curl -fsSL -o "$RUNNER_TEMP/idea.tar.gz" "https://download.jetbrains.com/idea/idea-${IDEA_VERSION}.tar.gz"
+          echo "${IDEA_SHA256}  $RUNNER_TEMP/idea.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/idea.tar.gz" -C "$RUNNER_TEMP/idea" --strip-components=1
+          rm "$RUNNER_TEMP/idea.tar.gz"
+
+      - name: Save IntelliJ IDEA
+        if: steps.cache-idea.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: ${{ runner.temp }}/idea
+          key: idea-${{ env.IDEA_VERSION }}-linux
+
+      - name: Check code style
+        env:
+          PR_BASE_REPO: ${{ github.event.pull_request.base.repo.clone_url }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          # only the files changed since the base are checked
+          if [ -n "$PR_BASE_SHA" ]; then
+            # pull request - compare to the target branch
+            git remote add target "$PR_BASE_REPO"
+            git fetch target
+            BASE="$PR_BASE_SHA"
+          elif [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            # push - compare to the commit before the push
+            git fetch --depth=1 origin "$PUSH_BEFORE"
+            BASE="$PUSH_BEFORE"
+          else
+            # manual run - compare to the previous commit
+            git fetch --deepen=1 origin
+            BASE="HEAD~1"
+          fi
+          echo "FORMAT_BASE=$BASE" >> "$GITHUB_ENV"
+          IDEA_BINARY="$RUNNER_TEMP/idea/bin/idea.sh" scripts/IdeaFormat --base "$BASE"
+
+      # the checklists only the files - on failure apply the formatting in the CI workspace and print / upload the
+      # complete diff (apply it locally with 'git apply idea-format.patch')
+      - name: Print all style violations
+        if: failure() && env.FORMAT_BASE != ''
+        run: |
+          IDEA_BINARY="$RUNNER_TEMP/idea/bin/idea.sh" scripts/IdeaFormat --format --base "$FORMAT_BASE"
+          git diff > idea-format.patch
+          git --no-pager diff --stat
+          git --no-pager diff
+
+      - name: Upload style violations patch
+        if: failure() && env.FORMAT_BASE != ''
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: idea-format.patch
+          path: idea-format.patch
+          if-no-files-found: ignore

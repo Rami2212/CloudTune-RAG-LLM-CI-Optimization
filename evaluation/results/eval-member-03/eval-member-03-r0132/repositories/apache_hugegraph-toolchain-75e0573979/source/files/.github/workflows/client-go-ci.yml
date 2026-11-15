@@ -1,0 +1,86 @@
+name: "go-client-ci"
+
+on:
+  workflow_call:
+    inputs:
+      server-baselines:
+        type: string
+        default: '["candidate"]'
+      current-artifact-name:
+        type: string
+        required: true
+      current-repository:
+        type: string
+        required: true
+      current-ref:
+        type: string
+        required: true
+      current-commit:
+        type: string
+        required: true
+      server-repository:
+        type: string
+        default: apache/hugegraph
+      artifact-name:
+        type: string
+        required: true
+      server-commit:
+        type: string
+        required: true
+      server-ref:
+        type: string
+        required: true
+
+jobs:
+  client-go-ci:
+    runs-on: ubuntu-latest
+    env:
+      TRAVIS_DIR: hugegraph-client/assembly/travis
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        SERVER_BASELINE: ${{ fromJSON(inputs.server-baselines) }}
+
+    steps:
+      - name: Fetch Code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+
+      - name: Setup Server JVM
+        id: server-java
+        uses: actions/setup-java@v5
+        with:
+          java-version: ${{ matrix.SERVER_BASELINE == 'candidate' && '17' || '11' }}
+          distribution: temurin
+          overwrite-settings: false
+
+      - name: Setup HugeGraph server
+        uses: ./.github/actions/setup-hugegraph-server
+        with:
+          travis-dir: ${{ env.TRAVIS_DIR }}
+          commit-id: ${{ matrix.SERVER_BASELINE == 'candidate' && inputs.current-commit || inputs.server-commit }}
+          repository: ${{ matrix.SERVER_BASELINE == 'candidate' && inputs.current-repository || inputs.server-repository }}
+          fetch-ref: ${{ matrix.SERVER_BASELINE == 'candidate' && inputs.current-ref || inputs.server-ref }}
+          artifact-name: ${{ matrix.SERVER_BASELINE == 'candidate' && inputs.current-artifact-name || inputs.artifact-name }}
+          mode: start
+          java-version: ${{ matrix.SERVER_BASELINE == 'candidate' && '17' || '11' }}
+          java-home: ${{ steps.server-java.outputs.path }}
+
+      - name: Init Go env
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.x'
+          cache-dependency-path: hugegraph-client-go/go.sum
+
+      - name: Go test
+        run: |
+          go version
+          sudo swapoff -a
+          sudo sysctl -w vm.swappiness=1
+          sudo sysctl -w fs.file-max=262144
+          sudo sysctl -w vm.max_map_count=262144
+          cd hugegraph-client-go
+          # Each live Server baseline must execute requests rather than replay cached test results.
+          make test GOTEST='GO111MODULE=on go test -race -count=1 -timeout 30s -gcflags="-N -l"'

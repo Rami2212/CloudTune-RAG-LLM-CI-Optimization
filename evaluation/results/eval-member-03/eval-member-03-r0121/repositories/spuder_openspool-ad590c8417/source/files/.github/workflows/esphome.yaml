@@ -1,0 +1,224 @@
+name: Build ESPHome
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+*'
+
+# Prevent parallel runs if accidentially pushing multiple tags in quick succession
+concurrency: 
+  group: ${{ github.workflow }}-${{ github.ref }}
+
+permissions:
+  contents: write
+  actions: read
+  checks: write
+
+jobs:
+  check-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag_on_main: ${{ steps.check_tag.outputs.tag_on_main }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if tag is on main branch
+        id: check_tag
+        run: |
+          TAG_COMMIT=$(git rev-list -n 1 ${{ github.ref_name }})
+          MAIN_COMMIT=$(git rev-parse origin/main)
+          if git merge-base --is-ancestor $TAG_COMMIT $MAIN_COMMIT; then
+            echo "tag_on_main=true" >> $GITHUB_OUTPUT
+            echo "Tag is on main branch"
+          else
+            echo "tag_on_main=false" >> $GITHUB_OUTPUT
+            echo "Tag is not on main branch"
+          fi
+
+  build:
+    needs: check-tag
+    if: needs.check-tag.outputs.tag_on_main == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [esp32s2, esp32s3]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT }}
+          fetch-depth: 0
+      
+      - name: Create empty secrets file
+        run: |
+          touch firmware/secrets.yaml
+          touch firmware/conf.d/secrets.yaml
+      
+      - name: Setup yq
+        uses: vegardit/gha-setup-yq@v1
+
+      - name: Set git sha
+        run: |
+          SUMMARY=$(git log -1 --pretty=%B)
+          SUMMARY="${SUMMARY//'%'/'%25'}"
+          SUMMARY="${SUMMARY//$'\n'/'%0A'}"
+          SUMMARY="${SUMMARY//$'\r'/'%0D'}"
+          echo "RELEASE_SUMMARY=$SUMMARY" >> $GITHUB_ENV
+
+      - name: Modify version.yaml
+        run: |
+          yq -i '.substitutions.version = "${{ github.ref_name }}"' firmware/conf.d/version.yaml
+          cat firmware/conf.d/version.yaml
+
+      - name: Build OpenSpool-Mini firmware
+        uses: esphome/build-action@v7.0.0
+        with:
+          yaml-file: ${{ github.workspace }}/firmware/lolin_s2_mini.yaml
+          version: 2025.8.1
+          release-summary: ${{ env.RELEASE_SUMMARY }}
+          release-url: https://openspool.io/firmware
+          complete-manifest: false
+        if: matrix.target == 'esp32s2'
+
+      - name: Build OpenSpool-AMS firmware
+        uses: esphome/build-action@v7.0.0
+        with:
+          yaml-file: ${{ github.workspace }}/firmware/lolin_s3_mini.yaml
+          version: 2025.8.1
+          release-summary: ${{ env.RELEASE_SUMMARY }}
+          release-url: https://openspool.io/firmware
+          complete-manifest: false
+        if: matrix.target == 'esp32s3'
+      
+      - name: ls
+        run: |
+          ls -la
+          ls openspool-${{ matrix.target }}/* || true
+
+      - name: Generate md5 checksum
+        run: |
+          ls -la openspool-${{ matrix.target }}
+
+          for file in openspool-${{ matrix.target }}/*.bin; do
+            md5sum "$file" | awk '{print $1}' > "${file}.md5"
+            md5_length=$(wc -c < "${file}.md5")
+            if [ "$md5_length" -ne 33 ]; then
+              echo "MD5 generation failed for $file (length: $md5_length)"
+              exit 1
+            fi
+          ls -la openspool-${{ matrix.target }}
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: openspool-${{ matrix.target }}
+          path: openspool-${{ matrix.target }}/**/*
+          retention-days: 5
+          if-no-files-found: error
+
+  combine-manifests:
+    needs: [check-tag, build]
+    if: needs.check-tag.outputs.tag_on_main == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT }}
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded-artifacts
+
+      - name: list artifacts
+        run: |
+          ls -ial 
+
+      - name: Purge local firmware
+        run: |
+          rm -f docs/firmware/*.json || true
+          rm -f docs/firmware/*.bin || true
+          cp downloaded-artifacts/openspool-esp32s2/*.bin docs/firmware/
+          cp downloaded-artifacts/openspool-esp32s2/*.md5 docs/firmware/
+          cp downloaded-artifacts/openspool-esp32s3/*.bin docs/firmware/
+          cp downloaded-artifacts/openspool-esp32s3/*.md5 docs/firmware/
+
+      - name: Combined manifests
+        run: |
+          jq -n --arg version "${{ github.ref_name }}" '{
+            name: "OpenSpool",
+            version: $version,
+            builds: [],
+            new_install_prompt_erase: true
+          }' > docs/firmware/manifest.json
+
+          for target in esp32s2 esp32s3; do
+            if [ -f "downloaded-artifacts/openspool-$target/manifest.json" ]; then
+              jq --slurpfile new_build "downloaded-artifacts/openspool-$target/manifest.json" '.builds += $new_build' docs/firmware/manifest.json > temp.json && mv temp.json docs/firmware/manifest.json
+            else
+              echo "Warning: manifest for $target not found"
+              exit 1
+            fi
+          done
+
+          jq '.' docs/firmware/manifest.json
+          ls -l docs/firmware
+
+      - name: Setup yq
+        uses: vegardit/gha-setup-yq@v1
+
+      - name: Modify version.yaml
+        run: |
+          yq -i '.substitutions.version = "${{ github.ref_name }}"' firmware/conf.d/version.yaml
+          cat firmware/conf.d/version.yaml
+
+      - name: Update manifest
+        run: |
+          git stash push -m "Stash before switching to main"
+          git checkout main
+          git pull origin main
+          git stash apply
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add firmware/conf.d/version.yaml
+          git add docs/firmware/*
+          git diff --staged || true
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+            exit 1
+          else
+            git commit -m "Update version to ${{ github.ref_name }}"
+            git push origin main
+          fi
+          git status
+
+      - name: Create Release Folder
+        run: |
+          mkdir -p release
+          cp docs/firmware/manifest.json release/manifest.json
+          cp docs/firmware/*.bin release/
+          cp docs/firmware/*.md5 release/
+
+      - name: Release ${{ github.ref_name }}
+        uses: "marvinpinto/action-automatic-releases@latest"
+        with:
+          repo_token: "${{ secrets.GITHUB_TOKEN }}"
+          automatic_release_tag: "${{ github.ref_name }}"
+          prerelease: false
+          files: |
+            release/**/*
+
+      # - name: Release Latest
+      #   uses: "marvinpinto/action-automatic-releases@latest"
+      #   with:
+      #     repo_token: "${{ secrets.GITHUB_TOKEN }}"
+      #     automatic_release_tag: "latest"
+      #     prerelease: false
+      #     files: |
+      #       release/**/*

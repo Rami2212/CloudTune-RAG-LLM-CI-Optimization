@@ -1,0 +1,58 @@
+name: check_latest_release
+
+on:
+  release:
+    types: [released]
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: The GitHub release tag corresponding to the PyPI releases to test
+        required: true
+        default: non-existent-tag
+  
+jobs:
+  install-module-and-run-examples:
+    name: example_test
+    if: github.repository == 'ni/nimi-python'
+    # Use win32 nimibot
+    # win64 already handles post-commit testing for coverage
+    # linux doesn't support all modules
+    runs-on:
+      - self-hosted
+      - windows
+      - x64
+      - rdss-nimibot-win-10-py32
+    timeout-minutes: 30
+    steps:
+      - name: checkout repository
+        uses: actions/checkout@v3
+
+      - name: Extract module name and version from release tag
+        id: extract_tag
+        shell: python
+        run: |
+          import os
+          import json
+
+          # Extract module name and version from the release tag
+          # Assuming the tag format is <module_name>-<version>, e.g., nidigital-1.4.0
+          with open(os.getenv("GITHUB_EVENT_PATH"), "r", encoding="utf-8") as event_file:
+            event = json.load(event_file)
+          if os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch":
+            tag = event["inputs"]["release_tag"]
+          else:
+            tag = event["release"]["tag_name"]
+
+          assert tag.count("-") == 1, f"Invalid tag format: {tag}. Expected format: <module_name>-<version>"
+          module_name, module_version = tag.split("-")
+          with open(os.getenv("GITHUB_OUTPUT"), "a", encoding="utf-8") as output_file:
+            output_file.write(f"module_name={module_name}\n")
+            output_file.write(f"module_version={module_version}\n")
+      # NOTE: we don't upload test coverage for this
+      - name: run examples using PyPI uploads
+        uses: ./.github/actions/run_examples_using_pypi_uploads
+        with:
+          module_name: ${{ steps.extract_tag.outputs.module_name }}
+          module_version: ${{ steps.extract_tag.outputs.module_version }}

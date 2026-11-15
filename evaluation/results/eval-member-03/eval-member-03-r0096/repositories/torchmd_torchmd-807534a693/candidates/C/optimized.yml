@@ -1,0 +1,48 @@
+name: Test
+
+on:
+  workflow_dispatch:
+  workflow_call:
+  schedule:
+    - cron: "0 0 * * 0" # Run every Sunday at 0:00
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["ubuntu-latest"]
+        python-version: ["3.12"]
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache uv dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-uv-${{ matrix.python-version }}-${{ hashFiles('pyproject.toml', 'uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-${{ matrix.python-version }}-
+
+      - name: Install the project
+        run: uv sync --all-extras --dev
+
+      - name: Lint with flake8
+        run: |
+          # stop the build if there are Python syntax errors or undefined names
+          uv run flake8 ./torchmd --count --select=E9,F63,F7,F82 --show-source --statistics
+          # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
+          uv run flake8 ./torchmd --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+      - name: Run tests
+        # For example, using `pytest`
+        run: uv run pytest tests

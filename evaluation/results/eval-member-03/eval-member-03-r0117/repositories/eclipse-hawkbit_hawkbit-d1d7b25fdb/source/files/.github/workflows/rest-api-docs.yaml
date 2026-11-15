@@ -1,0 +1,92 @@
+name: REST API Docs
+
+# Regenerates the OpenAPI specs rendered by the GitHub Pages docs (docs/rest-api/mgmt.json, ddi.json - loaded by
+# docs/rest-api/mgmt.html, ddi.html) and commits them if they have changed.
+# Triggered only by changes in the inputs the Management and DDI API specs are generated from.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      # dependency versions (springdoc, Spring Boot)
+      - 'pom.xml'
+      # permissions and role hierarchy - rendered as "Required Permission: X (or implied by ...)" in the Mgmt API spec
+      - 'hawkbit-core/src/main/java/org/eclipse/hawkbit/auth/**'
+      # shared REST API (@RequiredPermissions, ApiPermission) and REST core (springdoc setup, OpenApi, error model)
+      - 'hawkbit-rest/hawkbit-rest-api/src/main/**'
+      - 'hawkbit-rest/hawkbit-rest-core/src/main/**'
+      - 'hawkbit-mgmt/hawkbit-mgmt-api/src/main/**'
+      - 'hawkbit-mgmt/hawkbit-mgmt-resource/src/main/**'
+      - 'hawkbit-mgmt/hawkbit-mgmt-resource/src/test/java/org/eclipse/hawkbit/mgmt/rest/resource/MgmtOpenApiSpecExportTest.java'
+      - 'hawkbit-ddi/hawkbit-ddi-api/src/main/**'
+      - 'hawkbit-ddi/hawkbit-ddi-resource/src/main/**'
+      - 'hawkbit-ddi/hawkbit-ddi-resource/src/test/java/org/eclipse/hawkbit/ddi/rest/resource/DdiOpenApiSpecExportTest.java'
+      - 'hawkbit-rest/hawkbit-rest-core/src/test/java/org/eclipse/hawkbit/rest/util/OpenApiSpecExporter.java'
+      - '.github/workflows/rest-api-docs.yaml'
+
+permissions:
+  contents: read
+
+# a newer run supersedes an older one - it generates the specs from a newer state
+concurrency:
+  group: rest-api-docs
+  cancel-in-progress: true
+
+jobs:
+  rest-api-docs:
+    # only on original eclipse-hawkbit/hawkbit repo or when manually triggered
+    if: github.repository == 'eclipse-hawkbit/hawkbit' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    outputs:
+      base: ${{ steps.upload-changes.outputs.base }}
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.ref }}
+          # the build runs tests - don't leave the GITHUB_TOKEN in .git/config
+          persist-credentials: false
+
+      - name: Set up JDK
+        uses: actions/setup-java@v6.2.0
+        with:
+          distribution: 'temurin'
+          java-version: '25'
+
+      - name: Cache maven repository
+        uses: ./.github/actions/maven-cache
+
+      # the export tests write the specs (as served by /v3/api-docs/{group}) to <module>/target/openapi/
+      - name: Generate OpenAPI specs
+        run: |
+          mvn test --batch-mode \
+            -pl hawkbit-mgmt/hawkbit-mgmt-resource,hawkbit-ddi/hawkbit-ddi-resource -am \
+            -Dtest=MgmtOpenApiSpecExportTest,DdiOpenApiSpecExportTest -Dsurefire.failIfNoSpecifiedTests=false
+          cp hawkbit-mgmt/hawkbit-mgmt-resource/target/openapi/mgmt.json docs/rest-api/mgmt.json
+          cp hawkbit-ddi/hawkbit-ddi-resource/target/openapi/ddi.json docs/rest-api/ddi.json
+
+      - name: Upload OpenAPI specs
+        id: upload-changes
+        uses: ./.github/actions/upload-changes
+        with:
+          files: |
+            docs/rest-api/mgmt.json
+            docs/rest-api/ddi.json
+
+  # committed directly if changed - in a separate job, without the build
+  commit:
+    needs: rest-api-docs
+    uses: ./.github/workflows/reusable_workflow_commit-changes.yaml
+    permissions:
+      contents: write
+    with:
+      ref: ${{ github.ref }}
+      base: ${{ needs.rest-api-docs.outputs.base }}
+      files: |
+        docs/rest-api/mgmt.json
+        docs/rest-api/ddi.json
+      message: "[Docs] Automated commit of REST API docs (OpenAPI specs) changes"

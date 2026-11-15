@@ -1,0 +1,104 @@
+# .github/workflows/release.yml
+name: Release
+on:
+  release:
+    types: [published]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          architecture: "x64"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: main_service/frontend/package-lock.json
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Validate release versions and ancestry
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python - <<'PY'
+          import ast
+          import os
+          import tomllib
+          from pathlib import Path
+
+          client_version = tomllib.loads(Path("client/pyproject.toml").read_text())["project"]["version"]
+          main_version = tomllib.loads(Path("main_service/pyproject.toml").read_text())["project"]["version"]
+          node_version = tomllib.loads(Path("node_service/pyproject.toml").read_text())["project"]["version"]
+
+          def assignment(path, name):
+              tree = ast.parse(Path(path).read_text())
+              for statement in tree.body:
+                  if isinstance(statement, ast.Assign):
+                      if any(isinstance(target, ast.Name) and target.id == name for target in statement.targets):
+                          return ast.literal_eval(statement.value)
+              raise AssertionError(f"{name} missing from {path}")
+
+          release_tag = os.environ["RELEASE_TAG"]
+          versions = {
+              client_version,
+              main_version,
+              node_version,
+              assignment("client/src/burla/__init__.py", "__version__"),
+              assignment("main_service/src/main_service/__init__.py", "CURRENT_BURLA_VERSION"),
+              assignment("node_service/src/node_service/__init__.py", "__version__"),
+          }
+          assert versions == {release_tag}, versions
+
+          min_compatible = assignment(
+              "main_service/src/main_service/__init__.py",
+              "MIN_COMPATIBLE_CLIENT_VERSION",
+          )
+          assert tuple(map(int, min_compatible.split("."))) <= tuple(
+              map(int, release_tag.split("."))
+          ), (
+              min_compatible,
+              release_tag,
+          )
+          PY
+          RELEASE_SHA=$(git rev-list -n 1 "$RELEASE_TAG")
+          git fetch origin main
+          git merge-base --is-ancestor "$RELEASE_SHA" origin/main
+
+      - name: Build dist
+        run: |
+          make -C main_service build-frontend
+          uv build --directory ./client
+
+      - name: Publish to PyPI
+        run: uv publish --directory ./client --check-url https://pypi.org/simple/burla/ --token "${{ secrets.PYPI_TOKEN }}"
+
+  # The prod relay's entire config (frps version + config, auth plugin,
+  # backend URL) ships from this repo, so every release re-runs the deploy
+  # script against burla-prod. The script fingerprints that config and no-ops
+  # when the running relay already matches, so this only replaces the relay VM
+  # when something under relay/ actually changed.
+  deploy-relay:
+    needs: release
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::018789813546:role/burla-relay-deployer
+          aws-region: us-east-1
+      - run: ./relay/deploy_relay_aws.sh --region us-east-1 --subdomain-host relay.burla.dev

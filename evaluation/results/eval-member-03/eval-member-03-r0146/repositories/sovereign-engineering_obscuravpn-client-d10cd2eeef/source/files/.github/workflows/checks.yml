@@ -1,0 +1,179 @@
+name: Checks
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - '**'
+  push:
+    branches:
+      - 'main'
+
+concurrency:
+  # group is workflow specific and based on the branch (e.g. PRs) or tag
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # we don't want to cancel checks on the main branch
+  cancel-in-progress: ${{ github.ref_name != 'main' }}
+
+jobs:
+  flake_check_linux:
+    name: Flake Check Linux
+    runs-on: [nix]
+    steps:
+      - name: git checkout
+        uses: actions/checkout@v6
+      - name: Nix Checks
+        shell: bash
+        run: |
+          nix flake check \
+            --keep-going \
+            --no-update-lock-file \
+            --print-build-logs \
+            --show-trace
+      - name: Nix Build
+        shell: bash
+        run: |
+          nix build '.#apks-foss' \
+            --no-update-lock-file \
+            --print-build-logs \
+            --show-trace
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: obscura-debug.apk
+          path: result/app-foss-debug-unsigned.apk
+          retention-days: 30
+
+  flake_check_macos:
+    name: Flake Check macOS
+    runs-on:
+      # https://namespace.so/docs/features/faster-github-actions#using-runner-labels
+      - nscloud-macos-sequoia-arm64-12x28-with-cache
+      - nscloud-cache-tag-obscuravpn-client
+      - nscloud-cache-size-50gb
+    steps:
+      - name: git checkout
+        uses: actions/checkout@v6
+
+      - uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          # The action fails to mount at `/nix` and we want to let the Nix installer handle that anyways.
+          path: /tmp/nix
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          determinate: false
+          mac-volume-label: obscuravpn-client
+
+      - name: Nix Checks
+        shell: bash
+        run: |
+          nix flake check \
+            --keep-going \
+            --no-update-lock-file \
+            --print-build-logs \
+            --show-trace
+
+  macos_build:
+    name: MacOS build
+    runs-on:
+      # https://namespace.so/docs/reference/github-actions/runner-configuration#runner-labels
+      - nscloud-macos-tahoe-arm64-12x28-with-cache
+      - nscloud-cache-tag-obscuravpn-client
+      - nscloud-cache-size-50gb
+    steps:
+      - name: git checkout
+        uses: actions/checkout@v6
+
+      - name: unshallow and fetch git tags
+        shell: bash
+        run: |
+          git fetch --prune --unshallow --tags
+
+      - uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          # The action fails to mount at `/nix` and we want to let the Nix installer handle that anyways.
+          path: /tmp/nix
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          determinate: false
+          mac-volume-label: obscuravpn-client
+
+      - name: Build macOS client
+        shell: bash
+        run: |
+          xcodebuild build \
+            -workspace apple/client.xcodeproj/project.xcworkspace \
+            -scheme 'Prod Client' \
+            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED="NO" CODE_SIGN_ENTITLEMENTS="" CODE_SIGNING_ALLOWED="NO"
+
+  ios_build:
+    name: iOS All
+    runs-on:
+      # https://namespace.so/docs/reference/github-actions/runner-configuration#runner-labels
+      - nscloud-macos-tahoe-arm64-12x28-with-cache
+      - nscloud-cache-tag-obscuravpn-client
+      - nscloud-cache-size-50gb
+    steps:
+      - name: git checkout
+        uses: actions/checkout@v6
+
+      - name: unshallow and fetch git tags
+        shell: bash
+        run: |
+          git fetch --prune --unshallow --tags
+
+      - uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          # The action fails to mount at `/nix` and we want to let the Nix installer handle that anyways.
+          path: /tmp/nix
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          determinate: false
+          mac-volume-label: obscuravpn-client
+
+      - name: Build iOS client
+        shell: bash
+        run: |
+          xcodebuild build \
+            -workspace apple/client.xcodeproj/project.xcworkspace \
+            -scheme 'Obscura VPN iOS' \
+            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED="NO" CODE_SIGN_ENTITLEMENTS="" CODE_SIGNING_ALLOWED="NO"
+
+  sync:
+    name: Sync
+    if: |
+      github.repository == 'sovereign-engineering/obscuravpn-client-internal'
+      && github.ref == 'refs/heads/main'
+    needs:
+      - flake_check_linux
+      - flake_check_macos
+      - ios_build
+      - macos_build
+    runs-on: nscloud-ubuntu-20.04-amd64-2x2
+    environment: sync
+    steps:
+      - name: git checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # We need all history to check for internal commits.
+      - name: Check Restricted Commits
+        run: |
+          echo "Ensuring that we have full history."
+          git log --pretty=oneline 5a25968c93bda974d63f9f96e2be38d7277d0993
+          echo "Ensuring that internal history is not present in HEAD."
+          ! git merge-base --is-ancestor 5a25968c93bda974d63f9f96e2be38d7277d0993 HEAD
+      - name: Push to Public
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.OBSCURA_CLIENT_SSH_KEY }}
+        run: |
+          echo "$SSH_PRIVATE_KEY" > "$RUNNER_TEMP/ssh-private-key"
+          chmod 600 "$RUNNER_TEMP/ssh-private-key"
+          export GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/ssh-private-key"
+
+          git push git@github.com:Sovereign-Engineering/obscuravpn-client.git HEAD:main

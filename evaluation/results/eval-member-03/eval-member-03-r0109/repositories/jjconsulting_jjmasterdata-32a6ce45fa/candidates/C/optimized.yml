@@ -1,0 +1,33 @@
+name: .NET
+
+on:
+  push:
+    branches: [ "main", "rc" ]
+  pull_request:
+    branches: [ "main", "rc" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+
+    steps:
+    - uses: actions/checkout@v7.0.1
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v6.0.0
+      with:
+        dotnet-version: 10.0.x
+    - name: Cache NuGet packages
+      uses: actions/cache@v4
+      with:
+        path: ~/.nuget/packages
+        key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj', '**/packages.lock.json') }}
+        restore-keys: |
+          ${{ runner.os }}-nuget-
+    - name: Build
+      run: |
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          VERSION_SUFFIX="rc.${{ github.event.pull_request.number }}.${{ github.run_number }}"
+        else
+          VERSION_SUFFIX=""
+        fi
+        dotnet build -p:VersionSuffix="${VERSION_SUFFIX}" -p:ContinuousIntegrationBuild=true
