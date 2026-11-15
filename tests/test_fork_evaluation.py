@@ -219,6 +219,20 @@ class HostedProtocolTests(unittest.TestCase):
                     self.assertEqual(ensure_dispatch(source), expected)
                     self.assertEqual(ensure_dispatch(expected), expected)
 
+    def test_dispatch_harness_preserves_leading_comments_and_blank_lines(self):
+        for newline in ("\n", "\r\n"):
+            for prefix in ("  # event comment\n", "\n  # event comment\n  \n"):
+                with self.subTest(newline=repr(newline), prefix=prefix):
+                    source = ("name: CI\non:\n" + prefix +
+                              "  push:\n    branches: [main]\n"
+                              "  pull_request:\n    branches: [main]\n"
+                              "jobs:\n  test:\n    runs-on: ubuntu-latest\n"
+                              "    steps:\n      - run: echo ok\n").replace("\n", newline).encode()
+                    expected = source.replace(b"on:" + newline.encode(),
+                                              ("on:" + newline + "  workflow_dispatch:" + newline).encode(), 1)
+                    self.assertEqual(ensure_dispatch(source), expected)
+                    self.assertEqual(ensure_dispatch(expected), expected)
+
     def test_dispatch_harness_rejects_quoted_sequence_events(self):
         source = b"'on':\n  - push\njobs:\n  test:\n    steps:\n      - run: echo ok\n"
         with self.assertRaises(ValueError):

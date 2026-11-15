@@ -1,0 +1,35 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [HIGH] Add maven dependency cache to "build-and-deploy-snapshot" job
+# Estimated savings: ~5 min/run
+#
+name: Build and Deploy Snapshot
+on:
+  push:
+    branches:
+      - main
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+jobs:
+  build-and-deploy-snapshot:
+    name: Build and Deploy Snapshot
+    runs-on: ubuntu-latest
+    if: ${{ github.repository == 'spring-io/spring-javaformat' }}
+    steps:
+    - name: Check Out
+      uses: actions/checkout@v4
+    - name: Set Up
+      uses: ./.github/actions/setup
+    - name: Build
+      run: ./mvnw clean deploy --batch-mode --no-transfer-progress --update-snapshots -DaltDeploymentRepository=distribution::file://$(pwd)/distribution-repository
+    - name: Deploy
+      uses: spring-io/artifactory-deploy-action@v0.0.1
+      with:
+        folder: 'distribution-repository'
+        uri: 'https://repo.spring.io'
+        repository: 'libs-snapshot-local'
+        build-name: spring-javaformat
+        username: ${{ secrets.ARTIFACTORY_USERNAME }}
+        password: ${{ secrets.ARTIFACTORY_PASSWORD }}
+        signing-key: ${{ secrets.GPG_PRIVATE_KEY }}
+        signing-passphrase: ${{ secrets.GPG_PASSPHRASE }}

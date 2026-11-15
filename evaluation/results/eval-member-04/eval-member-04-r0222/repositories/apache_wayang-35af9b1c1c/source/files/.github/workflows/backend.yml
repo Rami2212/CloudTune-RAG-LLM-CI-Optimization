@@ -1,0 +1,82 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+name: Backend
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: backend-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+
+jobs:
+  check-license:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Check License Header
+        uses: apache/skywalking-eyes/header@main
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          java-version:  17
+          distribution: 'temurin'
+      - name: Install Protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven
+      - name: Validate documentation POM
+        run: |
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          ns = {'m': 'http://maven.apache.org/POM/4.0.0'}
+          root_version = ET.parse('pom.xml').findtext('m:version', namespaces=ns)
+          docs_parent = ET.parse('wayang-docs/pom.xml').findtext('m:parent/m:version', namespaces=ns)
+          if docs_parent != root_version:
+              raise SystemExit(f'Documentation parent {docs_parent} does not match root {root_version}')
+          PY
+          ./mvnw validate -B -Pweb-documentation -pl wayang-docs
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r python/src/pywy/requirements.txt
+      - name: Build And Install
+        run: ./mvnw clean install -B -Dmaven.test.skip=true
+      - name: Run Maven Unit tests
+        run: ./mvnw clean verify -B -Dmaven.test.skip=false -Dwayang.configuration=file:$(pwd)/tools/test/config/wayang.properties
+      - name: Run Python Unit tests
+        run: pytest -ra --config tools/test/config/wayang.properties python/src/pywy/tests/

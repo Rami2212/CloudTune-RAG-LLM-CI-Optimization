@@ -1,0 +1,122 @@
+plugins {
+    id "com.netflix.nebula.ospackage" version "12.3.0"
+}
+// Get version from main project gradle
+def packVersion = properties.get("packageVersion")
+def jarVersion = properties.get("jarVersion")
+
+dependencies {
+    implementation project(':HIRS_Utils')
+    implementation libs.commons.io
+    implementation libs.jcommander
+    runtimeOnly libs.slf4j.simple // CLI, not HIRS_Utils, selects its logging provider.
+}
+
+ext.configDir = new File(projectDir, 'config')
+
+jar {
+    dependsOn configurations.runtimeClasspath
+    // Keep jar clean:
+    exclude 'META-INF/*.SF', 'META-INF/*.DSA', 'META-INF/*.RSA', 'META-INF/*.MF'
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    manifest {
+        attributes(
+                "Main-Class": "hirs.tcg_eventlog.Main",
+                'Class-Path': configurations.runtimeClasspath.files.collect { it.getName() }.join(' ')
+        )
+    }
+    from {
+        configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) }
+    }
+    //jar name format: [archiveBaseName]-[archiveAppendix]-[archiveVersion]-[archiveClassifier].[archiveExtension]
+    archiveVersion = jarVersion
+}
+
+// Produce packages
+ospackage {
+    packageName = 'tcg-eventlog-tool'
+    os = LINUX
+    arch = NOARCH
+    version = "$packVersion"
+    release = '1'
+
+    user = 'root'
+    fileMode = 0755
+
+    into('/opt/eltool/lib') {
+        from jar.outputs.files
+        from configurations.runtimeClasspath
+    }
+
+    into('/opt/eltool/scripts') {
+        filePermissions {
+           unix(0755)
+        }
+        from('scripts') {
+            exclude {
+                FileTreeElement details ->
+                    details.file.name.endsWith('.bat')
+            }
+        }
+    }
+
+    into('/opt/eltool/docs') {
+        from('docs') {
+            exclude {
+                FileTreeElement details ->
+                    details.file.name.endsWith('.odt')
+            }
+        }
+        from('./') {
+            include {
+                FileTreeElement details ->
+                    details.file.name.endsWith('.md')
+            }
+        }
+    }
+
+    // Copy vendor-table into /tmp to avoid conflict with the ACA 
+    into('/opt/eltool/default-properties') {
+        from('../../HIRS_Utils/src/main/resources/vendor-table.json') {
+            fileMode = 0664
+            addParentDirs = true
+        }
+    }
+
+    // place elt link in system path to enable command line access
+    link("/usr/local/bin/elt", "/opt/eltool/scripts/eventlog.sh", 0x755)
+
+    // Post Install
+    postInstall "echo ${jarVersion} > /opt/eltool/VERSION"
+
+    // Post Uninstall
+    postUninstall 'rm -rf /opt/eltool'
+
+    buildRpm {
+        arch = X86_64
+        requires('hwdata', '0.314', GREATER | EQUAL)
+    }
+
+    buildDeb {
+        arch = 'amd64'
+        requires('hwdata', '0.314', GREATER | EQUAL)
+    }
+
+}
+
+
+tasks.register('buildZip', Zip) {
+    dependsOn jar
+    from(tasks.jar.archiveFile) {
+        rename(filename ->
+                "${project.name}.jar")
+        into '/'
+    }
+
+    archiveBaseName.set(project.name)
+    destinationDirectory.set(file("$buildDir/distributions"))
+    archiveFileName.set("${project.name}.zip")
+}
+
+buildZip.dependsOn jar
+//build.dependsOn buildZip

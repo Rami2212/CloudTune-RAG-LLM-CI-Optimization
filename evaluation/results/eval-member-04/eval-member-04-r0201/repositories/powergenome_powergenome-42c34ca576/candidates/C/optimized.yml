@@ -1,0 +1,51 @@
+name: pytest
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 5
+      matrix:
+        # 3.12 is the default development version. 3.11 keeps the declared
+        # lower bound in pyproject.toml covered by tests.
+        python-version: ["3.12", "3.11"]
+
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install uv
+      uses: astral-sh/setup-uv@v6
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: Cache uv dependencies
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/uv
+        key: ${{ runner.os }}-uv-${{ hashFiles('uv.lock') }}-${{ matrix.python-version }}
+        restore-keys: |
+          ${{ runner.os }}-uv-${{ hashFiles('uv.lock') }}-${{ matrix.python-version }}
+          ${{ runner.os }}-uv-
+    - name: Install powergenome with dev dependencies
+      run: |
+        # --locked asserts uv.lock is up to date and installs exactly what it pins
+        uv sync --extra dev --locked --python ${{ matrix.python-version }}
+    - name: Lint with flake8
+      run: |
+        uv pip install flake8
+        # stop the build if there are Python syntax errors or undefined names.
+        # Exclude .venv since uv creates it inside the workspace (the previous
+        # micromamba environment lived outside the repo).
+        uv run flake8 . --exclude=.venv --count --select=E9,F63,F7,F82 --show-source --statistics
+        # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
+        uv run flake8 . --exclude=.venv --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+    - name: Test with pytest
+      env:
+        PUDL_DB: ${{ secrets.PUDL_DB }}
+        PG_DB: ${{ secrets.PG_DB }}
+      run: |
+        uv run pytest --cov=powergenome tests/ --cov-report=xml
+    - name: Upload test coverage report to CodeCov
+      uses: codecov/codecov-action@v4
+      env:
+        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
