@@ -1,0 +1,111 @@
+name: "Build 🔨"
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  push:
+    branches: [ main ]
+    paths:
+      - '**'
+      - '!Translations/*.lproj/**'
+      - 'Translations/en.lproj/**'
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: "Build 🔨"
+    if: github.event.pull_request.draft == false
+    strategy:
+      fail-fast: false
+      matrix:
+        scheme:
+          - "Swiftfin"
+          - "Swiftfin tvOS"
+
+    runs-on: xcode-27
+
+    env:
+      XCODE_VERSION: "27.1"
+      FASTLANE_XCODEBUILD_SETTINGS_TIMEOUT: "120"
+      FASTLANE_XCODEBUILD_SETTINGS_RETRIES: "2"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+
+      - name: Install Homebrew dependencies
+        run: brew bundle --file Brewfile
+
+      - name: Restore Swift packages
+        id: swift-packages
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            build/SourcePackages/checkouts
+            build/SourcePackages/repositories
+            build/SourcePackages/artifacts
+            build/SourcePackages/workspace-state.json
+          key: spm-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.XCODE_VERSION }}-${{ matrix.scheme }}-${{ hashFiles('Swiftfin.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
+          restore-keys: |
+            spm-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.XCODE_VERSION }}-${{ matrix.scheme }}-
+
+      - name: Build
+        uses: nick-fields/retry@v4
+        env:
+          SCHEME: ${{ matrix.scheme }}
+        with:
+          max_attempts: 3
+          retry_on: error
+          timeout_minutes: 60
+          command: |
+            bundle exec fastlane buildLane \
+              "scheme:$SCHEME" \
+              "xcodeVersion:$XCODE_VERSION"
+
+      - name: Save Swift packages
+        if: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && steps.swift-packages.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            build/SourcePackages/checkouts
+            build/SourcePackages/repositories
+            build/SourcePackages/artifacts
+            build/SourcePackages/workspace-state.json
+          key: ${{ steps.swift-packages.outputs.cache-primary-key }}
+
+      - name: Package unsigned IPA
+        env:
+          SCHEME: ${{ matrix.scheme }}
+        run: |
+          set -euo pipefail
+          mkdir -p fastlane/build/Payload
+          cp -R fastlane/build/*.xcarchive/Products/Applications/*.app fastlane/build/Payload/
+          cd fastlane/build
+          zip -r -y "$SCHEME-unsigned.ipa" Payload
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.scheme }}-unsigned
+          path: fastlane/build/*-unsigned.ipa
+          if-no-files-found: error
+          compression-level: 0

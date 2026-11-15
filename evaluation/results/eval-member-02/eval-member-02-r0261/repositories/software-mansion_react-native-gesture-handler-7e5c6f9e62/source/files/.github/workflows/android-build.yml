@@ -1,0 +1,56 @@
+name: Build Android app
+
+# Reusable: builds one example app in Release and uploads the APK.
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: Directory under apps/ holding the example app to build.
+        required: true
+        type: string
+      artifact-name:
+        description: Name to upload the built APK under.
+        required: true
+        type: string
+      abi:
+        description: ABI to build. Must match the emulator the e2e job installs the APK on.
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: Use Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: oracle
+          java-version: 17
+
+      - name: Use Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: '.nvmrc'
+          cache: yarn
+
+      - name: Install node dependencies
+        working-directory: apps/${{ inputs.app }}
+        run: yarn install --immutable
+
+      - name: Build app in Release mode
+        working-directory: apps/${{ inputs.app }}/android
+        run: ./gradlew :app:assembleRelease --console=plain -PreactNativeArchitectures=${{ inputs.abi }}
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: apps/${{ inputs.app }}/android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3

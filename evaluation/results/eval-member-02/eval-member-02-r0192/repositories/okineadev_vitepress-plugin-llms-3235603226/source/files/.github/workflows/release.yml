@@ -1,0 +1,85 @@
+name: 🚀 Release + Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release (e.g. 1.2.3)
+        required: false
+        default: conventional
+        type: string
+
+      run-tests:
+        description: Run tests before release
+        required: false
+        default: false
+        type: boolean
+
+# Minimal read permissions at workflow level
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    if: github.event.inputs.run-tests == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/tests.yml
+    with:
+      run-on-windows: true
+
+  release:
+    name: 🚀 Release
+    needs: test
+    if: ${{ !cancelled() && (needs.test.result == 'success' || needs.test.result == 'skipped') }}
+    runs-on: ubuntu-slim
+
+    permissions:
+      id-token: write # Required for OIDC authentication with NPM
+      contents: write # Required for creating tags and releases
+      attestations: write # Required for signing artifacts with GitHub attestations
+
+    steps:
+      - name: 🔐 Authentication for pushing to the main branch
+        uses: actions/create-github-app-token@v3.3.0
+        id: app-token
+        with:
+          app-id: ${{ secrets.BOT_APP_ID }}
+          private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+
+      - name: 📥 Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          # Required for fetching tags and generating release notes
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: true
+
+      - name: 🔧 Setup Bun
+        uses: oven-sh/setup-bun@v2.2.0
+
+      - name: 📦 Install dependencies
+        run: bun ci
+
+      - name: 🤖 Setup GitHub Actions Bot
+        uses: cli-stuff/setup-github-actions-bot@v0.1
+
+      - name: 📈 Bump version
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+          HUSKY: 0
+        run: bunx bumpp@^10.2.0 $VERSION --commit --tag --push --yes --no-verify
+
+      - name: 🛠️ Build package
+        run: bun run build
+
+      - name: 📜 Generate changelog and create GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bunx gitpaper@^0.0.1 --release
+
+      - name: 📦 Publish to NPM Registry
+        run: bunx npm@latest publish

@@ -1,0 +1,73 @@
+name: Cloud launch vector 100k
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloud-launch-vector-100k-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Labels OSS telemetry from this workflow's Helix processes as internal.
+  HELIX_DEPLOYMENT_ID: helix-internal-ci
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  build-vector-100k:
+    name: Build vector 100k contract
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the isolated public vector lifecycle
+        run: |
+          test_binary="$(
+            cargo test --release -p db --features production-scale \
+              --test production_index_lifecycle_scale --no-run --message-format=json \
+              | jq -r 'select(
+                  .reason == "compiler-artifact"
+                  and .target.name == "production_index_lifecycle_scale"
+                  and .executable != null
+                ) | .executable' \
+              | tail -n 1
+          )"
+          test -x "$test_binary"
+          mkdir -p vector-100k-test
+          cp "$test_binary" vector-100k-test/production_index_lifecycle_scale
+          sha256sum vector-100k-test/production_index_lifecycle_scale \
+            >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vector-100k-test-${{ github.sha }}
+          path: vector-100k-test/production_index_lifecycle_scale
+          if-no-files-found: error
+          retention-days: 1
+
+  vector-100k:
+    name: Vector 100k create, search, drop, and residue
+    needs: build-vector-100k
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: vector-100k-test-${{ github.sha }}
+          path: vector-100k-test
+      - name: Record the exact tested repository revision
+        run: |
+          echo "DB revision: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          echo "Feature set: production-scale" >> "$GITHUB_STEP_SUMMARY"
+      - name: Run the isolated public vector lifecycle
+        run: |
+          chmod +x vector-100k-test/production_index_lifecycle_scale
+          vector-100k-test/production_index_lifecycle_scale \
+            index_lifecycle_vector_scale_contract \
+            --exact --nocapture --test-threads=1

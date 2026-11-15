@@ -1,0 +1,162 @@
+name: Deploy
+on:
+  workflow_dispatch:
+    inputs:
+      new_version:
+        description: New version to deploy
+        required: true
+        type: string
+
+env:
+  BIN_NAME: cotp
+  PROJECT_NAME: cotp
+  REPO_NAME: replydev/cotp
+
+jobs:
+  dist:
+    name: Dist
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false # don't fail other jobs if one fails
+      matrix:
+        build:
+          [
+            x86_64-linux,
+            aarch64-linux,
+            x86_64-macos,
+            aarch64-macos,
+            x86_64-win-msvc,
+          ]
+        include:
+          - build: x86_64-linux
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - build: aarch64-linux
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - build: x86_64-macos
+            os: macos-latest
+            target: x86_64-apple-darwin
+          - build: aarch64-macos
+            os: macos-latest
+            target: aarch64-apple-darwin
+          - build: x86_64-win-msvc
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
+
+      # Cache dependencies
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-release
+
+      - name: Install Dependencies for Linux
+        if: contains(matrix.build, 'linux')
+        run: sudo apt update && sudo apt install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Build archive
+        shell: bash
+        run: |
+          mkdir dist
+          if [ "${{ matrix.os }}" == *"windows"* ]; then
+            cp "target/${{ matrix.target }}/release/$BIN_NAME.exe" "dist/"
+          else
+            cp "target/${{ matrix.target }}/release/$BIN_NAME" "dist/"
+          fi
+
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: cotp-${{ matrix.build }}
+          path: dist
+
+  publish:
+    name: "Publish binaries to release page"
+    needs: [dist]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+        with:
+          submodules: false
+
+      - uses: actions/download-artifact@v8
+      - run: ls -al cotp-*
+
+      - name: Build archive
+        shell: bash
+        env:
+          NEW_VERSION: ${{ inputs.new_version }}
+        run: |
+          set -ex
+
+          rm -rf tmp
+          mkdir tmp
+          mkdir dist
+
+          for dir in cotp-* ; do
+              platform=${dir#"cotp-"}
+              unset exe
+              # If platform contains "win" then append .exe to the filename
+              if [[ "$platform" == *"win"* ]]; then
+                  exe=".exe"
+              fi
+              pkgname=$PROJECT_NAME-$NEW_VERSION-$platform
+              mkdir tmp/$pkgname
+              # cp LICENSE README.md tmp/$pkgname
+              mv cotp-$platform/$BIN_NAME$exe tmp/$pkgname
+              chmod +x tmp/$pkgname/$BIN_NAME$exe
+
+              if [ "$exe" = "" ]; then
+                  tar cJf dist/$pkgname.tar.xz -C tmp $pkgname
+              else
+                  (cd tmp && 7z a -r ../dist/$pkgname.zip $pkgname)
+              fi
+          done
+
+      - name: Upload binaries to release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: dist/*
+          file_glob: true
+          tag: v${{ inputs.new_version }}
+          overwrite: true
+
+  publish_on_cargo_crates:
+    name: "Publish crate on crates.io"
+    needs: [dist]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+        with:
+          submodules: false
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Login
+        run: cargo login ${{ secrets.CRATE_AUTH_TOKEN }}
+
+      - name: List
+        run: cargo package --list
+
+      - name: Publish
+        run: cargo publish

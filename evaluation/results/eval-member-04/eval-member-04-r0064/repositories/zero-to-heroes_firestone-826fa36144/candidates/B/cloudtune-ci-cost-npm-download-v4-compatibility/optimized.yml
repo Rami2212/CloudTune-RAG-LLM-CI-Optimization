@@ -1,0 +1,40 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [MEDIUM] Add concurrency group to "pr-build.yml"
+# - [LOW] Use shallow clone in "build" job
+# Estimated savings: ~2 min/run
+#
+name: PR Build Check
+
+on:
+    pull_request:
+        branches:
+            - '*'
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+    build:
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+
+            - name: Setup Node.js
+              uses: actions/setup-node@v4
+              with:
+                  node-version: '20'
+                  cache: 'npm'
+
+            - name: Install dependencies
+              run: npm ci
+
+            - name: Build with production configuration
+              run: npx nx build --configuration=production
+              env:
+                  NODE_ENV: production
+                  NODE_OPTIONS: --max-old-space-size=12288

@@ -1,0 +1,119 @@
+name: Ubuntu-ustk
+
+# https://www.jeffgeerling.com/blog/2020/running-github-actions-workflow-on-schedule-and-other-events
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+  schedule:
+    - cron: '0 2 * * SUN'
+
+# https://stackoverflow.com/questions/66335225/how-to-cancel-previous-runs-in-the-pr-when-you-push-new-commitsupdate-the-curre#comment133398800_72408109
+# https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#concurrency
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  # https://github.com/orgs/community/discussions/28474#discussioncomment-3350256
+  check_skip_flags:
+    name: Check skip flags
+    runs-on: ubuntu-latest
+    outputs:
+      head-commit-message: ${{ steps.get_head_commit_message.outputs.headCommitMsg }}
+    steps:
+      - name: Get repo
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Print head git commit message
+        id: get_head_commit_message
+        run: echo "headCommitMsg=$(git show -s --format=%s)" >> $GITHUB_OUTPUT
+
+  build-ubuntu-dep-apt-ustk:
+    runs-on: ${{ matrix.os }}
+    needs: check_skip_flags
+    if: >-
+      ${{
+        (!contains(needs.check_skip_flags.outputs.head-commit-message, '[SKIP-CI ALL]') &&
+        !contains(needs.check_skip_flags.outputs.head-commit-message, '[SKIP-CI UBUNTU-USTK]')) ||
+        contains(needs.check_skip_flags.outputs.head-commit-message, '[ENABLE-CI UBUNTU-USTK]')
+      }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-latest]
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v7
+
+    - name: Print system information
+      run: lscpu
+
+    - name: Print OS information
+      run: lsb_release -a
+
+    - name: Print compiler information
+      run: dpkg --list | grep compiler
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y libx11-dev libdc1394-dev libv4l-dev liblapack-dev libopenblas-dev libeigen3-dev libopencv-dev nlohmann-json3-dev
+
+    - name: Workaround OpenBLAS 0.3.20 Cooperlake kernel
+      # On recent runners (e.g. Intel Xeon 6973P-C), OpenBLAS 0.3.20 available on Ubuntu 22.04 selects the AVX-512
+      # Cooperlake kernel that produces wrong results: photometricMappingPCAVisualServoing doesn't converge, while it
+      # converges with the Haswell kernel. Force the Haswell kernel (AVX2) for all the next steps
+      run: |
+        OPENBLAS_VERSION=$(dpkg-query -W -f='${Version}' libopenblas0-pthread 2>/dev/null || true)
+        echo "OpenBLAS version: ${OPENBLAS_VERSION}"
+        if [[ "${OPENBLAS_VERSION}" == 0.3.20* ]] && grep -q -w avx2 /proc/cpuinfo; then
+          echo "Force OpenBLAS Haswell kernel"
+          echo "OPENBLAS_CORETYPE=Haswell" >> $GITHUB_ENV
+        fi
+
+    - name: Clone visp-images
+      env:
+        BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
+      # https://remarkablemark.org/blog/2022/09/25/check-git-branch-exists-in-remote-repository/
+      run: |
+        git clone --depth 1 https://github.com/lagadic/visp-images ${HOME}/visp-images
+        echo "VISP_INPUT_IMAGE_PATH=$HOME/visp-images" >> $GITHUB_ENV
+        echo ${VISP_INPUT_IMAGE_PATH}
+
+    - name: Clone ustk-dataset
+      run: |
+        git clone --depth 1 https://github.com/lagadic/ustk-dataset ${HOME}/ustk-dataset
+        echo "USTK_DATASET_PATH=$HOME/ustk-dataset" >> $GITHUB_ENV
+        echo ${USTK_DATASET_PATH}
+
+    - name: Clone ustk
+      run: |
+        git clone --depth 1 https://github.com/lagadic/ustk ${HOME}/ustk
+
+    - name: Clone ustk-sample
+      run: |
+        git clone --depth 1 https://github.com/lagadic/ustk-sample ${HOME}/ustk-sample
+
+    - name: Configure CMake
+      run: |
+        mkdir build
+        cd build
+        cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/tmp/usr/local -DVISP_CONTRIB_MODULES_PATH=${HOME}/ustk/modules
+        cat ViSP-third-party.txt
+
+    - name: Compile
+      working-directory: build
+      run: |
+        make -j$(nproc) install
+
+    - name: Run unit tests
+      working-directory: build
+      run: ctest -j$(nproc) --output-on-failure
+
+    - name: ViSP + UsTK as 3rdparty with cmake
+      run: |
+        cd ${HOME}/ustk-sample
+        mkdir ustk-sample-build
+        cd ustk-sample-build
+        cmake .. -DVISP_DIR=/tmp/usr/local/lib/cmake/visp
+        make -j$(nproc)

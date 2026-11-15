@@ -1,0 +1,102 @@
+name: Update dependencies
+
+on:
+  workflow_dispatch:
+    inputs:
+      git:
+        description: Update Git ("latest", version, or "skip")
+        required: true
+        default: 'latest'
+      g4w:
+        description: Update Git for Windows ("latest", version, or "skip")
+        required: true
+        default: 'latest'
+      lfs:
+        description: Update Git LFS ("latest", version, or "skip")
+        required: true
+        default: 'latest'
+      gcm:
+        description:
+          Update Git Credential Manager ("latest", version, or "skip")
+        required: true
+        default: 'latest'
+
+jobs:
+  update-dependencies:
+    name: Update dependencies
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/create-github-app-token@v1
+        id: generate-token
+        with:
+          app-id: ${{ vars.RELEASES_APP_ID }}
+          private-key: ${{ secrets.RELEASES_APP_KEY }}
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ steps.generate-token.outputs.token }}
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+      - name: Install dependencies
+        run: npm install
+      - name: Update Git
+        if: ${{ github.event.inputs.git != 'skip' }}
+        env:
+          GITHUB_ACCESS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          npx tsx script/update-git.ts git --tag "${{ github.event.inputs.git }}" --g4w-tag "${{ github.event.inputs.g4w }}"
+      - name: Update Git LFS
+        if: ${{ github.event.inputs.lfs != 'skip' }}
+        env:
+          GITHUB_ACCESS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          npx tsx script/update-git-lfs.ts lfs --tag "${{ github.event.inputs.lfs }}"
+      - name: Update Git Credential Manager
+        if: ${{ github.event.inputs.gcm != 'skip' }}
+        env:
+          GITHUB_ACCESS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          npx tsx script/update-git-credential-manager.ts --tag "${{ github.event.inputs.gcm }}"
+      - name: Get author name
+        id: get_author
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo name=`gh api users/${{ github.actor }} | jq -j .name` >> $GITHUB_OUTPUT
+      - name: Prettify
+        run: npm run prettier-fix
+      - name: Generate PR contents
+        id: pr-contents
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_ACTION_RUN_URL:
+            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{
+            github.run_id }}
+        run: node ./script/generate-release-pr-contents.mjs >> $GITHUB_OUTPUT
+      - name: Create pull request
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+          GIT_AUTHOR_NAME: ${{ steps.get_author.outputs.name || github.actor }}
+          GIT_AUTHOR_EMAIL:
+            ${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com
+          GIT_COMMITTER_NAME: dugite-releases[bot]
+          GIT_COMMITTER_EMAIL: 241944550+dugite-releases[bot]@users.noreply.github.com
+          PR_TITLE: ${{ steps.pr-contents.outputs.title }}
+        run: |
+          branch="update-dependencies-auto-${{ github.run_id }}"
+          git checkout -b "$branch"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No dependency changes detected; skipping commit, push, and pull request creation."
+            exit 0
+          fi
+          git commit -m "$PR_TITLE"
+          git push origin "$branch"
+          gh pr create \
+            --title "$PR_TITLE" \
+            --body-file ./pr-body.md \
+            --head "$branch"

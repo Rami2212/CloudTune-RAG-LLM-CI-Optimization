@@ -1,0 +1,47 @@
+name: Test macOS build
+
+on:
+  pull_request:
+    paths:
+      - .nvmrc
+      - .github/workflows/macos-build.yml
+      - packages/react-native-gesture-handler/RNGestureHandler.podspec
+      - packages/react-native-gesture-handler/apple/**
+      - apps/macos-example/macos/**
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    if: github.repository == 'software-mansion/react-native-gesture-handler'
+
+    runs-on: macos-15-xlarge
+    env:
+      WORKING_DIRECTORY: apps/macos-example
+    concurrency:
+      group: macos-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: '.nvmrc'
+          cache: yarn
+
+      - name: Install node dependencies
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+        run: yarn
+
+      - name: Install pods
+        working-directory: ${{ env.WORKING_DIRECTORY }}/macos
+        run: bundle install && bundle exec pod install
+
+      - name: Build app
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+        run: npx react-native-macos run-macos

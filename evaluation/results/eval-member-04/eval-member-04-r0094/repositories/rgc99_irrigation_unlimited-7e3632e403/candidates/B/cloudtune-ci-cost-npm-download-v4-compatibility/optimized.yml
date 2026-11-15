@@ -1,0 +1,66 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 3 optimizations:
+# - [HIGH] Add pip dependency cache to "style" job
+# - [HIGH] Add pip dependency cache to "tests" job
+# - [MEDIUM] Add concurrency group to "pull.yml"
+# Estimated savings: ~8 min/run
+#
+name: Pull actions
+
+on:
+  pull_request:
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  validate:
+    runs-on: "ubuntu-latest"
+    name: Validate
+    steps:
+        - uses: "actions/checkout@v6"
+
+        - name: HACS validation
+          uses: "hacs/action@main"
+          with:
+            category: "integration"
+            ignore: brands
+
+        - name: Hassfest validation
+          uses: "home-assistant/actions/hassfest@master"
+
+  style:
+    runs-on: "ubuntu-latest"
+    name: Check style formatting
+    steps:
+        - uses: "actions/checkout@v6"
+        - uses: "actions/setup-python@v6"
+          with:
+            python-version: "3.x"
+        - run: python3 -m pip install black
+        - run: black .
+
+  tests:
+    runs-on: "ubuntu-latest"
+    name: Run tests
+    steps:
+      - name: Check out code from GitHub
+        uses: "actions/checkout@v6"
+      - name: Setup Python
+        uses: "actions/setup-python@v6"
+        with:
+          python-version: "3.13"
+      - name: Install requirements
+        run: python3 -m pip install -r requirements_test.txt
+      - name: Run tests
+        run: |
+          pytest \
+            -qq \
+            --timeout=300 \
+            --durations=10 \
+            -n auto \
+            --cov custom_components.irrigation_unlimited \
+            -o console_output_style=count \
+            -p no:sugar \
+            tests

@@ -1,0 +1,60 @@
+name: Bundler
+
+# trigger on every commit push and PR for all branches
+on:
+  push:
+    branches: ['**']
+    paths-ignore:
+      - '**/*.md'
+  pull_request:
+    branches: ['**']
+    paths-ignore:
+      - '**/*.md'
+
+jobs:
+  bundler-support:
+    name: Bundler support
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Configure sysctl limits
+        run: |
+          sudo swapoff -a
+          sudo sysctl -w vm.swappiness=1
+          sudo sysctl -w fs.file-max=262144
+          sudo sysctl -w vm.max_map_count=262144
+
+      - name: Runs OpenSearch cluster
+        run: |
+          make cluster.clean cluster.opensearch.build cluster.opensearch.start
+
+      - name: Use Node.js 24.x
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.x
+
+      - name: Install
+        run: |
+          npm install
+          npm install --prefix test/bundlers/parcel-test
+          npm install --prefix test/bundlers/rollup-test
+          npm install --prefix test/bundlers/webpack-test
+          npm install --prefix test/bundlers/esbuild-test
+
+      - name: Build
+        run: |
+          npm run build --prefix test/bundlers/parcel-test
+          npm run build --prefix test/bundlers/rollup-test
+          npm run build --prefix test/bundlers/webpack-test
+          npm run build:aws --prefix test/bundlers/esbuild-test
+          npm run build:awsv3 --prefix test/bundlers/esbuild-test
+
+      - name: Run bundle
+        run: |
+          npm start --prefix test/bundlers/parcel-test
+          npm start --prefix test/bundlers/rollup-test
+          npm start --prefix test/bundlers/webpack-test
+          npm run start:aws --prefix test/bundlers/esbuild-test
+          npm run start:awsv3 --prefix test/bundlers/esbuild-test

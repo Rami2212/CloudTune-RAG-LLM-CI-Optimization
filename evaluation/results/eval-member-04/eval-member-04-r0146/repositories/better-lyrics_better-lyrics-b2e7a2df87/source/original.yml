@@ -1,0 +1,99 @@
+name: Auto-fix Code Quality Issues
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate GitHub App Token
+        id: app-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token || github.token }}
+          fetch-depth: 0
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.ref || github.ref }}
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.x"
+
+      - name: Install dependencies
+        run: |
+          npm install
+          npm install --no-save @biomejs/cli-linux-x64@2.0.4 @rspack/binding-linux-x64-gnu@1.5.8
+
+      - name: Run Biome check (fork PRs)
+        id: biome-check
+        if: steps.app-token.outputs.token == ''
+        continue-on-error: true
+        run: |
+          npm run lint 2>&1 | tee biome-output.txt
+          exit ${PIPESTATUS[0]}
+
+      - name: Show Biome fix instructions (fork PRs)
+        if: steps.app-token.outputs.token == '' && steps.biome-check.outcome == 'failure'
+        run: echo "::warning::Biome check found issues. Please run 'npm run lint' locally and push the fixes."
+
+      - name: Run Biome lint and format
+        if: steps.app-token.outputs.token != ''
+        run: npm run lint
+
+      - name: Run Knip check (fork PRs)
+        id: knip-check
+        if: steps.app-token.outputs.token == ''
+        continue-on-error: true
+        run: npm run knip
+
+      - name: Show Knip fix instructions (fork PRs)
+        if: steps.app-token.outputs.token == '' && steps.knip-check.outcome == 'failure'
+        run: echo "::warning::Knip found unused exports/dependencies. Please run 'npm run knip:fix' locally and push the fixes."
+
+      - name: Run Knip fix
+        if: steps.app-token.outputs.token != ''
+        continue-on-error: true
+        run: npm run knip:fix
+
+      - name: Check for changes and last author
+        id: check-changes
+        if: steps.app-token.outputs.token != ''
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "changes_detected=true" >> $GITHUB_OUTPUT
+            LAST_AUTHOR=$(git log -1 --pretty=format:'%an')
+            LAST_COMMIT_MSG=$(git log -1 --pretty=format:'%s')
+
+            if [ "$LAST_AUTHOR" == "better-lyrics-harmonizer[bot]" ] && [ "$LAST_COMMIT_MSG" == "Auto-fix: Apply Biome and Knip fixes" ]; then
+              echo "::error::Infinite loop detected: Bot found more changes after its own auto-fix. Manual intervention required."
+              exit 1
+            fi
+          else
+            echo "changes_detected=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit and push changes
+        if: steps.app-token.outputs.token != '' && steps.check-changes.outputs.changes_detected == 'true'
+        uses: planetscale/ghcommit-action@v0.2.19
+        with:
+          commit_message: "Auto-fix: Apply Biome and Knip fixes"
+          repo: ${{ github.repository }}
+          branch: ${{ github.head_ref || github.ref_name }}
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}

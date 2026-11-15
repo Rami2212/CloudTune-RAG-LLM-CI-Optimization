@@ -1,0 +1,104 @@
+name: Build
+on:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lints:
+    name: Lints
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # Cache dependencies
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: lint-ci
+
+      - name: Install dependencies
+        run: |
+          sudo apt update && sudo apt install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
+        shell: bash
+
+      - name: Run cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: Run cargo clippy
+        run: cargo clippy -- -D warnings
+  test:
+    name: Build debug artifacts
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        build:
+          [
+            x86_64-linux,
+            aarch64-linux,
+            x86_64-macos,
+            aarch64-macos,
+            x86_64-win-msvc,
+          ]
+        include:
+          - build: x86_64-linux
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - build: aarch64-linux
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - build: x86_64-macos
+            os: macos-latest
+            target: x86_64-apple-darwin
+          - build: aarch64-macos
+            os: macos-latest
+            target: aarch64-apple-darwin
+          - build: x86_64-win-msvc
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
+
+      # Cache dependencies
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install Dependencies for Linux
+        if: contains(matrix.build, 'linux')
+        run: sudo apt update && sudo apt install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
+
+      - name: Run tests
+        run: cargo test --locked
+      
+      - name: Run tests in production mode
+        run: cargo test --locked --release
+
+      - name: Build debug binary
+        run: cargo build --locked
+
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: bins-${{ matrix.build }}
+          # Two paths, the first for x86_64 jobs, the second for aarch64.
+          # No need to dispatch, if the path is not found we continue normally
+          path: |
+            target/debug/cotp*
+            target/aarch64-unknown-linux-gnu/debug/cotp*
+          if-no-files-found: error

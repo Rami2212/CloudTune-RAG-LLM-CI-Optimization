@@ -1,0 +1,763 @@
+name: Upgrade Test
+
+# Release-gated and manually triggerable. Runs the out-of-process cross-binary upgrade harness
+# (`crates/ika-upgrade-test/`) on the `ika-k8s-large` self-hosted runner.
+# Unlike the in-process cluster/integration suites, this spawns REAL,
+# separately-compiled `ika-validator` child processes against an external
+# `sui` localnet, swaps binaries across epochs, and asserts the in-place
+# protocol-version upgrade contract (see
+# dev-docs/specs/cross-binary-upgrade.md).
+#
+# Manual dispatch can run any scenario. Relevant pull requests run only
+# `v145_rollout`, avoiding the full expensive matrix on unrelated changes.
+# (The v3/v4-era rehearsals — cross_binary, v118_*, v121_rollout — were
+# retired when protocol v3/v4 support was removed; v145_rollout is their
+# successor against the current v1.4.5 release.) Pick the scenario with
+# the `test` input:
+#
+#   smoke        — go/no-go plumbing: 4 same-binary processes reach epoch 2.
+#                  Needs only the current build. Fastest.
+#   workload     — full user DKG -> Presign -> Sign on-chain at genesis
+#                  protocol v7. Current build only.
+#   v145_rollout — the deployed-release compatibility gate: boot the literal
+#                  v1.4.5 release (one commit for mainnet AND testnet, which
+#                  run protocol v7 — the only version either binary supports,
+#                  so the run genesises there),
+#                  upgrade exactly one validator to the current build,
+#                  converge two mixed aggregated reshares with
+#                  zero malicious reports and per-authority output
+#                  byte-equality, then swap the rest and converge again — a
+#                  pure binary swap, no protocol transition. Defaults to
+#                  old_ref=release/mainnet-v1.4.5, old_bin_name=ika-validator.
+#                  Retargeting from v1.4.1 moved the OLD side across
+#                  v1.4.2-v1.4.5: the Sui mainnet-v1.77.2 -> v1.83.1 move
+#                  (#2146 consensus-owned replay and raw consensus-key
+#                  authority labels, #2182), the published-inkrypto key
+#                  derivation (#2168), startup MPC-input/key-mapping
+#                  preparation (#2138 with #2190's boot-replay fix, #2176)
+#                  and the OCS read-path fixes. The v141 gates straddled
+#                  those; both sides of this one are past them, so none is
+#                  straddled here.
+#                  v1.4.5 decodes Sui's TransactionExpiration::Validity, so
+#                  the OLD side now runs on the default localnet: the
+#                  UPGRADE_TEST_LEGACY_SUI_TRANSACTIONS carve-out literal
+#                  v1.4.1 needed is gone (see
+#                  dev-docs/specs/cross-binary-upgrade.md).
+#                  Immediately after a retarget, `main` == the OLD tag, so
+#                  the gate is a same-binary run; real cross-binary coverage
+#                  returns as `main` diverges.
+#                  v1.4.5 is post-#2074, so — as with the v1.4.0 and v1.4.1
+#                  gates before it, and unlike the v1.3.1-based one — this
+#                  mixed committee shares ONE storage model. Crossing the
+#                  event-sourcing change is no longer covered by anything:
+#                  mid_epoch_rollback was the only scenario that did it and
+#                  was retired once v1.4.0 shipped (see
+#                  dev-docs/specs/event-sourced-epoch.md, "Rolling back").
+#   v145_mid_session — upgrade one validator after its OLD round-two contribution;
+#                  require NEW round-three participation and output in that same
+#                  session, with the fourth validator suspended. Real crypto only.
+#   v145_churn   — v145_rollout's churn counterpart: full sequential swap
+#                  over the literal v1.4.5 committee, then a mirrored OCS
+#                  joiner folds into the reshared v1.4.5-origin key (4→5)
+#                  and a shrink reshare removes an original (5→4). Same OLD
+#                  defaults as v145_rollout.
+#   malicious_v145 — test-testing counterpart: honest literal-v1.4.5
+#                  committee + ONE current validator built with the
+#                  test-testing reconfiguration-message fault; honest
+#                  validators must convict it and reshare without it
+#                  (committee dips to 3). Green = the v145 gates are not
+#                  vacuous. Same OLD defaults as v145_rollout.
+#   wedged_drain — the #2102 wedged-but-alive drain gate: one validator's
+#                  MPC drain is parked (production-binary env hook) without
+#                  stopping its service, so its round channel fills, its
+#                  consensus fold parks and the commit-liveness watchdog must
+#                  HOLD rather than exit. Asserts the whole signature from
+#                  /metrics only — blocked seconds climbing against a flat
+#                  consumed round, depth pinned at capacity, silence held,
+#                  committed-leader round still advancing, peers untouched —
+#                  then unparks and requires recovery with no restart. Current
+#                  build only. LONG (~50 min of cluster time: the park has to
+#                  run inside the first half of one deliberately long epoch,
+#                  before that epoch's reshare), so it is NOT in the
+#                  pull-request default and is dispatched on demand or as part
+#                  of `all`.
+#   restart_spectator — the #1952 mid-epoch-restart gate: one validator is
+#                  restarted (same binary) far from an epoch boundary, in an
+#                  epoch with an established network key and ongoing
+#                  internal-presign volume, and must resume LIVE
+#                  registry-driven top-up instantiation within the epoch —
+#                  not merely stay consensus-healthy while peers absorb the
+#                  sessions. Current build only; production presign-pool
+#                  sizing (the sustained-volume ingredient).
+#
+# Each scenario binds the fixed Sui localnet ports (9000/9123) and chdirs the
+# process during publish, so only ONE runs per job — `--test-threads=1`, one
+# `--test` target.
+#
+# The OLD binary for v145_rollout is built from `old_ref` in an isolated
+# `git worktree`, at that ref's OWN pinned toolchain (rustup honors the
+# worktree's rust-toolchain.toml). All binaries build with default features —
+# enforcement (enforce-minimum-cpu) is runtime-gated to validators on the ika
+# testnet/mainnet networks, so it is inert on the CI localnet (its ika
+# system object maps to Chain::Unknown), and v1.4.5 already carries the
+# runtime gate.
+
+on:
+  pull_request:
+    paths:
+      # WHAT THIS LIST IS, so the next person does not have to re-derive it:
+      # the `ika-validator` binary's own in-repo dependency closure — the crate
+      # that builds the binary (`ika-node`) plus every workspace crate it pulls
+      # in — together with the harness crate and the workflows that run it.
+      # If a source change can end up INSIDE the binary this suite spawns, or
+      # can change how the harness drives it, it belongs here. Re-derive with
+      # `cargo tree -p ika-node -e normal --workspace` when a crate is added;
+      # today that closure is ika-node, ika-core, ika-network, ika-types,
+      # ika-protocol-config, ika-config, ika-archival, ika-sui-client,
+      # ika-telemetry, dwallet-mpc-types, dwallet-mpc-centralized-party,
+      # dwallet-classgroups-types and dwallet-rng. (`ika-protocol-config-macros`
+      # is a workspace member but nothing depends on it, and the `consensus-*`,
+      # inkrypto and `sui-*` deps live OUT of this repo, pinned by tag/rev in
+      # the root manifest — so `Cargo.toml`/`Cargo.lock` below already catch
+      # every bump to them.)
+      - "Cargo.toml"
+      - "Cargo.lock"
+      # ika-core and ika-node are the only closure crates whose manifest carries
+      # feature flags this workflow itself toggles (enforce-minimum-cpu,
+      # dwallet-mpc-unsafe-mock, test-testing, jemalloc), so those two are
+      # listed whole; any other manifest edit that changes what gets built also
+      # moves `Cargo.lock`.
+      - "crates/ika-core/Cargo.toml"
+      # Whole crates, not module lists. This suite spawns REAL validator
+      # processes that reach each other over anemo and swap binaries across
+      # an epoch: consensus admission and ordering, the per-epoch store and
+      # epoch-close accounting, checkpoint build/certify/sync, the
+      # cross-epoch handoff certificate, validator mpc_data announcements
+      # and the freeze, the chain reads at epoch entry, and every BCS type
+      # that crosses the wire between two binary versions — nearly all of
+      # `ika-core` and effectively all of `ika-types` are load-bearing here.
+      #
+      # A per-module list has now rotted three times. `authority.rs` was
+      # missing (the #1917 close-timing fix would have merged without this
+      # suite ever running had it not been dispatched by hand);
+      # `consensus_handler.rs` and `messages_consensus.rs` were missing for
+      # the same reason; then `handoff_cert.rs` — which one scenario
+      # explicitly asserts, "the cross-epoch handoff cert still verifies" —
+      # was missing because it was EXTRACTED out of `validator_metadata.rs`,
+      # which was itself never listed, along with `epoch_tasks/**` and
+      # `sui_connector/**`. Every one of those gaps was found by noticing
+      # after the fact that a merged or in-review change had never triggered
+      # the suite.
+      #
+      # The cost is that unrelated churn in these crates also triggers the
+      # suite. That is the cheaper mistake: a wasted run costs runner time,
+      # a missed run costs a cross-binary regression reaching a release.
+      - "crates/ika-core/src/**"
+      - "crates/ika-types/**"
+      - "crates/ika-network/**"
+      - "crates/ika-node/Cargo.toml"
+      # The binary itself. `ika-validator` is a bin target of THIS crate
+      # (`src/bin/ika-validator.rs`), and only its manifest was listed — so a
+      # change to node startup, the validator bin, service wiring or the
+      # archival/telemetry plumbing shipped without this suite ever running.
+      # Same failure mode as the per-module rot above, one level up.
+      - "crates/ika-node/src/**"
+      - "crates/dwallet-mpc-*/**"
+      - "crates/ika-protocol-config/**"
+      # The remainder of the closure. Source globs only (`src/**`): these crates
+      # carry READMEs, fixtures and config templates whose churn cannot change
+      # the binary, and a doc-only edit should not spend an `ika-k8s-large`
+      # runner. Broad within the crate, though — everything below is
+      # wire-format- or chain-contract-bearing across a binary swap:
+      #   ika-sui-client  — the chain reads/writes both binaries share; its
+      #                     untagged BCS mirrors ARE the wire format.
+      #   ika-config      — node + genesis config both binaries must parse
+      #                     identically for a mixed committee to boot.
+      #   ika-archival    — checkpoint archive/sync formats read across epochs.
+      #   ika-telemetry   — linked into the binary; its init runs before the
+      #                     node does, so a break there is a boot failure.
+      #   dwallet-classgroups-types, dwallet-rng — the class-groups key and
+      #                     RNG types that go out in mpc_data announcements and
+      #                     into MPC messages. NOT matched by
+      #                     `crates/dwallet-mpc-*/**`; that glob is narrower
+      #                     than "the crypto crates".
+      - "crates/ika-sui-client/src/**"
+      - "crates/ika-config/src/**"
+      - "crates/ika-archival/src/**"
+      - "crates/ika-telemetry/src/**"
+      - "crates/dwallet-classgroups-types/src/**"
+      - "crates/dwallet-rng/src/**"
+      - "crates/ika-upgrade-test/**"
+      - ".github/workflows/upgrade-test.yaml"
+      - ".github/workflows/release.yaml"
+  workflow_call:
+    inputs:
+      test:
+        description: "Scenario or comma-separated scenarios"
+        type: string
+        required: false
+        default: "v145_rollout"
+      candidate_sha:
+        description: "Exact release-candidate commit SHA to check out and test"
+        type: string
+        required: true
+      old_ref:
+        type: string
+        required: false
+        default: ""
+      old_bin_name:
+        type: string
+        required: false
+        default: ""
+      epoch_duration_ms:
+        type: string
+        required: false
+        default: ""
+      max_mpc_computation_cores:
+        type: string
+        required: false
+        default: ""
+      rust_log:
+        type: string
+        required: false
+        default: "info"
+      heap_profile:
+        type: boolean
+        required: false
+        default: false
+      use_mocks:
+        type: boolean
+        required: false
+        default: false
+      test_testing_fault:
+        description: "TEST ONLY: corrupt v145_rollout contributions or withhold the v145_mid_session candidate"
+        type: boolean
+        required: false
+        default: false
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Scenarios: 'all', or a comma-separated subset e.g. 'smoke,workload'. Each runs as its own parallel job."
+        type: string
+        required: true
+        # Default 'all' = every scenario. Or a comma-separated subset. Each
+        # selected scenario is a separate matrix job (separate runner), with
+        # fail-fast disabled.
+        default: "all"
+      candidate_sha:
+        description: "Exact candidate SHA (empty = SHA captured when the run is dispatched)"
+        type: string
+        required: false
+        default: ""
+      old_ref:
+        description: "Git ref/tag/sha for the OLD binary (empty = per-scenario default; v145_rollout uses release/mainnet-v1.4.5)"
+        type: string
+        required: false
+        default: ""
+      old_bin_name:
+        description: "OLD validator bin name (empty = ika-validator)"
+        type: string
+        required: false
+        default: ""
+      epoch_duration_ms:
+        description: "Override ika genesis epoch duration in ms (v145_rollout requires >=480000, wedged_drain >=1680000; empty = scenario default)"
+        type: string
+        required: false
+        default: ""
+      max_mpc_computation_cores:
+        description: "Cap each validator's concurrent dwallet-MPC computations (bounds peak memory for co-located test validators; empty = node default = host cores)"
+        type: string
+        required: false
+        default: ""
+      rust_log:
+        description: "RUST_LOG for the harness + child validators (default info)"
+        type: string
+        required: false
+        default: "info"
+      heap_profile:
+        description: "Enable jemalloc heap profiling (jeprof) to find what holds validator memory — pair with ONE light scenario, e.g. test=workload"
+        type: boolean
+        required: false
+        default: false
+      use_mocks:
+        description: "Build with INSECURE deterministic MPC mocks. Off by default."
+        type: boolean
+        required: false
+        default: false
+      test_testing_fault:
+        description: "TEST ONLY: v145_rollout corrupts current reconfiguration messages; v145_mid_session withholds NEW while OLD peers finish. Both controls must fail their evidence gate."
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  # Literal prefix, NOT ${{ github.workflow }}: inside a workflow_call,
+  # github.workflow resolves to the CALLER's name, so the release gate
+  # computed the same group its caller was holding ("Release-<tag-ref>")
+  # and GitHub killed it at startup as a self-deadlock — silently skipping
+  # the release Draft job (first hit: release/testnet-1.2.1). A literal
+  # prefix keeps per-ref dedup for dispatches while never colliding with
+  # a caller's group.
+  group: upgrade-test-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+  RUST_BACKTRACE: 1
+  RUST_LOG: ${{ inputs.rust_log || 'info' }}
+  CANDIDATE_SHA: ${{ inputs.candidate_sha || github.event.pull_request.head.sha || github.sha }}
+  rust_stable: "1.99.1"
+
+jobs:
+  # Resolve `inputs.test` into the matrix of scenarios to run: 'all' fans every
+  # scenario out (each as its own job on its own runner); a single scenario
+  # runs just that one.
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    steps:
+      - id: pick
+        env:
+          # The default is the deployed-release compatibility gate, the one
+          # scenario every relevant pull request and release candidate runs.
+          TEST: ${{ inputs.test || 'v145_rollout' }}
+        run: |
+          set -euo pipefail
+          ALL="smoke workload v145_rollout v145_mid_session v145_churn malicious_v145 restart_spectator wedged_drain"
+          if [ "$TEST" = "all" ]; then
+            SELECTED="$ALL"
+          else
+            # Comma-separated subset -> space-separated, whitespace trimmed.
+            SELECTED=$(echo "$TEST" | tr ',' ' ' | xargs)
+          fi
+          json=""
+          for t in $SELECTED; do
+            case " $ALL " in
+              *" $t "*) ;;
+              *) echo "unknown scenario '$t' (valid: $ALL, or 'all')" >&2; exit 1 ;;
+            esac
+            json="$json\"$t\","
+          done
+          [ -n "$json" ] || { echo "no scenarios selected" >&2; exit 1; }
+          echo "matrix={\"test\":[${json%,}]}" >> "$GITHUB_OUTPUT"
+          echo "selected scenarios: $SELECTED"
+
+  upgrade-test:
+    needs: setup
+    # One job per scenario, each on its own runner, in parallel. fail-fast off
+    # so one scenario's failure (or a runner death) doesn't cancel the others.
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+    name: ${{ matrix.test }}
+    runs-on: ika-k8s-large
+    # An upgrade scenario crosses several long epochs plus a cold build of
+    # both the current binaries and the OLD ref; the ceiling covers that.
+    timeout-minutes: 240
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          # Full history + tags: the OLD binary is built from an arbitrary
+          # ref (e.g. the release/mainnet-v1.4.5 tag) via `git worktree add`.
+          fetch-depth: 0
+          # Resolve once at trigger time; never rebuild a moving branch head.
+          ref: ${{ inputs.candidate_sha || github.event.pull_request.head.sha || github.sha }}
+
+      - name: Runner resources
+        run: |
+          ACTUAL_SHA=$(git rev-parse HEAD)
+          [ "$ACTUAL_SHA" = "$CANDIDATE_SHA" ] || { echo "checked out $ACTUAL_SHA, expected exact candidate $CANDIDATE_SHA" >&2; exit 1; }
+          echo "exact candidate SHA: $ACTUAL_SHA"
+          # Surface what this pod ACTUALLY gets — the scale set advertises up
+          # to 80 vCPUs, but a low cgroup quota (requests/limits mismatch) or
+          # node oversubscription silently throttles the crypto workloads.
+          echo "nproc: $(nproc)"
+          echo "cgroup cpu.max: $(cat /sys/fs/cgroup/cpu.max 2>/dev/null || cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us 2>/dev/null || echo n/a)"
+          echo "cgroup memory.max: $(cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo n/a)"
+          free -g 2>/dev/null || true
+          uptime || true
+
+      - name: Setup SSH
+        uses: ./.github/actions/setup-ssh
+        with:
+          deploy-key: ${{ secrets.GH_DEPLOY_KEY }}
+
+      - name: Install Rust ${{ env.rust_stable }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_stable }}
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install build dependencies
+        run: |
+          # Some runner pods lack IPv6 egress while DNS returns AAAA records,
+          # so force IPv4 and retry — apt mirror flakiness otherwise fails the
+          # whole job before any test runs.
+          if command -v sudo >/dev/null; then SUDO=sudo; else SUDO=; fi
+          APT="-o Acquire::ForceIPv4=true"
+          for attempt in 1 2 3; do
+            $SUDO apt-get $APT update && \
+              $SUDO apt-get $APT install -y cmake clang pkg-config libssl-dev curl && break
+            echo "apt attempt $attempt failed; retrying in 15s" && sleep 15
+          done
+          command -v cmake >/dev/null || { echo "build dependencies missing after retries"; exit 1; }
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "upgrade-test"
+
+      # A mismatched local sui completes DKG but stalls reconfiguration, so the
+      # binary must match the workspace Sui pin. Derive the tag from the root
+      # Cargo.toml at runtime rather than hardcoding it — this auto-tracks the
+      # pin (no second place to bump) and avoids colliding with ika's own
+      # `mainnet-v1.1.8` release tag, which has the same shape.
+      - name: Install Sui (workspace-pinned tag)
+        run: |
+          set -euo pipefail
+          SUI_TAG=$(grep -oE '(mainnet|testnet)-v[0-9]+\.[0-9]+\.[0-9]+' Cargo.toml | sort -u | head -1)
+          [ -n "$SUI_TAG" ] || { echo "could not read Sui pin from Cargo.toml" >&2; exit 1; }
+          echo "workspace Sui pin: $SUI_TAG"
+          mkdir -p "$HOME/.local/bin"
+          curl -L "https://github.com/MystenLabs/sui/releases/download/${SUI_TAG}/sui-${SUI_TAG}-ubuntu-x86_64.tgz" > sui.tgz
+          tar -xzf sui.tgz
+          cp ./sui "$HOME/.local/bin/sui"
+          chmod +x "$HOME/.local/bin/sui"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/sui" --version
+
+      - name: Resolve test selection
+        env:
+          TEST: ${{ matrix.test }}
+          IN_OLD_REF: ${{ inputs.old_ref }}
+          IN_OLD_BIN_NAME: ${{ inputs.old_bin_name }}
+        run: |
+          set -euo pipefail
+          case "$TEST" in
+            smoke)        RUN_FLAG=RUN_UPGRADE_SMOKE ;;
+            workload)     RUN_FLAG=RUN_WORKLOAD_TEST ;;
+            v145_churn)   RUN_FLAG=RUN_V145_CHURN ;;
+            v145_mid_session) RUN_FLAG=RUN_V145_MID_SESSION ;;
+            malicious_v145) RUN_FLAG=RUN_MALICIOUS_V145 ;;
+            restart_spectator) RUN_FLAG=RUN_RESTART_SPECTATOR ;;
+            wedged_drain) RUN_FLAG=RUN_WEDGED_DRAIN ;;
+            v145_rollout)   RUN_FLAG=RUN_V145_ROLLOUT ;;
+            *) echo "unknown test: $TEST" >&2; exit 1 ;;
+          esac
+          # Per-scenario OLD-binary defaults; explicit inputs override (an
+          # empty input falls through to the default via `:=`).
+          OLD_REF="$IN_OLD_REF"
+          OLD_BIN_NAME="$IN_OLD_BIN_NAME"
+          case "$TEST" in
+            v145_churn | malicious_v145 | v145_mid_session)
+              : "${OLD_REF:=release/mainnet-v1.4.5}"
+              : "${OLD_BIN_NAME:=ika-validator}"
+              ;;
+            v145_rollout)
+              # OLD is the release the fleet is running; NEW is the candidate.
+              # Both support protocol v7 only, so the boundary under test is a
+              # pure binary swap.
+              : "${OLD_REF:=release/mainnet-v1.4.5}"
+              : "${OLD_BIN_NAME:=ika-validator}"
+              ;;
+          esac
+          {
+            echo "RUN_FLAG=$RUN_FLAG"
+            echo "TEST_NAME=$TEST"
+            echo "OLD_REF=$OLD_REF"
+            echo "OLD_BIN_NAME=$OLD_BIN_NAME"
+          } >> "$GITHUB_ENV"
+          echo "test=$TEST flag=$RUN_FLAG old_ref=${OLD_REF:-<none>} old_bin=${OLD_BIN_NAME:-<none>}"
+
+      - name: Build current binaries
+        # When heap_profile is on, keep full symbols IN the binary so jeprof can
+        # name frames: the release profile has `debug = 1` but
+        # `strip = 'debuginfo'` + `split-debuginfo = 'packed'`, which moves the
+        # line tables OUT to a side file — jeprof reads only the binary, so it
+        # falls back to `::clone@<addr>`. Overriding strip=none + split=off
+        # embeds them (keeps the target dir at target/release/, unlike switching
+        # to the release-dbgsym profile). Off → the repo defaults (stripped, ~1GB
+        # smaller binary), so non-profiling runs are unchanged.
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: ${{ inputs.heap_profile && 'none' || 'debuginfo' }}
+          CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: ${{ inputs.heap_profile && 'off' || 'packed' }}
+          USE_MOCKS: ${{ inputs.use_mocks }}
+          TEST_TESTING_FAULT: ${{ inputs.test_testing_fault }}
+        run: |
+          set -euo pipefail
+          # Every gate whose evidence is cross-binary agreement. Mocked
+          # cryptography is deterministic, so two binaries agree under it for
+          # reasons that say nothing about whether they agree in production —
+          # a green run on mocks is not merely weaker evidence, it is evidence
+          # of a different claim. Add any transition gate here the moment one
+          # exists again — it is the run standing behind a version flip on a
+          # live network, which is where mocked agreement is most misleading.
+          case "$TEST_NAME" in
+            v145_rollout|v145_churn|malicious_v145|v145_mid_session)
+              if [ "$USE_MOCKS" = "true" ]; then
+                echo "$TEST_NAME is a cross-binary gate and must use real cryptography" >&2
+                exit 1
+              fi
+              ;;
+          esac
+          # Both controls must fail their own evidence gate. Mid-session uses
+          # a harness-only missing-participant control, not a faulty binary.
+          if [ "$TEST_TESTING_FAULT" = "true" ] && [ "$TEST_NAME" != "v145_rollout" ] && [ "$TEST_NAME" != "v145_mid_session" ]; then
+            echo "test_testing_fault requires v145_rollout or v145_mid_session" >&2
+            exit 1
+          fi
+          if [ "$TEST_TESTING_FAULT" = "true" ] && [ "$TEST_NAME" = "v145_rollout" ]; then
+            NODE_FAULT_FEATURES="--features test-testing"
+            echo "building deliberately faulty current validator; this validation run must fail closed"
+          else
+            NODE_FAULT_FEATURES=""
+          fi
+          # `use_mocks` builds the binaries with the INSECURE deterministic
+          # mocks.
+          NODE_FEATURES=""
+          IKA_FEATURES=""
+          if [ "$USE_MOCKS" = "true" ]; then
+            NODE_FEATURES="--features dwallet-mpc-unsafe-mock"
+            IKA_FEATURES="--features dwallet-mpc-unsafe-mock"
+          fi
+          # Compilation in its own step: the Downloaded/Compiling stream is
+          # the majority of this job's log volume and collapses in the UI when
+          # green. Default features (enforce-minimum-cpu + jemalloc) are kept:
+          # enforcement is runtime-gated to validators on the ika
+          # testnet/mainnet networks, so it never fires on this localnet.
+          cargo build --release $NODE_FEATURES $NODE_FAULT_FEATURES -p ika-node --bin ika-validator --bin ika-notifier
+          cargo build --release -p ika --bin ika $IKA_FEATURES
+          if [ "$TEST_NAME" = "malicious_v145" ]; then
+            # The deliberately-faulty validator: current source with the
+            # feature-gated reconfiguration-message fault compiled IN. Built
+            # after the normal binaries and copied aside (the feature build
+            # overwrites target/release/ika-validator; malicious_v145 never
+            # reads the honest current validator, so the overwrite is inert).
+            cargo build --release --features test-testing -p ika-node --bin ika-validator
+            cp target/release/ika-validator "$GITHUB_WORKSPACE/ika-validator-faulty"
+            echo "FAULTY_BIN=$GITHUB_WORKSPACE/ika-validator-faulty" >> "$GITHUB_ENV"
+          fi
+          cargo test --no-run --release -p ika-upgrade-test --test "$TEST_NAME"
+
+      - name: Build OLD binary from ${{ env.OLD_REF }}
+        if: ${{ matrix.test == 'v145_rollout' || matrix.test == 'v145_churn' || matrix.test == 'malicious_v145' || matrix.test == 'v145_mid_session' }}
+        run: |
+          set -euo pipefail
+          WT="$GITHUB_WORKSPACE/old-build"
+          git worktree remove --force "$WT" 2>/dev/null || true
+          rm -rf "$WT"
+          # Resolve the requested ref to one immutable commit before creating
+          # the worktree. A tag/branch is normally present only as
+          # origin/<name> or refs/tags/<name>; an arbitrary SHA may need an
+          # explicit fetch.
+          if git rev-parse --verify "${OLD_REF}^{commit}" >/dev/null 2>&1; then
+            OLD_COMMIT=$(git rev-parse --verify "${OLD_REF}^{commit}")
+          elif git rev-parse --verify "origin/${OLD_REF}^{commit}" >/dev/null 2>&1; then
+            OLD_COMMIT=$(git rev-parse --verify "origin/${OLD_REF}^{commit}")
+          else
+            git fetch --no-tags origin "$OLD_REF"
+            OLD_COMMIT=$(git rev-parse --verify "FETCH_HEAD^{commit}")
+          fi
+          test -n "$OLD_COMMIT" || { echo "could not resolve old_ref '$OLD_REF' to a commit" >&2; exit 1; }
+          echo "resolved OLD_REF=$OLD_REF to immutable commit $OLD_COMMIT"
+          git worktree add --force --detach "$WT" "$OLD_COMMIT"
+          # Build at the OLD ref's own toolchain (rustup reads the worktree's
+          # rust-toolchain.toml). Default features: v1.4.5's
+          # enforce-minimum-cpu is runtime-gated (inert on the CI localnet),
+          # matching its production build.
+          ( cd "$WT" && cargo build --release -p ika-node --bin "$OLD_BIN_NAME" )
+          OLD_BIN="$WT/target/release/$OLD_BIN_NAME"
+          test -x "$OLD_BIN" || { echo "OLD binary missing: $OLD_BIN" >&2; exit 1; }
+          echo "OLD_BIN=$OLD_BIN" >> "$GITHUB_ENV"
+          echo "built OLD binary: $OLD_BIN"
+
+      - name: Run ${{ matrix.test }}
+        env:
+          USE_MOCKS: ${{ inputs.use_mocks }}
+          MID_SESSION_PARTICIPATION_CONTROL: ${{ inputs.test_testing_fault && matrix.test == 'v145_mid_session' }}
+          # smoke/workload read IKA_VALIDATOR_BIN/
+          # IKA_NOTIFIER_BIN/IKA_BIN; v145_rollout reads NEW_BIN/NOTIFIER_BIN/
+          # OLD_BIN/IKA_BIN (OLD_BIN comes from the build step via
+          # $GITHUB_ENV; unset for the others, which ignore it). Setting both
+          # naming sets is harmless — each test reads only its own.
+          IKA_VALIDATOR_BIN: ${{ github.workspace }}/target/release/ika-validator
+          NEW_BIN: ${{ github.workspace }}/target/release/ika-validator
+          IKA_NOTIFIER_BIN: ${{ github.workspace }}/target/release/ika-notifier
+          NOTIFIER_BIN: ${{ github.workspace }}/target/release/ika-notifier
+          IKA_BIN: ${{ github.workspace }}/target/release/ika
+          # SUI_BIN is set from $HOME in the run script (the install step
+          # copied sui to ~/.local/bin/sui).
+          # Persistent per-validator data + logs under the workspace so the
+          # uploads below can recover them (the harness default lives on a
+          # developer NVMe path that does not exist on the runner).
+          UPGRADE_TEST_DIR: ${{ github.workspace }}/upgrade-test-data
+          # Empty string fails to parse and the test falls back to its own
+          # default, so this is safe to pass unconditionally.
+          EPOCH_DURATION_MS: ${{ inputs.epoch_duration_ms }}
+          # Cap concurrent dwallet-MPC computations per validator. NOTE: this
+          # bounds CPU concurrency (each computation already fans out across the
+          # whole rayon pool via the `parallel` crypto feature), not memory
+          # directly. Empty -> node default.
+          MAX_MPC_COMPUTATION_CORES: ${{ inputs.max_mpc_computation_cores }}
+          # Shrink the per-curve presign pools (production maxima 30k-150k each x
+          # 10 pools, RocksDB-backed) for the out-of-process test validators —
+          # they otherwise fill GiB-scale pools the test never uses (a Sign needs
+          # a handful of presigns). The node honors this env via
+          # ProtocolConfig::enable_small_presign_pools_for_local_swarm; mainnet
+          # never sets it. This is the other half of the per-validator RSS that
+          # parks the 5-validator pod at the 96 GiB ceiling.
+          IKA_ENABLE_SMALL_PRESIGN_POOLS: "1"
+          # heap_profile: turn on jemalloc heap profiling. prof IS compiled in
+          # (tikv-jemalloc-sys `profiling` feature). The conf env-var NAME depends
+          # on the jemalloc symbol prefix: librocksdb-sys feature-unifies
+          # `unprefixed_malloc_on_supported_platforms` onto the shared
+          # tikv-jemalloc-sys, so on Linux the allocator is UNPREFIXED and reads
+          # `MALLOC_CONF` — NOT `_RJEM_MALLOC_CONF`. Earlier runs set only the
+          # prefixed name and got zero dumps regardless of interval/load. Set BOTH
+          # so it works whichever prefix a given build resolves to. Each validator
+          # dumps a `.heap` per pid every ~256 MiB allocated (lg_prof_interval:28);
+          # the "Heap profile" step below symbolizes the latest with jeprof.
+          # Empty when off — the compiled-in background_thread:true still applies
+          # and is what bounds RSS / fixed the OOM, independent of this var.
+          MALLOC_CONF: ${{ inputs.heap_profile && format('prof:true,prof_active:true,prof_prefix:{0}/upgrade-test-data/jeprof,lg_prof_interval:28', github.workspace) || '' }}
+          _RJEM_MALLOC_CONF: ${{ inputs.heap_profile && format('prof:true,prof_active:true,prof_prefix:{0}/upgrade-test-data/jeprof,lg_prof_interval:28', github.workspace) || '' }}
+        run: |
+          set -uo pipefail
+          export SUI_BIN="$HOME/.local/bin/sui"
+          export "${RUN_FLAG}=1"
+          # Keep production pool sizing/timing for the rollout gate and the
+          # restart-spectator gate (whose sustained internal-presign volume IS
+          # the ingredient under test — small pools fill and quiesce, and a
+          # quiet top-up loop can't prove resumption). The reduced-pool
+          # override remains a resource concession for the lighter scenarios,
+          # not compatibility evidence.
+          if [ "$TEST_NAME" = "v145_rollout" ] || [ "$TEST_NAME" = "restart_spectator" ]; then
+            unset IKA_ENABLE_SMALL_PRESIGN_POOLS
+          fi
+          if [ "$TEST_NAME" = "v145_mid_session" ]; then
+            unset IKA_ENABLE_SMALL_PRESIGN_POOLS
+            # OLD already exposes these round/receipt events. Keep both
+            # binaries literal; the harness observes their existing logs.
+            export RUST_LOG="${RUST_LOG},ika_core::dwallet_mpc::crytographic_computation::request=debug,ika_core::dwallet_mpc::crytographic_computation::orchestrator=debug,ika_core::dwallet_mpc::dwallet_mpc_service=debug,ika_core::dwallet_mpc::mpc_manager=debug,ika_core::dwallet_mpc::mpc_session=debug"
+          fi
+          mkdir -p "$UPGRADE_TEST_DIR"
+          echo "running $TEST_NAME (flag $RUN_FLAG); sui=$SUI_BIN old_bin=${OLD_BIN:-<none>}"
+          # Resource sampler (CPU + MEMORY) -> resource-sampler.log, BACKGROUNDED
+          # so the test runs in the FOREGROUND and its [flow N/total] progress +
+          # logs stream LIVE to the step log (via tee), not only the artifact.
+          # Every 15s: effective CPUs, loadavg, mem current/max/pct, swap, the
+          # cgroup oom_kill counter, top-RSS. (This file is lost on a "runner
+          # lost communication" death — an OOMKilled/137 at the pod's 96 GiB
+          # cgroup limit, captured off-pod via `kubectl top`/describe or node
+          # dmesg. Idle validators ~7.5-8 GB.)
+          ( set +eu
+            CG=/sys/fs/cgroup
+            prev=$(awk '/usage_usec/{print $2}' "$CG/cpu.stat" 2>/dev/null || echo 0)
+            memmax=$(cat "$CG/memory.max" 2>/dev/null || echo 0); case "$memmax" in ''|max) memmax=0;; esac
+            while true; do
+              sleep 15
+              cur=$(awk '/usage_usec/{print $2}' "$CG/cpu.stat" 2>/dev/null || echo "$prev")
+              cpus="$(( (cur - prev) / 15000000 )).$(( ((cur - prev) / 1500000) % 10 ))"; prev=$cur
+              load=$(cut -d' ' -f1-3 /proc/loadavg)
+              memcur=$(cat "$CG/memory.current" 2>/dev/null || echo 0)
+              swap=$(cat "$CG/memory.swap.current" 2>/dev/null || echo 0)
+              oom=$(awk '/^oom_kill /{print $2}' "$CG/memory.events" 2>/dev/null || echo 0); [ -n "$oom" ] || oom=0
+              pct=0; [ "$memmax" -gt 0 ] && pct=$(( memcur * 100 / memmax ))
+              top=$(ps -eo rss,comm --sort=-rss 2>/dev/null | awk 'NR>1 && NR<=4{printf "%s:%dM ",$2,$1/1024}')
+              echo "$(date -u +%T) cpus=$cpus load=$load mem=$((memcur/1048576))M/$((memmax/1048576))M pct=${pct}% swap=$((swap/1048576))M oom_kill=$oom top=[$top]" >> resource-sampler.log
+            done ) &
+          SAMPLER_PID=$!
+          # One scenario, one process: the harness binds fixed Sui ports and
+          # chdirs during publish, so --test-threads=1 is mandatory. `tee`
+          # streams the test output (incl. [flow N/total]) LIVE to the step log
+          # AND to the artifact; PIPESTATUS[0] is cargo's exit code, not tee's.
+          set +e
+          cargo test --release -p ika-upgrade-test --test "$TEST_NAME" \
+            -- --nocapture --test-threads=1 2>&1 | tee upgrade-test.log
+          rc=${PIPESTATUS[0]}
+          kill "$SAMPLER_PID" 2>/dev/null || true
+          # The RUN_* gate makes the scenario #[ignore]d when unset, so a
+          # misconfigured gate (or a harness that leaves child processes and
+          # muddies cargo's exit code) could SKIP the test yet still exit 0 — a
+          # false green (#1714). Assert the gated test actually ran and passed;
+          # this run step uses `set -uo pipefail` (no -e), so fail rc explicitly
+          # rather than relying on grep's exit status.
+          if [ "$rc" -eq 0 ] && ! grep -q "test result: ok. 1 passed" upgrade-test.log; then
+            echo "::error::$TEST_NAME exited 0 but did not report 'test result: ok. 1 passed' (gate misfire / skipped)"
+            rc=1
+          fi
+          exit "$rc"
+
+      - name: Summarize results
+        if: always()
+        run: |
+          grep -E "^test .*(ok|FAILED)|test result|PASSED|panicked|MPC timings|MPC timing comparison" upgrade-test.log | tail -60 || true
+
+      - name: Heap profile (jeprof)
+        if: ${{ always() && inputs.heap_profile }}
+        run: |
+          set +e
+          DIR="${{ github.workspace }}/upgrade-test-data"
+          BIN="${{ github.workspace }}/target/release/ika-validator"
+          echo "heap dumps under $DIR:"; ls -la "$DIR"/jeprof.*.heap 2>/dev/null | tail -12
+          # jeprof ships with libjemalloc-dev; it reads the .heap dump + the
+          # binary's symbols to attribute live bytes to call paths. The build
+          # step above keeps full symbols in the binary when heap_profile is on
+          # (strip=none, split-debuginfo=off), so frames resolve to names.
+          if ! command -v jeprof >/dev/null; then
+            if command -v sudo >/dev/null; then SUDO=sudo; else SUDO=; fi
+            $SUDO apt-get -o Acquire::ForceIPv4=true install -y libjemalloc-dev 2>&1 | tail -3
+          fi
+          LAST=$(ls -t "$DIR"/jeprof.*.heap 2>/dev/null | head -1)
+          if [ -n "$LAST" ] && command -v jeprof >/dev/null; then
+            # Read by CUMULATIVE and hide jemalloc's own sampling frames
+            # (prof_backtrace*/prof_dump* are the universal backtrace-capture
+            # leaf — flat-sorted they show ~99% and bury the real call sites).
+            echo "=== jeprof --inuse_space --cum (top allocation call paths; jemalloc prof frames hidden) — $LAST ==="
+            jeprof --text --cum --show_bytes --inuse_space \
+              --ignore='prof_backtrace|prof_dump|prof_alloc|prof_tctx|je_prof' \
+              "$BIN" "$LAST" 2>/dev/null | head -50
+          else
+            echo "no heap dumps or jeprof missing — heap_profile must be on AND a workload-bearing scenario must have run"
+          fi
+
+      - name: Upload heap dumps
+        if: ${{ always() && inputs.heap_profile }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: jeprof-${{ matrix.test }}-${{ github.run_attempt }}
+          path: upgrade-test-data/jeprof.*.heap
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Upload resource sampler log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: resource-sampler-${{ matrix.test }}-${{ github.run_attempt }}
+          path: resource-sampler.log
+          retention-days: 7
+
+      - name: Upload test log
+        # always: a timeout kill registers as 'cancelled', not 'failure', and
+        # the partial log of a multi-epoch run must survive it.
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: upgrade-test-log-${{ matrix.test }}-${{ github.run_attempt }}
+          path: upgrade-test.log
+          retention-days: 7
+
+      - name: Upload validator logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          # Logs only — the data dirs hold multi-GB RocksDB state.
+          name: upgrade-test-node-logs-${{ matrix.test }}-${{ github.run_attempt }}
+          path: upgrade-test-data/**/*.log
+          retention-days: 7
+          if-no-files-found: ignore

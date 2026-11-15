@@ -1,0 +1,168 @@
+# Description: this workflow publishes UI packages to `latest` tag on NPM.
+#
+# Triggered by: whenever a PR is merged to `hotfix` branch (called from release.yml)
+
+# If successful, we will publish all updated UI packages to NPM.
+
+name: Test and Publish / hotfix
+
+# Called from release.yml on pushes to hotfix
+on:
+  workflow_call:
+
+permissions:
+  id-token: write # This is required for requesting the JWT
+  contents: write # Used to push tags to GitHub
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      has-changesets: ${{ steps.has-changesets.outputs.has-changesets }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # This makes Actions fetch all Git history so that Changesets can generate changelogs with the correct commits
+          fetch-depth: 0
+      - name: Check if repo has unconsumed changesets
+        id: has-changesets
+        uses: ./.github/actions/has-changesets
+
+  publish-hotfix:
+    needs: setup
+    uses: ./.github/workflows/reusable-tagged-publish.yml
+    with:
+      dist-tag: hotfix
+
+  build-test:
+    uses: ./.github/workflows/reusable-build-system-test.yml
+    needs:
+      - setup
+      - publish-hotfix
+    if: ${{ needs.setup.outputs.has-changesets != 'true' }}
+    with:
+      dist-tag: hotfix
+      # Install the exact version this run published; `@hotfix` may resolve to a stale or newer release.
+      ui-version: ${{ needs.publish-hotfix.outputs.version }}
+    secrets:
+      AUTH_E2E_ROLE_ARN: ${{ secrets.AUTH_E2E_ROLE_ARN }}
+      DOMAIN: ${{ secrets.DOMAIN }}
+      PHONE_NUMBER: ${{ secrets.PHONE_NUMBER }}
+      USERNAME: ${{ secrets.USERNAME }}
+      NEW_PASSWORD: ${{ secrets.NEW_PASSWORD }}
+      VALID_PASSWORD: ${{ secrets.VALID_PASSWORD }}
+
+  build-test-react-native:
+    uses: ./.github/workflows/reusable-build-system-test-react-native.yml
+    needs:
+      - setup
+      - publish-hotfix
+    if: ${{ needs.setup.outputs.has-changesets != 'true' }}
+    with:
+      dist-tag: hotfix
+      # Install the exact version this run published; `@hotfix` may resolve to a stale or newer release.
+      ui-version: ${{ needs.publish-hotfix.outputs.version }}
+
+  publish:
+    runs-on: ubuntu-latest
+    environment: deployment
+    needs:
+      - setup
+      - build-test
+      - build-test-react-native
+    if: ${{ needs.setup.outputs.has-changesets != 'true' }}
+    # Job-level permissions replace workflow-level ones; id-token is required for npm trusted publishing (OIDC)
+    permissions:
+      contents: write # Used to push tags to GitHub
+      id-token: write
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # This makes Actions fetch all Git history so that Changesets can generate changelogs with the correct commits
+          fetch-depth: 0
+      - name: Setup Node.js 24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          # Exact pin keeps npm >= 11.5.1 (Node 24.22.1 bundles npm 11.19.1), required for npm trusted publishing
+          node-version: 24.22.1
+          cache: 'yarn'
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 2
+      - name: Install packages
+        uses: ./.github/actions/install-with-retries
+        with:
+          skip-cypress-binary: true # publishing doesn't need cypress
+          frozen-lockfile: true # publish from exactly what yarn.lock pins
+      - name: Build packages
+        run: yarn build
+      - name: Publish to @latest
+        uses: changesets/action@aba318e9165b45b7948c60273e0b72fce0a64eb9 #v1.4.7
+        with:
+          publish: yarn publish:latest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # npm authenticates via trusted publishing (OIDC). changesets/action v1.4.7 always writes
+          # `//registry.npmjs.org/:_authToken=$NPM_TOKEN` to ~/.npmrc; an empty value keeps it from
+          # writing the literal string `undefined`. npm replaces the token with the OIDC token at publish time.
+          NPM_TOKEN: ''
+
+  create-pr-to-main:
+    needs: setup
+    if: ${{ needs.setup.outputs.has-changesets != 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BASE_BRANCH: "main"
+      HEAD_BRANCH: "hotfix"
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # Check if hotfix -> main PR already exists
+      - name: Check for existing PR
+        id: check-pr
+        run: |
+          PR_EXISTS=$(gh pr list --base $BASE_BRANCH --head $HEAD_BRANCH --json number --jq 'length > 0')
+          echo "exists=$PR_EXISTS" >> $GITHUB_OUTPUT
+      # Create a new PR if one doesn't exist
+      - name: Create PR to main
+        if: steps.check-pr.outputs.exists == 'false'
+        run: |
+          gh pr create \
+            --base $BASE_BRANCH \
+            --head $HEAD_BRANCH \
+            --title "chore: Merge hotfix into main" \
+            --body "Merge the recently completed hotfix back into the main development branch. Generated by the publish-hotfix workflow."
+
+  log-failure-metric:
+    # Send a failure data point to metric PublishLatestFailure in github-workflows@ us-east-2
+    runs-on: ubuntu-latest
+    environment: ci
+    needs: create-pr-to-main
+    if: ${{ failure() }}
+    steps:
+      - name: Log failure data point to metric PublishLatestFailure
+        uses: aws-amplify/amplify-ui/.github/actions/log-metric@main
+        with:
+          metric-name: PublishLatestFailure
+          value: 1
+          role-to-assume: ${{ secrets.METRIC_LOGGER_ROLE_ARN }}
+          aws-region: us-east-2
+
+  log-success-metric:
+    # Send a success data point to metric PublishLatestFailure in github-workflows@ us-east-2
+    runs-on: ubuntu-latest
+    environment: ci
+    needs: create-pr-to-main
+    if: ${{ success() }}
+    steps:
+      - name: Log success data point to metric PublishLatestFailure
+        uses: aws-amplify/amplify-ui/.github/actions/log-metric@main
+        with:
+          metric-name: PublishLatestFailure
+          value: 0
+          role-to-assume: ${{ secrets.METRIC_LOGGER_ROLE_ARN }}
+          aws-region: us-east-2

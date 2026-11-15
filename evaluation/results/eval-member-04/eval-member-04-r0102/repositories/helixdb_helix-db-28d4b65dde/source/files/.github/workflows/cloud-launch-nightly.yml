@@ -1,0 +1,149 @@
+name: Cloud launch nightly
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloud-launch-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Labels OSS telemetry from this workflow's Helix processes as internal.
+  HELIX_DEPLOYMENT_ID: helix-internal-ci
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  planner-matrix:
+    name: Planner matrix shard ${{ matrix.shard }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Run complete normalized planner shard
+        env:
+          HELIX_PLANNER_SHARD_COUNT: "4"
+          HELIX_PLANNER_SHARD_INDEX: ${{ matrix.shard }}
+        run: cargo run --release -p helix-db-testkit --example check_planner_matrix
+
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-24.04-arm
+    # A cold leg builds cargo-fuzz and the ASAN target before its five-minute
+    # window; set from a cold estimate, tighten to the measured p95 + 5 min.
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - fuzz_dir: crates/db-testkit/fuzz
+            target: query_json
+          - fuzz_dir: crates/db-testkit/fuzz
+            target: planner_context_ast
+          - fuzz_dir: crates/db-testkit/fuzz
+            target: planner_interpreter
+          - fuzz_dir: crates/db-testkit/fuzz
+            target: stateful_action_trace
+          - fuzz_dir: crates/db/fuzz
+            target: current_secondary_records
+          - fuzz_dir: crates/db/fuzz
+            target: current_search_records
+          - fuzz_dir: crates/db/fuzz
+            target: current_index_v2_keys
+          - fuzz_dir: crates/db/fuzz
+            target: current_index_v2_records
+          - fuzz_dir: crates/db/fuzz
+            target: current_index_v2_work
+          - fuzz_dir: crates/db/fuzz
+            target: current_index_v2_bitmap
+    steps:
+      - uses: actions/checkout@v6
+      # A dated nightly: a new one each day breaks builds and cache keys.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-11-01
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.fuzz_dir }}
+          workspaces: ${{ matrix.fuzz_dir }} -> target
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Run checked-in regression corpus and five-minute fuzz window
+        working-directory: ${{ matrix.fuzz_dir }}
+        # cargo-fuzz passes -Z flags, so override the stable rust-toolchain.toml pin.
+        env:
+          RUSTUP_TOOLCHAIN: nightly-2026-11-01
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=300
+
+  workload-matrix:
+    name: Deterministic workload seeds
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Oversized V4 bitmap cleanup and reopen
+        run: >-
+          cargo test -p db
+          index_lifecycle::secondary::tests::oversized_v4_bitmap_cleanup_survives_reopen_at_default_limit
+          -- --ignored --exact --nocapture
+      - name: Real LocalFileSystem matrix
+        run: cargo test -p helix-db-testkit --test sustained_local_disk
+      - name: Isolation and transport restart contracts
+        run: cargo test -p helix-db-testkit --test isolation_histories && cargo test -p server
+
+  queue-soak:
+    name: Queued index publication soak
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Writers, readers, builds, and publication under compaction and restarts
+        env:
+          SOAK_SEEDS: "4"
+        run: >-
+          cargo test --release -p db --lib
+          index_lifecycle::queue::soak_tests::concurrent_writes_builds_and_publication_stay_exact_under_compaction
+          -- --ignored --exact --nocapture
+      # Debug PR runs use fewer seeds of these randomized tests and skip the
+      # ignored golden graph; this step runs them at full scale.
+      - name: Full-scale random vector write sequences and the pinned golden graph
+        env:
+          GRAPH_SEEDS: "8"
+          DIRECT_SEEDS: "24"
+          STRAY_SEEDS: "2"
+        run: >-
+          cargo test --release -p db --lib --
+          index_lifecycle::queue::vector_graph_tests::random_queued_vector_writes_keep_every_graph_valid
+          index_lifecycle::queue::vector_graph_tests::random_direct_vector_writes_keep_one_locator_per_link
+          search::vector::hnsw::mutation::locator_tests::stray_locators_never_survive_a_delete_or_upsert
+          index_lifecycle::queue::planning_session_tests::every_session_policy_publishes_the_pinned_golden_graph
+          --include-ignored --exact --nocapture
+
+  vector-lifecycle:
+    name: Bounded 8k vector lifecycle
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Public vector create, search, drop, and residue contract
+        run: >-
+          cargo test --release -p db --features production-scale
+          --test production_index_lifecycle_scale index_lifecycle_vector_ci_contract
+          -- --exact --nocapture --test-threads=1

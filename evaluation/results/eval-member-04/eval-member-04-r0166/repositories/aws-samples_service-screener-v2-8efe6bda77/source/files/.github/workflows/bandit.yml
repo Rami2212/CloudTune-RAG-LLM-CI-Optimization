@@ -1,0 +1,38 @@
+# Bandit is a security linter designed to find common security issues in Python code.
+# The results of the scan will be found under the Security tab of your repository.
+
+name: Bandit
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    - cron: '30 11 * * 6'
+
+jobs:
+  bandit:
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install Bandit
+        run: pip install bandit[sarif]
+
+      - name: Run Bandit Scan
+        run: bandit -r . -f sarif -o bandit-results.sarif --skip B310 --exit-zero
+
+      - name: Upload SARIF results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: bandit-results.sarif

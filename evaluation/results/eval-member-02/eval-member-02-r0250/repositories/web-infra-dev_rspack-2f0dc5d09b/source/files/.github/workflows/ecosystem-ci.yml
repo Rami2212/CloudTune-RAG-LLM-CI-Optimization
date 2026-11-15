@@ -1,0 +1,76 @@
+name: Ecosystem CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        type: number
+        description: 'Run ecosystem CI on PR number'
+        required: true
+      suite:
+        description: 'testsuite to run. runs all test suites when `-`.'
+        required: false
+        type: choice
+        options:
+          - '-'
+          - modernjs
+          - rspress
+          - rsbuild
+          - rslib
+          - rstest
+          - rsdoctor
+          - examples
+          - devserver
+          - plugin
+          - lynx-stack
+          - rsbuild-rsc-plugin
+      suiteRefType:
+        description: 'type of suite ref to use'
+        required: true
+        type: choice
+        options:
+          - precoded
+          - branch
+          - tag
+          - commit
+        default: 'precoded'
+      suiteRef:
+        description: 'suite ref to use'
+        required: true
+        type: string
+        default: 'precoded'
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  ecosystem_ci_dispatch:
+    name: Dispatch ecosystem CI
+    runs-on: ${{ fromJSON(vars.CI_LINUX_MINI_RUNNER || '"ubuntu-latest"') }}
+    if: github.repository == 'web-infra-dev/rspack'
+    steps:
+      - name: Get PR info
+        id: pr-info
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: ${{ github.event.inputs.pr }},
+            });
+            core.setOutput('branch', pr.head.ref);
+            core.setOutput('repo', pr.head.repo.full_name);
+
+      - name: Trigger Ecosystem CI
+        uses: rstackjs/rstack-ecosystem-ci/.github/actions/ecosystem_ci_dispatch@4b0ec855ccbd27595a0df4781ed58b77e64d25ee # v0.3.5
+        with:
+          github-token: ${{ secrets.REPO_RSTACK_ECO_CI_GITHUB_TOKEN }}
+          ecosystem-owner: web-infra-dev
+          ecosystem-repo: rspack
+          workflow-file: rspack-ecosystem-ci-from-pr.yml
+          pr-number: ${{ github.event.inputs.pr }}
+          client-payload: '{"prNumber":"${{ github.event.inputs.pr }}","branchName":"${{ steps.pr-info.outputs.branch }}","repo":"${{ steps.pr-info.outputs.repo }}","suite":"${{ github.event.inputs.suite || ''-'' }}","suiteRefType":"${{ github.event.inputs.suiteRefType }}","suiteRef":"${{ github.event.inputs.suiteRef }}"}'
+          branch: ${{ steps.pr-info.outputs.branch }}

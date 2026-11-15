@@ -1,0 +1,56 @@
+name: Generate API from Spec
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * 0" # Every Sunday at midnight GMT
+jobs:
+  generate-api:
+    if: ${{ github.repository == 'opensearch-project/opensearch-js' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./api_generator
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Config git to rebase
+        run: git config --global pull.rebase true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate API
+        run: |-
+          npm run download_spec
+          npm run generate_api
+
+      - name: Get current date
+        id: date
+        run: echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
+
+      - name: Create pull request
+        uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7
+        with:
+          push-to-fork: opensearch-ci-bot/opensearch-js
+          token: ${{ secrets.OPENSEARCH_CI_BOT_TOKEN }}
+          commit-message: "Updated opensearch-js to reflect the latest OpenSearch API spec (${{ env.date }})"
+          title: "[AUTOCUT] Update opensearch-js to reflect the latest OpenSearch API spec (${{ env.date }})"
+          body: |
+            Update `opensearch-js` to reflect the latest [OpenSearch API spec](https://api-spec.opensearch.org/opensearch-openapi.yaml).
+            Date: ${{ env.date }}
+          branch: update-api-from-spec-${{ env.date }}
+          base: main
+          signoff: true
+          labels: |
+            autocut

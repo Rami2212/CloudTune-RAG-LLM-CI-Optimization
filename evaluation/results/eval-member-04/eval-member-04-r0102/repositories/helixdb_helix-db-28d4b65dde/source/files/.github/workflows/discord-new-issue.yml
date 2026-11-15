@@ -1,0 +1,45 @@
+name: Notify Discord of new issues
+
+on:
+  issues:
+    types: [opened]
+
+permissions: {}
+
+jobs:
+  notify:
+    name: Notify Discord
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Send issue notification
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_ISSUES_WEBHOOK_URL }}
+          ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+        run: |
+          test -n "$DISCORD_WEBHOOK_URL"
+
+          jq -n \
+            --arg author "$ISSUE_AUTHOR" \
+            --arg number "$ISSUE_NUMBER" \
+            --arg title "$ISSUE_TITLE" \
+            --arg url "$ISSUE_URL" \
+            '{
+              username: "HelixDB Issues",
+              allowed_mentions: {parse: []},
+              embeds: [{
+                title: $title,
+                url: $url,
+                description: ("Opened by `" + $author + "`"),
+                color: 5814783,
+                footer: {text: ("HelixDB/helix-db issue #" + $number)}
+              }]
+            }' |
+            curl --silent --show-error --fail-with-body \
+              --retry 3 --retry-all-errors \
+              --header "Content-Type: application/json" \
+              --data-binary @- \
+              "$DISCORD_WEBHOOK_URL"

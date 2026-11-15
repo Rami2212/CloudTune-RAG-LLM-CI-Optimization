@@ -1,0 +1,59 @@
+on: pull_request
+
+jobs:
+  golden:
+    runs-on: [ARM64]
+    steps:
+      - name: Generate token
+        id: generate_token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.GH_ACTIONS_HELPER_APP_ID }}
+          private-key: ${{ secrets.GH_ACTIONS_HELPER_PK }}
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ steps.generate_token.outputs.token }}
+          ref: ${{ github.event.pull_request.head.ref }}
+      - uses: actions/setup-go@v4
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run tests
+        run: make update-golden-files
+      - name: Commit updated mod tidy
+        uses: EndBug/add-and-commit@v9
+        with:
+          add: -A
+          message: commit from ci -- updated golden files
+  test:
+    runs-on: [ARM64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v4
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run tests
+        run: make test-ci
+
+  lint:
+    runs-on: [ARM64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v4
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@v3
+        with:
+          node-version: 18
+      - uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 1.1.3
+      - name: golangci-lint
+        uses: reviewdog/action-golangci-lint@v2
+        with:
+          reporter: github-pr-review
+          golangci_lint_flags: "--config=./.golangci.yml -v --timeout 5m"
+      - name: terraform fmt
+        run: terraform fmt -check -diff -recursive testdata

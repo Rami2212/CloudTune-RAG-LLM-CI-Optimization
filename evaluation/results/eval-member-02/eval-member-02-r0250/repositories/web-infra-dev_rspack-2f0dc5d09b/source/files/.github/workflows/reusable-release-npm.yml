@@ -1,0 +1,174 @@
+name: Reusable Release Npm
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        description: 'Release Npm Tag'
+        required: true
+      tag_confirm:
+        type: string
+        description: 'Release Npm Tag Double Check'
+        required: true
+      test:
+        type: boolean
+        description: 'Run JS tests before release'
+        required: true
+        default: true
+      dry_run:
+        type: boolean
+        description: 'DryRun release'
+        required: true
+        default: false
+      push_tags:
+        type: boolean
+        description: 'push tags to github'
+        required: true
+        default: true
+
+permissions:
+  # To publish packages with provenance
+  id-token: write
+  # Allow commenting on issues for `reusable-build.yml`
+  issues: write
+
+jobs:
+  validate:
+    name: Validate Npm Tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check tag matches tag_confirm
+        run: |
+          if [ "${{ inputs.tag }}" != "${{ inputs.tag_confirm }}" ]; then
+            echo "Error: tag and tag_confirm must match"
+            echo "tag: ${{ inputs.tag }}"
+            echo "tag_confirm: ${{ inputs.tag_confirm }}"
+            exit 1
+          fi
+          echo "npm tag validation passed: ${{ inputs.tag }}"
+
+  build:
+    name: Build ${{ matrix.array.target }}${{ matrix.array.binding_postfix }}
+    needs: validate
+    strategy:
+      fail-fast: false # for better utilize ci runners
+      matrix:
+        array:
+          - target: x86_64-unknown-linux-gnu
+            runner: ${{ vars.LINUX_SELF_HOSTED_RUNNER_LABELS || '"ubuntu-22.04"' }}
+            test-runner: '"ubuntu-22.04"'
+          - target: aarch64-unknown-linux-gnu
+            runner: ${{ vars.LINUX_SELF_HOSTED_RUNNER_LABELS || '"ubuntu-22.04"' }}
+            test-runner: '"ubuntu-22.04"'
+          - target: riscv64gc-unknown-linux-gnu
+            runner: ${{ vars.LINUX_SELF_HOSTED_RUNNER_LABELS || '"ubuntu-22.04"' }}
+            test-runner: '"ubuntu-22.04"'
+          - target: x86_64-unknown-linux-musl
+            runner: ${{ vars.LINUX_SELF_HOSTED_RUNNER_LABELS || '"ubuntu-22.04"' }}
+            test-runner: '"ubuntu-22.04"'
+          - target: aarch64-unknown-linux-musl
+            runner: ${{ vars.LINUX_SELF_HOSTED_RUNNER_LABELS || '"ubuntu-22.04"' }}
+            test-runner: '"ubuntu-22.04"'
+          - target: riscv64gc-unknown-linux-musl
+            runner: ${{ vars.LINUX_SELF_HOSTED_RUNNER_LABELS || '"ubuntu-22.04"' }}
+            test-runner: '"ubuntu-22.04"'
+          - target: powerpc64le-unknown-linux-gnu
+            runner: ${{ vars.LINUX_SELF_HOSTED_RUNNER_LABELS || '"ubuntu-22.04"' }}
+            test-runner: '"ubuntu-22.04"'
+          - target: s390x-unknown-linux-gnu
+            runner: ${{ vars.LINUX_SELF_HOSTED_RUNNER_LABELS || '"ubuntu-22.04"' }}
+            test-runner: '"ubuntu-22.04"'
+          - target: i686-pc-windows-msvc
+            runner: ${{ vars.WINDOWS_SELF_HOSTED_RUNNER_LABELS || '"windows-latest"' }}
+            test-runner: '"windows-latest"'
+          - target: x86_64-pc-windows-msvc
+            runner: ${{ vars.WINDOWS_SELF_HOSTED_RUNNER_LABELS || '"windows-latest"' }}
+            test-runner: '"windows-latest"'
+          - target: aarch64-pc-windows-msvc
+            runner: ${{ vars.WINDOWS_SELF_HOSTED_RUNNER_LABELS || '"windows-latest"' }}
+            test-runner: '"windows-latest"'
+          - target: x86_64-apple-darwin
+            runner: ${{ vars.MAC_SELF_HOSTED_RUNNER_LABELS || '"macos-latest"' }}
+            test-runner: '"macos-latest"'
+          - target: aarch64-apple-darwin
+            runner: ${{ vars.MAC_SELF_HOSTED_RUNNER_LABELS || '"macos-latest"' }}
+            test-runner: '"macos-latest"'
+          # The wasm release build is the release wall-clock long pole. Build the
+          # wasi and browser variants as two parallel jobs (one variant per
+          # runner). Only the wasi (node) variant runs the wasm tests; the
+          # browser variant is build-only (see reusable-build / build-test).
+          - target: wasm32-wasip1-threads
+            runner: ${{ vars.LINUX_SELF_HOSTED_RUNNER_LABELS || '"ubuntu-22.04"' }}
+          - target: wasm32-wasip1-threads
+            runner: ${{ vars.LINUX_SELF_HOSTED_RUNNER_LABELS || '"ubuntu-22.04"' }}
+            binding_postfix: '-browser'
+    uses: ./.github/workflows/reusable-build.yml
+    with:
+      target: ${{ matrix.array.target }}
+      runner: ${{ matrix.array.runner }}
+      test-runner: ${{ matrix.array.test-runner }}
+      binding_postfix: ${{ matrix.array.binding_postfix }}
+      test: ${{ inputs.test }}
+      profile: 'release'
+      # release artifacts must be built from scratch
+      force-rebuild: true
+
+  release:
+    name: Release
+    environment: npm
+    permissions:
+      contents: write
+      # To publish packages with provenance
+      id-token: write
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # This makes Actions fetch only one branch to release
+          fetch-depth: 1
+
+      - name: Pnpm Setup
+        uses: ./.github/actions/pnpm/setup
+        with:
+          node-version: 24
+
+      - name: Pnpm Install
+        run: pnpm i
+
+      - name: Download artifacts
+        uses: actions/download-artifact@65a9edc5881444af0b9093a5e628f2fe47ea3b2e # v4.1.7
+        with:
+          path: artifacts
+          pattern: bindings-*
+
+      - name: Clean artifacts
+        run: find artifacts -type f -name '*.d.ts'  | xargs rm -f
+
+      - name: Build node packages
+        run: pnpm run build:js
+
+      - name: Move artifacts
+        run: |
+          ls -R artifacts
+          node scripts/build-npm.mjs
+
+      - name: Show binding packages
+        run: ls -R npm
+
+      # Update npm to the latest version to enable OIDC
+      - name: Update npm
+        run: |
+          npm install -g npm@latest
+          npm --version
+
+      - name: Release Npm
+        run: |
+          ./x publish stable --tag ${{inputs.tag}} ${{inputs.dry_run && '--dry-run' || '--no-dry-run'}} ${{inputs.push_tags && '--push-tags' || '--no-push-tags'}}
+        env:
+          REPOSITORY: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          ONLY_RELEASE_TAG: true

@@ -1,0 +1,147 @@
+name: Check
+on:
+  pull_request:
+  push:
+    branches: ["master"]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  check:
+    # Forks deploy from their own branches and commit content from /manage;
+    # only run the full check in the upstream repository.
+    if: ${{ github.repository == 'yunyuyuan/nuxt-blog' }}
+    # Pinned: ubuntu-latest is migrating to 26.04, which Playwright 1.54 does not support.
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Prepare Nuxt
+        # eslint.config.mjs imports .nuxt/eslint.config.mjs, which nuxi prepare generates.
+        run: pnpm exec nuxi prepare
+      - name: Lint
+        run: pnpm exec eslint . --max-warnings 0
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Unit tests
+        run: pnpm test:unit
+      - name: Load the local script tasks
+        # Loads every task module, so errors at the top level of layer/scripts show up here
+        run: pnpm exec gulp --tasks
+      - name: Build
+        run: pnpm build
+        env:
+          NB_PRERENDER_STRICT: "true"
+      - name: Check static output
+        run: test -f .output/public/404.html
+      - name: Check that pages do not prefetch unused code
+        # layer/nuxt.config.ts turns off the manifest prefetch. Without it, every first visit
+        # downloads the admin layout, the editor and monaco (about 900KB gzip)
+        run: |
+          files=$(grep -rl --include='*.html' 'rel="prefetch"' .output/public || true)
+          if [ -n "$files" ]; then
+            echo "::error::These pages have <link rel=\"prefetch\">:"
+            echo "$files" | head -20
+            exit 1
+          fi
+  starter:
+    # Installs the starter like a new user does: @yunyuyuan/nuxt-blog from a packed tarball
+    # instead of the workspace, and no lockfile, so it gets the newest Nuxt that the
+    # range in starter/package.json allows. The copy is outside this repository, so
+    # pnpm does not use the workspace of this repository.
+    if: ${{ github.repository == 'yunyuyuan/nuxt-blog' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - name: Pack the layer
+        run: pnpm --dir layer pack --pack-destination "$RUNNER_TEMP"
+      - name: Copy the starter and use the packed layer
+        # The runner context is not available in job-level env, so the later steps
+        # read STARTER_DIR from GITHUB_ENV
+        run: |
+          STARTER_DIR="$RUNNER_TEMP/starter"
+          echo "STARTER_DIR=$STARTER_DIR" >> "$GITHUB_ENV"
+          cp -r starter "$STARTER_DIR"
+          cd "$STARTER_DIR"
+          npm pkg set "dependencies.@yunyuyuan/nuxt-blog=file:$(ls "$RUNNER_TEMP"/yunyuyuan-nuxt-blog-*.tgz)"
+      - name: Install dependencies
+        working-directory: ${{ env.STARTER_DIR }}
+        run: pnpm install --no-frozen-lockfile
+      - name: Prepare Nuxt
+        working-directory: ${{ env.STARTER_DIR }}
+        run: pnpm exec nuxi prepare
+      - name: Typecheck
+        working-directory: ${{ env.STARTER_DIR }}
+        run: pnpm typecheck
+      - name: Load the local script tasks
+        working-directory: ${{ env.STARTER_DIR }}
+        run: pnpm exec gulp --tasks
+      - name: Build
+        working-directory: ${{ env.STARTER_DIR }}
+        run: pnpm build
+        env:
+          NB_PRERENDER_STRICT: "true"
+      - name: Check static output
+        working-directory: ${{ env.STARTER_DIR }}
+        run: |
+          test -f .output/public/404.html
+          test -f .output/public/articles/93332711/index.html
+          test -d .output/public/sticker
+      - name: Check that pages do not prefetch unused code
+        # Same check as in the check job. This job uses the newest Nuxt, so it also finds
+        # a Nuxt version that no longer uses the build:manifest hook of layer/nuxt.config.ts
+        working-directory: ${{ env.STARTER_DIR }}
+        run: |
+          files=$(grep -rl --include='*.html' 'rel="prefetch"' .output/public || true)
+          if [ -n "$files" ]; then
+            echo "::error::These pages have <link rel=\"prefetch\">:"
+            echo "$files" | head -20
+            exit 1
+          fi
+      - name: Check that the dev server pre-bundles the client dependencies
+        # Last step: the dev server keeps running in the background until the job ends
+        working-directory: ${{ env.STARTER_DIR }}
+        run: |
+          pnpm exec nuxt dev --port 3000 > "$RUNNER_TEMP/dev.log" 2>&1 &
+          for _ in $(seq 1 60); do curl -sf -o /dev/null http://localhost:3000/ && break; sleep 2; done
+          node "$GITHUB_WORKSPACE/.github/scripts/check-optimized-deps.mjs" || { cat "$RUNNER_TEMP/dev.log"; exit 1; }
+  e2e:
+    if: ${{ github.repository == 'yunyuyuan/nuxt-blog' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Build for e2e
+        run: pnpm build-for-test
+      - name: E2E tests
+        run: pnpm test:prod-and-e2e

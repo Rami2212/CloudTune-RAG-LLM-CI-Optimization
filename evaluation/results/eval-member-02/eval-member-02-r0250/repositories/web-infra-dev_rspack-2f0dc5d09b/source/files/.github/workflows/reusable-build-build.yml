@@ -1,0 +1,266 @@
+name: Build Binding
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        required: true
+        type: string
+      runner: # Runner labels
+        required: true
+        type: string
+      profile: # Rust profile, "ci" or "production" or "profiling"
+        default: 'ci'
+        required: false
+        type: string
+      ref: # Git reference to checkout
+        required: false
+        type: string
+      binding_postfix: # specify extra postfix for binding artifact
+        required: false
+        type: string
+      force-rebuild: # Disable Rust cache and build from scratch, e.g. for release builds
+        required: false
+        type: boolean
+        default: false
+
+env:
+  # Since CI builds are more akin to from-scratch builds, incremental compilation adds unnecessary dependency-tracking and IO overhead, reducing caching effectiveness.
+  # https://github.com/rust-lang/rust-analyzer/blob/25368d24308d6a94ffe8b99f0122bcf5a2175322/.github/workflows/ci.yaml#L11
+  CARGO_INCREMENTAL: 0
+  MEASURE_CARGO_FRESH: ${{ inputs.profile == 'ci' && '1' || '' }}
+
+jobs:
+  build:
+    name: Build ${{ inputs.target }}${{ inputs.binding_postfix }}
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref }}
+          clean: ${{ runner.environment == 'github-hosted' }}
+
+      - name: Disable CPU hogs (Windows)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        uses: ./.github/actions/windows-disable-cpu-hogs
+
+      - name: Download and install zstd
+        if: ${{ runner.os == 'Windows' }}
+        shell: bash # Use bash for curl and unzip commands
+        run: |
+          curl -L https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-v1.5.7-win64.zip --output zstd.zip
+          unzip zstd.zip
+          mv zstd-v1.5.7-win64/zstd.exe C:/Windows/System32/
+          # Verify installation
+          zstd --version
+
+      - name: Pnpm Setup
+        timeout-minutes: 5
+        uses: ./.github/actions/pnpm/setup
+
+      - name: Install Binding Dependencies
+        run: pnpm --filter @rspack/binding install --frozen-lockfile
+
+      - name: Install Rust Toolchain
+        uses: ./.github/actions/rustup
+        with:
+          key: ${{ inputs.target }}-${{ inputs.profile }}
+          # don't need use cache in self-hosted windows; benefits of build with cargo build are wasted by cache restore
+          save-if: true
+          use-cache: ${{ !inputs.force-rebuild }}
+
+      - name: Setup Zig for musl build
+        if: ${{ contains(inputs.target, 'musl') }}
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+        with:
+          version: '0.14.1'
+
+      - name: Install cargo-zigbuild for musl build
+        if: ${{ contains(inputs.target, 'musl') }}
+        uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Install clang with PowerPC and SystemZ backends
+        if: ${{ inputs.target == 'powerpc64le-unknown-linux-gnu' || inputs.target == 's390x-unknown-linux-gnu' }}
+        run: command -v clang-15 || { sudo apt-get update && sudo apt-get install -y clang-15; }
+
+      # setup rust target for native runner
+      - name: Setup Rust Target
+        run: rustup target add ${{ inputs.target }}
+
+      - name: Run Cargo codegen
+        run: cargo codegen
+
+      - name: Trim paths
+        run: |
+          echo $'\n' >> .cargo/config.toml
+          echo 'trim-paths = true' >> .cargo/config.toml
+
+      - name: Enable checksum-freshness (CI profile only)
+        if: ${{ inputs.profile == 'ci' }}
+        run: echo 'checksum-freshness = true' >> .cargo/config.toml
+
+      # Fix: Resolve disk space error "ENOSPC: no space left on device" on GitHub Actions runners
+      - name: Free disk cache
+        if: ${{ runner.environment == 'github-hosted' && inputs.target == 'x86_64-unknown-linux-gnu' }}
+        uses: xc2/free-disk-space@fbe203b3788f2bebe2c835a15925da303eaa5efe # v1.0.0
+        with:
+          tool-cache: false
+          # Keep LLVM/Clang for native dependencies built with TARGET_CC=clang.
+          large-packages: false
+
+      # Linux
+      - name: Check clang
+        if: ${{ inputs.target == 'x86_64-unknown-linux-gnu' }}
+        run: |
+          command -v clang
+          clang --version
+
+      - name: Build x86_64-unknown-linux-gnu
+        if: ${{ inputs.target == 'x86_64-unknown-linux-gnu' }}
+        run: RUST_TARGET=x86_64-unknown-linux-gnu USE_NAPI_CROSS=1 pnpm build:binding:${{ inputs.profile }}
+        env:
+          TARGET_CC: clang
+
+      - name: Build aarch64-unknown-linux-gnu
+        if: ${{ inputs.target == 'aarch64-unknown-linux-gnu' }}
+        run: RUST_TARGET=aarch64-unknown-linux-gnu USE_NAPI_CROSS=1 pnpm build:binding:${{ inputs.profile }}
+        env:
+          TARGET_CC: clang
+
+      # `@napi-rs/cross-toolchain` does not support riscv64 right now
+      - name: Build riscv64gc-unknown-linux-gnu
+        if: ${{ inputs.target == 'riscv64gc-unknown-linux-gnu' }}
+        run: |
+          sudo apt update
+          sudo apt install -y gcc-riscv64-linux-gnu
+          export CC_riscv64gc_unknown_linux_gnu=riscv64-linux-gnu-gcc
+          export CXX_riscv64gc_unknown_linux_gnu=riscv64-linux-gnu-g++
+          export AR_riscv64gc_unknown_linux_gnu=riscv64-linux-gnu-ar
+          RUST_TARGET=riscv64gc-unknown-linux-gnu pnpm build:binding:${{ inputs.profile }}
+
+      - name: Build x86_64-unknown-linux-musl
+        if: ${{ inputs.target == 'x86_64-unknown-linux-musl' }}
+        run: RUST_TARGET=x86_64-unknown-linux-musl USE_ZIG=1 pnpm build:binding:${{ inputs.profile }}
+        env:
+          TARGET_CC: clang
+
+      - name: Build aarch64-unknown-linux-musl
+        if: ${{ inputs.target == 'aarch64-unknown-linux-musl' }}
+        run: RUST_TARGET=aarch64-unknown-linux-musl USE_ZIG=1 pnpm build:binding:${{ inputs.profile }}
+        env:
+          TARGET_CC: clang
+
+      - name: Build riscv64gc-unknown-linux-musl
+        if: ${{ inputs.target == 'riscv64gc-unknown-linux-musl' }}
+        run: RUST_TARGET=riscv64gc-unknown-linux-musl USE_ZIG=1 pnpm build:binding:${{ inputs.profile }}
+        env:
+          TARGET_CC: clang
+
+      - name: Build powerpc64le-unknown-linux-gnu
+        if: ${{ inputs.target == 'powerpc64le-unknown-linux-gnu' }}
+        run: RUST_TARGET=powerpc64le-unknown-linux-gnu USE_NAPI_CROSS=1 pnpm build:binding:${{ inputs.profile }}
+        env:
+          TARGET_CC: clang-15
+
+      - name: Build s390x-unknown-linux-gnu
+        if: ${{ inputs.target == 's390x-unknown-linux-gnu' }}
+        run: RUST_TARGET=s390x-unknown-linux-gnu USE_NAPI_CROSS=1 pnpm build:binding:${{ inputs.profile }}
+        env:
+          TARGET_CC: clang-15
+
+      # Windows
+      - name: Build i686-pc-windows-msvc
+        if: ${{ inputs.target == 'i686-pc-windows-msvc' }}
+        run: RUST_TARGET=${{ inputs.target }} DISABLE_PLUGIN=1 pnpm build:binding:${{ inputs.profile }}
+
+      - name: Build x86_64-pc-windows-msvc
+        if: ${{ inputs.target == 'x86_64-pc-windows-msvc' }}
+        run: RUST_TARGET=${{ inputs.target }} pnpm build:binding:${{ inputs.profile }}
+
+      - name: Build aarch64-pc-windows-msvc
+        if: ${{ inputs.target == 'aarch64-pc-windows-msvc' }}
+        run: RUST_TARGET=${{ inputs.target }} DISABLE_PLUGIN=1 pnpm build:binding:${{ inputs.profile }}
+
+      # Mac
+      - name: Build x86_64-apple-darwin
+        if: ${{ inputs.target == 'x86_64-apple-darwin' }}
+        run: |
+          RUST_TARGET=${{ inputs.target }} pnpm build:binding:${{ inputs.profile }}
+
+      - name: Build aarch64-apple-darwin
+        if: ${{ inputs.target == 'aarch64-apple-darwin' }}
+        run: |
+          if [[ "${{ runner.environment == 'github-hosted' }}" == "true" ]]; then
+            # Github runner
+            sudo rm -Rf /Library/Developer/CommandLineTools/SDKs/*;
+          fi
+          export CC=$(xcrun -f clang);
+          export CXX=$(xcrun -f clang++);
+          SYSROOT=$(xcrun --sdk macosx --show-sdk-path);
+          export CFLAGS="-isysroot $SYSROOT -isystem $SYSROOT";
+          RUST_TARGET=${{ inputs.target }} pnpm build:binding:${{ inputs.profile }}
+
+      # WASM
+      # For CI, build the full WASI binding once and reuse it for browser tests by
+      # copying it to the browser artifact name. The browser-specific slim build is
+      # only needed for release packaging.
+      - name: Build wasm32-wasip1-threads with linux
+        if: ${{ inputs.target == 'wasm32-wasip1-threads' && inputs.profile != 'release' }}
+        run: |
+          DISABLE_PLUGIN=1 RUST_TARGET=wasm32-wasip1-threads pnpm build:binding:${{ inputs.profile }}
+          cp crates/node_binding/rspack.wasm32-wasi.wasm crates/node_binding/rspack.browser.wasm
+
+      - name: Setup binaryen
+        if: ${{ inputs.target == 'wasm32-wasip1-threads' && inputs.profile == 'release' }}
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/binaryen.tar.gz" \
+            "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-x86_64-linux.tar.gz"
+          tar xz -C "$RUNNER_TEMP" -f "$RUNNER_TEMP/binaryen.tar.gz" "binaryen-version_$BINARYEN_VERSION/bin/wasm-opt"
+          echo "$RUNNER_TEMP/binaryen-version_$BINARYEN_VERSION/bin" >> "$GITHUB_PATH"
+        env:
+          BINARYEN_VERSION: '131'
+
+      # WASM Release (use profile = release-wasi) + wasm-opt
+      # The wasi and browser variants are split into two parallel matrix jobs
+      # (see reusable-release-npm.yml) and selected here via binding_postfix.
+      - name: Build wasm32-wasip1-threads wasi variant (release-wasi) with linux
+        if: ${{ inputs.target == 'wasm32-wasip1-threads' && inputs.profile == 'release' && inputs.binding_postfix == '' }}
+        run: |
+          pnpm --filter @rspack/binding build:release:wasm
+          wasm-opt -Oz crates/node_binding/rspack.wasm32-wasi.wasm -o crates/node_binding/rspack.wasm32-wasi.optimized.wasm
+          mv crates/node_binding/rspack.wasm32-wasi.optimized.wasm crates/node_binding/rspack.wasm32-wasi.wasm
+
+      - name: Build wasm32-wasip1-threads browser variant (release-wasi) with linux
+        if: ${{ inputs.target == 'wasm32-wasip1-threads' && inputs.profile == 'release' && inputs.binding_postfix == '-browser' }}
+        run: |
+          pnpm --filter @rspack/binding build:release:browser
+          wasm-opt -Oz crates/node_binding/rspack.browser.wasm -o crates/node_binding/rspack.browser.optimized.wasm
+          mv crates/node_binding/rspack.browser.optimized.wasm crates/node_binding/rspack.browser.wasm
+
+      - name: Check WASI types
+        if: ${{ inputs.target == 'wasm32-wasip1-threads' }}
+        run: pnpm --filter @rspack/binding test:wasi
+
+      - name: Diff artifact
+        run: |
+          export EXCLUDE=":(exclude).cargo/config.toml"
+          git diff --quiet -- . "$EXCLUDE" || (git diff --name-status -- . "$EXCLUDE" && exit 1)
+
+      - name: Upload artifact
+        uses: ./.github/actions/artifact/upload
+        with:
+          name: bindings-${{ inputs.target }}${{ inputs.binding_postfix}}
+          path: |
+            crates/node_binding/*.node
+            crates/node_binding/*.d.ts
+            ${{ inputs.target == 'wasm32-wasip1-threads' && 'crates/node_binding/rspack.wasi.d.cts' || '' }}
+            crates/node_binding/rspack.wasm32-wasi.wasm
+            crates/node_binding/rspack.wasm32-wasi.debug.wasm
+            crates/node_binding/rspack.browser.wasm

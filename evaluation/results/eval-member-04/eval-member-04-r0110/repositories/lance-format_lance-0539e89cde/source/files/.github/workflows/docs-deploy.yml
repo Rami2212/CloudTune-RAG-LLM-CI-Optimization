@@ -1,0 +1,102 @@
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: publish-site
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Checkout lance-spark
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: lancedb/lance-spark
+          path: lance-spark
+      - name: Checkout lance-namespace
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: jackye1995/lance-namespace
+          ref: ns-catalog-split
+          path: lance-namespace
+      - name: Checkout lance-ray
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: lancedb/lance-ray
+          path: lance-ray
+      - name: Checkout lance-huggingface
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: lance-format/lance-huggingface
+          path: lance-huggingface
+      - name: Checkout lance-namespace-impls
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: jackye1995/lance-namespace-impls
+          ref: jack/ns-catalog-split
+          path: lance-namespace-impls
+      - name: Checkout lance-duckdb
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: lance-format/lance-duckdb
+          path: lance-duckdb
+      - name: Checkout lance-trino
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: lance-format/lance-trino
+          path: lance-trino
+      - name: Checkout lance-context
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: lance-format/lance-context
+          path: lance-context
+      - name: Checkout lance-flink
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: lance-format/lance-flink
+          path: lance-flink
+      - name: Configure Git Credentials
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+      - name: "Set up Python"
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version-file: "docs/pyproject.toml"
+      - name: Install uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          enable-cache: true
+      - name: Assemble full docs website
+        env:
+          LANCE_NAMESPACE_REPO: ${{ github.workspace }}/lance-namespace
+          LANCE_NAMESPACE_IMPLS_REPO: ${{ github.workspace }}/lance-namespace-impls
+          LANCE_SPARK_REPO: ${{ github.workspace }}/lance-spark
+          LANCE_RAY_REPO: ${{ github.workspace }}/lance-ray
+          LANCE_TRINO_REPO: ${{ github.workspace }}/lance-trino
+          LANCE_DUCKDB_REPO: ${{ github.workspace }}/lance-duckdb
+          LANCE_HUGGINGFACE_REPO: ${{ github.workspace }}/lance-huggingface
+          LANCE_CONTEXT_REPO: ${{ github.workspace }}/lance-context
+          LANCE_FLINK_REPO: ${{ github.workspace }}/lance-flink
+        run: |
+          docs/make-full-website.sh
+      - name: Deploy
+        working-directory: docs
+        run: uv run mkdocs gh-deploy --force

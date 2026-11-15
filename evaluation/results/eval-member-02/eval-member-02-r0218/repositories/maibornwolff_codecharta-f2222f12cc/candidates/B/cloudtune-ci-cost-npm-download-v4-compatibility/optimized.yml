@@ -1,0 +1,54 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [HIGH] Add npm dependency cache to "deploy" job
+# Estimated savings: ~4 min/run
+#
+name: Deploy GitHub Pages
+'on':
+  workflow_dispatch: null
+  push:
+    paths:
+      - gh-pages/**
+      - analysis/model/src/main/kotlin/de/maibornwolff/codecharta/model/Project.kt
+      - .github/workflows/deploy-github-pages.yml
+    branches:
+      - main
+jobs:
+  deploy:
+    name: Build & Deploy Docs (Astro) to GitHub Pages
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: gh-pages
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Setup Java for example validation
+        uses: actions/setup-java@v5.2.0
+        with:
+          distribution: temurin
+          java-version: 25
+      - name: Validate documentation example
+        working-directory: analysis
+        run: ./gradlew :ccsh:run --args="check ../../gh-pages/src/assets/examples/minimal.cc.json"
+      - name: Build site
+        run: npm run build
+      - name: Deploy to GitHub Pages
+        uses: JamesIves/github-pages-deploy-action@v4.8.0
+        with:
+          token: ${{ secrets.DEPLOY_TOKEN }}
+          branch: gh-pages
+          folder: gh-pages/dist
+          clean-exclude: |
+            /stg
+            /visualization/app
+            /visualization/coverage

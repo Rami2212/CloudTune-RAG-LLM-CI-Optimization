@@ -1,0 +1,54 @@
+name: Audit
+
+on:
+  workflow_dispatch: {}
+  push:
+    paths:
+      - yarn.lock
+  pull_request:
+    paths:
+      - yarn.lock
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '22'
+
+concurrency:
+  group: 'audit'
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    name: Run audit
+    runs-on: ubuntu-latest
+    env:
+      WEBHOOK: ${{ secrets.DISCORD_AUDIT_WEBHOOK }}
+    steps:
+    # Setup
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.ref }}
+    - name: Enable Yarn 4.x
+      run: corepack enable
+    - name: Setup NodeJS ${{ env.NODE_VERSION }}
+      uses: actions/setup-node@v6
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'yarn'
+    - name: Install packages
+      run: yarn install --immutable
+    # Run the actual audit
+    - name: Audit
+      run: |
+        yarn npm audit --recursive --severity moderate --json > audit_result.json || true
+    - name: Format results
+      run: ./scripts/audit-report.sh format
+    - name: Report to Discord
+      if: env.WEBHOOK != ''
+      env:
+        RUN_URL: https://github.com/Zettlr/Zettlr/actions/runs/${{ github.run_id }}
+      run: ./scripts/audit-report.sh discord
+    - name: Report results in summary
+      run: ./scripts/audit-report.sh summary

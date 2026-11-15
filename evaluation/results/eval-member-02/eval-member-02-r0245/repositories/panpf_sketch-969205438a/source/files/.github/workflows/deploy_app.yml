@@ -1,0 +1,59 @@
+name: Deploy App
+
+on:
+  workflow_dispatch:
+  push:
+    branches: main
+
+env:
+  JAVA_VERSION: 21
+  JAVA_DISTRIBUTION: zulu
+
+jobs:
+  deploy-app:
+    name: Deploy App
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        continue-on-error: true
+        timeout-minutes: 5
+        with:
+          cache-overwrite-existing: true
+
+      - name: Build the web app
+        run: ./gradlew samples:wasmJsApp:wasmJsBrowserDistribution
+
+      - name: Check out the gh-pages branch
+        run: |
+          git fetch origin gh-pages:gh-pages
+          git checkout gh-pages
+
+      - name: Remove old app directory
+        run: rm -rf app/*
+
+      - name: Create app directory
+        run: mkdir -p app
+
+      - name: Move build artifacts to app directory
+        run: mv samples/wasmJsApp/build/dist/wasmJs/productionExecutable/* app/
+
+      - name: Commit and push changes
+        uses: stefanzweifel/git-auto-commit-action@v4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          commit_message: "Update web app"
+          branch: gh-pages
+          file_pattern: app/*

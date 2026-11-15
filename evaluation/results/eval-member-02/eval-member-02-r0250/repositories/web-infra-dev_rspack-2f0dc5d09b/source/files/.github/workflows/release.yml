@@ -1,0 +1,102 @@
+name: Release Full
+
+on:
+  workflow_dispatch:
+    inputs:
+      # NPM-specific inputs
+      npm_tag:
+        type: choice
+        description: 'Release Npm Tag'
+        required: true
+        options:
+          - canary
+          - nightly
+          - latest
+          - beta
+          - alpha
+          - rc
+      npm_tag_confirm:
+        type: choice
+        description: 'Release Npm Tag Double Check'
+        required: true
+        options:
+          - canary
+          - nightly
+          - latest
+          - beta
+          - alpha
+          - rc
+      test:
+        type: boolean
+        description: 'Run JS tests before release'
+        required: true
+        default: true
+
+      # Common inputs
+      dry_run:
+        type: boolean
+        description: 'DryRun release'
+        required: true
+        default: false
+      push_tags:
+        type: boolean
+        description: 'Push tags to repository'
+        required: true
+        default: true
+
+      # Control which releases to run
+      release_npm:
+        type: boolean
+        description: 'Release NPM packages'
+        required: false
+        default: true
+      release_crates:
+        type: boolean
+        description: 'Release Rust crates'
+        required: false
+        default: true
+
+permissions:
+  # To publish packages with provenance
+  id-token: write
+  # Allow commenting on issues
+  issues: write
+  # Allow writing contents for tags
+  contents: write
+
+jobs:
+  validate_inputs:
+    name: Validate Inputs
+    runs-on: ubuntu-latest
+    if: ${{ inputs.release_npm }}
+    steps:
+      - name: Validate npm tag confirmation
+        run: |
+          if [ "${{ inputs.npm_tag }}" != "${{ inputs.npm_tag_confirm }}" ]; then
+            echo "Error: npm_tag and npm_tag_confirm must match"
+            echo "npm_tag: ${{ inputs.npm_tag }}"
+            echo "npm_tag_confirm: ${{ inputs.npm_tag_confirm }}"
+            exit 1
+          fi
+          echo "npm_tag validation passed: ${{ inputs.npm_tag }}"
+
+  release_npm:
+    name: Release NPM Packages
+    if: ${{ inputs.release_npm }}
+    needs: [validate_inputs]
+    uses: ./.github/workflows/reusable-release-npm.yml
+    with:
+      tag: ${{ inputs.npm_tag }}
+      tag_confirm: ${{ inputs.npm_tag_confirm }}
+      test: ${{ inputs.test }}
+      dry_run: ${{ inputs.dry_run }}
+      push_tags: ${{ inputs.push_tags }}
+
+  release_crates:
+    name: Release Rust Crates
+    if: ${{ inputs.release_crates }}
+    uses: ./.github/workflows/reusable-release-crates.yml
+    with:
+      dry_run: ${{ inputs.dry_run }}
+      push_tags: ${{ inputs.push_tags }}
+    secrets: inherit

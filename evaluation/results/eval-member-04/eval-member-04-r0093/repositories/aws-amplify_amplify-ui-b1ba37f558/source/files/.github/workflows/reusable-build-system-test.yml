@@ -1,0 +1,196 @@
+# Description: this is a reusable workflow that runs build on mega-apps that have all the connected components for React Native.
+#
+# See build-system-test.yml for usage.
+on:
+  workflow_call:
+    inputs:
+      dist-tag:
+        required: true
+        type: string
+      ui-version:
+        # Exact Amplify UI version to install. Defaults to resolving `dist-tag`.
+        required: false
+        type: string
+        default: ''
+    secrets:
+      AUTH_E2E_ROLE_ARN:
+        required: true
+      DOMAIN:
+        required: true
+      PHONE_NUMBER:
+        required: true
+      USERNAME:
+        required: true
+      NEW_PASSWORD:
+        required: true
+      VALID_PASSWORD:
+        required: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment: ci
+    strategy:
+      fail-fast: false
+      matrix:
+        framework: [react]
+        framework-version: [latest]
+        build-tool: [next, vite]
+        build-tool-version: [latest]
+        pkg-manager: [npm]
+        node-version: [24]
+        pkg-manager-version: [latest]
+        include:
+          # Next.js 14 is the floor for @aws-amplify/ui-react-geo: Next.js 13's
+          # compiler produces a broken client bundle for maplibre-gl v6.
+          - framework: react
+            framework-version: 18
+            build-tool: next
+            build-tool-version: 14
+            pkg-manager: npm
+            node-version: 24
+          # Vite 6 is the lowest Vite major still supported upstream; v5 and
+          # below are end-of-life (see https://vite.dev/releases). Vite 3's
+          # default build target pinned `safari13`, which predates BigInt and
+          # broke esbuild on Amplify's native BigInt literals; v4+ default to a
+          # BigInt-capable target, so no build.target override is needed.
+          - framework: react
+            framework-version: 18
+            build-tool: vite
+            build-tool-version: 6
+            pkg-manager: npm
+            node-version: 24
+
+          - framework: angular
+            framework-version: latest
+            build-tool: angular-cli
+            build-tool-version: latest
+            pkg-manager: npm
+            node-version: 24
+          # Angular 20 is the floor of the @aws-amplify/ui-angular peer range.
+          # Angular 19 reached end of life on 2026-05-19.
+          - framework: angular
+            framework-version: 20
+            build-tool: angular-cli
+            build-tool-version: 20
+            pkg-manager: npm
+            node-version: 24
+
+          - framework: vue
+            framework-version: 3 # here use "3" instead of "latest" because .vuerc(preset) doesn't accept "latest" as "vueVersion"
+            build-tool: vue-cli
+            build-tool-version: latest
+            pkg-manager: yarn # vue-cli defualt pkg-manager is yarn. It can't be customized in the preset.json.
+            node-version: 24
+          - framework: vue
+            framework-version: latest
+            build-tool: vite
+            build-tool-version: latest
+            pkg-manager: npm
+            node-version: 24
+          # Vite 6 is the lowest Vite major still supported upstream
+          # (v5 and below are EOL: https://vite.dev/releases).
+          - framework: vue
+            framework-version: 3
+            build-tool: vite
+            build-tool-version: 6
+            pkg-manager: npm
+            node-version: 24
+          - framework: vue
+            framework-version: latest
+            build-tool: nuxt
+            build-tool-version: latest
+            pkg-manager: npm
+            node-version: 24
+
+    env:
+      MEGA_APP_NAME: ${{matrix.framework}}-${{ matrix.framework-version }}-${{ matrix.build-tool }}-${{ matrix.build-tool-version }}-ui-${{ inputs.dist-tag }}
+
+    steps:
+      - name: Checkout Amplify UI
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Setup Node.js ${{ matrix.node-version }} with ${{ matrix.pkg-manager }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: ${{ matrix.pkg-manager }}
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 2
+      - name: Add Amplify CLI
+        run: yarn global add @aws-amplify/cli
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          aws-region: us-east-2
+          role-to-assume: ${{ secrets.AUTH_E2E_ROLE_ARN }}
+      # Amplify CLI does not support headless pull with temporary credentials
+      # when useProfile is false.
+      # See: https://github.com/aws-amplify/amplify-cli/issues/11009.
+      - name: Create temp AWS profile
+        run: |
+          aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID && \
+          aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY && \
+          aws configure set aws_session_token $AWS_SESSION_TOKEN && \
+          aws configure set default.region $AWS_REGION
+      - name: Pull down AWS environments
+        run: npm run pull
+        working-directory: build-system-tests
+      - name: Delete AWS Profile
+        run: rm -rf ~/.aws
+      - name: Restore cypress runner from Cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        id: restore-cypress-cache
+        with:
+          path: ~/.cache/Cypress
+          key: ${{ runner.os }}-node24-canary-cypress-${{ hashFiles('build-system-tests/e2e/yarn.lock') }}
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 1
+      # `--name` pins the app directory to MEGA_APP_NAME; without it setup-mega-app.sh derives the name
+      # from `--tag`, and a dotted exact version is not a valid project name for some CLIs (e.g. `ng new`).
+      - name: Create MegaApp ${{ env.MEGA_APP_NAME }} and run build on NodeJS ${{ matrix.node-version }}
+        run: npm run setup:${{ matrix.framework }}:${{matrix.build-tool}} -- --framework-version ${{matrix.framework-version}} --build-tool-version ${{matrix.build-tool-version}} --pkg-manager ${{matrix.pkg-manager}} --name ${{ env.MEGA_APP_NAME }} --tag "$UI_TAG"
+        shell: bash
+        env:
+          UI_TAG: ${{ inputs.ui-version || inputs.dist-tag }}
+        working-directory: build-system-tests
+      - name: Install e2e packages
+        uses: ./.github/actions/install-with-retries
+        with:
+          working-directory: build-system-tests/e2e
+          # If we got a cache hit on cypress runner, then we will skip cypress binary
+          # installation. Otherwise, it will install cypress binary.
+          skip-cypress-binary: ${{ steps.restore-cypress-cache.outputs.cache-hit }}
+        # If cypress cache was missed, then we need to create new cache entry and upload it.
+        # At this point, cypress runner should've been installed from the previous installation
+        # step, so we go ahead and update the cache entry.
+      - name: Cache cypress runner
+        if: steps.restore-cypress-cache.outputs.cache-hit != 'true'
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/Cypress
+          key: ${{ runner.os }}-node24-canary-cypress-${{ hashFiles('build-system-tests/e2e/yarn.lock') }}
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 1
+      - name: Run E2E tests against ${{ env.MEGA_APP_NAME }} example
+        run: npm run test:web
+        id: e2e
+        working-directory: build-system-tests
+        env:
+          # Env values for testing flows
+          DOMAIN: ${{ secrets.DOMAIN }}
+          PHONE_NUMBER: ${{ secrets.PHONE_NUMBER }}
+          USERNAME: ${{ secrets.USERNAME }}
+          NEW_PASSWORD: ${{ secrets.NEW_PASSWORD }}
+          VALID_PASSWORD: ${{ secrets.VALID_PASSWORD }}
+          TAGS: '@${{ matrix.framework }}'
+
+      - name: Upload videos and screenshots
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ failure() && steps.e2e.outcome != 'success' }}
+        with:
+          name: canary-cypress-error-${{ env.MEGA_APP_NAME }}
+          path: |
+            build-system-tests/e2e/cypress/videos/**
+            build-system-test/e2e/cypress/screenshots/**
+          retention-days: 5

@@ -1,0 +1,55 @@
+name: CodSpeed Benchmarks
+
+on:
+  push:
+    branches:
+      - "main"
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+      - labeled
+  # `workflow_dispatch` allows CodSpeed to trigger backtest
+  # performance analysis in order to generate initial data.
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmarks:
+    name: Run benchmarks
+    # PRs only get benchmarked if they have the `run-benchmarks` label.
+    # Forks don't have access to CodSpeed secrets, so skip them.
+    if: |
+      github.repository_owner == 'zizmorcore'
+        && (contains(github.event.pull_request.labels.*.name, 'run-benchmarks')
+          || github.event_name == 'push'
+          || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          cache-all-crates: true
+
+      - uses: astral-sh/setup-uv@v10.3.3
+
+      - name: Build zizmor (release)
+        run: cargo build --release
+
+      - name: Run the benchmarks
+        uses: CodSpeedHQ/action@v5.6.1
+        with:
+          mode: walltime
+          run: make bench
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

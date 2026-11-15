@@ -1,0 +1,65 @@
+name: i18n
+
+on:
+  workflow_dispatch: {} # Enable manual triggers
+  schedule: # Run every Tuesday night at 02:17 (random minute to avoid high loads)
+    - cron: '17 2 * * TUE'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  NODE_VERSION: '22'
+
+# Ensure only a single build workflow runs at any one time
+concurrency:
+  group: ${{ github.workflow }}
+
+jobs:
+  refresh:
+    name: i18n
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone repository (develop branch)
+        uses: actions/checkout@v6
+        with:
+          ref: develop
+          fetch-depth: 0
+      - name: Enable Yarn 4.x
+        run: corepack enable
+      - name: Setup NodeJS ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'yarn'
+      # The scripts require some modules that we need to install.
+      - name: Install dependencies
+        run: yarn install --immutable
+      # Gettext is not installed on Ubuntu by default, so we have to do it here
+      - name: Install gettext
+        run: |
+          sudo apt-get update
+          sudo apt-get install gettext
+      - name: Configure git
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+      - name: "[Optional] Create new branch `i18n-update-${{ github.run_id }}`"
+        run: |
+          git checkout -b i18n-update-${{ github.run_id }}
+      # Update translations
+      - name: Update translations
+        run: |
+          ./scripts/i18n.sh
+      - name: Commit and Open PR
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "chore(i18n): Update translations ($(date))"
+          git push -u origin i18n-update-${{ github.run_id }}
+          gh pr create -B develop -H i18n-update-${{ github.run_id }} --title "chore(i18n): Update translations ($(date))" --body "This PR updates all translation PO-files. CAUTION: Do not merge this PR if there are unmerged translation updates, since those will otherwise become unmergeable. This PR will be recreated every week, so it's better to close it rather than have contributors rebase their changes."
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

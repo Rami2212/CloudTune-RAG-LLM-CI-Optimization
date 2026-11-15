@@ -1,0 +1,41 @@
+# Run cargo tests in an OpenBSD VM.
+#
+# See https://github.com/cross-platform-actions/action
+
+
+on: [push]
+
+name: openbsd
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # these tests are extremely slow to run
+    timeout-minutes: 320
+    steps:
+    - uses: actions/checkout@v7.0.1
+    - name: Run tests in an OpenBSD VM
+      uses: cross-platform-actions/action@v1.3.0
+      with:
+        operating_system: openbsd
+        version: '7.4'
+        architecture: arm64
+        shell: bash
+        environment_variables: CI
+        run: |
+          sudo pkg_add -U -I curl
+          sudo pkg_add -U -I lang/rust
+          echo "~~~~ rustc --version ~~~~"
+          rustc --version
+          sudo pkg_add -U -I graphics/ffmpeg
+          sudo pkg_add -U -I vlc
+          sudo pkg_add -U -I textproc/libxslt
+          sudo pkd_add -U -I devel/protobuf
+          # these don't seem to be packaged in OpenBSD ports
+          # sudo pkg_add -U -I multimedia/gpac-mp4box
+          # mp4box -version
+          # sudo pkg_add -U -I Bento4
+          # mp4decrypt || true
+          ls -la
+          cargo build --jobs 1 --no-default-features --features rustls,compression,scte35
+          cargo test --jobs 1 --no-default-features --features rustls,compression,scte35

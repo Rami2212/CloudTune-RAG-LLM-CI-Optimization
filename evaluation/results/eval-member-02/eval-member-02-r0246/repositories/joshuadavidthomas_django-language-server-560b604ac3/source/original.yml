@@ -1,0 +1,249 @@
+name: test
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .github/actions/setup/action.yml
+      - .github/workflows/test.yml
+      - Justfile
+      - crates/**
+      - tests/**
+      - tools/corpus-python.sh
+      - tools/release.py
+      - Cargo.lock
+      - Cargo.toml
+      - pyproject.toml
+      - noxfile.py
+      - mise.toml
+      - rust-toolchain.toml
+      - uv.lock
+  push:
+    branches:
+      - main
+    paths:
+      - .github/actions/setup/action.yml
+      - .github/workflows/test.yml
+      - Justfile
+      - crates/**
+      - tests/**
+      - tools/corpus-python.sh
+      - tools/release.py
+      - Cargo.lock
+      - Cargo.toml
+      - pyproject.toml
+      - noxfile.py
+      - mise.toml
+      - rust-toolchain.toml
+      - uv.lock
+  workflow_call:
+    inputs:
+      os:
+        description: Comma-delineated list of OS targets to run tests on
+        required: false
+        type: string
+      ref:
+        description: Git ref to test
+        required: false
+        type: string
+  workflow_dispatch:
+    inputs:
+      os:
+        description: Comma-delineated list of OS targets to run tests on
+        required: false
+        type: string
+
+concurrency:
+  group: test-${{ inputs.ref || github.ref }}
+  # Runs on main finish so they can save the caches pull requests restore.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_COLOR: "1"
+  PYTHONUNBUFFERED: "1"
+  UV_CACHE_DIR: ${{ github.workspace }}/.cache/uv
+
+permissions: {}
+
+jobs:
+  should-run:
+    if: "${{ github.event_name != 'push' || startsWith(github.ref, 'refs/tags/') || !contains(github.event.head_commit.message, ':bookmark: bump version') }}"
+    runs-on: ubuntu-latest
+    steps:
+      - run: true
+
+  generate-matrix:
+    needs: [should-run]
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: $/.github/actions/setup
+        with:
+          tools: uv just
+          uv-cache-key: ${{ runner.os }}-${{ runner.arch }}-uv-matrix-${{ hashFiles('uv.lock', 'mise.toml', 'noxfile.py') }}
+
+      - id: set-matrix
+        env:
+          INPUT_OS: ${{ inputs.os }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          os="$INPUT_OS"
+          if [[ -z "$os" && "$BRANCH" == release/* ]]; then
+            os="macos-latest,ubuntu-latest,windows-latest"
+          fi
+          just gha-matrix "$os"
+
+  test:
+    name: Python ${{ matrix.python-version }}, Django ${{ matrix.django-version }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: generate-matrix
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.generate-matrix.outputs.matrix) }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      # The legs differ only in Python and Django, so they share one Rust cache and one uv
+      # cache per OS. The first leg saves them.
+      - uses: $/.github/actions/setup
+        with:
+          tools: uv rust just
+          save: ${{ strategy.job-index == 0 }}
+          rust-cache: test
+          uv-cache-key: ${{ runner.os }}-${{ runner.arch }}-uv-test-${{ hashFiles('uv.lock', 'mise.toml', 'noxfile.py') }}
+          corpus: true
+
+      - name: Run tests
+        shell: bash
+        env:
+          DJANGO_VERSION: ${{ matrix.django-version }}
+          PYTHON_VERSION: ${{ matrix.python-version }}
+        run: just test-cell "$PYTHON_VERSION" "$DJANGO_VERSION"
+
+  corpus:
+    name: Project-backed corpus
+    runs-on: ubuntu-22.04
+    needs: should-run
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      # Rebuild environments in CI to exercise dependency resolution on each run.
+      - uses: $/.github/actions/setup
+        with:
+          tools: uv rust just
+          rust-cache: corpus
+          uv-cache-key: ${{ runner.os }}-${{ runner.arch }}-uv-corpus-${{ hashFiles('crates/djls-testing/manifest.lock', 'crates/djls-testing/manifest.toml', 'mise.toml') }}
+          corpus: true
+
+      - name: Install native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev libffi-dev liblzma-dev libpq-dev libcurl4-openssl-dev
+
+      # Saved only from main, like the caches in the setup action.
+      - name: Restore historical interpreters
+        id: interpreters-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: crates/djls-testing/.corpus/interpreters
+          key: ${{ runner.os }}-${{ runner.arch }}-ubuntu22-corpus-python-${{ hashFiles('tools/corpus-python.sh') }}
+
+      - name: Rebuild environments and test snapshots
+        run: just corpus
+
+      - name: Save historical interpreters
+        if: github.ref == 'refs/heads/main' && steps.interpreters-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: crates/djls-testing/.corpus/interpreters
+          key: ${{ steps.interpreters-cache.outputs.cache-primary-key }}
+
+      - name: Record resolved environment provenance
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: corpus-environments
+          path: crates/djls-testing/.corpus/environments/*/provenance.json
+          include-hidden-files: true
+          if-no-files-found: warn
+
+  vendored-spec-fixtures:
+    runs-on: ubuntu-latest
+    needs: should-run
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      # Builds the corpus binary, which the test legs also build.
+      - uses: $/.github/actions/setup
+        with:
+          tools: rust just
+          save: false
+          rust-cache: test
+          corpus: true
+
+      - name: Sync corpus
+        run: just corpus sync --source-only
+
+      - name: Check vendored spec fixtures
+        run: just corpus vendor-spec-fixtures --check
+
+  e2e:
+    runs-on: ubuntu-latest
+    needs: should-run
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      # Uses the same Python, Django and dependencies as the first test leg, so it restores
+      # that leg's caches.
+      - uses: $/.github/actions/setup
+        with:
+          tools: uv rust just
+          save: false
+          rust-cache: test
+          uv-cache-key: ${{ runner.os }}-${{ runner.arch }}-uv-test-${{ hashFiles('uv.lock', 'mise.toml', 'noxfile.py') }}
+
+      - name: Run e2e tests
+        shell: bash
+        run: just e2e
+
+  tests:
+    runs-on: ubuntu-latest
+    needs: [test, corpus, vendored-spec-fixtures, e2e]
+    if: always()
+    steps:
+      - name: OK
+        if: ${{ !(contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
+        run: exit 0
+      - name: Fail
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: exit 1

@@ -1,0 +1,48 @@
+name: Release
+
+# A reviewed version tag on master packages an unsigned IPA and publishes
+# the corresponding versioned notes. PRs only run archive validation.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-26
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.6'
+      - name: Validate release tag and notes
+        run: |
+          [[ "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/master
+          VERSION_NAME="${GITHUB_REF_NAME#v}"
+          IFS=. read -r MAJOR MINOR PATCH <<< "$VERSION_NAME"
+          BUILD_NUMBER=$((MAJOR * 10000 + MINOR * 100 + PATCH))
+          test -s "Documentation/Releases/$VERSION_NAME.md"
+          echo "VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+      - name: Build unsigned Release archive
+        run: |
+          bash .github/scripts/archive-unsigned-app.sh \
+            build/SwiftRadio.xcarchive "$VERSION_NAME" "$BUILD_NUMBER"
+      - name: Package and validate unsigned IPA
+        run: |
+          python3 .github/scripts/package-unsigned-app.py \
+            build/SwiftRadio.xcarchive "swift-radio-$GITHUB_REF_NAME-unsigned.ipa" \
+            "$VERSION_NAME" "$BUILD_NUMBER"
+      - name: Create GitHub release
+        run: |
+          gh release create "$GITHUB_REF_NAME" "swift-radio-$GITHUB_REF_NAME-unsigned.ipa" \
+            --verify-tag --title "Swift Radio $GITHUB_REF_NAME" \
+            --notes-file "Documentation/Releases/$VERSION_NAME.md"
+        env:
+          GH_TOKEN: ${{ github.token }}

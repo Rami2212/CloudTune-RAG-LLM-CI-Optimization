@@ -1,0 +1,590 @@
+#
+# Copyright 2023 The Dapr Authors
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#     http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+## Required secrets:
+# - DAPR_BOT_TOKEN: Token for the Dapr bot
+
+name: dapr-test-sdk
+
+on:
+  # Run every 12 hours on weekdays, and every 24 hours on weekends.
+  schedule:
+    - cron: "16 */11 * * 1-5"
+    - cron: "41 0 * * 0,6"
+  # Dispatch on external events
+  repository_dispatch:
+    types:
+    - test-sdk-all
+    - test-sdk-python
+    - test-sdk-java
+    - test-sdk-js
+    - test-sdk-go
+env:
+  GOOS: linux
+  GOARCH: amd64
+  GOPROXY: https://proxy.golang.org
+
+permissions: {}
+
+# Job(s) can be triggered with the following commands:
+  # /test-sdk-all
+  # /test-sdk-python
+  # /test-sdk-java
+  # /test-sdk-js
+  # /test-sdk-go
+jobs:
+  python-sdk:
+    if: |
+      github.event_name == 'schedule' ||
+      ( github.event_name == 'repository_dispatch' &&
+        (
+          github.event.action == 'test-sdk-all' ||
+          github.event.action == 'test-sdk-python'
+        )
+      )
+    name: "Python SDK verification tests"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write    
+    steps:
+      - name: Set up for scheduled test
+        if: github.event_name != 'repository_dispatch'
+        run: |
+          echo "CHECKOUT_REPO=${{ github.repository }}" >> $GITHUB_ENV
+          echo "CHECKOUT_REF=refs/heads/master" >> $GITHUB_ENV
+        shell: bash
+      - name: Parse test payload
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/github-script@v6.2.0
+        with:
+          github-token: ${{secrets.DAPR_BOT_TOKEN}}
+          script: |
+            const testPayload = context.payload.client_payload;
+            if (testPayload) {
+              var fs = require('fs');
+              // Set environment variables
+              fs.appendFileSync(process.env.GITHUB_ENV,
+                `CHECKOUT_REPO=${testPayload.pull_head_repo}\n`+
+                `CHECKOUT_REF=${testPayload.pull_head_ref}\n`+
+                `PR_NUMBER=${testPayload.issue.number}`
+              );
+            }
+      - name: Create PR comment
+        if: env.PR_NUMBER != ''
+        uses: artursouza/sticky-pull-request-comment@v2.2.0
+        with:
+          header: ${{ github.run_id }}-python
+          number: ${{ env.PR_NUMBER }}
+          GITHUB_TOKEN: ${{ secrets.DAPR_BOT_TOKEN }}
+          message: |
+            # Dapr SDK Python test
+
+            🔗 **[Link to Action run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})**
+
+            Commit ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Check out code
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.CHECKOUT_REPO }}
+          ref: ${{ env.CHECKOUT_REF }}
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+      - name: "Set up Go"
+        id: setup-go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: "go.mod"
+      - name: Checkout python-sdk repo to run tests.
+        uses: actions/checkout@v6
+        with:
+          repository: dapr/python-sdk
+          path: python-sdk
+      - name: Set up Dapr CLI
+        uses: dapr/.github/.github/actions/setup-dapr-cli@main
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Initialize Dapr runtime
+        uses: dapr/.github/.github/actions/setup-dapr-runtime@main
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and override daprd
+        run: |
+          make
+          mkdir -p $HOME/.dapr/bin/
+          cp dist/linux_amd64/release/daprd $HOME/.dapr/bin/daprd
+      - name: Override placement service
+        run: |
+          docker stop dapr_placement
+          ./dist/linux_amd64/release/placement --healthz-port 9091 &
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.2.0
+      - name: Install dependencies
+        working-directory: python-sdk
+        run: uv sync --frozen --all-packages --group tests
+      # The conversation examples need a local LLM. Same setup as python-sdk's own CI.
+      - name: Set up Llama
+        run: |
+          curl -fsSL https://github.com/ollama/ollama/releases/download/v0.32.0/ollama-linux-amd64.tar.zst | sudo tar --zstd -xf - -C /usr/local
+          sudo rm -f /usr/local/lib/ollama/libggml-cpu-sapphirerapids.so
+          nohup ollama serve > "$RUNNER_TEMP/ollama-serve.log" 2>&1 &
+          timeout 60 bash -c 'until curl -fsS http://127.0.0.1:11434/api/tags > /dev/null; do sleep 1; done'
+          ollama pull llama3.2:latest
+      - name: Check Python Examples
+        working-directory: python-sdk
+        run: uv run pytest tests/examples/
+      - name: Update PR comment for success
+        if: ${{ success() }}
+        uses: artursouza/sticky-pull-request-comment@v2.2.0
+        with:
+          header: ${{ github.run_id }}-python
+          number: ${{ env.PR_NUMBER }}
+          append: true
+          GITHUB_TOKEN: ${{ secrets.DAPR_BOT_TOKEN }}
+          message: |
+            ## ✅ Python SDK tests passed
+      - name: Update PR comment for failure
+        if: ${{ failure() }}
+        uses: artursouza/sticky-pull-request-comment@v2.2.0
+        with:
+          header: ${{ github.run_id }}-python
+          number: ${{ env.PR_NUMBER }}
+          append: true
+          GITHUB_TOKEN: ${{ secrets.DAPR_BOT_TOKEN }}
+          message: |
+            ## ❌ Python SDK tests failed
+
+            Please check the logs for details on the error.
+      - name: Update PR comment for cancellation
+        if: ${{ cancelled() }}
+        uses: artursouza/sticky-pull-request-comment@v2.2.0
+        with:
+          header: ${{ github.run_id }}-python
+          number: ${{ env.PR_NUMBER }}
+          append: true
+          GITHUB_TOKEN: ${{ secrets.DAPR_BOT_TOKEN }}
+          message: |
+            ## ⚠️ Python SDK tests cancelled
+
+            The Action has been canceled
+
+  java-sdk:
+    if: |
+      github.event_name == 'schedule' ||
+      ( github.event_name == 'repository_dispatch' &&
+        (
+          github.event.action == 'test-sdk-all' ||
+          github.event.action == 'test-sdk-java'
+        )
+      )
+    name: "Java SDK verification tests"
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      JDK_VER: 17
+    steps:
+      - name: Set up for scheduled test
+        if: github.event_name != 'repository_dispatch'
+        run: |
+          echo "CHECKOUT_REPO=${{ github.repository }}" >> $GITHUB_ENV
+          echo "CHECKOUT_REF=refs/heads/master" >> $GITHUB_ENV
+        shell: bash
+      - name: Parse test payload
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/github-script@v6.2.0
+        with:
+          github-token: ${{secrets.DAPR_BOT_TOKEN}}
+          script: |
+            const testPayload = context.payload.client_payload;
+            if (testPayload) {
+              var fs = require('fs');
+              // Set environment variables
+              fs.appendFileSync(process.env.GITHUB_ENV,
+                `CHECKOUT_REPO=${testPayload.pull_head_repo}\n`+
+                `CHECKOUT_REF=${testPayload.pull_head_ref}\n`+
+                `PR_NUMBER=${testPayload.issue.number}`
+              );
+            }
+      - name: Create PR comment
+        if: env.PR_NUMBER != ''
+        uses: artursouza/sticky-pull-request-comment@v2.2.0
+        with:
+          header: ${{ github.run_id }}-java
+          number: ${{ env.PR_NUMBER }}
+          GITHUB_TOKEN: ${{ secrets.DAPR_BOT_TOKEN }}
+          message: |
+            # Dapr SDK Java test
+
+            🔗 **[Link to Action run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})**
+
+            Commit ref: ${{ env.CHECKOUT_REF }}
+      - name: Check out code
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.CHECKOUT_REPO }}
+          ref: ${{ env.CHECKOUT_REF }}
+      - name: Set up OpenJDK ${{ env.JDK_VER }}
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JDK_VER }}
+      - name: "Set up Go"
+        id: setup-go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: "go.mod"
+      - name: Checkout java-sdk repo to run tests.
+        uses: actions/checkout@v6
+        with:
+          repository: dapr/java-sdk
+          path: java-sdk
+      # The java-sdk integration tests run daprd, placement and scheduler with
+      # Testcontainers, using the image tag pinned in DaprContainerConstants.
+      # Build those images from this commit and give them that tag, so the
+      # tests use them instead of pulling the release images.
+      - name: Build daprd, placement and scheduler images
+        run: |
+          make build BINARIES="daprd placement scheduler"
+          DAPR_VERSION=$(sed -n 's/.*String DAPR_VERSION = "\(.*\)";.*/\1/p' java-sdk/testcontainers-dapr/src/main/java/io/dapr/testcontainers/DaprContainerConstants.java)
+          if [ -z "$DAPR_VERSION" ]; then
+            echo "Could not read DAPR_VERSION from java-sdk" && exit 1
+          fi
+          for bin in daprd placement scheduler; do
+            docker build --build-arg PKG_FILES=$bin -f docker/Dockerfile dist/linux_amd64/release -t daprio/$bin:$DAPR_VERSION
+          done
+      - name: Install java-sdk
+        run: cd java-sdk && ./mvnw clean install -B -q -DskipTests
+      - name: Integration tests
+        id: integration_tests
+        run: cd java-sdk && ./mvnw -B -pl '!durabletask-client' -Pintegration-tests dependency:copy-dependencies verify
+      - name: Upload failsafe test report for sdk-tests on failure
+        if: ${{ failure() && steps.integration_tests.conclusion == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: failsafe-report-sdk-tests
+          path: java-sdk/sdk-tests/target/failsafe-reports
+      - name: Upload surefire test report for sdk-tests on failure
+        if: ${{ failure() && steps.integration_tests.conclusion == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-report-sdk-tests
+          path: java-sdk/sdk-tests/target/surefire-reports
+      - name: Update PR comment for success
+        if: ${{ success() }}
+        uses: artursouza/sticky-pull-request-comment@v2.2.0
+        with:
+          header: ${{ github.run_id }}-java
+          number: ${{ env.PR_NUMBER }}
+          append: true
+          GITHUB_TOKEN: ${{ secrets.DAPR_BOT_TOKEN }}
+          message: |
+            ## ✅ Java SDK tests passed
+      - name: Update PR comment for failure
+        if: ${{ failure() }}
+        uses: artursouza/sticky-pull-request-comment@v2.2.0
+        with:
+          header: ${{ github.run_id }}-java
+          number: ${{ env.PR_NUMBER }}
+          append: true
+          GITHUB_TOKEN: ${{ secrets.DAPR_BOT_TOKEN }}
+          message: |
+            ## ❌ Java SDK tests failed
+
+            Please check the logs for details on the error.
+      - name: Update PR comment for cancellation
+        if: ${{ cancelled() }}
+        uses: artursouza/sticky-pull-request-comment@v2.2.0
+        with:
+          header: ${{ github.run_id }}-java
+          number: ${{ env.PR_NUMBER }}
+          append: true
+          GITHUB_TOKEN: ${{ secrets.DAPR_BOT_TOKEN }}
+          message: |
+            ## ⚠️ Java SDK tests cancelled
+
+            The Action has been canceled
+
+  js-sdk:
+    if: |
+      github.event_name == 'schedule' ||
+      ( github.event_name == 'repository_dispatch' &&
+        (
+          github.event.action == 'test-sdk-all' ||
+          github.event.action == 'test-sdk-js'
+        )
+      )
+    name: "JS SDK verification tests"
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      NODE_VER: 22
+    steps:
+      - name: Set up for scheduled test
+        if: github.event_name != 'repository_dispatch'
+        run: |
+          echo "CHECKOUT_REPO=${{ github.repository }}" >> $GITHUB_ENV
+          echo "CHECKOUT_REF=refs/heads/master" >> $GITHUB_ENV
+        shell: bash
+      - name: Parse test payload
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/github-script@v6.2.0
+        with:
+          github-token: ${{secrets.DAPR_BOT_TOKEN}}
+          script: |
+            const testPayload = context.payload.client_payload;
+            if (testPayload) {
+              var fs = require('fs');
+              // Set environment variables
+              fs.appendFileSync(process.env.GITHUB_ENV,
+                `CHECKOUT_REPO=${testPayload.pull_head_repo}\n`+
+                `CHECKOUT_REF=${testPayload.pull_head_ref}\n`+
+                `PR_NUMBER=${testPayload.issue.number}`
+              );
+            }
+      - name: Create PR comment
+        if: env.PR_NUMBER != ''
+        uses: artursouza/sticky-pull-request-comment@v2.2.0
+        with:
+          header: ${{ github.run_id }}-js
+          number: ${{ env.PR_NUMBER }}
+          GITHUB_TOKEN: ${{ secrets.DAPR_BOT_TOKEN }}
+          message: |
+            # Dapr SDK JS test
+
+            🔗 **[Link to Action run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})**
+
+            Commit ref: ${{ env.CHECKOUT_REF }}
+      - name: Check out code
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.CHECKOUT_REPO }}
+          ref: ${{ env.CHECKOUT_REF }}
+      - name: NodeJS - Install
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ env.NODE_VER }}
+      - name: "Set up Go"
+        id: setup-go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: "go.mod"
+      - name: Checkout js-sdk repo to run tests.
+        uses: actions/checkout@v6
+        with:
+          repository: dapr/js-sdk
+          path: js-sdk
+      # The js-sdk e2e tests run daprd, placement and scheduler with
+      # Testcontainers, using daprio/<image>:$DAPR_RUNTIME_VERSION. Build those
+      # images from this commit under a local tag the tests are pointed at.
+      - name: Build daprd, placement and scheduler images
+        run: |
+          make build BINARIES="daprd placement scheduler"
+          for bin in daprd placement scheduler; do
+            docker build --build-arg PKG_FILES=$bin -f docker/Dockerfile dist/linux_amd64/release -t daprio/$bin:dev
+          done
+      - name: Install dependencies
+        run: cd js-sdk && npm ci
+      - name: Build Package
+        run: cd js-sdk && npm run build
+      - name: Run E2E tests
+        id: tests
+        run: cd js-sdk && npm run test:e2e:all
+        env:
+          DAPR_RUNTIME_VERSION: dev
+      - name: Run E2E test to show successful TypeScript build
+        run: |
+          cd js-sdk/test/e2e/typescript-build
+          npm install
+          npm run start
+      - name: Update PR comment for success
+        if: ${{ success() }}
+        uses: artursouza/sticky-pull-request-comment@v2.2.0
+        with:
+          header: ${{ github.run_id }}-js
+          number: ${{ env.PR_NUMBER }}
+          append: true
+          GITHUB_TOKEN: ${{ secrets.DAPR_BOT_TOKEN }}
+          message: |
+            ## ✅ JS SDK tests passed
+      - name: Update PR comment for failure
+        if: ${{ failure() }}
+        uses: artursouza/sticky-pull-request-comment@v2.2.0
+        with:
+          header: ${{ github.run_id }}-js
+          number: ${{ env.PR_NUMBER }}
+          append: true
+          GITHUB_TOKEN: ${{ secrets.DAPR_BOT_TOKEN }}
+          message: |
+            ## ❌ JS SDK tests failed
+
+            Please check the logs for details on the error.
+      - name: Update PR comment for cancellation
+        if: ${{ cancelled() }}
+        uses: artursouza/sticky-pull-request-comment@v2.2.0
+        with:
+          header: ${{ github.run_id }}-js
+          number: ${{ env.PR_NUMBER }}
+          append: true
+          GITHUB_TOKEN: ${{ secrets.DAPR_BOT_TOKEN }}
+          message: |
+            ## ⚠️ JS SDK tests cancelled
+
+            The Action has been canceled
+
+  go-sdk:
+    if: |
+      github.event_name == 'schedule' ||
+      ( github.event_name == 'repository_dispatch' &&
+        (
+          github.event.action == 'test-sdk-all' ||
+          github.event.action == 'test-sdk-go'
+        )
+      )
+    name: "Go SDK verification tests"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Set up for scheduled test
+        if: github.event_name != 'repository_dispatch'
+        run: |
+          echo "CHECKOUT_REPO=${{ github.repository }}" >> $GITHUB_ENV
+          echo "CHECKOUT_REF=refs/heads/master" >> $GITHUB_ENV
+        shell: bash
+      - name: Parse test payload
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/github-script@v6.2.0
+        with:
+          github-token: ${{secrets.DAPR_BOT_TOKEN}}
+          script: |
+            const testPayload = context.payload.client_payload;
+            if (testPayload) {
+              var fs = require('fs');
+              // Set environment variables
+              fs.appendFileSync(process.env.GITHUB_ENV,
+                `CHECKOUT_REPO=${testPayload.pull_head_repo}\n`+
+                `CHECKOUT_REF=${testPayload.pull_head_ref}\n`+
+                `PR_NUMBER=${testPayload.issue.number}`
+              );
+            }
+      - name: Create PR comment
+        if: env.PR_NUMBER != ''
+        uses: artursouza/sticky-pull-request-comment@v2.2.0
+        with:
+          header: ${{ github.run_id }}-go
+          number: ${{ env.PR_NUMBER }}
+          GITHUB_TOKEN: ${{ secrets.DAPR_BOT_TOKEN }}
+          message: |
+            # Dapr SDK Go test
+
+            🔗 **[Link to Action run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})**
+
+            Commit ref: ${{ env.CHECKOUT_REF }}
+      - name: Check out code
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.CHECKOUT_REPO }}
+          ref: ${{ env.CHECKOUT_REF }}
+      - name: "Set up Go"
+        id: setup-go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: "go.mod"
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+      - name: Checkout go-sdk repo to run tests.
+        uses: actions/checkout@v6
+        with:
+          repository: dapr/go-sdk
+          path: go-sdk
+      - name: Install Mechanical Markdown
+        run: |
+          cd go-sdk
+          python -m pip install --upgrade pip
+          pip install mechanical-markdown
+      - name: Set up Dapr CLI
+        uses: dapr/.github/.github/actions/setup-dapr-cli@main
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Initialize Dapr runtime
+        uses: dapr/.github/.github/actions/setup-dapr-runtime@main
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and override daprd with HEAD.
+        run: |
+          make
+          mkdir -p $HOME/.dapr/bin/
+          cp dist/linux_amd64/release/daprd $HOME/.dapr/bin/daprd
+      - name: Override placement service.
+        run: |
+          docker stop dapr_placement
+          ./dist/linux_amd64/release/placement --healthz-port 9091 &
+      - name: Check Examples
+        run: |
+          cd go-sdk/examples
+          ./validate.sh actor
+          ./validate.sh configuration
+          ./validate.sh crypto
+          ./validate.sh grpc-service
+          ./validate.sh hello-world
+          ./validate.sh pubsub
+          ./validate.sh service
+          ./validate.sh socket
+          ./validate.sh workflow
+          ./validate.sh workflow-parallel
+      - name: Update PR comment for success
+        if: ${{ success() }}
+        uses: artursouza/sticky-pull-request-comment@v2.2.0
+        with:
+          header: ${{ github.run_id }}-go
+          number: ${{ env.PR_NUMBER }}
+          append: true
+          GITHUB_TOKEN: ${{ secrets.DAPR_BOT_TOKEN }}
+          message: |
+            ## ✅ Go SDK tests passed
+      - name: Update PR comment for failure
+        if: ${{ failure() }}
+        uses: artursouza/sticky-pull-request-comment@v2.2.0
+        with:
+          header: ${{ github.run_id }}-go
+          number: ${{ env.PR_NUMBER }}
+          append: true
+          GITHUB_TOKEN: ${{ secrets.DAPR_BOT_TOKEN }}
+          message: |
+            ## ❌ Go SDK tests failed
+
+            Please check the logs for details on the error.
+      - name: Update PR comment for cancellation
+        if: ${{ cancelled() }}
+        uses: artursouza/sticky-pull-request-comment@v2.2.0
+        with:
+          header: ${{ github.run_id }}-go
+          number: ${{ env.PR_NUMBER }}
+          append: true
+          GITHUB_TOKEN: ${{ secrets.DAPR_BOT_TOKEN }}
+          message: |
+            ## ⚠️ Go SDK tests cancelled
+
+            The Action has been canceled

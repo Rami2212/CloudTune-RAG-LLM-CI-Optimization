@@ -1,0 +1,191 @@
+name: Build
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    name: ${{ matrix.os }} ${{ matrix.cxx_compiler }} ${{ matrix.build_type }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            c_compiler: gcc-12
+            cxx_compiler: g++-12
+            build_type: Release
+
+          - os: ubuntu-22.04
+            c_compiler: clang-18
+            cxx_compiler: clang++-18
+            build_type: Release
+
+          - os: ubuntu-22.04
+            c_compiler: clang-19
+            cxx_compiler: clang++-19
+            build_type: Release
+
+          - os: ubuntu-24.04
+            c_compiler: gcc-13
+            cxx_compiler: g++-13
+            build_type: Release
+
+          - os: ubuntu-24.04
+            c_compiler: gcc-14
+            cxx_compiler: g++-14
+            build_type: Release
+
+          - os: ubuntu-24.04
+            c_compiler: clang-18
+            cxx_compiler: clang++-18
+            build_type: Release
+
+          - os: ubuntu-24.04
+            c_compiler: clang-19
+            cxx_compiler: clang++-19
+            build_type: Release
+
+          - os: macos-15
+            c_compiler: clang
+            cxx_compiler: clang++
+            build_type: Release
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+
+          # Pick the correct Ubuntu codename for apt.llvm.org (jammy vs noble).
+          LLVM_SUITE=""
+          if [[ "${{ matrix.os }}" == "ubuntu-22.04" ]]; then
+            LLVM_SUITE="jammy"
+          elif [[ "${{ matrix.os }}" == "ubuntu-24.04" ]]; then
+            LLVM_SUITE="noble"
+          else
+            echo "Unsupported Linux runner: ${{ matrix.os }}"
+            exit 1
+          fi
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates \
+            gpg \
+            software-properties-common \
+            wget
+
+          # Core deps
+          sudo apt-get install -y --no-install-recommends \
+            re2c ninja-build libhiredis-dev redis-server
+
+          # LLVM apt repo (for clang-18/19)
+          if [[ "${{ matrix.cxx_compiler }}" == "clang++-18" || "${{ matrix.cxx_compiler }}" == "clang++-19" ]]; then
+            sudo mkdir -p /etc/apt/keyrings
+            wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/llvm.gpg
+
+            if [[ "${{ matrix.cxx_compiler }}" == "clang++-18" ]]; then
+              echo "deb [signed-by=/etc/apt/keyrings/llvm.gpg] http://apt.llvm.org/${LLVM_SUITE}/ llvm-toolchain-${LLVM_SUITE}-18 main" | sudo tee /etc/apt/sources.list.d/llvm.list >/dev/null
+            fi
+            if [[ "${{ matrix.cxx_compiler }}" == "clang++-19" ]]; then
+              echo "deb [signed-by=/etc/apt/keyrings/llvm.gpg] http://apt.llvm.org/${LLVM_SUITE}/ llvm-toolchain-${LLVM_SUITE}-19 main" | sudo tee /etc/apt/sources.list.d/llvm.list >/dev/null
+            fi
+
+            sudo apt-get update
+          fi
+
+          # Toolchains
+          if [[ "${{ matrix.cxx_compiler }}" == "clang++-18" ]]; then
+            sudo apt-get install -y --no-install-recommends clang-18
+          fi
+          if [[ "${{ matrix.cxx_compiler }}" == "clang++-19" ]]; then
+            sudo apt-get install -y --no-install-recommends clang-19
+          fi
+          if [[ "${{ matrix.cxx_compiler }}" == "g++-12" ]]; then
+            sudo apt-get install -y --no-install-recommends gcc-12 g++-12
+          fi
+          if [[ "${{ matrix.cxx_compiler }}" == "g++-13" ]]; then
+            sudo apt-get install -y --no-install-recommends gcc-13 g++-13
+          fi
+          if [[ "${{ matrix.cxx_compiler }}" == "g++-14" ]]; then
+            sudo apt-get install -y --no-install-recommends gcc-14 g++-14
+          fi
+
+      - name: Install dependencies (MacOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install re2c ninja redis hiredis
+
+      - name: Cache Z3
+        id: cache-z3
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/z3-install
+            ${{ github.workspace }}/z3-build
+          key: z3-${{ matrix.os }}-${{ matrix.cxx_compiler }}-z3-4.15.4-${{ hashFiles('.github/workflows/build.yml') }}
+          restore-keys: |
+            z3-${{ matrix.os }}-${{ matrix.cxx_compiler }}-z3-4.15.4-
+
+      - name: Set Z3 environment (cache hit)
+        if: steps.cache-z3.outputs.cache-hit == 'true'
+        run: |
+          echo "Z3_PREFIX=${{ github.workspace }}/z3-install" >> "${GITHUB_ENV}"
+          echo "Z3_LIBDIR=${{ github.workspace }}/z3-install/lib" >> "${GITHUB_ENV}"
+          if [[ "${RUNNER_OS}" == "macOS" ]]; then
+            echo "DYLD_LIBRARY_PATH=${{ github.workspace }}/z3-install/lib:${DYLD_LIBRARY_PATH-}" >> "${GITHUB_ENV}"
+          else
+            echo "LD_LIBRARY_PATH=${{ github.workspace }}/z3-install/lib:${LD_LIBRARY_PATH-}" >> "${GITHUB_ENV}"
+          fi
+
+      - name: Build Z3 (from source)
+        if: steps.cache-z3.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+
+          Z3_TAG="z3-4.15.4"
+          Z3_SRC="${GITHUB_WORKSPACE}/z3-src"
+          Z3_BUILD="${GITHUB_WORKSPACE}/z3-build"
+          Z3_INSTALL="${GITHUB_WORKSPACE}/z3-install"
+
+          rm -rf "${Z3_SRC}" "${Z3_BUILD}" "${Z3_INSTALL}"
+          git clone --depth 1 --branch "${Z3_TAG}" https://github.com/Z3Prover/z3.git "${Z3_SRC}"
+
+          Z3_CMAKE_ARGS=(
+            -G Ninja
+            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_INSTALL_PREFIX="${Z3_INSTALL}"
+            -DZ3_BUILD_TEST_EXECUTABLES=OFF
+            -DZ3_BUILD_EXECUTABLE=OFF
+            -DCMAKE_C_COMPILER="${CMAKE_C_COMPILER}"
+            -DCMAKE_CXX_COMPILER="${CMAKE_CXX_COMPILER}"
+          )
+
+          cmake -S "${Z3_SRC}" -B "${Z3_BUILD}" "${Z3_CMAKE_ARGS[@]}"
+
+          cmake --build "${Z3_BUILD}" --target install
+
+          echo "Z3_PREFIX=${Z3_INSTALL}" >> "${GITHUB_ENV}"
+          echo "Z3_LIBDIR=${Z3_INSTALL}/lib" >> "${GITHUB_ENV}"
+
+          # Runtime loader hints (fallback if RPATH isn't sufficient on a runner).
+          if [[ "${RUNNER_OS}" == "macOS" ]]; then
+            echo "DYLD_LIBRARY_PATH=${Z3_INSTALL}/lib:${DYLD_LIBRARY_PATH-}" >> "${GITHUB_ENV}"
+          else
+            echo "LD_LIBRARY_PATH=${Z3_INSTALL}/lib:${LD_LIBRARY_PATH-}" >> "${GITHUB_ENV}"
+          fi
+
+      - name: Compile
+        run: bash .github/scripts/build.sh
+
+      - name: Run Tests
+        run: ninja check
+        working-directory: build
+
+    env:
+      CMAKE_BUILD_TYPE: ${{ matrix.build_type }}
+      CMAKE_C_COMPILER: ${{ matrix.c_compiler }}
+      CMAKE_CXX_COMPILER: ${{ matrix.cxx_compiler }}
+#      CMAKE_CXX_FLAGS: "-fsanitize=address,undefined"

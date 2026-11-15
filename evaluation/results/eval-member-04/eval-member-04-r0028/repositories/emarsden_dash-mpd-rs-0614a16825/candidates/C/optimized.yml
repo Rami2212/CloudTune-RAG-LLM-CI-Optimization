@@ -1,0 +1,82 @@
+on: [push]
+
+name: build/linux
+
+# This is currently needed to build the http3 functionality in the reqwest crate
+env:
+  RUSTFLAGS: '--cfg reqwest_unstable'
+
+jobs:
+  check:
+    name: dash-mpd-rs check/nightly
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+           fetch-depth: 0
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-nightly-${{ hashFiles('**/Cargo.lock') }}
+      - uses: taiki-e/install-action@cargo-hack
+      - name: Install ffmpeg + protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev protobuf-compiler cmake libxml2-utils
+          cargo check
+          cargo hack check --feature-powerset --no-dev-deps --skip socks,http3,xee-xslt
+
+  test:
+    name: dash-mpd-rs test/stable
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+           fetch-depth: 0
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-stable-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install ffmpeg + GPAC + mediainfo
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev gpac mediainfo 
+          MP4Box -version
+
+      - name: Install mkvmerge
+        run: sudo apt install mkvtoolnix
+
+      - name: Install Bento4 mp4decrypt
+        run: |
+          wget -q -O /tmp/bento4.zip https://www.bok.net/Bento4/binaries/Bento4-SDK-1-6-0-641.x86_64-unknown-linux.zip
+          unzip /tmp/bento4.zip "Bento4-SDK-*/bin/mp4decrypt" -d /tmp
+          sudo mv /tmp/Bento4-SDK*/bin/mp4decrypt /usr/local/bin
+
+      - name: Install shaka-packager
+        run: |
+          wget -q -O /tmp/shaka-packager https://github.com/shaka-project/shaka-packager/releases/latest/download/packager-linux-x64
+          mv /tmp/shaka-packager /usr/local/bin
+          chmod +x /usr/local/bin/shaka-packager
+
+      - name: Install xsltproc + protoc
+        run: sudo apt-get -y install xsltproc protobuf-compiler cmake libxml2-utils
+
+      # The Github runners are failing the container-based tests with a "cannot retrieve cmd line"
+      # error from podman.
+      - name: Run tests
+        run: |
+          RUST_LOG=info cargo test --jobs 1 --test muxing -- --show-output --test-threads=1
+          RUST_LOG=info cargo test --jobs 1 -- --test-threads=1 --skip container
+          # cargo test --jobs 1 --all-features -- --test-threads=1 --skip container
+          cargo run --example download_bbc
