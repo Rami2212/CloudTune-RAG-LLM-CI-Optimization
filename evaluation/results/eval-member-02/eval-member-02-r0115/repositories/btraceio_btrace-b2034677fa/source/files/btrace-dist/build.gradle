@@ -1,0 +1,1038 @@
+plugins {
+    id 'java'
+    id 'maven-publish'
+    id 'signing'
+    alias(libs.plugins.shadow)
+    alias(libs.plugins.ospackage)
+    alias(libs.plugins.sdkman.vendors)
+    id 'io.btrace.fat-agent'
+}
+
+import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
+import org.gradle.internal.os.OperatingSystem
+
+repositories {
+    mavenCentral()
+}
+
+def distBase = layout.buildDirectory.dir("resources/main").get().asFile.absolutePath
+def distTarget = "${distBase}/v${project.version}"
+def libsDir = new File("${distTarget}/libs")
+
+def includes = [:]
+
+compileJava {
+    sourceCompatibility = 8
+    targetCompatibility = 8
+    javaCompiler = javaToolchains.compilerFor {
+        languageVersion.set(JavaLanguageVersion.of(8))
+    }
+}
+
+includes['agent'] = {
+    if (it.directory) {
+        return true
+    }
+    if (it.path.endsWith('.jar')) {
+        return true
+    }
+    return it.path.startsWith('org/jctools/') ||
+            it.path.startsWith('io/btrace/agent/') ||
+            it.path.startsWith('io/btrace/instr/') ||
+            it.path.startsWith('io/btrace/runtime/') ||
+            it.path.startsWith('io/btrace/extension/') ||
+            it.path.startsWith('io/btrace/core/comm/') ||
+            it.path.startsWith('io/btrace/core/handlers/') ||
+            // core/extensions moved to shared section
+            // include the messages resource bundle and class in the agent jar (bootstrap can't load resources)
+            it.path == 'io/btrace/core/Messages.class' ||
+            it.path == 'io/btrace/core/messages.properties'
+}
+
+includes['boot'] = {
+    if (it.directory) {
+        return true
+    }
+    if (it.path.endsWith('.jar')) {
+        return true
+    }
+    if (it.path.startsWith('io/btrace/core/')) {
+        if (it.path == 'io/btrace/core/Messages.class' || it.path == 'io/btrace/core/messages.properties') {
+            // messages resource bundle&class are hoisted to agent and client jars
+            return false
+        }
+        return true
+    }
+    if (it.path.startsWith('org/objectweb/asm/')) {
+        if (it.path.startsWith('org/objectweb/asm/commons/') ||
+                it.path.startsWith('org/objectweb/asm/util/') ||
+                it.path.startsWith('org/objectweb/asm/xml/')) {
+            return false
+        }
+        return true
+    }
+    if (it.path.startsWith('META-INF/services')) {
+        return !it.path.contains('com.sun.') && !it.path.contains('javax.annotation.')
+    }
+    // btrace-runtime classes should ONLY be in .classdata form (agent section), not as regular .class files
+    return it.path.startsWith("org/slf4j/") ||
+            it.path.startsWith('io/btrace/extension/') ||
+            it.path.startsWith('org/jctools/')
+            // Extensions are loaded from extensions/ directory
+}
+
+includes['client'] = {
+    if (it.directory) {
+        return true
+    }
+    if (it.path.endsWith('.jar')) {
+        return true
+    }
+    if (it.path.startsWith('io/btrace')) {
+        return !it.path.startsWith('io/btrace/agent')
+    }
+    if (it.path.startsWith('com/googlecode/lanterna/')) {
+        return true
+    }
+    if (it.path.startsWith('META-INF/services')) {
+        return !it.path.contains('com.sun.') && !it.path.contains('javax.annotation.')
+    }
+    return it.path.startsWith("org/slf4j") ||
+            it.path.startsWith('org/objectweb/asm') ||
+            it.path.startsWith('org/jctools')
+}
+
+
+configurations {
+    artifact.extendsFrom implementation
+    bootstrapInputs {
+        canBeConsumed = false
+        canBeResolved = true
+    }
+}
+
+dependencies {
+    implementation project(':btrace-agent')
+    implementation project(':btrace-client')
+    implementation project(':btrace-compiler')
+    bootstrapInputs project(':btrace-agent')
+
+    testImplementation platform(libs.junit)
+    testImplementation libs.junit.jupiter
+}
+
+jar {
+    onlyIf { false }  // Disable default jar task
+}
+
+sourcesJar {
+    onlyIf { false }
+}
+
+sourceSets {
+    main {
+        output.resourcesDir = file("${distTarget}")
+    }
+}
+artifacts {
+    archives file("${distTarget}/libs/btrace.jar")
+}
+
+// Intermediate shadow jar with all dependencies and relocations
+// This is NOT an output artifact, just used for building the masked jar
+task allClassesShadow(type: ShadowJar) {
+    group 'Build'
+    archiveBaseName.set('btrace-all-temp')
+    archiveVersion.set('')
+    archiveClassifier.set('shadow')
+    destinationDirectory = layout.buildDirectory.dir("tmp")
+
+    configurations = [project.configurations.artifact]
+
+    // Relocate dependencies
+    relocate 'org.jctools', 'io.btrace.libs.org.jctools'
+    relocate 'org.objectweb.asm', 'io.btrace.libs.org.objectweb.asm'
+    relocate 'org.slf4j', 'io.btrace.libs.org.slf4j'
+    // Rewrite META-INF/services/* names+content to match the relocated classes above,
+    // otherwise ServiceLoader (e.g. SLF4J provider lookup) can't find them.
+    mergeServiceFiles()
+
+    // Don't create a manifest for this intermediate jar
+    manifest {
+        attributes([:])
+    }
+}
+
+// uberJar removed - btrace.jar (masked jar) is the single source of truth
+
+// ==================== Masked JAR ====================
+// Single JAR with .classdata masking for bootstrap isolation
+// Bootstrap classes are stored as .class, non-bootstrap as .classdata
+// Uses existing shadow JARs to get properly relocated classes
+
+def maskedJarTmpDir = layout.buildDirectory.dir("masked-jar-tmp").get().asFile
+
+// Task to prepare agent classes with .classdata extension
+task prepareAgentClassdata(type: Copy) {
+    group 'Build'
+    description 'Prepare agent classes with .classdata extension'
+    dependsOn allClassesShadow, processResources
+
+    inputs.files allClassesShadow.archiveFile
+    outputs.dir "${maskedJarTmpDir}/agent"
+
+    into "${maskedJarTmpDir}/agent"
+
+    from(provider { zipTree(allClassesShadow.archiveFile) }) {
+        include 'io/btrace/BTrace.class'
+        include 'io/btrace/libs/org/jctools/**/*.class'
+        include 'io/btrace/agent/**/*.class'
+        include 'io/btrace/instr/**/*.class'
+        include 'io/btrace/instr/jaxb.index'  // Required for JAXB probe descriptor loading
+        include 'io/btrace/runtime/**/*.class'
+        include 'io/btrace/extension/**/*.class'
+        include 'io/btrace/core/comm/**/*.class'
+        include 'io/btrace/core/handlers/**/*.class'
+        include 'io/btrace/core/Messages.class'
+        include 'io/btrace/core/messages.properties'
+        // Exclude classes that go in shared section
+        exclude 'io/btrace/core/extensions/**'
+        exclude 'io/btrace/core/annotations/**'
+        // Exclude bootstrap runtime classes (now in btrace-core)
+        exclude 'io/btrace/runtime/BTraceRuntimeAccess.class'
+        exclude 'io/btrace/runtime/BTraceRuntimeAccess$*.class'
+        exclude 'io/btrace/runtime/LinkingFlag.class'
+        // BTraceBootstrap is the BSM for flat DSL indy calls; lives in bootstrap CL only
+        exclude 'io/btrace/runtime/BTraceBootstrap.class'
+        exclude 'META-INF/**'
+        rename { name -> name.endsWith('.class') ? name.replace('.class', '.classdata') : name }
+    }
+
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+// Task to prepare client classes with .classdata extension
+task prepareClientClassdata(type: Copy) {
+    group 'Build'
+    description 'Prepare client classes with .classdata extension'
+    dependsOn allClassesShadow, processResources
+
+    inputs.files allClassesShadow.archiveFile
+    outputs.dir "${maskedJarTmpDir}/client"
+
+    into "${maskedJarTmpDir}/client"
+
+    from(provider { zipTree(allClassesShadow.archiveFile) }) {
+        include 'io/btrace/client/**/*.class'
+        include 'io/btrace/extcli/**/*.class'
+        include 'io/btrace/compiler/**/*.class'
+        // btracec emits persisted probe packs through InstrPackGenerator. Keep its implementation
+        // and non-bootstrap dependencies visible to the client masked classloader.
+        include 'io/btrace/instr/**/*.class'
+        include 'io/btrace/runtime/**/*.class'
+        include 'io/btrace/extension/**/*.class'
+        include 'io/btrace/libs/org/objectweb/asm/**/*.class'
+        include 'io/btrace/libs/org/jctools/**/*.class'
+        include 'io/btrace/libs/org/slf4j/**/*.class'
+        include 'com/googlecode/lanterna/**/*.class'
+        // Core classes are supplied by the bootstrap/shared sections. Runtime and extension
+        // classes are intentionally retained here for the compiler-side probe-pack generator.
+        exclude 'io/btrace/core/**'
+        exclude 'META-INF/**'
+        rename { name -> name.endsWith('.class') ? name.replace('.class', '.classdata') : name }
+    }
+
+    // Messages is excluded from the core/** block above but is required by Main.usage().
+    // It cannot be in bootstrap (Messages.class.getClassLoader() would return null there,
+    // breaking ResourceBundle.getBundle()), so it must be in the client masked section.
+    from(provider { zipTree(allClassesShadow.archiveFile) }) {
+        include 'io/btrace/core/Messages.class'
+        include 'io/btrace/core/messages.properties'
+        rename { name -> name.endsWith('.class') ? name.replace('.class', '.classdata') : name }
+    }
+
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+// Task to prepare shared classes with .classdata extension (used by both agent and client)
+task prepareSharedClassdata(type: Copy) {
+    group 'Build'
+    description 'Prepare shared classes with .classdata extension (for both agent and client)'
+    dependsOn allClassesShadow, processResources
+
+    inputs.files allClassesShadow.archiveFile
+    outputs.dir "${maskedJarTmpDir}/shared"
+
+    into "${maskedJarTmpDir}/shared"
+
+    from(provider { zipTree(allClassesShadow.archiveFile) }) {
+        // Only include classes used by both client and agent
+        include 'io/btrace/core/comm/**/*.class'
+        include 'io/btrace/core/extensions/**/*.class'
+        include 'io/btrace/core/annotations/**/*.class'
+        include 'io/btrace/libs/org/objectweb/asm/**/*.class'
+        // Exclude ASM packages not needed
+        exclude 'io/btrace/libs/org/objectweb/asm/commons/**'
+        exclude 'io/btrace/libs/org/objectweb/asm/util/**'
+        exclude 'io/btrace/libs/org/objectweb/asm/xml/**'
+        exclude 'META-INF/**'
+        rename { name -> name.endsWith('.class') ? name.replace('.class', '.classdata') : name }
+    }
+
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+def bootIncludes = {
+    if (it.directory) {
+        return true
+    }
+    if (it.path.endsWith('.jar')) {
+        return true
+    }
+    if (it.path.startsWith('io/btrace/core/')) {
+        if (it.path == 'io/btrace/core/Messages.class'
+                || it.path == 'io/btrace/core/messages.properties') {
+            return false
+        }
+        if (it.path.startsWith('io/btrace/core/extensions/')) {
+            return false
+        }
+        // Include handlers - probe classes need them in their static initializers
+        if (it.path.startsWith('io/btrace/core/handlers/')) {
+            return true
+        }
+        if (it.path.startsWith('io/btrace/core/comm/')) {
+            return false
+        }
+        // Include annotations - needed by compiler at compile-time
+        if (it.path.startsWith('io/btrace/core/annotations/')) {
+            return true
+        }
+        return true
+    }
+    // Include BTrace flat DSL class — needed by javac when compiling scripts
+    if (it.path == 'io/btrace/BTrace.class') {
+        return true
+    }
+    if (it.path.startsWith('META-INF/services')) {
+        return !it.path.contains('com.sun.') && !it.path.contains('javax.annotation.')
+    }
+    // Include BTraceRuntimeAccess and LinkingFlag from btrace-core (bootstrap classes)
+    if (it.path.startsWith('io/btrace/runtime/')) {
+        // Match BTraceRuntimeAccess but NOT BTraceRuntimeAccessImpl
+        if (it.path.startsWith('io/btrace/runtime/BTraceRuntimeAccess.class')
+                || it.path.startsWith('io/btrace/runtime/BTraceRuntimeAccess$')
+                || it.path.startsWith('io/btrace/runtime/LinkingFlag')) {
+            return true
+        }
+        // Include invokedynamic bootstrap classes (they use volatile fields to reach agent implementations)
+        if (it.path.startsWith('io/btrace/runtime/Indy')
+                || it.path.startsWith('io/btrace/runtime/ExtensionIndy')) {
+            return true
+        }
+        // BTraceBootstrap is the BSM for flat DSL INVOKEDYNAMIC calls; must be visible
+        // to application classloaders so the JVM can resolve the bootstrap method
+        if (it.path.startsWith('io/btrace/runtime/BTraceBootstrap')) {
+            return true
+        }
+        // Include Auxiliary class - probe classes are defined via MethodHandles.privateLookupIn(Auxiliary.class)
+        // and must be bootstrap-visible so they're accessible from application classloaders
+        if (it.path.startsWith('io/btrace/runtime/auxiliary/Auxiliary')) {
+            return true
+        }
+        return false
+    }
+    // Include ExtensionBridge interface (referenced by ExtensionIndy)
+    if (it.path == 'io/btrace/extension/ExtensionBridge.class') {
+        return true
+    }
+    // Include slf4j for bootstrap classes (DebugSupport needs it)
+    if (it.path.startsWith('org/slf4j/')) {
+        return true
+    }
+    return false
+}
+
+task bootstrapJar(type: ShadowJar) {
+    archiveBaseName.set('btrace-bootstrap')
+    archiveVersion.set('')
+    archiveClassifier.set('')
+
+    include bootIncludes
+
+    configurations = [project.configurations.bootstrapInputs]
+    relocate 'org.jctools', 'io.btrace.libs.boot.org.jctools'
+    relocate 'org.objectweb.asm', 'io.btrace.libs.org.objectweb.asm'
+    relocate 'org.slf4j', 'io.btrace.libs.org.slf4j'
+    // Rewrite META-INF/services/* names+content to match the relocated classes above,
+    // otherwise ServiceLoader (e.g. SLF4J provider lookup) can't find them.
+    mergeServiceFiles()
+}
+
+// Single JAR with .classdata masking for bootstrap isolation
+task btraceJar(type: Jar) {
+    group 'Build'
+    description 'Creates single JAR with .classdata masking for bootstrap isolation'
+    archiveBaseName.set('btrace')
+    archiveVersion.set('')
+    archiveClassifier.set('')
+    destinationDirectory = libsDir
+
+    dependsOn prepareAgentClassdata, prepareClientClassdata, prepareSharedClassdata
+    dependsOn project(':btrace-boot').tasks.jar
+    dependsOn bootstrapJar
+
+    // 1. Include boot loader class (must be in bootstrap as .class)
+    from(project(':btrace-boot').sourceSets.main.output) {
+        include 'io/btrace/boot/**/*.class'
+    }
+
+    // 2. Include bootstrap classes from bootstrapJar (as .class)
+    from(zipTree(bootstrapJar.archiveFile)) {
+        include '**/*.class'
+        include 'META-INF/services/**'
+        include '**/jaxb.index'  // Required for JAXB probe descriptor loading
+        exclude 'io/btrace/core/comm/**'
+        // Include annotations in bootstrap (needed by ExtensionIndy at runtime)
+        // Exclude manifest from bootstrap jar
+        exclude 'META-INF/MANIFEST.MF'
+    }
+
+    // External provided-style extensions use btrace.jar directly as both their compilation and
+    // processor path. The self-contained processor classes therefore need regular root entries;
+    // the rest of the extension implementation remains masked. No processor service entry is
+    // shipped: this jar is on the boot class path of instrumented JVMs, where any javac would
+    // discover it and fail. Extension builds name the processor with -processor instead.
+    from(zipTree(allClassesShadow.archiveFile)) {
+        include 'io/btrace/extension/processor/**/*.class'
+    }
+    exclude 'META-INF/services/javax.annotation.processing.Processor'
+
+    // 3. Include masked agent classes (as .classdata)
+    into('META-INF/btrace/agent') {
+        from("${maskedJarTmpDir}/agent") {
+            include '**/*.classdata'
+            include '**/messages.properties'
+            include '**/jaxb.index'  // Required for JAXB probe descriptor loading
+        }
+    }
+
+    // 4. Include masked client classes (as .classdata)
+    into('META-INF/btrace/client') {
+        from("${maskedJarTmpDir}/client") {
+            include '**/*.classdata'
+            include '**/messages.properties'
+        }
+    }
+
+    // 5. Include shared classes (as .classdata) - used by both agent and client
+    into('META-INF/btrace/shared') {
+        from("${maskedJarTmpDir}/shared") {
+            include '**/*.classdata'
+        }
+    }
+
+    // 6. Include extensions in root (needed by bootstrap)
+    // Note: Messages class is NOT included in bootstrap - it uses ResourceBundle.getBundle()
+    // with Messages.class.getClassLoader() which returns null for bootstrap classes,
+    // causing NPE. Messages is only in agent/client sections where classloader is non-null.
+    from(project(':btrace-core').sourceSets.main.output) {
+        include 'io/btrace/core/extensions/**/*.class'
+    }
+
+    manifest {
+        attributes(
+            'Premain-Class': 'io.btrace.boot.Loader',
+            'Agent-Class': 'io.btrace.boot.Loader',
+            'Main-Class': 'io.btrace.boot.Loader',
+            'Can-Redefine-Classes': true,
+            'Can-Retransform-Classes': true,
+            'Boot-Class-Path': 'btrace.jar',
+            'BTrace-Version': version,
+            'BTrace-Agent-Main': 'io.btrace.agent.Main',
+            'BTrace-Client-Main': 'io.btrace.client.Main',
+            // `java -jar btrace.jar -l` lists JVMs through jvmstat (ignored by JDK 8)
+            'Add-Exports': 'jdk.internal.jvmstat/sun.jvmstat.monitor'
+        )
+    }
+
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+tasks.named('compileTestJava') {
+    dependsOn btraceJar
+    dependsOn 'copyDtraceLib', 'copyExtensions'
+}
+
+test {
+    dependsOn btraceJar
+    useJUnitPlatform()
+}
+
+/**
+ * Fat agent JAR configuration via BTrace Fat Agent Plugin.
+ *
+ * Creates a fat agent JAR with embedded extensions for single-JAR deployment.
+ *
+ * Structure:
+ * btrace-agent-fat.jar
+ * ├── META-INF/
+ * │   ├── MANIFEST.MF (BTrace-Embedded-Extensions: ext1,ext2)
+ * │   └── btrace-extensions/
+ * │       └── ext-id/
+ * │           ├── extension.properties
+ * │           └── io/btrace/ext/impl/...  # Impl classes (.classdata), per extension
+ * └── io/btrace/...           # Agent + API classes (.class)
+ *
+ * Usage:
+ *   ./gradlew :btrace-dist:fatAgentJar -PembedExtensions=btrace-spark,btrace-metrics
+ */
+// The extensions that ship with a release, declared in the root build.gradle. It drives the
+// distribution's extensions/ directory, the set the fat agent embeds by default and the set
+// published to Maven Central, so none of them can disagree about what "default" means.
+def releaseExtensionProjects = rootProject.ext.releaseExtensionProjects
+
+btraceFatAgent {
+    baseName = 'btrace-agent-fat'
+    // Deliberately outside distTarget. The distribution archives copy that tree wholesale, so a
+    // fat agent written into it rides along into every zip, tarball, deb and rpm whenever
+    // something happens to build it first.
+    outputDir = project.layout.buildDirectory.dir('fat-agent').get().asFile
+
+    // Reference the single masked JAR (agent + boot merged into btraceJar)
+    agentJarTask = 'btraceJar'
+
+    // Auto-discover extensions from subprojects, but embed only the released set unless the
+    // build explicitly asks for something else via -PembedExtensions.
+    autoDiscover = true
+    defaultExtensions = releaseExtensionProjects
+    filterProperty = 'embedExtensions'
+
+    // Package relocations
+    relocate 'org.jctools', 'io.btrace.libs.agent.org.jctools'
+    relocate 'org.objectweb.asm', 'io.btrace.libs.org.objectweb.asm'
+    relocate 'org.slf4j', 'io.btrace.libs.org.slf4j'
+}
+
+task fixPermissions {
+    onlyIf {
+        !OperatingSystem.current().isWindows()
+    }
+
+    doLast {
+        ant.chmod(dir: "${distTarget}/bin", perm: '500', includes: '*', excludes: '*.bat')
+    }
+
+    dependsOn processResources
+}
+
+task copyDtraceLib(type: Copy) {
+    from "${projectDir}/../btrace-dtrace/build/dtrace/libs"
+    into "${distTarget}/libs/"
+}
+
+// Sync, not Copy: the allow-list below is only meaningful if the destination mirrors it exactly.
+// A Copy leaves behind archives and exploded directories belonging to extensions that have since
+// been withdrawn from the release set, so an incremental build keeps shipping them and the
+// allow-list silently stops being enforced. Sync removes anything not produced by this build,
+// including the subdirectories explodeExtensions creates, which that task then recreates.
+task copyExtensions(type: Sync) {
+    group 'Build'
+    description 'Mirror the released extension ZIP archives into the extensions/ directory'
+    into "${distTarget}/extensions/"
+}
+
+gradle.projectsEvaluated {
+    tasks.named('copyExtensions').configure { t ->
+        releaseExtensionProjects.each { extensionProjectPath ->
+            def extensionProject = project(extensionProjectPath)
+            t.dependsOn("${extensionProjectPath}:packageExtension")
+            t.from(extensionProject.layout.buildDirectory.dir('distributions')) {
+                include "*-extension.zip"
+            }
+        }
+    }
+}
+
+task explodeExtensions {
+    group 'Build'
+    description 'Explode extension ZIP archives into extension subdirectories'
+    dependsOn copyExtensions
+
+    doLast {
+        def extensionsDir = file("${distTarget}/extensions")
+        if (!extensionsDir.exists()) {
+            return
+        }
+
+        extensionsDir.listFiles().each { file ->
+            if (file.name.endsWith('-extension.zip')) {
+                // Extract extension name from filename: btrace-metrics-2.3.0-SNAPSHOT-extension.zip -> btrace-metrics
+                def extensionName = file.name.replaceAll(/-\d+.*-extension\.zip$/, '')
+                def targetDir = new File(extensionsDir, extensionName)
+                targetDir.mkdirs()
+
+                // Explode ZIP into extension directory
+                copy {
+                    from zipTree(file)
+                    into targetDir
+                }
+
+                logger.info("Exploded extension ${file.name} into ${extensionName}/")
+            }
+        }
+    }
+}
+
+// copyExtensions deletes the exploded directories, and tasks such as compileTestJava and shadowJar
+// depend on it alone; without this, they leave the distribution with archives the compiler can
+// not resolve extension classes from.
+copyExtensions.finalizedBy explodeExtensions
+
+tasks.named('test').configure {
+    dependsOn explodeExtensions
+}
+
+// Gradle archive tasks normalise file permissions for reproducibility, so the mode set on disk by
+// fixPermissions does not reach the archives. Set the mode of the Unix launchers explicitly.
+def makeLaunchersExecutable = { AbstractArchiveTask archive ->
+    archive.filesMatching('bin/*') { FileCopyDetails details ->
+        if (!details.name.endsWith('.bat')) {
+            details.permissions { unix(0755) }
+        }
+    }
+}
+
+task buildZip(type: Zip) {
+    dependsOn btraceJar, fixPermissions, explodeExtensions
+    from "${distTarget}"
+    include "**/*"
+
+    archiveBaseName.set('btrace')
+    archiveVersion.set("v${project.version}")
+    archiveClassifier.set("bin")
+    destinationDirectory = layout.buildDirectory.dir("distributions")
+    makeLaunchersExecutable(it)
+}
+
+task buildSdkmanZip(type: Zip) {
+    // SDKMAN installs the extracted archive as the candidate home. Keep bin/ and libs/ at the
+    // archive root; an extra v<version>/ directory makes the installed candidate unusable.
+    from "${distTarget}"
+    include "**/*"
+
+    archiveBaseName.set('btrace')
+    archiveVersion.set("v${project.version}")
+    archiveClassifier.set("sdkman-bin")
+    destinationDirectory = layout.buildDirectory.dir("distributions")
+    makeLaunchersExecutable(it)
+}
+
+task buildTgz(type: Tar) {
+    into ('/'){
+        from "${distTarget}"
+        include '**/*'
+    }
+
+    archiveBaseName.set('btrace')
+    archiveVersion.set("v${project.version}")
+    archiveClassifier.set("bin")
+    destinationDirectory = layout.buildDirectory.dir("distributions")
+    archiveExtension.set('tar.gz')
+    compression = Compression.GZIP
+    makeLaunchersExecutable(it)
+}
+
+ospackage {
+    packageName = 'btrace'
+    release = 1
+    os = LINUX
+
+    into '/opt/btrace'
+
+    from("${distTarget}/bin") {
+        into 'bin'
+        fileMode 0755
+    }
+
+    from("${distTarget}/libs") {
+        into 'libs'
+    }
+
+    from("${distTarget}/docs") {
+        into 'docs'
+    }
+
+    from("${distTarget}/samples") {
+        into 'samples'
+    }
+
+    link('/usr/local/bin/btrace', '/opt/btrace/bin/btrace')
+    link('/usr/local/bin/btracer', '/opt/btrace/bin/btracer')
+    link('/usr/local/bin/btracec', '/opt/btrace/bin/btracec')
+    link('/usr/local/bin/btracex', '/opt/btrace/bin/btracex')
+}
+
+buildDeb {
+    requires('openjdk-8-jdk')
+}
+
+copyDtraceLib.dependsOn project(':btrace-dtrace').build
+// fatAgentJar reads btraceJar's output, which sits in the same libs directory copyDtraceLib
+// writes into, so Gradle sees it consuming that task's output. Moving the fat agent's own output
+// out of the distribution tree does not change that: this ordering is about what it reads.
+// buildSdkmanZip needs no such guard any more, because nothing writes the fat agent into the
+// tree the archives copy.
+fatAgentJar.mustRunAfter copyDtraceLib
+shadowJar.dependsOn btraceJar, copyDtraceLib, copyExtensions
+buildTgz.dependsOn btraceJar, fixPermissions, copyDtraceLib, processResources, explodeExtensions
+buildZip.dependsOn btraceJar, fixPermissions, copyDtraceLib, processResources, explodeExtensions
+buildSdkmanZip.dependsOn btraceJar, fixPermissions, copyDtraceLib, processResources, explodeExtensions
+buildDeb.dependsOn btraceJar, fixPermissions, copyDtraceLib, processResources, explodeExtensions
+buildRpm.dependsOn btraceJar, fixPermissions, copyDtraceLib, processResources, explodeExtensions
+build.dependsOn buildSdkmanZip, buildZip, buildTgz, buildDeb, buildRpm
+
+// The published artifact is the fat agent, so what it embeds is a release decision rather than a
+// build detail. -PembedExtensions still overrides the default set, and a stray property or an
+// ORG_GRADLE_PROJECT_embedExtensions in the publishing environment would put example extensions
+// on Maven Central, or none at all, with no way to take it back.
+//
+// The expected ids are spelled out rather than derived from releaseExtensionProjects: deriving
+// them would make this assert only that the list equals itself, and the ids and the project paths
+// are different identifier spaces.
+def publishedExtensionIds = [
+    'btrace-contracts', 'btrace-gpu-bridge', 'btrace-llm-trace', 'btrace-metrics',
+    'btrace-otel', 'btrace-rag-quality', 'btrace-statsd', 'btrace-utils'
+]
+
+task verifyEmbeddedExtensions {
+    group 'Verification'
+    description 'Assert the published fat agent embeds exactly the released extension set'
+    dependsOn fatAgentJar
+
+    doLast {
+        def jar = fatAgentJar.archiveFile.get().asFile
+        def declared = new java.util.jar.JarFile(jar).withCloseable { j ->
+            j.manifest?.mainAttributes?.getValue('BTrace-Embedded-Extensions')
+        }
+        def actual = (declared ?: '').split(',').collect { it.trim() }.findAll { it }.sort()
+        def expected = publishedExtensionIds.sort()
+        if (actual != expected) {
+            throw new GradleException(
+                "${jar.name} embeds ${actual} but the release set is ${expected}. " +
+                'Publishing this would ship the wrong extensions. If the release set changed, ' +
+                'update releaseExtensionProjects and publishedExtensionIds together.')
+        }
+        logger.lifecycle("[dist] Verified embedded extensions: ${actual.join(', ')}")
+    }
+}
+
+tasks.matching { it.name.startsWith('publishBtracePublicationTo') }.configureEach {
+    dependsOn verifyEmbeddedExtensions
+}
+
+task releaseSmoke(type: Exec) {
+    group = 'Verification'
+    description = 'Run acquisition and first-trace smoke tests against the built distribution'
+    dependsOn btraceJar, fatAgentJar, fixPermissions, explodeExtensions
+
+    workingDir rootProject.projectDir
+    commandLine 'bash',
+            rootProject.file('scripts/release-smoke.sh'),
+            '--distribution', distTarget,
+            '--fat-agent', fatAgentJar.archiveFile.get().asFile,
+            '--version', project.version
+}
+
+// Docker build tasks
+task buildDockerContext(type: Copy, dependsOn: [btraceJar, copyDtraceLib, processResources, fixPermissions, explodeExtensions]) {
+    group 'Docker'
+    description 'Prepare Docker build context with BTrace distribution'
+
+    from "${distTarget}"
+    into layout.buildDirectory.dir("docker-context/btrace")
+    filePermissions { unix(0644) }
+
+    doLast {
+        // Copy entrypoint script
+        copy {
+            from "${projectDir}/../docker/docker-entrypoint.sh"
+            into layout.buildDirectory.dir("docker-context")
+        }
+        // Copy .dockerignore to build context so Docker can use it
+        copy {
+            from "${projectDir}/../docker/.dockerignore"
+            into layout.buildDirectory.dir("docker-context")
+        }
+    }
+}
+
+task buildDockerImage(type: Exec, dependsOn: buildDockerContext) {
+    group 'Docker'
+    description 'Build main Debian-based Docker image'
+
+    onlyIf {
+        project.hasProperty('dockerEnabled') &&
+        (project.hasProperty('dockerBuildx') ?
+            'docker buildx version'.execute().waitFor() == 0 :
+            'docker --version'.execute().waitFor() == 0)
+    }
+
+    workingDir "${projectDir}/../docker"
+
+    def buildArgs = [
+        'docker', 'build',
+        '--build-arg', "BTRACE_VERSION=${project.version}",
+        '-t', "ghcr.io/btraceio/btrace:${project.version}",
+        '-t', "ghcr.io/btraceio/btrace:latest",
+        '-f', 'Dockerfile',
+        layout.buildDirectory.dir("docker-context").get().asFile.absolutePath
+    ]
+
+    if (project.hasProperty('dockerBuildx')) {
+        buildArgs.add(1, 'buildx')
+        buildArgs.addAll(['--platform', 'linux/amd64,linux/arm64'])
+    }
+
+    commandLine buildArgs
+}
+
+task buildDockerImageAlpine(type: Exec, dependsOn: buildDockerContext) {
+    group 'Docker'
+    description 'Build Alpine-based Docker image'
+
+    onlyIf {
+        project.hasProperty('dockerEnabled') &&
+        (project.hasProperty('dockerBuildx') ?
+            'docker buildx version'.execute().waitFor() == 0 :
+            'docker --version'.execute().waitFor() == 0)
+    }
+
+    workingDir "${projectDir}/../docker"
+
+    def buildArgs = [
+        'docker', 'build',
+        '--build-arg', "BTRACE_VERSION=${project.version}",
+        '-t', "ghcr.io/btraceio/btrace:${project.version}-alpine",
+        '-t', "ghcr.io/btraceio/btrace:latest-alpine",
+        '-f', 'Dockerfile.alpine',
+        layout.buildDirectory.dir("docker-context").get().asFile.absolutePath
+    ]
+
+    if (project.hasProperty('dockerBuildx')) {
+        buildArgs.add(1, 'buildx')
+        buildArgs.addAll(['--platform', 'linux/amd64,linux/arm64'])
+    }
+
+    commandLine buildArgs
+}
+
+task buildDockerImageDistroless(type: Exec, dependsOn: buildDockerContext) {
+    group 'Docker'
+    description 'Build distroless Docker image'
+
+    onlyIf {
+        project.hasProperty('dockerEnabled') &&
+        (project.hasProperty('dockerBuildx') ?
+            'docker buildx version'.execute().waitFor() == 0 :
+            'docker --version'.execute().waitFor() == 0)
+    }
+
+    workingDir "${projectDir}/../docker"
+
+    def buildArgs = [
+        'docker', 'build',
+        '--build-arg', "BTRACE_VERSION=${project.version}",
+        '-t', "ghcr.io/btraceio/btrace:${project.version}-distroless",
+        '-t', "ghcr.io/btraceio/btrace:latest-distroless",
+        '-f', 'Dockerfile.distroless',
+        layout.buildDirectory.dir("docker-context").get().asFile.absolutePath
+    ]
+
+    if (project.hasProperty('dockerBuildx')) {
+        buildArgs.add(1, 'buildx')
+        buildArgs.addAll(['--platform', 'linux/amd64'])
+    }
+
+    commandLine buildArgs
+}
+
+task buildDockerImages {
+    group 'Docker'
+    description 'Build all Docker image variants'
+    dependsOn buildDockerImage, buildDockerImageAlpine, buildDockerImageDistroless
+}
+
+['agent', 'boot', 'client'].each { name ->
+    // Define a temporary directory for the sources
+    def tempDir = layout.buildDirectory.dir("tmp/${name}Sources").get().asFile
+
+    // first, we will copy the classes and make sure there are no empty directories
+    tasks.create(name: "${name}CopySources", type: Copy) {
+        doFirst {
+            tempDir.deleteDir()  // Ensure the directory is clean
+        }
+
+        into tempDir
+
+        duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+        gradle.projectsEvaluated {
+            rootProject.childProjects.each { projectName, siblingProject ->
+                // Skip the current project to avoid duplication
+                if (siblingProject != project) {
+                    from(siblingProject.sourceSets.main.allSource) {
+                        include includes["${name}"]
+                        exclude 'META-INF/**'
+                    }
+                }
+            }
+        }
+
+        doLast {
+            // Recursively delete empty directories
+            def deleteEmptyDirs
+            deleteEmptyDirs = { dir ->
+                dir.eachDir { subDir ->
+                    deleteEmptyDirs(subDir)
+                    if (!subDir.listFiles().any()) {
+                        subDir.deleteDir()
+                    }
+                }
+            }
+            deleteEmptyDirs(tempDir)
+        }
+    }
+
+    // we will use the output of the previous task to crate the JAR
+    tasks.create(name: "${name}SourcesJar", type: Jar, dependsOn: "${name}CopySources") {
+        group 'Documentation'
+        description "Build the btrace-${name} sources jar."
+
+        archiveAppendix = "${name}"
+        archiveClassifier = "sources"
+        duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+
+        from tempDir
+    }
+
+    tasks.create(name: "${name}Javadoc", type: Javadoc) {
+        group 'Documentation'
+        description "Generates Javadoc API documentation for the btrace-${name}."
+
+        title = "btrace-${name}"
+        destinationDir = layout.buildDirectory.dir("docs/${name}/javadoc").get().asFile
+        classpath = files(compileJava.destinationDirectory) + configurations.artifact.asFileTree
+        options.addStringOption('Xdoclint:all,-missing', '-quiet')
+        failOnError false
+
+        project.parent.subprojects.each { subproject ->
+            // Skip the current project to avoid duplication
+            if (subproject != project) {
+                // Add source from sibling projects based on filter
+                source subproject.sourceSets.main.java.matching {
+                    include includes["${name}"]
+                }
+            }
+        }
+
+        // Include classpath of all sibling projects
+        project.parent.subprojects.each { subproject ->
+            // Skip the current project to avoid duplication
+            if (subproject != project) {
+                classpath += subproject.sourceSets.main.compileClasspath
+            }
+        }
+    }
+
+
+    tasks.create(name: "${name}JavadocJar", type: Jar) {
+        group 'Documentation'
+        description "Build the btrace-${name} javadoc jar."
+
+        archiveAppendix = "${name}"
+        archiveClassifier = "javadoc"
+        from tasks["${name}Javadoc"].getOutputs()
+    }
+}
+
+sdkman {
+    consumerKey = project.hasProperty("sdkman.key") ? project.property("sdkman.key") : System.getenv('SDKMAN_KEY')
+    consumerToken = project.hasProperty("sdkman.token") ? project.property("sdkman.token") : System.getenv('SDKMAN_TOKEN')
+    candidate = "btrace"
+    version = "${project.version}"
+    url = "https://github.com/btraceio/btrace/releases/download/v${project.version}/btrace-v${project.version}-sdkman-bin.zip"
+    hashtag = "btrace"
+}
+
+["sdkReleaseVersion", "sdkAnnounceVersion"].forEach {
+    tasks[it].onlyIf {
+        !project.version.toString().endsWith("-SNAPSHOT")
+    }
+}
+
+publishing {
+    repositories {
+        maven {
+            // Central Portal URLs (OSSRH was sunset on June 30, 2025)
+            def releasesRepoUrl = "https://ossrh-staging-api.central.sonatype.com/service/local/staging/deploy/maven2/"
+            def snapshotsRepoUrl = "https://central.sonatype.com/repository/maven-snapshots/"
+            url = version.endsWith('SNAPSHOT') ? snapshotsRepoUrl : releasesRepoUrl
+
+            credentials {
+                // Use Central Portal user token credentials
+                username = project.hasProperty("sonatype.user") ? project.property("sonatype.user") : System.getenv('SONATYPE_USER')
+                password = project.hasProperty("sonatype.password") ? project.property("sonatype.password") : System.getenv('SONATYPE_PASSWORD')
+            }
+        }
+    }
+
+    publications {
+        btrace(MavenPublication) {
+            artifactId 'btrace'
+            groupId 'io.btrace'
+            // The fat agent, not the lean masked jar. A Maven or jbang user has no
+            // $BTRACE_HOME/extensions directory to discover, so publishing the lean engine left
+            // them with core tracing and none of the default extensions. Embedding costs about
+            // seven percent in size and nothing at runtime, since an extension is inert until a
+            // script injects it. The distribution is unaffected: it keeps shipping the lean
+            // libs/btrace.jar alongside its extensions directory.
+            artifact fatAgentJar
+            pom.withXml {
+                addPomDetails(asNode(), 'btrace')
+            }
+        }
+    }
+}
+
+def addPomDetails(node, name) {
+    node.appendNode('name', name)
+    node.appendNode('url', 'https://github.com/btraceio/btrace')
+    node.appendNode('description',
+            'BTrace: A safe, dynamic tracing tool for the Java platform, with the default'
+                    + ' extensions embedded')
+    def scmNode = node.appendNode('scm')
+    scmNode.appendNode('url', 'https://github.com/btraceio/btrace')
+    scmNode.appendNode('connection', 'scm:git:https://github.com/btraceio/btrace.git')
+    scmNode.appendNode('developerConnection', 'scm:git:https://github.com/btraceio/btrace.git')
+
+    def licenseNode = node.appendNode('licenses').appendNode('license')
+    licenseNode.appendNode('name', 'The Apache License, Version 2.0')
+    licenseNode.appendNode('url', 'https://www.apache.org/licenses/LICENSE-2.0.txt')
+
+    def developerNode = node.appendNode('developers').appendNode('developer')
+    developerNode.appendNode('id', 'jbachorik')
+    developerNode.appendNode('name', 'Jaroslav Bachorik')
+    developerNode.appendNode('email', 'j.bachorik@btrace.io')
+}
+
+signing {
+    def signingKey = project.hasProperty('gpg.signing.key') ? project.property('gpg.signing.key') : System.getenv("GPG_SIGNING_KEY")
+    def signingPwd = project.hasProperty('gpg.signing.pwd') ? project.property('gpg.signing.pwd') : System.getenv("GPG_SIGNING_PWD")
+
+    if (signingKey != null && signingPwd != null) {
+        useInMemoryPgpKeys(signingKey, signingPwd)
+    }
+    // Central needs the signatures; a snapshot installed into mavenLocal does not
+    required = { gradle.taskGraph.allTasks.any { it.name.endsWith('ToSonatypeRepository') } }
+    sign publishing.publications.btrace
+}

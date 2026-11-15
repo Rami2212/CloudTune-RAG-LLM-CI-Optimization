@@ -1,0 +1,63 @@
+name: Unit Tests
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+
+    runs-on: ${{ matrix.operating-system }}
+    strategy:
+      matrix:
+        operating-system: [ubuntu-latest]
+        php-versions: ['8.2', '8.3', '8.4']
+        include:
+          - php-versions: '8.2'
+            phpunit-versions: 10
+          - php-versions: '8.3'
+            phpunit-versions: 11
+          - php-versions: '8.4'
+            phpunit-versions: 12
+
+    name: PHP ${{ matrix.php-versions }} Test with PHPUnit ${{ matrix.phpunit-versions }} on ${{ matrix.operating-system }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup PHP with Xdebug
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: ${{ matrix.php-versions }}
+        extensions: json
+        tools: phpunit:${{ matrix.phpunit-versions }}
+        coverage: xdebug
+
+    - name: Check PHP Version
+      run: php -v
+    
+    - name: Validate composer.json and composer.lock
+      run: composer validate --strict
+
+    - name: Composer install
+      run: composer install --optimize-autoloader --prefer-dist --ignore-platform-reqs
+
+    - name: Run test suite
+      env: 
+          IPINFO_TOKEN: ${{ secrets.IPINFO_TOKEN }}
+          XDEBUG_MODE: "coverage"
+      run: /usr/local/bin/phpunit --coverage-html=coverage
+
+    - name: Archive code coverage results
+      uses: actions/upload-artifact@v4
+      with:
+        name: code-coverage-report-${{ matrix.php-versions }}-${{ matrix.phpunit-versions }}-${{ matrix.operating-system }}
+        path: coverage/
+        retention-days: 90

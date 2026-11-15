@@ -1,0 +1,118 @@
+name: Update Requests library
+
+on:
+  schedule:
+    - cron: '0 3 * * 1' # Run every Monday at 03:00 UTC.
+  workflow_dispatch:
+
+concurrency:
+  group: update-requests
+  cancel-in-progress: true
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-requests:
+    name: Check and update Requests library
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Get the latest Requests release tag
+        id: latest_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          LATEST_TAG=$(gh api repos/WordPress/Requests/releases/latest --jq '.tag_name')
+          if [[ -z "${LATEST_TAG}" || "${LATEST_TAG}" == "null" ]]; then
+            echo "Failed to retrieve latest Requests release tag." >&2
+            exit 1
+          fi
+          echo "tag=${LATEST_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Get the current Requests version from install script
+        id: current_version
+        run: |
+          CURRENT_TAG=$(grep -oP 'REQUESTS_TAG="\K[^"]+' utils/install-requests.sh)
+          if [[ -z "${CURRENT_TAG}" ]]; then
+            echo "Failed to determine current Requests version from utils/install-requests.sh." >&2
+            exit 1
+          fi
+          echo "tag=${CURRENT_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Update install script and bundle if versions differ
+        if: steps.latest_release.outputs.tag != steps.current_version.outputs.tag
+        env:
+          LATEST_TAG: ${{ steps.latest_release.outputs.tag }}
+          CURRENT_TAG: ${{ steps.current_version.outputs.tag }}
+        run: |
+          sed -i "s/REQUESTS_TAG=\"${CURRENT_TAG}\"/REQUESTS_TAG=\"${LATEST_TAG}\"/" utils/install-requests.sh
+          grep -q "REQUESTS_TAG=\"${LATEST_TAG}\"" utils/install-requests.sh || { echo "Failed to update REQUESTS_TAG in install script." >&2; exit 1; }
+          bash utils/install-requests.sh
+
+      - name: Validate modified files
+        if: steps.latest_release.outputs.tag != steps.current_version.outputs.tag
+        run: |
+          mapfile -t changed_files < <(git diff --name-only)
+
+          if [ "${#changed_files[@]}" -eq 0 ]; then
+            echo "No files changed by update; nothing to validate."
+            exit 0
+          fi
+
+          allowed_regex='^(utils/install-requests\.sh|bundle/rmccue/requests(/|$))'
+          disallowed=()
+
+          for f in "${changed_files[@]}"; do
+            if ! [[ "$f" =~ $allowed_regex ]]; then
+              disallowed+=("$f")
+            fi
+          done
+
+          if [ "${#disallowed[@]}" -ne 0 ]; then
+            echo "Error: Unexpected files were modified by utils/install-requests.sh:"
+            printf '  %s\n' "${disallowed[@]}"
+            exit 1
+          fi
+
+          echo "All modified files are within the allowed paths."
+      - name: Commit and Create Pull Request
+        if: steps.latest_release.outputs.tag != steps.current_version.outputs.tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST_TAG: ${{ steps.latest_release.outputs.tag }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+          BRANCH_NAME: "update/requests-${{ steps.latest_release.outputs.tag }}"
+          PR_BODY: |
+            This automated PR updates the bundled [Requests](https://github.com/WordPress/Requests) library from `${{ steps.current_version.outputs.tag }}` to `${{ steps.latest_release.outputs.tag }}`.
+
+            Please review the [Requests changelog](https://github.com/WordPress/Requests/releases/tag/${{ steps.latest_release.outputs.tag }}) before merging.
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git checkout -b "$BRANCH_NAME"
+            git add utils/install-requests.sh bundle/rmccue/requests/
+            git commit -m "Update bundled Requests library to ${LATEST_TAG}"
+            git push -f origin "$BRANCH_NAME"
+            
+            PR_NUMBER=$(gh pr list --head "$BRANCH_NAME" --json number --jq '.[0].number // empty')
+            if [ -z "$PR_NUMBER" ]; then
+              gh pr create \
+                --title "Update bundled Requests library to ${LATEST_TAG}" \
+                --body "$PR_BODY" \
+                --label "Requests" \
+                --base "$BASE_BRANCH" \
+                --head "$BRANCH_NAME"
+            else
+              gh pr edit "$PR_NUMBER" \
+                --title "Update bundled Requests library to ${LATEST_TAG}" \
+                --body "$PR_BODY" \
+                --add-label "Requests" \
+                --base "$BASE_BRANCH"
+            fi
+          fi
+
+

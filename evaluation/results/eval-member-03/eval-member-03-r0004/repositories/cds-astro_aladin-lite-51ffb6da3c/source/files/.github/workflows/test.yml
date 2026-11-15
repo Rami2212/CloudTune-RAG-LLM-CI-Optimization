@@ -1,0 +1,40 @@
+name: Run tests
+on:
+  push:
+    branches:
+      - develop
+  pull_request:
+    branches:
+      - develop
+  # Allows to run this workflow manually from the Actions tab
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout branch ${{ github.head_ref }}"
+        uses: actions/checkout@v3
+      - name: "Setup node"
+        uses: actions/setup-node@v3
+        with:
+          node-version: 16
+      - name: "Install the rust compiler"
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          source "$HOME/.cargo/env"
+      - name: "Install wasm-pack"
+        run: |
+          curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh -s -- -y
+      - name: "Run cargo clippy"
+        run: cd src/core && cargo clippy --all-targets --features=webgl2 -- -D warnings
+      - name: Format check
+        run: cd src/core && cargo fmt --all -- --check
+      - name: "Install dependencies"
+        run: |
+          npm install
+      - name: "Build Aladin Lite"
+        run: |
+          npm run build:dbg
+      - name: "Run the rust tests"
+        run: |
+          npm run test:build

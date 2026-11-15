@@ -1,0 +1,43 @@
+name: "Sync Dev to Version Branch"
+
+# Thin caller of the shared reusable dev-sync workflow in supertokens/actions.
+# On every push to dev, it computes the next version from unreleased changie
+# fragments and creates or force-updates a release PR:
+#
+#   release/vX.Y.Z  ->  X.Y  (version branch)
+#
+# Can also be triggered manually to override the bump type. The node-specific
+# release prep (rebuild lib/build/) and the set of files to stage are passed as
+# inputs; the orchestration logic lives once in the reusable workflow.
+
+on:
+    push:
+        branches:
+            - dev
+    workflow_dispatch:
+        inputs:
+            bump:
+                description: "Override bump type (default: auto — inferred from change kinds)"
+                type: choice
+                default: auto
+                options:
+                    - auto
+                    - minor
+                    - patch
+
+permissions:
+    contents: write
+    pull-requests: write
+
+jobs:
+    sync:
+        uses: supertokens/actions/.github/workflows/dev-sync.yml@main
+        secrets: inherit
+        with:
+            bump: ${{ inputs.bump || 'auto' }}
+            prepare: |
+                npm ci
+                npm run build
+            add_paths: ".changes/ CHANGELOG.md package.json lib/ts/version.ts lib/build/"
+            version_check_hint: '\`package.json\` and version constant'
+            post_merge_note: 'the [Release Pipeline](../actions/workflows/pipeline-release-tag.yml) will start automatically, or trigger it manually with branch \`${target_branch}\`.'

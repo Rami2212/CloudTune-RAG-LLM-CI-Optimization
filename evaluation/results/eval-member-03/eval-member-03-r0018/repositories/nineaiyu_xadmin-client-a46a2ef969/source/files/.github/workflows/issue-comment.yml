@@ -1,0 +1,52 @@
+on:
+  issue_comment:
+    types: [created]
+
+name: Add issues workflow labels
+
+permissions:
+  issues: write
+
+jobs:
+  add-label-if-is-author:
+    runs-on: ubuntu-latest
+    if: (github.event.issue.user.id == github.event.comment.user.id) && !github.event.issue.pull_request && (github.event.issue.state == 'open')
+    steps:
+      - name: Author replied, mark pending processing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          number="${{ github.event.issue.number }}"
+          labels=$(gh issue view "$number" --repo "$GITHUB_REPOSITORY" --json labels --jq '.labels[].name')
+          if ! grep -qxF "🔔 Pending processing" <<<"$labels"; then
+            gh issue edit "$number" --repo "$GITHUB_REPOSITORY" --add-label "🔔 Pending processing"
+          fi
+          if grep -qxF "⏳ Pending feedback" <<<"$labels"; then
+            gh issue edit "$number" --repo "$GITHUB_REPOSITORY" --remove-label "⏳ Pending feedback"
+          fi
+
+  add-label-if-is-member:
+    runs-on: ubuntu-latest
+    if: ${{ !github.event.issue.pull_request && (github.event.issue.state == 'open') }}
+    steps:
+      - name: Maintainer replied, mark pending feedback
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          number="${{ github.event.issue.number }}"
+          commenter="${{ github.event.comment.user.login }}"
+          # 原实现按「组织公开成员」判断成员身份，本仓库为个人账号无组织，
+          # 语义收敛为仓库协作者（owner 天然是协作者），非协作者评论不切标签
+          if ! gh api "repos/$GITHUB_REPOSITORY/collaborators/$commenter" >/dev/null 2>&1; then
+            echo "$commenter is not a collaborator, skip"
+            exit 0
+          fi
+          labels=$(gh issue view "$number" --repo "$GITHUB_REPOSITORY" --json labels --jq '.labels[].name')
+          if ! grep -qxF "⏳ Pending feedback" <<<"$labels"; then
+            gh issue edit "$number" --repo "$GITHUB_REPOSITORY" --add-label "⏳ Pending feedback"
+          fi
+          if grep -qxF "🔔 Pending processing" <<<"$labels"; then
+            gh issue edit "$number" --repo "$GITHUB_REPOSITORY" --remove-label "🔔 Pending processing"
+          fi

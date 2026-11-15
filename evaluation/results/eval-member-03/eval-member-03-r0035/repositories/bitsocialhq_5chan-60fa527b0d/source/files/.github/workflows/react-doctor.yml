@@ -1,0 +1,36 @@
+# React Doctor PR review.
+# Runs the same advisory task-diff diagnostics as agent verification and CI.
+# It reads doctor.config.jsonc, so the React-Compiler rules
+# we don't enforce stay suppressed (see that file and
+# docs/agent-playbooks/known-surprises.md). We do NOT chase the aggregate score.
+name: React Doctor
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: react-doctor-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  react-doctor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # so React Doctor can diff against the merge-base for new-vs-existing
+      - name: Setup Node.js v22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable
+      - name: Install dependencies
+        run: yarn install --immutable
+      - name: Run React Doctor on changed files
+        run: yarn doctor:check --base "origin/${{ github.base_ref }}"

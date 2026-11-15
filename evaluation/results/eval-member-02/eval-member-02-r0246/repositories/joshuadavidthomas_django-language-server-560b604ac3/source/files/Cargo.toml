@@ -1,0 +1,133 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+
+[workspace.dependencies]
+djls = { path = "crates/djls" }
+djls-bench = { path = "crates/djls-bench" }
+djls-conf = { path = "crates/djls-conf" }
+djls-db = { path = "crates/djls-db" }
+djls-format = { path = "crates/djls-format" }
+djls-ide = { path = "crates/djls-ide" }
+djls-lsp = { path = "crates/djls-lsp" }
+djls-project = { path = "crates/djls-project", default-features = false }
+djls-semantic = { path = "crates/djls-semantic" }
+djls-server = { path = "crates/djls-server" }
+djls-source = { path = "crates/djls-source" }
+djls-templates = { path = "crates/djls-templates" }
+djls-testing = { path = "crates/djls-testing" }
+djls-wasm = { path = "crates/djls-wasm" }
+
+# core deps, pin exact versions
+salsa = "0.28.0"
+tower-lsp-server = { version = "0.23.0", features = ["proposed"] }
+
+annotate-snippets = "0.12"
+anyhow = "1.0"
+camino = { version = "1.2", features = ["serde1"] }
+clap = { version = "4.6", features = ["derive"] }
+compact_str = { version = "0.10", features = ["serde"] }
+config = { version = "0.15", features = ["toml"] }
+configparser = "3.1"
+dashmap = "6.2"
+datatest-stable = "0.3.3"
+directories = "6.0"
+divan = { package = "codspeed-divan-compat", version = "4.3" }
+djangofmt = { git = "https://github.com/UnknownPlatypus/djangofmt", tag = "v1.0.0", default-features = false }
+dotenvy = "0.15"
+dunce = "1.0"
+flate2 = "1.1"
+futures-util = "0.3"
+ignore = "0.4"
+insta = { version = "1.47", features = ["glob", "yaml"] }
+libtest-mimic = "0.8.2"
+# Keep in sync with djangofmt's pin; `djls-format` matches on its error type.
+markup_fmt = { git = "https://github.com/UnknownPlatypus/markup_fmt", rev = "c5ebe002d53736f1945ac8ec2f20df49878d9070" }
+memchr = "2.8"
+notify = "8.2"
+pep440_rs = "0.7.3"
+pep508_rs = "0.9.2"
+percent-encoding = "2.3"
+proptest = { version = "1", default-features = false, features = ["std"] }
+proc-macro2 = { version = "1.0", features = ["span-locations"] }
+pulldown-cmark = "0.13.4"
+rayon = "1.12"
+# ring builds far faster than reqwest's default aws-lc-rs provider, whose C build
+# dominated cold compiles of the corpus tool.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "charset", "http2", "json", "rustls-no-provider", "system-proxy"] }
+regex = "1.12"
+rustc-hash = "2.1"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+sha2 = "0.11"
+syn = { version = "3.0", features = ["full", "visit"] }
+tar = "0.4"
+tempfile = "3.26"
+thiserror = "2.0"
+tokio = { version = "1.52", features = ["full"] }
+toml = "1.1"
+tower-service = "0.3"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "time"] }
+# Keep paired with wasm-bindgen-cli in mise.toml; the CLI must match exactly.
+wasm-bindgen = "0.2"
+which = "8.0"
+zip = { version = "9.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+ruff_python_ast = { git = "https://github.com/astral-sh/ruff.git", rev = "ce5f7b6127a5d684e96fd0f8e387f73c41c7a1b0" }  # 0.15.0
+ruff_python_parser = { git = "https://github.com/astral-sh/ruff.git", rev = "ce5f7b6127a5d684e96fd0f8e387f73c41c7a1b0" }  # 0.15.0
+ruff_text_size = { git = "https://github.com/astral-sh/ruff.git", rev = "ce5f7b6127a5d684e96fd0f8e387f73c41c7a1b0" }  # 0.15.0
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+# pedantic
+missing_errors_doc = "allow"
+
+# restriction
+clone_on_ref_ptr = "warn"
+dbg_macro = "warn"
+expect_used = "warn"
+get_unwrap = "warn"
+let_underscore_must_use = "warn"
+map_err_ignore = "warn"
+mem_forget = "warn"
+mod_module_files = "warn"
+multiple_unsafe_ops_per_block = "warn"
+panic_in_result_fn = "warn"
+todo = "warn"
+undocumented_unsafe_blocks = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+unused_result_ok = "warn"
+unwrap_in_result = "warn"
+unwrap_used = "warn"
+wildcard_enum_match_arm = "warn"
+
+[profile.bench]
+debug = 2
+
+[profile.dev]
+debug = "line-tables-only"
+
+# Browser builds: `cargo build -p djls-wasm --target wasm32-unknown-unknown --profile wasm-release`.
+# Measured against `release`, "z" was smaller and no slower. Running wasm-opt afterwards
+# shrinks the raw module but grows it after gzip/brotli, so it is left out.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev.package]
+insta.opt-level = 3
+
+[profile.test]
+debug = "line-tables-only"

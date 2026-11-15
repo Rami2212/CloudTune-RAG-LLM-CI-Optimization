@@ -1,0 +1,147 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 4 optimizations:
+# - [HIGH] Add cargo dependency cache to "compatibility" job
+# - [HIGH] Add cargo dependency cache to "test" job
+# - [MEDIUM] Add concurrency group to "ci.yml"
+# - [LOW] Explicitly set fail-fast for large matrix job "compatibility" (42 combinations)
+# Estimated savings: ~20 min/run
+#
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  compatibility:
+    name: "Compat ${{ matrix.os }}/${{ matrix.toolchain }}/${{ matrix.fdb_feature_version }}"
+
+    strategy:
+      matrix:
+        os: ["ubuntu-latest", "macos-15", "macos-15-intel"]
+        toolchain: ["1.85.1", "stable"]
+        fdb_feature_version: ["fdb-7_4", "fdb-7_3", "fdb-7_1", "fdb-7_0", "fdb-6_3", "fdb-6_2", "fdb-6_1"]
+
+    runs-on: ${{ matrix.os }}
+
+    env:
+      CARGO_INCREMENTAL: 0
+      RUST_BACKTRACE: 1
+      # Select the matrix toolchain instead of the rust-toolchain.toml MSRV pin.
+      RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.0
+
+      - name: Setup FoundationDB
+        uses: foundationdb-rs/foundationdb-actions-install@v2.3.0
+        with:
+          version: "7.4.3"
+
+      - name: Check FDB library location
+        run: |
+          echo "=== Searching for libfdb_c ==="
+          find /usr -name "libfdb*" 2>/dev/null || true
+          find /opt -name "libfdb*" 2>/dev/null || true
+          ls -la /usr/local/lib/ 2>/dev/null | grep fdb || echo "No fdb in /usr/local/lib"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+
+      - name: Build
+        run: cargo build --verbose -p foundationdb --no-default-features --features ${{ matrix.fdb_feature_version }}
+
+      - name: Test
+        # Examples needs to have uuid enabled
+        run: cargo test --verbose -p foundationdb --no-default-features --features ${{ matrix.fdb_feature_version }},uuid
+
+
+  test:
+    name: "Test foundationDB with ${{ matrix.toolchain }}"
+    strategy:
+      matrix:
+        toolchain: ["1.85.1", "stable", "beta", "nightly"]
+
+    runs-on: "ubuntu-latest"
+
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.0
+
+      - name: Install FoundationDB
+        uses: foundationdb-rs/foundationdb-actions-install@v2.3.0
+        with:
+          version: "7.4.3"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "${{ matrix.toolchain }}"
+          components: rustfmt, clippy
+
+      - name: Run all tests of foundationdb
+        run: cargo test -p foundationdb --features num-bigint,embedded-fdb-include,fdb-7_4
+      - name: Run all tests of foundationdb with trace feature enabled
+        run: cargo test -p foundationdb --features num-bigint,embedded-fdb-include,fdb-7_4,trace
+      - name: Run all tests of foundationdb-tuple
+        run: cargo test -p foundationdb-tuple --all-features
+      - name: Run all tests of foundationdb-macros
+        run: cargo test -p foundationdb-macros
+      - name: Run all tests of foundationdb-simulation-tracing
+        run: cargo test -p foundationdb-simulation-tracing --no-default-features --features embedded-fdb-include,fdb-7_4
+
+  lint:
+    name: Rustfmt / Clippy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.0
+
+      - name: Install FoundationDB
+        uses: foundationdb-rs/foundationdb-actions-install@v2.3.0
+        with:
+          version: "7.4.3"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Fmt
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy-all
+
+  audit:
+    name: Cargo audit
+    runs-on: ubuntu-latest
+    # rustsec/audit-check builds cargo-audit, which needs a current rustc; the
+    # checked-in rust-toolchain.toml would otherwise force it onto the MSRV.
+    env:
+      RUSTUP_TOOLCHAIN: stable
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.0
+
+      - name: Install FoundationDB
+        uses: foundationdb-rs/foundationdb-actions-install@v2.3.0
+        with:
+          version: "7.1.37"
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,207 @@
+name: Build and Push Image
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # 手动重跑入口：tag 事件偶发不触发（删建同名 tag 会被事件系统合并）时，
+  # 用 gh workflow run "Build and Push Image" --ref <tag> 补跑
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Nodejs
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: pnpm/action-setup@v3
+        name: Install pnpm
+        id: pnpm-install
+        with:
+          version: 11.25.0
+          run_install: false
+
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        shell: bash
+        run: |
+          echo "STORE_PATH=$(pnpm store path)" >> $GITHUB_OUTPUT
+
+      - uses: actions/cache@v4
+        name: Setup pnpm cache
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Run Unit Tests
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm test:run
+
+      - name: Run Static Gates (tag release)
+        # tag 事件不经过 lint-code.yml（它只监听 main/dev）；发布镜像前必须把
+        # 只依赖本仓的门禁再跑一遍，避免用未过 lint/类型/红线的提交产出镜像。
+        # 跨仓门禁（contract / menu-* / docs-components / version）在 lint-code.yml 里跑，
+        # 发布 tag 签发前应已在 main 验证。
+        run: |
+          pnpm lint:eslint:check
+          pnpm lint:prettier:check
+          pnpm typecheck
+          node scripts/check-file-length.mjs
+          node scripts/check-function-length.mjs
+          pnpm check:template-root
+          pnpm check:tables
+          pnpm check:overlays
+          pnpm check:as-unknown
+          pnpm check:i18n
+          pnpm check:api-routes
+          pnpm check:contract-usage
+          pnpm check:ledger-ids
+
+  security-scan:
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Nodejs
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: pnpm/action-setup@v3
+        name: Install pnpm
+        with:
+          version: 11.25.0
+          run_install: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # 依赖高危门禁：官方源存量已于 2026-09-07 清零（59→0），正式从告警切为阻断。
+      # 该步骤发现 high/critical 即非零退出，阻断后续 build-and-push。
+      # 显式指定官方源：镜像源（如 npmmirror）不实现 security/advisories 端点，
+      # 会让 audit 以 ERR_PNPM_AUDIT_ENDPOINT_NOT_EXISTS 报错退出（假红）
+      # --ignore GHSA-vfj7-8cjw-p6xm（braces stack-exhaustion）：上游无修复版本
+      # （3.0.3 即 latest，advisory 覆盖 <=3.0.3 且 patched=None），且仅经
+      # fast-glob>micromatch>braces 进入构建期 devDependencies（stylelint /
+      # unplugin 链路），调用方传字面 glob pattern，不存在「深度嵌套 pattern」利用前提，
+      # 亦不进生产 bundle。上游发布修复后删除本豁免与 pnpm-workspace 注释。
+      - name: Dependency audit (blocking)
+        run: pnpm audit --audit-level high --registry=https://registry.npmjs.org --ignore GHSA-vfj7-8cjw-p6xm
+
+      - name: Generate SBOM (CycloneDX)
+        # mkdir -p：cyclonedx 不创建输出父目录，缺 sbom/ 时写文件直接 FileNotFound
+        run: |
+          mkdir -p sbom
+          pnpm sbom --sbom-format cyclonedx --out sbom/sbom-client.cdx.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-client
+          path: sbom/sbom-client.cdx.json
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image for scan (single arch)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          build-args: VERSION=${{ github.ref_name }}
+          tags: xadmin-client:scan
+
+      # 高危/严重漏洞阻断发布
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: xadmin-client:scan
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+
+  build-and-push:
+    needs: [test, security-scan]
+    runs-on: ubuntu-latest
+    # id-token / attestations 供镜像构建溯源签发；contents 供上传 Release 附件
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract repository name
+        id: repo
+        run: echo "REPO=$(basename ${{ github.repository }})" >> $GITHUB_ENV
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: nineaiyu/${{ env.REPO }}
+          tags: |
+            type=semver,pattern={{version}}
+
+      - name: Build and push multi-arch image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          build-args: VERSION=${{ steps.meta.outputs.version }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          file: Dockerfile
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # 关闭镜像内的构建溯源附件（OCI 1.1 artifact，config 为
+          # application/vnd.oci.empty.v1+json）：下游镜像源（阿里云仓）不支持该 manifest
+          # class，带上它会导致该版本镜像无法从 Docker Hub 同步过去。构建溯源仍由下方
+          # attest-build-provenance 步骤在 GitHub 侧签发（与镜像内附件无关）。
+          provenance: false
+
+      # 多架构推送时 digest 即镜像索引（manifest list）摘要，作为构建溯源主体
+      - name: Attest image build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: nineaiyu/xadmin-client
+          subject-digest: ${{ steps.push.outputs.digest }}
+
+      - name: Download SBOM artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom-client
+          path: sbom
+
+      - name: Upload SBOM to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: sbom/sbom-client.cdx.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

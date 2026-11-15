@@ -1,0 +1,177 @@
+# Run tests and upload to Codecov with GitHub Actions
+#
+# NOTE: Pin actions to a specific commit to avoid having the authentication
+# token stolen if the Action is compromised. See the comments and links here:
+# https://github.com/pypa/gh-action-pypi-publish/issues/27
+#
+name: test
+
+# Only build PRs, the main branch, and releases. Pushes to branches will only
+# be built when a PR is opened. This avoids duplicated buids in PRs comming
+# from branches in the origin repository (1 for PR and 1 for push).
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  release:
+    types:
+      - published
+
+# Use bash by default in all jobs
+defaults:
+  run:
+    # The -l {0} is necessary for conda environments to be activated
+    # But this breaks on MacOS if using actions/setup-python:
+    # https://github.com/actions/setup-python/issues/132
+    shell: bash -l {0}
+
+jobs:
+  #############################################################################
+  # Run tests
+  test:
+    name: ${{ matrix.os }} python=${{ matrix.python }} dependencies=${{ matrix.dependencies }}
+    runs-on: ${{ matrix.os }}-latest
+    strategy:
+      # Otherwise, the workflow would stop if a single job fails. We want to
+      # run all of them to catch failures in different combinations.
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu
+          - macos
+          - windows
+        dependencies:
+          - oldest
+          - latest
+        include:
+          - dependencies: oldest
+            python: "3.10"
+          - dependencies: latest
+            python: "3.13"
+    env:
+      REQUIREMENTS: env/requirements-build.txt env/requirements-test.txt
+      # Used to tag codecov submissions
+      OS: ${{ matrix.os }}
+      PYTHON: ${{ matrix.python }}
+      DEPENDENCIES: ${{ matrix.dependencies }}
+
+    steps:
+
+      # Checks-out your repository under $GITHUB_WORKSPACE
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # Need to fetch more than the last commit so that setuptools-scm can
+          # create the correct version string. If the number of commits since
+          # the last release is greater than this, the version still be wrong.
+          # Increase if necessary.
+          fetch-depth: 100
+          # The GitHub token is preserved by default but this job doesn't need
+          # to be able to push to GitHub.
+          persist-credentials: false
+
+      # Need the tags so that setuptools-scm can form a valid version number
+      - name: Fetch git tags
+        run: git fetch origin 'refs/tags/*:refs/tags/*'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON }}
+
+      - name: Collect requirements
+        run: |
+          echo "Install Dependente to capture dependencies:"
+          python -m pip install dependente==0.3.0
+          echo ""
+          echo "Capturing run-time dependencies:"
+          if [[ "${{ matrix.dependencies }}" == "oldest" ]]; then
+            dependente --source install --oldest > requirements-full.txt
+          else
+            dependente --source install > requirements-full.txt
+          fi
+          echo "Capturing dependencies from:"
+          for requirement in $REQUIREMENTS
+          do
+            echo "  $requirement"
+            cat $requirement >> requirements-full.txt
+          done
+          echo ""
+          echo "Collected dependencies:"
+          cat requirements-full.txt
+
+      - name: Get the pip cache folder
+        id: pip-cache
+        run: echo "dir=$(pip cache dir)" >> $GITHUB_OUTPUT
+
+      - name: Setup caching for pip packages
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.pip-cache.outputs.dir }}
+          key: pip-${{ runner.os }}-${{ env.PYTHON }}-${{ hashFiles('env/requirements-full.txt') }}
+
+      - name: Install requirements
+        run: python -m pip install -r requirements-full.txt
+
+      - name: List installed packages
+        run: python -m pip freeze
+
+      - name: Install the package in editable mode
+        run: python -m pip install --no-deps --editable .
+
+      - name: Run the tests
+        run: make test
+
+      - name: Convert coverage report to XML for codecov
+        run: coverage xml
+
+      - name: Upload coverage report as an artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage_${{ matrix.os }}_${{ matrix.dependencies }}
+          path: ./coverage.xml
+
+
+  #############################################################################
+  # Upload coverage report to codecov
+  codecov-upload:
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # Need to fetch more than the last commit so that setuptools-scm can
+          # create the correct version string. If the number of commits since
+          # the last release is greater than this, the version still be wrong.
+          # Increase if necessary.
+          fetch-depth: 100
+          # The GitHub token is preserved by default but this job doesn't need
+          # to be able to push to GitHub.
+          persist-credentials: false
+
+      - name: Download coverage report artifacts
+        # Download coverage reports from every runner.
+        # Maximum coverage is achieved by combining reports from every runner.
+        # Each coverage file will live in its own folder with the same name as
+        # the artifact.
+        uses: actions/download-artifact@v8
+        with:
+          pattern: coverage_*
+
+      - name: List all downloaded artifacts
+        run: ls -l -R .
+
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5
+        with:
+          # Upload all coverage report files
+          files: ./coverage_*/coverage.xml
+          # Fail the job so we know coverage isn't being updated. Otherwise it
+          # can silently drop and we won't know.
+          fail_ci_if_error: true
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

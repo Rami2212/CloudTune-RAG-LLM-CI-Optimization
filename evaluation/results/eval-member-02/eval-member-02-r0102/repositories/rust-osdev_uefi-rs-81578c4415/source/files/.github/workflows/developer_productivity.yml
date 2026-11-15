@@ -1,0 +1,47 @@
+name: Developer Productivity
+on:
+  merge_group:
+  push:
+  pull_request:
+jobs:
+  # Job to run change detection for Nix-related files
+  changes:
+    runs-on: ubuntu-latest
+    # Set job outputs to values from filter step.
+    outputs:
+      nix-src: ${{ steps.filter.outputs.nix-src }}
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            nix-src:
+              - 'nix/**'
+              - 'flake.nix'
+              - 'flake.lock'
+  # This is a convenience test to verify that the toolchain provided by
+  # shell.nix is valid and can build + run the integration test.
+  #
+  # It only runs if the "nix-src" output of the "changes" job is true.
+  nix_shell_toolchain:
+    name: "Nix shell toolchain: `cargo xtask run` works"
+    needs: changes
+    if: ${{ needs.changes.outputs.nix-src == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - uses: cachix/install-nix-action@v31
+      # Dedicated step to separate all the
+      # "copying path '/nix/store/...' from 'https://cache.nixos.org'."
+      # messages from the actual build output.
+      - name: Prepare Nix Store
+        run: nix develop --command bash -c "cargo --version"
+      - name: Run VM tests
+        run: |
+          COMMAND="cargo xtask run --target x86_64 --headless --ci --tpm=v1"
+          echo "Executing in Nix shell: $COMMAND"
+          nix develop --command bash -c "$COMMAND"

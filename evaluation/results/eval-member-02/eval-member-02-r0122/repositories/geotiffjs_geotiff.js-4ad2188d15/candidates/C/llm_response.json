@@ -1,0 +1,54 @@
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "logprobs": null,
+      "message": {
+        "content": "{\n  \"decision\": \"APPLY\",\n  \"workflow_yaml\": \"name: Node.js CI\\n\\non:\\n  push:\\n    branches: [ master ]\\n  pull_request:\\n    branches: [ master ]\\n\\njobs:\\n  ci:\\n    runs-on: ubuntu-latest\\n    timeout-minutes: 5\\n    steps:\\n    - uses: actions/checkout@v4\\n    - run: |\\n        docker pull ghcr.io/osgeo/gdal:ubuntu-small-latest ;\\n        docker run -i --rm -v `pwd`/test/data:/data ghcr.io/osgeo/gdal:ubuntu-small-latest bash -c \\\"apt-get update && apt-get -y install imagemagick libtiff-tools wget && cd /data && ./setup_data.sh\\\"\\n    - name: Use Node.js ${{ matrix.node-version }}\\n      uses: actions/setup-node@v6\\n      with:\\n        node-version: 24\\n        cache: 'npm'\\n    - run: npm ci --ignore-scripts\\n    - run: npm rebuild\\n    - run: npm run build\\n    - run: npm test\\n    - name: action-slack\\n      uses: 8398a7/action-slack@v3.8.0\\n      with:\\n        status: ${{ job.status }}\\n        fields: repo,message,commit,author,action,eventName,ref,workflow,job,took\\n      env:\\n        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}\\n      if: ${{ github.event_name != 'pull_request'}}\\n\",\n  \"rationale\": \"Add a custom job timeout of 5 minutes based on pattern P-LIT-CUSTOM-TIMEOUT. Historical CI runs for this repository complete in ~1.5-2 minutes (5 recent successful runs all under 2 minutes). A 5-minute timeout provides ~2.5x headroom over observed maximum while preventing runaway consumption from hung steps. The experimental evidence (experiment:batch-interactive-three--fb8b16eb65a11508) demonstrates 26.8% elapsed time savings with this pattern, and the literature reports 12.9% (free) / 8.1% (paid) VM time reduction. This change preserves all build/test coverage and adds no new permissions or network access.\",\n  \"evidence_ids\": [\"experiment:batch-interactive-three--fb8b16eb65a11508\", \"pattern:P-LIT-CUSTOM-TIMEOUT\"]\n}",
+        "reasoning": "Let me analyze the workflow and evidence to determine if there's a suitable CI optimization.\n\nThe workflow is a Node.js CI workflow that:\n1. Checks out code\n2. Pulls a Docker image and runs a setup script for test data\n3. Sets up Node.js 24 with npm cache\n4. Runs npm ci --ignore-scripts\n5. Runs npm rebuild\n6. Runs npm run build\n7. Runs npm test\n8. Sends Slack notification on non-PR events\n\nLooking at the evidence, I see several patterns:\n- P-LIT-CUSTOM-TIMEOUT: Adding timeout-minutes to jobs (experimental evidence shows 26.8% elapsed savings)\n- P-LIT-GHA-CACHE: Cache dependency downloads (literature reports modest benefit)\n- P-LIT-FAIL-FAST: Cancel remaining matrix jobs after failure (but this workflow doesn't use a matrix)\n- P-LIT-CANCEL-STALE: Cancel superseded runs\n- P-LIT-DISTRIBUTED-CACHE: Share cached build dependencies (experimental evidence for Python pip cache)\n\nThe workflow currently:\n- Uses `actions/setup-node@v6` with `cache: 'npm'` - this already caches npm dependencies\n- Has no timeout set on the job\n- Runs on push and PR to master branch\n- Single job (no matrix)\n\nThe most applicable optimization appears to be adding a custom timeout (P-LIT-CUSTOM-TIMEOUT) since:\n1. The workflow has no timeout currently\n2. The experimental evidence shows measurable savings (26.8% elapsed time reduction)\n3. The pattern is well-supported with evidence IDs: experiment:batch-interactive-three--fb8b16eb65a11508\n4. The workflow runs on ubuntu-latest and has a predictable runtime (based on history: ~1.5-2 minutes based on the CI history showing runs completing in ~1-2 minutes)\n\nLooking at the CI history:\n- Run 34750574882: created 09:55:57, updated 09:57:40 → ~1 min 43 sec\n- Run 34750484550: created 09:53:45, updated 09:55:11 → ~1 min 26 sec\n- Run 34750416396: created 09:52:09, updated 09:53:42 → ~1 min 33 sec\n- Run 26463766220: created 17:18:42, updated 17:20:09 → ~1 min 27 sec\n- Run 23754337631: created 15:59:31, updated 16:01:12 → ~1 min 41 sec\n\nAll runs complete in ~1.5-2 minutes. A 5-minute timeout (as used in the experimental evidence) would provide good headroom while preventing runaway jobs.\n\nThe evidence for P-LIT-CUSTOM-TIMEOUT shows:\n- Pattern ID: P-LIT-CUSTOM-TIMEOUT\n- Evidence IDs: experiment:batch-interactive-three--fb8b16eb65a11508\n- The example adds `timeout-minutes: 5` to the job\n- Reported vm_time_reduction_percent: free 12.9%, paid 8.1%\n- Experimental evidence shows 26.8% elapsed savings\n\nThis seems like a safe, well-supported optimization that preserves all build and test coverage.\n\nLet me also check if there are any contraindications. The pattern says contraindications include \"Valid slow runs exceed the proposed limit\". Given the historical runs are all under 2 minutes, a 5-minute timeout provides 2.5x headroom, which seems reasonable.\n\nI'll propose adding `timeout-minutes: 5` to the job.",
+        "reasoning_details": [
+          {
+            "format": "unknown",
+            "index": 0,
+            "text": "Let me analyze the workflow and evidence to determine if there's a suitable CI optimization.\n\nThe workflow is a Node.js CI workflow that:\n1. Checks out code\n2. Pulls a Docker image and runs a setup script for test data\n3. Sets up Node.js 24 with npm cache\n4. Runs npm ci --ignore-scripts\n5. Runs npm rebuild\n6. Runs npm run build\n7. Runs npm test\n8. Sends Slack notification on non-PR events\n\nLooking at the evidence, I see several patterns:\n- P-LIT-CUSTOM-TIMEOUT: Adding timeout-minutes to jobs (experimental evidence shows 26.8% elapsed savings)\n- P-LIT-GHA-CACHE: Cache dependency downloads (literature reports modest benefit)\n- P-LIT-FAIL-FAST: Cancel remaining matrix jobs after failure (but this workflow doesn't use a matrix)\n- P-LIT-CANCEL-STALE: Cancel superseded runs\n- P-LIT-DISTRIBUTED-CACHE: Share cached build dependencies (experimental evidence for Python pip cache)\n\nThe workflow currently:\n- Uses `actions/setup-node@v6` with `cache: 'npm'` - this already caches npm dependencies\n- Has no timeout set on the job\n- Runs on push and PR to master branch\n- Single job (no matrix)\n\nThe most applicable optimization appears to be adding a custom timeout (P-LIT-CUSTOM-TIMEOUT) since:\n1. The workflow has no timeout currently\n2. The experimental evidence shows measurable savings (26.8% elapsed time reduction)\n3. The pattern is well-supported with evidence IDs: experiment:batch-interactive-three--fb8b16eb65a11508\n4. The workflow runs on ubuntu-latest and has a predictable runtime (based on history: ~1.5-2 minutes based on the CI history showing runs completing in ~1-2 minutes)\n\nLooking at the CI history:\n- Run 34750574882: created 09:55:57, updated 09:57:40 → ~1 min 43 sec\n- Run 34750484550: created 09:53:45, updated 09:55:11 → ~1 min 26 sec\n- Run 34750416396: created 09:52:09, updated 09:53:42 → ~1 min 33 sec\n- Run 26463766220: created 17:18:42, updated 17:20:09 → ~1 min 27 sec\n- Run 23754337631: created 15:59:31, updated 16:01:12 → ~1 min 41 sec\n\nAll runs complete in ~1.5-2 minutes. A 5-minute timeout (as used in the experimental evidence) would provide good headroom while preventing runaway jobs.\n\nThe evidence for P-LIT-CUSTOM-TIMEOUT shows:\n- Pattern ID: P-LIT-CUSTOM-TIMEOUT\n- Evidence IDs: experiment:batch-interactive-three--fb8b16eb65a11508\n- The example adds `timeout-minutes: 5` to the job\n- Reported vm_time_reduction_percent: free 12.9%, paid 8.1%\n- Experimental evidence shows 26.8% elapsed savings\n\nThis seems like a safe, well-supported optimization that preserves all build and test coverage.\n\nLet me also check if there are any contraindications. The pattern says contraindications include \"Valid slow runs exceed the proposed limit\". Given the historical runs are all under 2 minutes, a 5-minute timeout provides 2.5x headroom, which seems reasonable.\n\nI'll propose adding `timeout-minutes: 5` to the job.",
+            "type": "reasoning.text"
+          }
+        ],
+        "refusal": null,
+        "role": "assistant"
+      },
+      "native_finish_reason": "stop"
+    }
+  ],
+  "created": 1794210500,
+  "id": "gen-1794210500-gPf32h3g6LmXjffFWWOL",
+  "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+  "object": "chat.completion",
+  "provider": "Nvidia",
+  "service_tier": null,
+  "system_fingerprint": null,
+  "usage": {
+    "completion_tokens": 1427,
+    "completion_tokens_details": {
+      "audio_tokens": 0,
+      "image_tokens": 0,
+      "reasoning_tokens": 868
+    },
+    "cost": 0,
+    "cost_details": {
+      "upstream_inference_completions_cost": 0,
+      "upstream_inference_cost": 0,
+      "upstream_inference_prompt_cost": 0
+    },
+    "is_byok": false,
+    "prompt_tokens": 27018,
+    "prompt_tokens_details": {
+      "audio_tokens": 0,
+      "cache_write_tokens": 0,
+      "cached_tokens": 0,
+      "video_tokens": 0
+    },
+    "total_tokens": 28445
+  }
+}

@@ -1,0 +1,139 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [MEDIUM] Add concurrency group to "exhaustive.yml"
+# - [LOW] Explicitly set fail-fast for large matrix job "test" (5 combinations)
+# Estimated savings: ~4 min/run
+#
+name: exhaustive
+
+env:
+  RUST_BACKTRACE: 1
+  RUSTFLAGS: --cfg async_compression_unstable
+  RUSTDOCFLAGS: --cfg async_compression_unstable
+
+jobs:
+  test:
+    name: cargo test
+    strategy:
+      matrix:
+        platform:
+        - { toolchain: stable, target: i686-pc-windows-msvc, os: windows-latest }
+        - { toolchain: stable, target: i686-unknown-linux-gnu, os: ubuntu-latest }
+        - { toolchain: stable, target: x86_64-apple-darwin, os: macos-latest }
+        - { toolchain: stable, target: x86_64-pc-windows-msvc, os: windows-latest }
+        - { toolchain: stable, target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
+    runs-on: ${{ matrix.platform.os }}
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      with:
+        toolchain: ${{ matrix.platform.toolchain }}
+        target: ${{ matrix.platform.target }}
+    - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+      with: { tool: cargo-nextest }
+    - run: cargo --locked nextest run --workspace --all-features
+    - run: cargo --locked test --workspace --doc --all-features
+
+  min-versions-shallow:
+    name: cargo test --shallow-minimal-versions
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      with: { toolchain: nightly }
+    - name: Update to shallow minimal versions
+      run:
+        cargo update $(
+          cargo metadata --all-features --format-version 1
+            | jq -r '
+              . as $root
+              | .resolve.nodes[]
+              | select(.id == $root.resolve.root)
+              | .deps[].pkg
+              | . as $dep
+              | $root.packages[]
+              | select(.id == $dep)
+              | "-p", "\(.name):\(.version)"
+            '
+        ) -Z minimal-versions
+    - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      with: { toolchain: stable }
+    - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+      with: { tool: cargo-nextest }
+    - run: cargo --locked nextest run --workspace --all-features
+    - run: cargo --locked test --workspace --doc --all-features
+
+  min-versions:
+    name: cargo test minimal-versions
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      with: { toolchain: nightly }
+    - name: Update to minimal versions
+      run:
+        cargo update -Z minimal-versions
+    - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      with: { toolchain: stable }
+    - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+      with: { tool: cargo-nextest }
+    - run: cargo --locked nextest run --workspace --all-features
+    - run: cargo --locked test --workspace --doc --all-features
+
+  check-features:
+    strategy:
+      matrix:
+        async_runtime: [tokio, futures-io]
+    name: check-features ${{ matrix.async_runtime }}
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -Dwarnings
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+    - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+      with:
+        tool: cargo-hack,just
+    - run: just check-features ${{ matrix.async_runtime }}
+
+  check-test-features:
+    strategy:
+      matrix:
+        async_runtime: [tokio, futures-io]
+    name: check-test-features ${{ matrix.async_runtime }}
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -Dwarnings
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+    - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+      with:
+        tool: cargo-hack,just
+    - run: just check-test-features ${{ matrix.async_runtime }}
+
+  # Dummy job to have a stable name for the "all tests pass" requirement
+  tests-pass:
+    name: Exhaustive tests pass
+    needs:
+      - test
+      - min-versions-shallow
+      - min-versions
+      - check-features
+      - check-test-features
+    if: always() # always run even if dependencies fail
+    runs-on: ubuntu-latest
+    steps:
+      # fail if ANY dependency has failed or cancelled
+      - if: "contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')"
+        run: exit 1
+      - run: exit 0
+
+on:
+  push:
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]

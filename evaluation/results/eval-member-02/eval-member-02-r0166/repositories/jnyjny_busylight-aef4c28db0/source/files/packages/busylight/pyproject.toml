@@ -1,0 +1,233 @@
+[project]
+name = "busylight-for-humans"
+version = "1.0.3"
+description = "Control USB connected LED lights, like a human."
+readme = "README.md"
+license = "Apache-2.0"
+authors = [
+    { name = "JnyJny", email = "erik.oshaughnessy@gmail.com" }
+]
+repository = "https://github.com/JnyJny/busylight.git"
+requires-python = ">=3.11,<4.0"
+dependencies = [
+    "busylight-core>=2.5.0",
+    "hidapi>=0.14.0.post4",
+    "loguru>=0.7.3",
+    "pyserial>=3.5",
+    "typer>=0.28.0",
+    "webcolors>=24.11.1",
+]
+classifiers = [
+  "License :: OSI Approved :: Apache Software License",
+  "Development Status :: 4 - Beta",
+  "Operating System :: OS Independent",
+  "Intended Audience :: Developers",
+  "Intended Audience :: End Users/Desktop",
+  "Environment :: Console",
+  "Topic :: System :: Hardware",
+  "Topic :: Utilities",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",  
+]
+
+[project.scripts]
+busylight = "busylight.__main__:cli"
+busyserve = "busylight.busyserve:busyserve_cli"
+
+[project.optional-dependencies]
+webapi = [
+    "fastapi>=0.162.1",
+    "uvicorn>=0.54.0",
+]
+web = [
+    "fastapi>=0.162.1",
+]
+docs = [
+    "mkdocs>=1.6.1",
+    "mkdocs-material>=9.8.1",
+    "mkdocs-git-revision-date-localized-plugin>=1.6.2",
+]
+
+[build-system]
+requires = ["uv_build"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "busylight"
+
+[tool.uv.sources]
+busylight-core = { workspace = true }
+
+[tool.deptry]
+known_first_party = ["busylight", "busylight_core"]
+package_module_name_map = {pyserial = "serial", hidapi = "hid", "busylight-core" = "busylight_core"}
+per_rule_ignores = {DEP002 = ["hidapi", "pyserial", "mkdocs", "mkdocs-material", "mkdocs-git-revision-date-localized-plugin"], DEP003 = ["pydantic"]}
+
+[tool.ruff]
+extend = "../../ruff.toml"
+fix = false
+line-length = 90
+
+[tool.ruff.lint]
+ignore = [
+  # comparison-to-singleton (E711, E712) -- legacy code style
+  "E711",
+  "E712",
+  # type-comparison (E721) -- legacy code style
+  "E721",
+  # line-too-long (E501) -- handled by formatter
+  "E501",
+  # unsorted-imports (I001) -- defer to a dedicated cleanup pass
+  "I001",
+  # unused-variable (F841) -- some are intentional side-effect calls
+  "F841",
+  # print-found (T201) -- CLI package, stdout output is the point
+  "T201",
+]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's DI pattern calls Depends()/Query()/Path() in argument defaults
+# by design -- this isn't the mutable-default-arg bug B008 looks for.
+# Same story for typer.Option()/typer.Argument() in CLI signatures.
+extend-immutable-calls = [
+  "fastapi.Depends", "fastapi.Query", "fastapi.Path",
+  "typer.Option", "typer.Argument",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+  # implicit-namespace-package (INP001) -- intentionally no __init__.py
+  "INP001",
+  # use-of-assert (S101) -- assert is the point in test code
+  "S101",
+  # import-outside-top-level (PLC0415) -- deferred imports inside test
+  # functions (e.g. after mocking sys.modules) are a normal pytest pattern
+  "PLC0415",
+  # private-member-access (SLF001) -- tests legitimately reach into
+  # private state to arrange a scenario
+  "SLF001",
+  # undocumented-public-{class,method,function} (D101/D102/D103) and
+  # undocumented-public-init (D107) -- test names are the documentation
+  "D101", "D102", "D103", "D107",
+  "F841",
+]
+"tests/test_busyserve.py" = [
+  # hardcoded-bind-all-interfaces (S104) -- asserting the documented
+  # default value in a mock, not an actual bind
+  "S104",
+]
+"src/busylight/busyserve.py" = [
+  # hardcoded-bind-all-interfaces (S104) -- deliberate, documented,
+  # user-overridable via --host
+  "S104",
+]
+"src/busylight/api/config.py" = [
+  # any-type (ANN401) -- pydantic `mode="before"` validators receive the
+  # raw pre-validation value, which is genuinely Any by design
+  "ANN401",
+]
+"src/busylight/api/logging_config.py" = [
+  # private-member-access (SLF001) -- sys._getframe() is loguru's own
+  # documented recipe for redirecting stdlib logging through it
+  "SLF001",
+]
+"src/busylight/api/dependencies.py" = [
+  # global-statement (PLW0603) -- standard module-level singleton pattern
+  # for a FastAPI DI provider, with an explicit release_* teardown
+  "PLW0603",
+]
+
+
+[dependency-groups]
+dev = [
+    "anyio>=4.15.1",
+    "coverage>=7.17.2",
+    "httpx>=0.28.1",
+]
+
+
+[tool.poe.tasks]
+
+# Code Quality
+
+_generate_coverage = "pytest --cov=./src/busylight --cov-report=html"
+_open_report = "open htmlcov/index.html"
+coverage.sequence = ["_generate_coverage", "_open_report"]
+coverage.help = "[Code Quality] Open generated coverage report in a browser."
+
+ruff-check.cmd = "ruff check src tests"
+ruff-check.help = "[Code Quality] Run ruff check on source."
+
+ruff-format.cmd = "ruff format src tests"
+ruff-format.help = "[Code Quality] Run ruff format on source."
+
+ruff.sequence = ["ruff-check", "ruff-format"]
+ruff.help = "[Code Quality] Run Ruff check and format on source."
+
+check.sequence = ["ruff"]
+check.help = "[Code Quality] Run all code quality tools on source."
+
+test.cmd = "pytest tests/"
+test.help = "[Code Quality] Run unit tests."
+
+qc.sequence = ["test", "check"]
+qc.help = "[Code Quality] Run all code quality tasks."
+
+# Publish tasks
+
+_preflight.shell = """
+if [ "$(git branch --show-current)" != "main" ]; then
+  echo "ERROR: publish must run from main branch" >&2
+  exit 1
+fi
+if [ -n "$(git status --porcelain)" ]; then
+  echo "ERROR: working tree is dirty" >&2
+  exit 1
+fi
+git fetch --quiet origin main
+if [ -n "$(git rev-list HEAD..origin/main)" ]; then
+  echo "ERROR: main is behind origin/main, run git pull first" >&2
+  exit 1
+fi
+"""
+_preflight.help = "Verify on an up-to-date main branch with clean working tree."
+
+_patch_bump = "uv version --bump patch"
+_minor_bump = "uv version --bump minor"
+_major_bump = "uv version --bump major"
+
+_add = "git add pyproject.toml ../../uv.lock"
+_commit = {shell = "git commit -m busylight-cli/v`uv version --short`"}
+_tag = {shell = "git tag busylight-cli/v`uv version --short`"}
+_push = "git push origin main"
+_push_tag = {shell = "git push origin busylight-cli/v`uv version --short`"}
+
+_update_pyproject = ["_add", "_commit", "_tag", "_push", "_push_tag"]
+
+publish_patch = ["_preflight", "_patch_bump", "_update_pyproject"]
+publish_minor = ["_preflight", "_minor_bump", "_update_pyproject"]
+publish_major = ["_preflight", "_major_bump", "_update_pyproject"]
+
+publish = {ref = "publish_patch"}
+
+# Release
+
+changelog.cmd = "git cliff --include-path 'packages/busylight/**'"
+changelog.help = "[Release] Generate full changelog to stdout."
+
+release-notes.cmd = "git cliff --include-path 'packages/busylight/**' --latest --strip header"
+release-notes.help = "[Release] Generate release notes for the latest tag."
+
+# Clean
+
+clean.cmd = "rm -rf htmlcov dist busylight.egg-info *.log"
+clean.help = "[Clean] Remove testing, build and code quality artifacts."
+
+# Misc
+
+tree.cmd = "tree . -a -I .venv -I .git -I .ruff_cache"
+tree.help = "List project files in tree format."
+

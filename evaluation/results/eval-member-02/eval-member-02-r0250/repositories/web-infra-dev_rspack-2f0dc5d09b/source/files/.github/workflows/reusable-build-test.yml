@@ -1,0 +1,238 @@
+name: Run Test
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        required: true
+        type: string
+      runner: # Runner labels
+        required: true
+        type: string
+      ref: # Git reference to checkout
+        required: false
+        type: string
+
+jobs:
+  watcher-rename-windows:
+    name: Native watcher rename regression (Windows)
+    if: inputs.target == 'x86_64-pc-windows-msvc'
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    env:
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: true
+      PUPPETEER_SKIP_DOWNLOAD: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref }}
+          clean: ${{ runner.environment == 'github-hosted' }}
+
+      - name: Download bindings
+        uses: ./.github/actions/artifact/download
+        with:
+          name: bindings-${{ inputs.target }}
+          path: crates/node_binding/
+
+      - name: Setup Pnpm
+        timeout-minutes: 5
+        uses: ./.github/actions/pnpm/setup
+        with:
+          node-version: 22
+
+      - name: Pnpm Install
+        run: pnpm i
+
+      - name: Build JavaScript packages
+        run: pnpm run build:js
+
+      - name: Verify rename aggregation and replacement
+        run: pnpm --dir tests/rspack-test run test Compiler.test.mjs -t "native-watcher-rename"
+
+  e2e:
+    name: E2E Testing
+    if: inputs.target == 'x86_64-unknown-linux-gnu' || inputs.target == 'wasm32-wasip1-threads'
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref }}
+          clean: ${{ runner.environment == 'github-hosted' }}
+
+      - name: Download bindings
+        uses: ./.github/actions/artifact/download
+        with:
+          name: bindings-${{ inputs.target }}
+          path: crates/node_binding/
+
+      # The @rspack/browser e2e needs rspack.browser.wasm. The wasi (node)
+      # artifact only ships rspack.wasm32-wasi.wasm, so reuse it under the
+      # browser name — the e2e runs against the wasi build, same as CI. The real
+      # browser variant is built and published by the separate -browser build
+      # job; it is intentionally not e2e-tested here.
+      - name: Provide browser wasm for e2e
+        if: ${{ inputs.target == 'wasm32-wasip1-threads' }}
+        run: cp -f crates/node_binding/rspack.wasm32-wasi.wasm crates/node_binding/rspack.browser.wasm
+
+      - name: Setup Pnpm
+        timeout-minutes: 5
+        uses: ./.github/actions/pnpm/setup
+        with:
+          node-version: 22
+
+      - name: Pnpm Install
+        run: pnpm i
+
+      - name: Calculate Node.js and pnpm Bin Paths
+        id: calculate-bin-paths
+        run: |
+          echo "node=$(dirname "$(command -v node)")" >> "$GITHUB_OUTPUT"
+          echo "pnpm=$(dirname "$(command -v pnpm)")" >> "$GITHUB_OUTPUT"
+
+      - name: Run e2e
+        uses: ./.github/actions/docker/run
+        if: inputs.target == 'x86_64-unknown-linux-gnu'
+        with:
+          # Jammy uses ubuntu 22.04
+          # If this is to change, make sure to upgrade the ubuntu version in GitHub Actions
+          image: mcr.microsoft.com/playwright:v1.65.0-jammy
+          # .cache is required by download artifact, and mount in ./.github/actions/docker/run
+          # The tool cache contains both Node.js and pnpm.
+          options: -v ${{ runner.tool_cache }}:${{runner.tool_cache}}
+          script: |
+            export PATH="${{ steps.calculate-bin-paths.outputs.node }}:${{ steps.calculate-bin-paths.outputs.pnpm }}:$PATH"
+            pnpm run build:js
+            pnpm run test:e2e
+
+      - name: Run e2e for @rspack/browser
+        uses: ./.github/actions/docker/run
+        if: inputs.target == 'wasm32-wasip1-threads'
+        with:
+          # Jammy uses ubuntu 22.04
+          # If this is to change, make sure to upgrade the ubuntu version in GitHub Actions
+          image: mcr.microsoft.com/playwright:v1.65.0-jammy
+          # .cache is required by download artifact, and mount in ./.github/actions/docker/run
+          # The tool cache contains both Node.js and pnpm.
+          options: -v ${{ runner.tool_cache }}:${{runner.tool_cache}}
+          script: |
+            export PATH="${{ steps.calculate-bin-paths.outputs.node }}:${{ steps.calculate-bin-paths.outputs.pnpm }}:$PATH"
+            export WASM=1
+            pnpm run build:js
+            pnpm run test:e2e-browser
+  test:
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false # wait for all test to finish for determining if it's node version based problem or general problem
+      matrix:
+        node: ${{ fromJSON(
+          inputs.target == 'wasm32-wasip1-threads'&& '[24]'
+          || inputs.target == 'riscv64gc-unknown-linux-gnu' && '[22]'
+          || inputs.target == 'powerpc64le-unknown-linux-gnu' && '[22]'
+          || inputs.target == 's390x-unknown-linux-gnu' && '[22]'
+          || contains(inputs.target, 'linux') && '[22, 24]'
+          || '[22]') }}
+    name: Test Node ${{ matrix.node }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: true
+      PUPPETEER_SKIP_DOWNLOAD: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref }}
+          clean: ${{ runner.environment == 'github-hosted' }}
+
+      - name: Disable CPU hogs (Windows)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        uses: ./.github/actions/windows-disable-cpu-hogs
+
+      - name: Download bindings
+        uses: ./.github/actions/artifact/download
+        with:
+          name: bindings-${{ inputs.target }}
+          path: crates/node_binding/
+
+      - name: Show restored binding
+        run: ls -lah crates/node_binding/
+
+      - name: Setup Pnpm
+        timeout-minutes: 5
+        uses: ./.github/actions/pnpm/setup
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Pnpm Install
+        run: pnpm i
+
+      ### x86_64-unknown-linux-gnu
+      - name: Test x86_64-unknown-linux-gnu
+        timeout-minutes: 15 # Tests should finish within 15 mins, please fix your tests instead of changing this to a higher timeout.
+        if: ${{ inputs.target == 'x86_64-unknown-linux-gnu' }}
+        run: pnpm run test:ci
+
+      - name: Upload linux test cache
+        if: ${{ inputs.target == 'x86_64-unknown-linux-gnu' && matrix.node == '24' }}
+        uses: ./.github/actions/artifact/upload
+        with:
+          name: testCase-persistentCache-linux
+          path: tests/rspack-test/js/temp/**/.cache
+          include-hidden-files: true
+
+      ### *-apple-darwin
+      - name: Test apple-darwin
+        timeout-minutes: 20 # Tests should finish within 15 mins, please fix your tests instead of changing this to a higher timeout.
+        if: ${{ contains(inputs.target, 'apple-darwin') }}
+        run: |
+          # arch is ARM and target is ARM
+          if [[ '${{ runner.arch }}' == ARM* && '${{ inputs.target }}' == 'aarch64-apple-darwin' ]]; then
+            pnpm run test:ci
+          fi
+          # arch is x64 and target is x64
+          if [[ '${{ runner.arch }}' != ARM* && '${{ inputs.target }}' != 'aarch64-apple-darwin' ]]; then
+            pnpm run test:ci
+          fi
+
+      ### x86_64-pc-windows-msvc
+      - name: Test x86_64-pc-windows-msvc
+        timeout-minutes: 10
+        if: ${{ inputs.target == 'x86_64-pc-windows-msvc' }}
+        run: pnpm run test:ci
+
+      - name: Upload windows test cache
+        if: ${{ inputs.target == 'x86_64-pc-windows-msvc' && matrix.node == '22' }}
+        uses: ./.github/actions/artifact/upload
+        with:
+          name: testCase-persistentCache-windows
+          path: tests/rspack-test/js/temp/**/.cache
+          include-hidden-files: true
+
+      ### WASM
+      - name: Test WASM
+        timeout-minutes: 15 # Tests should finish within 15 mins, please fix your tests instead of changing this to a higher timeout.
+        if: ${{ inputs.target == 'wasm32-wasip1-threads' }}
+        env:
+          NODE_NO_WARNINGS: 1
+          WASM: 1
+          RSPACK_LOADER_WORKER_THREADS: 1
+        run: pnpm run test:ci
+
+      - name: Upload Test Reporter
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rstest-event-reports-${{ inputs.target }}-node${{ matrix.node }}
+          path: '*-report.txt'
+          if-no-files-found: ignore

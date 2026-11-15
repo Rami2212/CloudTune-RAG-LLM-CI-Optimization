@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    tags:
+      - '*'
+    branches:
+      - '*'
+    paths-ignore:
+    - LICENSE
+    - README.md
+    - 'configs**'
+    - '**.sln'
+    - '**.vcxproj**'
+  pull_request:
+    paths-ignore:
+    - LICENSE
+    - README.md
+    - 'configs**'
+    - '**.sln'
+    - '**.vcxproj**'
+
+jobs:
+  build:
+    name: ${{ matrix.name }} Build
+    runs-on: ${{ matrix.os }}
+    env:
+        HL2SDKCS2: ${{ github.workspace }}/CS2Fixes/sdk
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows
+          - os: ubuntu-latest
+            name: SteamRT3
+            container: ghcr.io/source2ze/build-containers:steamrt3
+          - os: ubuntu-latest
+            name: SteamRT4
+            container: ghcr.io/source2ze/build-containers:steamrt4
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          path: CS2Fixes
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Checkout Metamod
+        uses: actions/checkout@v7
+        with:
+          repository: alliedmodders/metamod-source
+          ref: master
+          path: mmsource-2.0
+          submodules: recursive
+
+      - name: Checkout AMBuild
+        if: matrix.os == 'windows-latest'
+        uses: actions/checkout@v7
+        with:
+          repository: alliedmodders/ambuild
+          path: ambuild
+
+      - name: Install AMBuild
+        if: matrix.os == 'windows-latest'
+        run: pip install setuptools && cd ambuild && python setup.py install && cd ..
+
+      - name: Build
+        working-directory: CS2Fixes
+        shell: bash
+        run: |
+          mkdir build && cd build
+          python ../configure.py --enable-optimize --sdks cs2
+          ambuild
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.name }}
+          path: CS2Fixes/build/package/cs2
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+
+      - name: Package
+        run: |
+          version=`echo $GITHUB_REF | sed "s/refs\/tags\///"`
+          ls -Rall
+          if [ -d "./SteamRT3/" ]; then
+            cd ./SteamRT3/
+            tar -czf ../${{ github.event.repository.name }}-${version}-steamrt3.tar.gz *
+            cd -
+          fi
+          if [ -d "./SteamRT4/" ]; then
+            cd ./SteamRT4/
+            tar -czf ../${{ github.event.repository.name }}-${version}-steamrt4.tar.gz *
+            cd -
+          fi
+          if [ -d "./Windows/" ]; then
+            cd ./Windows/
+            zip -r ../${{ github.event.repository.name }}-${version}-windows.zip *
+            cd -
+          fi
+
+      - name: Release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: ${{ github.event.repository.name }}-*
+          tag: ${{ github.ref }}
+          file_glob: true

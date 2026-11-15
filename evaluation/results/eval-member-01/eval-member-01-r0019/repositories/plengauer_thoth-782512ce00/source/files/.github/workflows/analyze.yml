@@ -1,0 +1,94 @@
+name: "Analyze"
+on:
+  push:
+    branches:
+      - "main"
+      - "release/v*"
+  pull_request:
+    branches:
+      - "main"
+      - "release/v*"
+  schedule:
+    - cron: '0 0 * * *'
+env:
+  OTEL_KILL_SWITCH: ${{ vars.OTEL_KILL_SWITCH }}
+jobs:
+  security:
+    runs-on: ${{ (matrix.language == 'swift' && 'macos-latest') || 'ubuntu-latest' }}
+    permissions:
+      security-events: write
+      packages: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: c-cpp
+            build-mode: none
+          - language: javascript-typescript
+            build-mode: none
+          - language: python
+            build-mode: none
+          - language: java
+            build-mode: none
+          - language: actions
+            build-mode: none
+    env:
+      CODEQL_EXTRACTOR_CPP_BUILD_MODE_NONE: 'true' # scanning c/c++ without building it is an experimental feature and needs to be enabled like this until released
+    steps:
+      - uses: plengauer/opentelemetry-github/actions/instrument/job@5d34a21816f798c24f19857225b018a7f2af731f # v5.66.0
+        with:
+          secrets_to_redact: '["${{ github.token }}"]'
+        env:
+          OTEL_EXPORTER_OTLP_ENDPOINT: '${{ secrets.OTEL_EXPORTER_OTLP_ENDPOINT }}'
+          OTEL_EXPORTER_OTLP_HEADERS: '${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}'
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          category: "/language:${{matrix.language}}"
+  quality:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: write
+      pull-requests: write
+      issues: write
+      actions: read
+      security-events: write
+    steps:
+      - uses: plengauer/opentelemetry-github/actions/instrument/job@5d34a21816f798c24f19857225b018a7f2af731f # v5.66.0
+        env:
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.OTEL_EXPORTER_OTLP_ENDPOINT }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+        with:
+          secrets_to_redact: ${{ github.token }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: oxsecurity/megalinter@f2fe8c1cba37091848df3e524066c8c23ef353ed # v10.2.0
+        continue-on-error: true
+        env:
+          MEGALINTER_CONFIG: .github/mega-linter.yml
+          GITHUB_TOKEN: ${{ github.token }}
+          VALIDATE_ALL_CODEBASE: ${{ github.event_name != 'pull_request' }}
+          GITHUB_STATUS_REPORTER: true
+          GITHUB_COMMENT_REPORTER: true
+          SARIF_REPORTER: true
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: megalinter-reports
+          path: megalinter-reports/
+          if-no-files-found: ignore
+      - if: github.ref_name == 'main' && hashFiles('megalinter-reports/megalinter-report.sarif') != ''
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: megalinter-reports/megalinter-report.sarif
+          category: megalinter

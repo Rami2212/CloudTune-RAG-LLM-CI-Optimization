@@ -1,0 +1,92 @@
+name: build-image
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  image-name:
+    name: Image Name
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/fedora
+    outputs:
+      image-name: ${{ steps.image-name.outputs.image-name }}
+    steps:
+      - name: lowercase github.repository
+        id: image-name
+        run: |
+          echo "image-name=${GITHUB_REPOSITORY@L}" >> ${GITHUB_OUTPUT}
+  image-build:
+    name: Build image
+    runs-on: ubuntu-latest
+    needs: image-name
+    strategy:
+      fail-fast: false
+      matrix:
+        base-os:
+          - fedora
+          - debian
+          - distroless
+    container:
+      image: quay.io/buildah/stable:latest
+      options: --security-opt seccomp=/usr/share/containers/seccomp.json --privileged
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Buildah Login
+        id: buildah-login
+        run: >
+          echo "${{ secrets.GITHUB_TOKEN }}" | buildah login --username "${{ github.actor }}" --password-stdin ghcr.io/${{ needs.image-name.outputs.image-name }}
+
+      - name: Manifest Create
+        id: manifest-create
+        run: >
+          buildah manifest create ${{ needs.image-name.outputs.image-name }}
+
+      - name: Manifest Annotate
+        id: manifest-annotate
+        run: >
+          buildah manifest annotate
+          --index
+          --annotation org.opencontainers.image.revision="${{ github.sha }}"
+          ${{ needs.image-name.outputs.image-name }}
+
+      - name: Buildah Bud Debug
+        id: buildah-bud-debug
+        if: ${{ matrix.base-os == 'distroless' }}
+        run: >
+          buildah bud
+          --jobs=4
+          --platform=linux/amd64
+          --target=debug
+          --layers
+          --cache-from=ghcr.io/${{ needs.image-name.outputs.image-name }}/cache
+          --cache-to=ghcr.io/${{ needs.image-name.outputs.image-name }}/cache
+          -f ./${{ matrix.base-os }}.Containerfile
+          .
+      - name: Buildah Bud
+        id: buildah-bud
+        run: >
+          buildah bud
+          --jobs=4
+          --platform=linux/amd64
+          --manifest ${{ needs.image-name.outputs.image-name }}
+          --layers
+          --cache-from=ghcr.io/${{ needs.image-name.outputs.image-name }}/cache
+          --cache-to=ghcr.io/${{ needs.image-name.outputs.image-name }}/cache
+          -f ./${{ matrix.base-os }}.Containerfile
+          .
+
+      - name: Push To ghcr.io with SHA
+        id: push-to-ghcr-sha
+        run: >
+          buildah manifest push --all ${{ needs.image-name.outputs.image-name }}
+          docker://ghcr.io/${{ needs.image-name.outputs.image-name }}:${{ matrix.base-os }}-${{ github.sha }}
+      - name: Push To ghcr.io with latest
+        id: push-to-ghcr-latest
+        run:
+          buildah manifest push --all ${{ needs.image-name.outputs.image-name }}
+          docker://ghcr.io/${{ needs.image-name.outputs.image-name }}:${{ matrix.base-os }}-latest

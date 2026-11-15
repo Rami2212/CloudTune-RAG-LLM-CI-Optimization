@@ -1,0 +1,106 @@
+# SPDX-FileCopyrightText: © Sebastian Thomschke and contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-ArtifactOfProjectHomePage: https://github.com/Second-Hand-Friends/kleinanzeigen-bot
+#
+# https://docs.github.com/en/code-security/code-scanning/creating-an-advanced-setup-for-code-scanning/customizing-your-advanced-setup-for-code-scanning
+name: "CodeQL"
+
+on:  # https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows
+  schedule:
+    # https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule
+    - cron: '10 10 * * 1'  # Mondays 10:10 UTC
+  push:
+    branches: ['main', 'release']  # run only on protected branches to avoid duplicate PR runs
+    tags-ignore: ['**'] # don't build tags
+    paths-ignore:
+    - '**/*.md'
+    - '.act*'
+    - '.editorconfig'
+    - '.git*'
+    - 'codecov.yml'
+  pull_request:
+    paths-ignore:
+    - '**/*.md'
+    - '.act*'
+    - '.editorconfig'
+    - '.git*'
+    - 'codecov.yml'
+  workflow_dispatch:
+    # https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_dispatch
+
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHON_VERSION: "3.15"
+
+jobs:
+
+  ###########################################################
+  analyze:
+  ###########################################################
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      # required for all workflows
+      security-events: write
+
+      # required to fetch internal or private CodeQL packs
+      packages: read
+
+      # only required for workflows in private repositories
+      actions: read
+      contents: read
+
+    steps:
+    - name: "Show: GitHub event"
+      # Read from disk to avoid Linux's per-environment-variable size limit.
+      run: python -m json.tool "$GITHUB_EVENT_PATH"
+
+
+    - name: "Show: environment variables"
+      run: env | sort
+
+
+    - name: Git Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6.0.0
+      # https://github.com/actions/checkout
+
+
+    - name: "Install: Python and PDM"  # https://github.com/pdm-project/setup-pdm
+      uses: pdm-project/setup-pdm@544d7237314ee09c256785bd360f6b30add38b37 # v4.6
+      with:
+        python-version: "${{ env.PYTHON_VERSION }}"
+        allow-python-prereleases: true
+        cache: true
+
+
+    - name: "Install: Python dependencies"
+      run: |
+        set -eux
+
+        python --version
+        python -m pip install --upgrade pip
+        pip install --upgrade pdm
+        if [[ ! -e .venv ]]; then
+          pdm venv create || true
+        fi
+        pdm sync --clean -v
+
+
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+      # https://github.com/github/codeql-action/blob/main/init/action.yml
+      with:
+        languages: actions,python
+        # https://github.com/github/codeql-action#build-modes
+        build-mode: none
+        # https://docs.github.com/en/code-security/code-scanning/creating-an-advanced-setup-for-code-scanning/customizing-your-advanced-setup-for-code-scanning#using-queries-in-ql-packs
+        queries: security-and-quality
+
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+      # https://github.com/github/codeql-action

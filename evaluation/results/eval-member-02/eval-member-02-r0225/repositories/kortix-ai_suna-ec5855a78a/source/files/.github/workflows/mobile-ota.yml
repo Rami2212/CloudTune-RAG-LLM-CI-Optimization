@@ -1,0 +1,110 @@
+name: Mobile OTA
+
+# Ships the mobile app's JS/TS as an EAS Update. Native changes still need a
+# store build; apps/mobile/scripts/ota-publish.mjs skips a platform whose native
+# fingerprint differs from the newest build on the channel and says so.
+#
+#   Deploy Prod succeeded  -> channel `production` (store builds), so the JS
+#                             ships with the API it was released with
+#   workflow_dispatch      -> the chosen channel: `dev` ships the dev branch to
+#                             dev-backend builds; `production` ships the `prod`
+#                             branch, never unreleased dev code
+#
+# No push trigger here. The separate mobile-testflight.yml builds mobile dev
+# changes for TestFlight with the production API; it publishes no OTA.
+#
+# Rollback and the full runbook: apps/mobile/BUILD_GUIDE.md.
+
+on:
+  # workflow_run loads THIS file from dev, then checks out the deployed commit.
+  workflow_run:
+    workflows: [Deploy Prod]
+    types: [completed]
+    branches: [prod]
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Update channel
+        type: choice
+        required: true
+        default: dev
+        options: [dev, production]
+      dry_run:
+        description: Check every guard, publish nothing
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write # aws-env reads EXPO_TOKEN from AWS Secrets Manager
+
+jobs:
+  publish:
+    name: Publish ${{ github.event_name == 'workflow_run' && 'production' || inputs.channel || 'dev' }}
+    # Only a green Deploy Prod of `prod` in this repository, started by a push
+    # or a person, starts a release. A pull request can run its own copy of a
+    # workflow named "Deploy Prod"; that run must never reach the credentials.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       contains(fromJSON('["push", "workflow_dispatch"]'), github.event.workflow_run.event) &&
+       github.event.workflow_run.head_branch == 'prod' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ${{ vars.CI_RUNNER_M || 'ubuntu-24.04' }}
+    timeout-minutes: 30
+    # One publish per channel at a time, never cancelled: a cancelled run can
+    # leave one platform published and the other not.
+    concurrency:
+      group: mobile-ota-${{ github.event_name == 'workflow_run' && 'production' || inputs.channel || 'dev' }}
+      cancel-in-progress: false
+    env:
+      CHANNEL: ${{ github.event_name == 'workflow_run' && 'production' || inputs.channel || 'dev' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # A manual production run ships `prod`, the released code, not the branch
+          # the button ran from: store builds call the production API.
+          ref: ${{ github.event.workflow_run.head_sha || (inputs.channel == 'production' && 'prod') || github.sha }}
+          # The script diffs against the commit of the channel's last update.
+          fetch-depth: 0
+
+      # Before any credential is read: the commit must be part of `prod`.
+      - name: Require a commit of prod
+        if: env.CHANNEL == 'production'
+        run: |
+          git merge-base --is-ancestor HEAD origin/prod || {
+            echo "::error::$(git rev-parse HEAD) is not a commit of origin/prod; refusing to publish it."
+            exit 1
+          }
+
+      - name: Check out the aws-env action
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .aws-env
+          sparse-checkout: .github/actions
+          persist-credentials: false
+      - name: Read credentials from AWS Secrets Manager
+        uses: ./.aws-env/.github/actions/aws-env
+        with:
+          # An Expo robot access token for the `kortix` account.
+          keys: |
+            EXPO_TOKEN
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: |
+          corepack enable pnpm
+          pnpm install --frozen-lockfile
+          # The root .npmrc sets ignore-scripts=true, so the install skipped
+          # apps/mobile's postinstall. Without this the bundle ships unpatched.
+          pnpm --dir apps/mobile exec patch-package --error-on-fail
+          npm install --global eas-cli@20.3.0
+        env:
+          npm_config_engine_strict: "false"
+
+      - name: Publish
+        run: node apps/mobile/scripts/ota-publish.mjs "$CHANNEL" ${{ inputs.dry_run && '--dry-run' || '' }}

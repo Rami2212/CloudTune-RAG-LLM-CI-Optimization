@@ -1,0 +1,36 @@
+name: Run autotest
+
+on:
+  schedule:
+    - cron: '0 1,13 * * *'
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'src/**'
+      - 'build/**'
+      - 'test/**'
+      - 'configure.ac'
+  pull_request:
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test
+        run: |
+          sudo apt update && sudo apt install -y git wget
+          sudo apt install --no-install-recommends -y curl xz-utils \
+            autoconf automake libtool make gcc \
+            libseccomp-dev libcap-dev libc6-dev \
+            binutils qemu-user uidmap
+          git clone https://github.com/RuriOSS/qemu-user-static-x86_64
+          chmod 777 qemu-user-static-x86_64/*
+          sudo cp qemu-user-static-x86_64/* /usr/bin/
+
+          autoreconf -fi && ./configure
+          make test

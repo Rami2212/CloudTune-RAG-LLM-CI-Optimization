@@ -1,0 +1,204 @@
+plugins {
+	id 'java'
+	id 'jacoco'
+}
+
+apply plugin: 'org.springframework.boot'
+apply plugin: 'io.spring.dependency-management'
+
+java {
+	toolchain {
+		languageVersion = JavaLanguageVersion.of(21)
+	}
+}
+
+// Don't publish this module
+bootJar { enabled = false }
+jar { enabled = false }
+tasks.matching { it.name.startsWith('publish') }.configureEach {
+	enabled = false
+}
+
+repositories {
+	mavenLocal()
+	mavenCentral()
+}
+
+// Tell gradle to add the generated sources directory
+sourceSets {
+	test {
+		java {
+			srcDir file("${buildDir}/generated/sources/annotationProcessor/java/test")
+		}
+	}
+}
+
+dependencies {
+	implementation project(':redis-om-spring')
+	implementation project(':redis-om-spring-ai')
+
+	// Important for RedisOM annotation processing!
+	annotationProcessor project(':redis-om-spring')
+	testAnnotationProcessor project(':redis-om-spring')
+	testAnnotationProcessor "com.google.auto.service:auto-service:${autoServiceVersion}"
+
+	// Lombok
+	compileOnly 'org.projectlombok:lombok'
+	annotationProcessor 'org.projectlombok:lombok'
+	testCompileOnly 'org.projectlombok:lombok'
+	testAnnotationProcessor 'org.projectlombok:lombok'
+
+	// Spring
+	implementation 'org.springframework:spring-context-support'
+	implementation 'org.springframework.boot:spring-boot-starter-test'
+
+	// Spring AI
+	implementation "org.springframework.ai:spring-ai-openai:${springAiVersion}"
+	implementation "org.springframework.ai:spring-ai-ollama:${springAiVersion}"
+	implementation "org.springframework.ai:spring-ai-azure-openai:${springAiVersion}"
+	implementation "org.springframework.ai:spring-ai-vertex-ai-embedding:${springAiVersion}"
+	implementation "org.springframework.ai:spring-ai-bedrock:${springAiVersion}"
+	implementation "org.springframework.ai:spring-ai-transformers:${springAiVersion}"
+	implementation "org.springframework.ai:spring-ai-mistral-ai:${springAiVersion}"
+	implementation "org.springframework.ai:spring-ai-minimax:${springAiVersion}"
+	implementation "org.springframework.ai:spring-ai-zhipuai:${springAiVersion}"
+
+	// WebSocket
+	implementation 'jakarta.websocket:jakarta.websocket-api:2.1.1'
+	implementation 'jakarta.websocket:jakarta.websocket-client-api:2.1.1'
+
+	// DJL
+	implementation "ai.djl.spring:djl-spring-boot-starter-autoconfigure:${djlStarterVersion}"
+	implementation "ai.djl.spring:djl-spring-boot-starter-pytorch-auto:${djlStarterVersion}"
+	implementation "ai.djl.huggingface:tokenizers:${djlVersion}"
+
+	// Test
+	testImplementation 'org.junit.jupiter:junit-jupiter'
+	testImplementation 'org.assertj:assertj-core'
+	testImplementation 'org.mockito:mockito-core'
+	testImplementation "com.redis:testcontainers-redis:${testcontainersRedisVersion}"
+	testImplementation "com.karuslabs:elementary:${elementaryVersion}"
+	testImplementation "org.testcontainers:junit-jupiter:1.20.4"
+	testImplementation 'org.springframework.boot:spring-boot-jackson2'
+
+	// Other
+	implementation 'com.fasterxml.jackson.core:jackson-databind'
+	compileOnly "javax.enterprise:cdi-api:${cdi}"
+}
+
+// Use -parameters flag for Spring
+tasks.withType(JavaCompile).configureEach {
+	options.compilerArgs << '-parameters'
+}
+
+// Configure annotation processing
+compileTestJava {
+	options.annotationProcessorPath = configurations.testAnnotationProcessor
+	options.generatedSourceOutputDirectory = file("${buildDir}/generated/sources/annotationProcessor/java/test")
+}
+
+// JaCoCo configuration
+jacoco {
+	toolVersion = "0.8.12"
+}
+
+jacocoTestReport {
+	dependsOn test
+	classDirectories.setFrom(files(
+			project(':redis-om-spring').sourceSets.main.output.classesDirs,
+			project(':redis-om-spring-ai').sourceSets.main.output.classesDirs
+			))
+	sourceDirectories.setFrom(files(
+			project(':redis-om-spring').sourceSets.main.allSource.srcDirs,
+			project(':redis-om-spring-ai').sourceSets.main.allSource.srcDirs
+			))
+	reports {
+		html.required = true
+		xml.required = true
+		csv.required = false
+	}
+}
+
+test.finalizedBy jacocoTestReport
+
+// Test-shard definitions — used by CI to run tests in parallel.
+// Each shard runs on its own runner with its own Testcontainers Redis instance,
+// so there are no shared-state conflicts.
+//
+// Usage:  ./gradlew :tests:test -PtestShard=document   (or hash | stream | other)
+// Omit -PtestShard to run the full suite (local dev / single-job CI).
+//
+// The 'other' shard is a catch-all: it includes everything under
+// com.redis.om.spring.** and excludes the patterns claimed by the named shards.
+// This means any new test package is automatically picked up without having to
+// add it here explicitly.
+ext.namedShards = [
+	document: [
+		'com.redis.om.spring.annotations.document.**',
+	],
+	hash: [
+		'com.redis.om.spring.annotations.hash.**',
+	],
+	stream: [
+		'com.redis.om.spring.search.stream.**',
+	],
+]
+
+def redisOmSpringModuleMetadataFile = project(':redis-om-spring').layout.buildDirectory.file('publications/mavenJava/module.json')
+
+test {
+	useJUnitPlatform()
+	maxHeapSize = "1g"
+	dependsOn ':redis-om-spring:generateMetadataFileForMavenJavaPublication'
+
+	systemProperty 'redisOmSpring.moduleMetadata', redisOmSpringModuleMetadataFile.get().asFile.absolutePath
+	systemProperty 'redisOmSpring.jedisVersion', jedisVersion
+
+	testLogging {
+		events "passed", "skipped", "failed"
+		exceptionFormat = 'full'
+	}
+
+	// Apply shard filter when -PtestShard=<name> is supplied.
+	if (project.hasProperty('testShard')) {
+		def shard = project.property('testShard') as String
+		def validShards = namedShards.keySet() + ['other']
+		if (!validShards.contains(shard)) {
+			throw new GradleException("Unknown testShard '${shard}'. Valid values: ${validShards.join(', ')}")
+		}
+		filter {
+			if (shard == 'other') {
+				// Catch-all: everything not claimed by a named shard.
+				// New test packages are automatically included here.
+				includeTestsMatching 'com.redis.om.spring.**'
+				namedShards.values().flatten().each { excludeTestsMatching it }
+			} else {
+				namedShards[shard].each { includeTestsMatching it }
+			}
+		}
+	}
+}
+
+tasks.register('publicationMetadataTest', Test) {
+	description = 'Verifies Redis OM Spring Gradle publication metadata.'
+	group = 'verification'
+
+	dependsOn ':redis-om-spring:generateMetadataFileForMavenJavaPublication'
+	testClassesDirs = sourceSets.test.output.classesDirs
+	classpath = sourceSets.test.runtimeClasspath
+	useJUnitPlatform()
+	shouldRunAfter test
+
+	systemProperty 'redisOmSpring.moduleMetadata',
+			redisOmSpringModuleMetadataFile.get().asFile.absolutePath
+	systemProperty 'redisOmSpring.jedisVersion', jedisVersion
+
+	filter {
+		includeTestsMatching 'com.redis.om.spring.client.RedisOmSpringPublicationMetadataTest'
+	}
+
+	testLogging {
+		events "passed", "skipped", "failed"
+		exceptionFormat = 'full'
+	}
+}

@@ -1,0 +1,55 @@
+name: Windows CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v2
+
+      - name: Install Scoop
+        run: |
+          iwr -useb get.scoop.sh -outfile 'install-scoop.ps1'
+          ./install-scoop.ps1 -RunAsAdmin
+          echo "~\scoop\shims" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "C:\ProgramData\scoop\shims" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install Stack
+        run: scoop install stack
+
+      - name: Install LLVM
+        run: |
+          scoop install llvm
+          echo "C:\Users\runneradmin\scoop\apps\llvm\current\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - uses: actions/cache@v4
+        name: Cache stack dependencies
+        with:
+          path: C:\Users\runneradmin\AppData\Local\Programs\stack
+          key: ${{ runner.os }}-stack-deps-${{ hashFiles('**/stack.yaml.lock', '**/stack.yaml', '**/*.cabal', '**/package.yaml') }}
+          restore-keys: ${{ runner.os }}-stack-deps-
+
+      - uses: actions/cache@v4
+        name: Cache stack build
+        with:
+          path: C:\Users\runneradmin\AppData\Roaming\stack
+          key: ${{ runner.os }}-stack-build-${{ hashFiles('**/stack.yaml.lock', '**/stack.yaml', '**/*.cabal', '**/package.yaml') }}
+          restore-keys: ${{ runner.os }}-stack-build-
+
+      - name: Build
+        run: stack build
+
+      - name: Run Compiler Tests
+        run: stack test
+
+      - name: Run Carp Tests
+        shell: bash
+        run: ./scripts/run_carp_tests.sh -j 4 --no_sdl

@@ -1,0 +1,43 @@
+name: Builds & Tests
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+          - os: ubuntu-24.04
+          - os: macos-latest
+            target: aarch64-apple-darwin
+
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Install dependencies
+      run: sudo apt update && sudo apt install libfontconfig1-dev libfreetype-dev
+      if: contains(matrix.os, 'ubuntu')
+
+    - name: Update Rust
+      run: rustup update stable
+
+    - name: Install ARM target (macOS)
+      run: rustup target add aarch64-apple-darwin
+      if: matrix.target == 'aarch64-apple-darwin'
+
+    - name: Build
+      run: cargo build --verbose ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+
+    - name: Run tests
+      run: cargo test --all --verbose ${{ matrix.target && format('--target {0}', matrix.target) || '' }}

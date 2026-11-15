@@ -1,0 +1,62 @@
+tasks.named('wrapper', Wrapper).configure {
+    distributionType = Wrapper.DistributionType.ALL
+}
+
+ext.registerJarFiles = { List<String> filePaths ->
+    tasks.withType(Jar).configureEach {
+        filePaths.each { path ->
+            from(rootProject.file(path))
+        }
+    }
+}
+
+if (!project.hasProperty("factions_version")) {
+    var tmpVersion = project.minecraft_version + "-" + project.factions_mod_version
+    if (project.hasProperty("factions_test_id")) {
+        tmpVersion += "-test." + project.property("factions_test_id")
+    }
+    allprojects {
+        ext.factions_version = tmpVersion
+    }
+}
+
+if (!project.hasProperty("vampirism_version")) {
+    var tmpVersion = project.minecraft_version + "-" + project.vampirism_mod_version
+    if (project.hasProperty("vampirism_test_id")) {
+        tmpVersion += "-test." + project.property("vampirism_test_id")
+    }
+    allprojects {
+        ext.vampirism_version = tmpVersion
+    }
+}
+
+if (vampirism_factions_source_dependency.toBoolean()) {
+    allprojects {
+        ext.vampirism_factions_version = factions_version
+    }
+    print vampirism_factions_version
+}
+
+subprojects {
+    apply plugin: 'eclipse'
+    apply plugin: 'maven-publish'
+    apply from: rootProject.file('gradle/idea.gradle')
+    apply from: rootProject.file('gradle/license.gradle')
+
+    afterEvaluate {
+        def mavenUrl = System.getenv("MAVEN_URL")
+        if (mavenUrl) {
+            publishing {
+                repositories {
+                    maven {
+                        url = mavenUrl
+                        credentials {
+                            username = System.getenv("MAVEN_USERNAME") ?: ""
+                            password = System.getenv("MAVEN_PASSWORD") ?: ""
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

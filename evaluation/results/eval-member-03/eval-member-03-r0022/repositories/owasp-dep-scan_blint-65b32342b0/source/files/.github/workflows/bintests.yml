@@ -1,0 +1,95 @@
+name: binary tests
+
+on:
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: false
+permissions: {}
+jobs:
+  build:
+    permissions:
+      contents: read
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ['3.12']
+      fail-fast: false
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Linux packages
+      run: |
+        sudo apt-get update
+        sudo apt-get install zlib1g-dev libzstd-dev llvm-18 llvm-18-dev
+      if: runner.os == 'Linux'
+    - name: Packages
+      run: |
+        brew install llvm@18
+        echo /opt/homebrew/opt/llvm@18/bin >> $GITHUB_PATH
+      if: runner.os == 'macOS'
+    - name: Set up Python
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: Display Python version
+      run: python -c "import sys; print(sys.version)"
+    - name: Install poetry
+      run: |
+        python3 -m pip install poetry
+    - name: Install all
+      run: |        
+        poetry install --all-groups --all-extras
+      if: runner.os == 'Linux'
+      env:
+        NYXSTONE_LLVM_PREFIX: /usr/lib/llvm-18
+    - name: Install all
+      run: |        
+        poetry install --all-groups --all-extras
+      if: runner.os == 'macOS'
+      env:
+        NYXSTONE_LLVM_PREFIX: /opt/homebrew/opt/llvm@18
+        LDFLAGS: "-L/opt/homebrew/lib"
+        CPPFLAGS: "-I/opt/homebrew/include"
+    - name: Install all
+      run: |        
+        poetry install --without=extended --all-extras
+      if: runner.os == 'Windows'
+    - name: Test binaries
+      run: |
+        mkdir -p bintests gobintests rusttests
+        cd bintests
+        curl -LO https://github.com/owasp-dep-scan/dosai/releases/download/v0.1.1/Dosai.exe
+        curl -LO https://github.com/owasp-dep-scan/dosai/releases/download/v0.1.1/Dosai
+        curl -LO https://github.com/owasp-dep-scan/dosai/releases/download/v0.1.1/Dosai-osx-arm64
+        cd ..
+        cd gobintests
+        curl -LO https://github.com/containerd/containerd/releases/download/v1.7.14/containerd-1.7.14-linux-amd64.tar.gz
+        curl -LO https://github.com/containerd/nerdctl/releases/download/v1.7.4/nerdctl-1.7.4-windows-amd64.tar.gz
+        tar -xvf containerd-1.7.14-linux-amd64.tar.gz
+        tar -xvf nerdctl-1.7.4-windows-amd64.tar.gz
+        rm containerd-1.7.14-linux-amd64.tar.gz
+        rm nerdctl-1.7.4-windows-amd64.tar.gz
+        cd ..
+        cd rusttests
+        curl -LO https://github.com/BurntSushi/ripgrep/releases/download/14.1.0/ripgrep-14.1.0-x86_64-unknown-linux-musl.tar.gz
+        curl -LO https://github.com/BurntSushi/ripgrep/releases/download/14.1.0/ripgrep-14.1.0-x86_64-apple-darwin.tar.gz
+        curl -LO https://github.com/BurntSushi/ripgrep/releases/download/14.1.0/ripgrep-14.1.0-x86_64-pc-windows-gnu.zip
+        tar -xvf ripgrep-14.1.0-x86_64-unknown-linux-musl.tar.gz
+        rm ripgrep-14.1.0-x86_64-unknown-linux-musl.tar.gz
+        tar -xvf ripgrep-14.1.0-x86_64-apple-darwin.tar.gz
+        rm ripgrep-14.1.0-x86_64-apple-darwin.tar.gz
+        unzip ripgrep-14.1.0-x86_64-pc-windows-gnu.zip
+        rm ripgrep-14.1.0-x86_64-pc-windows-gnu.zip
+        cd ..
+        poetry run blint sbom -i bintests -o reports/bom-bin.json --deep
+        poetry run blint sbom -i gobintests -o reports/bom-go.json --deep
+        poetry run blint sbom -i rusttests -o reports/bom-rust.json --deep
+      env:
+        SCAN_DEBUG_MODE: "debug"
+      shell: bash

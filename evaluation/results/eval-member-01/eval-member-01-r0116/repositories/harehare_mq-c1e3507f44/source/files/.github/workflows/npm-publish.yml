@@ -1,0 +1,85 @@
+name: Publish npm package
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  publish-web:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v2.0.0
+        with:
+          cache: false
+      - uses: extractions/setup-just@v4.0.0
+        with:
+          just-version: 1.58.0
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2.88.1
+        with:
+          tool: wasm-pack
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6.1.0
+        with:
+          package_json_file: packages/mq-web/package.json
+      - name: Setup Node.js
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version-file: .tool-versions
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+      - name: Install dependencies
+        working-directory: packages/mq-web
+        run: pnpm install --frozen-lockfile
+      - name: Build
+        run: just build-web
+      - name: Publish to npm
+        working-directory: packages/mq-web
+        run: pnpm publish --access public --no-git-checks
+
+  publish-nodejs:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v2.0.0
+        with:
+          cache: false
+      - uses: extractions/setup-just@v4.0.0
+        with:
+          just-version: 1.58.0
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2.88.1
+        with:
+          tool: wasm-pack
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6.1.0
+        with:
+          package_json_file: packages/mq-web/package.json
+      - name: Setup Node.js
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version-file: .tool-versions
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+      - name: Install dependencies
+        working-directory: packages/mq-nodejs
+        run: pnpm install --frozen-lockfile
+      - name: Build
+        run: just build-node
+      - name: Publish to npm
+        working-directory: packages/mq-nodejs
+        run: pnpm publish --access public --no-git-checks
+

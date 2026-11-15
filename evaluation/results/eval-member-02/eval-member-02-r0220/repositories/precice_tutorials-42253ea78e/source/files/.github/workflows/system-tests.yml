@@ -1,0 +1,135 @@
+name: System tests (called)
+on:
+  workflow_call:
+    inputs:
+      suites:
+        description: 'Test suites to execute (comma-separated)'
+        default: 'release'
+        type: string
+      build_args:
+        description: 'Build arguments'
+        type: string
+      system_tests_branch:
+        description: 'Branch to take the system tests from'
+        default: 'develop'
+        type: string
+      log_level:
+        description: 'Logging verbosity level used for the systemtests'
+        default: 'INFO'
+        type: string
+      upload_artifacts:
+          description: 'TRUE or FALSE (FALSE -> Upload only when the workflow fails)'
+          default: 'TRUE'
+          type: string
+      job_label:
+        description: 'Optional label for job and artifact names (e.g. tutorial name)'
+        default: ''
+        type: string
+jobs:
+  run_system_tests:
+    name: ${{ inputs.job_label != '' && format('System tests ({0})', inputs.job_label) || 'System tests' }}
+    runs-on: [self-hosted, linux, x64, precice-tests-vm]
+    steps:
+    - name: Display a quick job summary
+      run: |
+        echo "Initiated by: ${{ github.actor }}"
+        echo "Test suites: ${{ inputs.suites}}"
+        echo "System tests branch (tests/): ${{ inputs.system_tests_branch }}"
+        echo "System tests log level: ${{ inputs.log_level }}"
+        echo "Uploading the runs folder on success: ${{ inputs.upload_artifacts }}"
+        echo "Running the following command inside tutorials/tests/:"
+        echo "python3 systemtests.py --build_args=${{inputs.build_args}} --suites=${{ inputs.suites}}"
+        echo "All workflow inputs: ${{ toJSON(github.event.inputs) }}"
+    - name: Prepare the Markdown step summary
+      run: |
+        {
+          echo "Job inputs:"
+          echo "- Initiated by: @${{ github.actor }}"
+          echo "- Test suites: \`${{ inputs.suites}}\`"
+          echo "- System tests branch (\`tests/\`): [\`${{ inputs.system_tests_branch }}\`](https://github.com/precice/tutorials/tree/${{ inputs.system_tests_branch }})"
+          echo "- System tests log level: \`${{ inputs.log_level }}\`"
+          echo "- Uploading the runs folder on success: \`${{ inputs.upload_artifacts }}\`"
+          echo ""
+          echo "Running the following command inside \`tutorials/tests/\`:"
+          echo "\`\`\`"
+          echo "python3 systemtests.py --build_args=${{inputs.build_args}} --suites=${{ inputs.suites}}"
+          echo "\`\`\`"
+          echo "All workflow inputs:"
+          echo "\`\`\`"
+          echo "${{ toJSON(github.event.inputs) }}"
+          echo "\`\`\`"
+        } >> "$GITHUB_STEP_SUMMARY"
+    - name: Move LFS URL to local LFS server
+      run: |
+        /home/precice/runners_root/scripts/make_lfs_local.sh
+    - name: 'Cleanup the folder'
+      run: |
+        ls -la ./
+        rm -rf ./*
+        rm -rf ./.??*
+        ls -la ./
+    - name: Check out Tutorials for the system tests (tests/)
+      uses: actions/checkout@v7
+      with:
+        repository: precice/tutorials
+        ref: ${{ inputs.system_tests_branch }}
+        lfs: true
+        fetch-depth: 0
+    - name: Map remote branches to local ones
+      run: |
+        /home/precice/runners_root/scripts/map_origin_to_local.sh ./
+    - name: Install Python dependencies
+      run: |
+        pip install --user -r tests/requirements.txt
+    - name: Copy runner-specific files (mirrors, restricted)
+      run: |
+        cp -r /home/precice/thirdparty ./tests/
+        cp -r /home/precice/restricted ./tests/
+    - name: Run tests
+      run: |
+        cd tests
+        python systemtests.py --build_args=${{ inputs.build_args}} --suites=${{ inputs.suites}} --log_level=${{ inputs.log_level}}
+        cd ../../
+    - name: Archive system test logs
+      if: ${{ always() }}
+      id: archive-logs
+      uses: actions/upload-artifact@v7
+      with:
+        name: system_tests_run_${{ github.run_id }}_${{ github.run_attempt }}${{ inputs.job_label != '' && format('_{0}', inputs.job_label) || '' }}_logs
+        path: |
+          runs/*/system-tests-build.log
+          runs/*/system-tests-run.log
+          runs/*/system-tests-compare.log
+          runs/*/system-tests-compare-diff.log
+          runs/*/*/system-tests_*.log
+        if-no-files-found: warn
+    - name: Archive fieldcompare diff visualizations
+      if: ${{ always() }}
+      id: archive-diffs
+      uses: actions/upload-artifact@v7
+      with:
+        name: system_tests_run_${{ github.run_id }}_${{ github.run_attempt }}${{ inputs.job_label != '' && format('_{0}', inputs.job_label) || '' }}_diffs
+        path: |
+          runs/*/diff-results/visualizations/**/*.png
+        if-no-files-found: ignore
+    - name: Link diff visualizations in the job summary
+      if: ${{ always() && steps.archive-diffs.outputs.artifact-url != '' }}
+      run: |
+        {
+          echo ""
+          echo "## Diff visualizations"
+          echo ""
+          echo "When fieldcompare fails, PNG renders of the archived diff VTK fields are included in the [\`_diffs\` artifact](${{ steps.archive-diffs.outputs.artifact-url }})."
+          echo "Look under \`runs/*/diff-results/visualizations/\`."
+        } >> "$GITHUB_STEP_SUMMARY"
+    - name: Archive run files
+      if: ${{ failure() || inputs.upload_artifacts == 'TRUE' }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: system_tests_run_${{ github.run_id }}_${{ github.run_attempt }}${{ inputs.job_label != '' && format('_{0}', inputs.job_label) || '' }}_full
+        path: |
+          runs/*
+          !runs/tests/thirdparty
+          !runs/tests/restricted
+          !runs/alya-flap*/
+

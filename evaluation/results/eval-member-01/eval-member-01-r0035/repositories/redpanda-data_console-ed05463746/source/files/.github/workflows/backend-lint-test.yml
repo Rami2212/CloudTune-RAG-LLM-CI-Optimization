@@ -1,0 +1,41 @@
+---
+name: "Backend verify"
+on:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  lint:
+    name: Lint Backend
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: 'backend/go.mod'
+          cache-dependency-path: 'backend/go.sum'
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.10
+          working-directory: backend
+          args: --timeout=10m --config=.golangci.yaml
+
+  test:
+    name: Test Backend
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: 'backend/go.mod'
+          cache-dependency-path: 'backend/go.sum'
+      - name: Setup Docker Builder
+        uses: useblacksmith/setup-docker-builder@v1
+      - name: Install Task
+        uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Unit & Integration Tests
+        run: task backend:test-integration

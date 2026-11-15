@@ -1,0 +1,63 @@
+---
+name: ci
+
+"on":
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint-unit:
+    uses: sous-chefs/.github/.github/workflows/lint-unit.yml@9.0.0
+    permissions:
+      actions: write
+      checks: write
+      pull-requests: write
+      statuses: write
+      issues: write
+
+  integration:
+    needs: lint-unit
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os:
+          - "amazonlinux-2023"
+          - "fedora-latest"
+          - "opensuse-leap-15"
+          - "almalinux-9"
+          - "almalinux-10"
+          - "centos-stream-9"
+          - "centos-stream-10"
+          - "debian-12"
+          - "debian-13"
+          - "ubuntu-2204"
+          - "ubuntu-2404"
+        suite:
+          - "default"
+          - "gem"
+          - "global"
+          - "ruby-uninstall"
+          - "system-install"
+          - "user-install"
+          - "custom-group-install"
+      fail-fast: false
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+      - name: Install Chef
+        uses: actionshub/chef-install@6.0.0
+        with:
+          version: latest
+      - name: Dokken
+        uses: actionshub/test-kitchen@3.0.0
+        env:
+          CHEF_LICENSE: accept-no-persist
+          KITCHEN_LOCAL_YAML: kitchen.dokken.yml
+        with:
+          suite: ${{ matrix.suite }}
+          os: ${{ matrix.os }}

@@ -1,0 +1,70 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [MEDIUM] Add concurrency group to "tests.yml"
+# Estimated savings: ~2 min/run
+#
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  merge_group:
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  integration_tests:
+    # Will not run if the event is a PR to bump-meilisearch-v* (so a pre-release PR)
+    # Will still run for each push to bump-meilisearch-v*
+    if: github.event_name != 'pull_request' || !startsWith(github.base_ref, 'bump-meilisearch-v')
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby-version: ['3.1', '3.2', '3.3']
+    name: integration-tests (ruby ${{ matrix.ruby-version }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Ruby ${{ matrix.ruby-version }}
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby-version }}
+      - name: Install ruby dependencies
+        run: bundle install --with test
+      - name: Meilisearch (latest) setup with Docker
+        run: docker run -d -p 7700:7700 getmeili/meilisearch-enterprise:latest meilisearch --master-key=masterKey --no-analytics
+      - name: Run test suite
+        run: bundle exec rspec
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v6
+        if: matrix.ruby-version == '3.3'
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  linter_check:
+    name: linter-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: 3.0
+      - name: Install ruby dependencies
+        run: bundle install --with test
+      - name: Run linter
+        run: bundle exec rubocop lib/ spec/
+
+  yaml-lint:
+    name: Yaml linting check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Yaml lint check
+        uses: ibiqlik/action-yamllint@v3
+        with:
+          config_file: .yamllint.yml

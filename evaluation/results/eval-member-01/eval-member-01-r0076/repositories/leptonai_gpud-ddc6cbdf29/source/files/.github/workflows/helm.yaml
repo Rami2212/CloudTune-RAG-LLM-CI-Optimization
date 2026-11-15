@@ -1,0 +1,83 @@
+name: Helm chart release
+
+"on":
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+
+      - name: Publish chart
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          chart=deployments/helm/gpud
+          pages_dir="$RUNNER_TEMP/gh-pages"
+          name="$(awk '$1 == "name:" { print $2; exit }' "$chart/Chart.yaml")"
+          version="${GITHUB_REF_NAME#v}"
+          package="$pages_dir/$name-$version.tgz"
+
+          git fetch origin gh-pages:refs/remotes/origin/gh-pages
+          git worktree add --detach "$pages_dir" origin/gh-pages
+
+          if [[ ! -f "$package" || ! -f "$pages_dir/index.yaml" ]]; then
+            if [[ ! -f "$package" ]]; then
+              helm package "$chart" \
+                --version "$version" \
+                --app-version "$version" \
+                --destination "$pages_dir"
+            fi
+            helm repo index "$pages_dir" --url https://leptonai.github.io/gpud
+          fi
+
+          cd "$pages_dir"
+          git add index.yaml "$name-$version.tgz"
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "Publish $name-$version"
+          git push origin HEAD:gh-pages
+
+  ngc:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      NGC_CLI_API_KEY: ${{ secrets.NVAPI_KEY }}
+      NGC_CLI_ORG: nvstaging
+      NGC_CLI_TEAM: lepton
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install NGC CLI
+        run: |
+          curl -fsSL https://api.ngc.nvidia.com/v2/resources/nvidia/ngc-apps/ngc_cli/versions/4.34.7/files/ngccli_linux.zip -o "$RUNNER_TEMP/ngccli.zip"
+          unzip -q "$RUNNER_TEMP/ngccli.zip" -d "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/ngc-cli" >> "$GITHUB_PATH"
+
+      - name: Package and push chart to NGC
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          package_dir="$RUNNER_TEMP/chart"
+
+          mkdir -p "$package_dir"
+          helm package deployments/helm/gpud \
+            --version "$version" \
+            --app-version "$version" \
+            --destination "$package_dir"
+          ngc registry chart push "nvstaging/lepton/gpud:$version" --source "$package_dir"

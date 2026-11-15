@@ -1,0 +1,67 @@
+name: Build Windows Binaries
+
+# merge_group lets the merge queue re-run the required Blint-Build check on
+# the speculative merge commit.
+on:
+  push:
+    branches:
+      - main
+      - release/*
+    tags:
+      - 'v*'
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  Blint-Build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      with:
+        path: blint
+        persist-credentials: false
+    - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+      with:
+        cache: false
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      with:
+        python-version: '3.14'
+    - name: Install poetry
+      id: poetry
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install setuptools pyinstaller tzdata poetry
+        cd blint
+        poetry config virtualenvs.create false
+        poetry install --without=extended --no-cache
+    - name: Binary windows build
+      run: |
+        cd blint
+        pyinstaller blint/cli.py --noconfirm --log-level=WARN --nowindow --onefile --name blint --add-data="blint/data;blint/data" --add-data="blint/data/annotations;blint/data/annotations" --collect-submodules blint --collect-submodules multi-demangle --collect-submodules oras --disable-windowed-traceback -i blint.ico --version-file=file_version_info.txt --noupx
+        (Get-FileHash .\dist\blint.exe).hash | Out-File -FilePath .\dist\blint.exe.sha256
+        set PYTHONIOENCODING=UTF-8
+        .\dist\blint.exe -i .\dist\blint.exe -o reports --no-banner
+        # Frozen worker-pool and parse-cache smoke; see the linux workflow note.
+        $env:BLINT_CACHE_DIR = "$env:TEMP\blint-smoke-cache"
+        .\dist\blint.exe --no-banner -q --jobs 2 --cache -i .\dist\blint.exe -o reports-jobs
+      env:
+        PYTHONIOENCODING: utf-8
+        LANG: en_US.utf-8
+        PYTHONUTF8: 1
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      with:
+        path: blint/dist
+        name: blint-windows
+    - name: Release
+      uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3.0.3
+      if: startsWith(github.ref, 'refs/tags/')
+      with:
+        files: |
+          blint/dist/blint.exe
+          blint/dist/blint.exe.sha256

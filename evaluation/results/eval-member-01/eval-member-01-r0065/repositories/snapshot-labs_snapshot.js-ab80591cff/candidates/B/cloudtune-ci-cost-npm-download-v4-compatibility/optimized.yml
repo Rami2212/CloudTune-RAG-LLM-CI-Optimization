@@ -1,0 +1,41 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [HIGH] Add yarn dependency cache to "tests" job
+# - [MEDIUM] Add concurrency group to "test.yml"
+# Estimated savings: ~6 min/run
+#
+name: Tests CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: ['18', '20', '22']
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: yarn install, build and run tests
+        run: |
+          yarn install --frozen-lockfile
+          yarn build
+          yarn test:once --coverage
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}

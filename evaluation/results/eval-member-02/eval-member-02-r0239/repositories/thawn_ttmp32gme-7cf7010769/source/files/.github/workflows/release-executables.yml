@@ -1,0 +1,212 @@
+name: Build and Release Executables
+
+on:
+  release:
+    types: [published]
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'resources/**'
+      - 'ttmp32gme-*.spec'
+      - 'pyproject.toml'
+      - '.github/workflows/release-executables.yml'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g., v2.0.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows Executable
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Install dependencies
+        run: |
+          uv pip install --system -e ".[build]"
+
+      - name: Download tttool for Windows
+        shell: pwsh
+        run: .github/scripts/install-tttool-windows.ps1 lib/win
+
+      - name: Download ffmpeg for Windows
+        run: |
+          Write-Host "Downloading ffmpeg for Windows"
+
+          # Function to download and extract ffmpeg with timeout
+          function Install-Ffmpeg {
+            param([int]$TimeoutSeconds = 60)
+
+            $tempDir = New-Item -ItemType Directory -Path (Join-Path $env:TEMP "ffmpeg-temp-$(Get-Random)")
+            $url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+            $zipPath = Join-Path $tempDir "ffmpeg.zip"
+
+            try {
+              # Download with timeout
+              $job = Start-Job -ScriptBlock {
+                param($url, $zipPath)
+                Invoke-WebRequest -Uri $url -OutFile $zipPath
+              } -ArgumentList $url, $zipPath
+
+              if (Wait-Job -Job $job -Timeout $TimeoutSeconds) {
+                Receive-Job -Job $job
+                Remove-Job -Job $job -Force
+
+                # Extract with timeout
+                $extractJob = Start-Job -ScriptBlock {
+                  param($zipPath, $tempDir)
+                  Expand-Archive -Path $zipPath -DestinationPath $tempDir -Force
+                } -ArgumentList $zipPath, $tempDir
+
+                if (Wait-Job -Job $extractJob -Timeout $TimeoutSeconds) {
+                  Receive-Job -Job $extractJob
+                  Remove-Job -Job $extractJob -Force
+
+                  # Find and move ffmpeg.exe
+                  $ffmpegDir = Get-ChildItem -Path $tempDir -Directory -Filter "ffmpeg-*" | Select-Object -First 1
+                  Move-Item -Path (Join-Path $ffmpegDir.FullName "bin/ffmpeg.exe") -Destination lib/win/ffmpeg.exe -Force
+                  return $true
+                } else {
+                  Stop-Job -Job $extractJob
+                  Remove-Job -Job $extractJob -Force
+                  return $false
+                }
+              } else {
+                Stop-Job -Job $job
+                Remove-Job -Job $job -Force
+                return $false
+              }
+            } finally {
+              # Cleanup temp directory
+              if (Test-Path $tempDir) {
+                Remove-Item -Recurse -Force $tempDir -ErrorAction SilentlyContinue
+              }
+            }
+          }
+
+          # Try first attempt
+          Write-Host "Attempting to download ffmpeg (attempt 1)..."
+          if (Install-Ffmpeg -TimeoutSeconds 60) {
+            Write-Host "ffmpeg installed successfully on first attempt"
+          } else {
+            Write-Host "First attempt failed or timed out, retrying..."
+            # Clean up any stale temp directories (Install-Ffmpeg cleans up its own temp dir in finally block)
+            Get-ChildItem -Path $env:TEMP -Directory -Filter "ffmpeg-temp-*" -ErrorAction SilentlyContinue |
+              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+            # Retry
+            Write-Host "Attempting to download ffmpeg (attempt 2)..."
+            if (Install-Ffmpeg -TimeoutSeconds 60) {
+              Write-Host "ffmpeg installed successfully on second attempt"
+            } else {
+              Write-Host "ffmpeg installation failed after 2 attempts"
+              exit 1
+            }
+          }
+
+          # Verify
+          lib/win/ffmpeg.exe -version
+
+      - name: Build Windows executable with PyInstaller
+        run: |
+          pyinstaller ttmp32gme-windows.spec --clean
+
+      - name: Upload Windows executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: ttmp32gme-windows
+          path: dist/ttmp32gme
+          retention-days: 30
+
+      - name: Create ZIP archive for release
+        if: github.event_name == 'release'
+        run: |
+          cd dist
+          Compress-Archive -Path ttmp32gme -DestinationPath ttmp32gme-windows.zip
+
+      - name: Upload to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/ttmp32gme-windows.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-macos:
+    name: Build macOS Executable
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Install dependencies
+        run: |
+          uv pip install --system -e ".[build]"
+
+      - name: Download tttool for macOS
+        run: .github/scripts/install-tttool-macos.sh lib/mac
+
+      - name: Download ffmpeg for macOS
+        run: .github/scripts/install-ffmpeg-macos.sh lib/mac
+
+      - name: Build macOS executable with PyInstaller
+        run: |
+          pyinstaller ttmp32gme-macos.spec --clean
+
+      - name: Prepare macOS artifact
+        run: |
+          # Create a clean artifact directory with the .app bundle
+          mkdir -p artifact-macos
+          cp -R dist/ttmp32gme.app artifact-macos/
+
+      - name: Upload macOS executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: ttmp32gme-macos
+          path: artifact-macos/
+          retention-days: 30
+
+      - name: Create ZIP archive for release
+        if: github.event_name == 'release'
+        run: |
+          cd dist
+          # For now, create a ZIP. Later we can create a proper DMG
+          zip -r ttmp32gme-macos.zip ttmp32gme.app
+
+      - name: Upload to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/ttmp32gme-macos.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

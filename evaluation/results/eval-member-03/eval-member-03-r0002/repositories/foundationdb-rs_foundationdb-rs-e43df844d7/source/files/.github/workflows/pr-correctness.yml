@@ -1,0 +1,60 @@
+name: PR correctness
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [ labeled, unlabeled, opened, synchronize, reopened ]
+
+jobs:
+  bindingtester:
+    if: contains(github.event.pull_request.labels.*.name, 'correctness')
+    name: Binding Tester
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        parallelism: ["1", "2", "3"]
+        toolchain: ["1.85.1", "stable", "beta", "nightly"]
+    env:
+      CARGO_INCREMENTAL: 0
+      RUST_BACKTRACE: 1
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.0
+        with:
+          submodules: recursive
+
+      - name: Setup FoundationDB
+        uses: foundationdb-rs/foundationdb-actions-install@v2.3.0
+        with:
+          version: "7.4.3"
+
+      # Setting up a fixed Python version because of https://github.com/foundationdb-rs/foundationdb-rs/issues/226
+      - name: Setup fixed Python version
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      # The rust binding no longer supports tenants, but the upstream harness
+      # (bindingtester.py, _insert_instructions) unconditionally clears the
+      # \xff\xff/management/tenant/map/ special-key range before every test,
+      # which fails with error 2136 (tenants_disabled) when tenant_mode is
+      # disabled (the 7.4 default). The cluster must therefore keep tenant
+      # mode enabled for the harness itself.
+      - name: Enable tenant mode for the bindingtester harness
+        run: fdbcli --exec "configure single memory tenant_mode=optional_experimental"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+
+      - name: Build
+        run: cargo build -p bindingtester
+
+      - name: Setup bindingtester
+        run: scripts/setup_bindingtester.sh target/debug/bindingtester
+
+      - name: Run bindingtester
+        run: scripts/run_bindingtester.sh 1000

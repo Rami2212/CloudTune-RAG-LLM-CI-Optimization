@@ -1,0 +1,111 @@
+name: GitHub Release on Tag
+on:
+
+  workflow_dispatch:
+    inputs:
+      netdisco_mibs_tag:
+        description: 'netdisco-mibs tag to use'
+        required: false
+        type: string
+        default: ''
+      debug:
+        description: 'With debug'
+        required: false
+        default:  'false'
+
+  push:
+    branches:
+      - master
+    tags:
+      - '4.[0-9][0-9][0-9]'
+
+jobs:
+  release_netdisco_mibs:
+    if: |
+      github.event_name == 'workflow_dispatch'
+      || (github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Get the Tag
+        run: |
+          echo "GH_REF_SHORT=${{ inputs.netdisco_mibs_tag || github.ref_name }}" >> $GITHUB_ENV
+
+      - name: Release
+        id: create_release
+        uses: softprops/action-gh-release@v3.0.2
+        with:
+          name: netdisco-mibs-${{ env.GH_REF_SHORT }}
+          tag_name: ${{ env.GH_REF_SHORT }}
+
+      - name: Download tarball
+        run: |
+          curl -LO https://github.com/netdisco/netdisco-mibs/archive/refs/tags/${{ env.GH_REF_SHORT }}.tar.gz
+
+      - name: Fetch files from external repository, add to archive, rename
+        run: |
+          tar -zxvf ${{ env.GH_REF_SHORT }}.tar.gz
+          cd netdisco-mibs-${{ env.GH_REF_SHORT }}
+          mkdir -p EXTRAS/sql
+          curl -L -o EXTRAS/sql/snmp-info-snmp-filter.sql "https://github.com/netdisco/upstream-sources/raw/refs/heads/master/bootstrap/snmp-info-snmp-filter.sql"
+          curl -L -o EXTRAS/sql/netdisco-mibs-snmp-object.sql.gz "https://github.com/netdisco/netdisco-mibs/raw/refs/heads/master/EXTRAS/sql/netdisco-mibs-snmp-object.sql.gz"
+          cd ..
+          tar -czf netdisco-mibs.tar.gz -C netdisco-mibs-${{ env.GH_REF_SHORT }} --transform 's,^,netdisco-mibs-${{ env.GH_REF_SHORT }}/,' .
+
+      - name: Delete existing tarball (if any)
+        id: delete_tarball
+        run: |
+          set -euo pipefail
+          ASSET_NAME="netdisco-mibs.tar.gz"
+          # ensure jq is available
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y jq
+          fi
+
+          # get release by tag
+          RELEASE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${{ env.GH_REF_SHORT }}")
+
+          RELEASE_ID=$(echo "$RELEASE" | jq -r '.id // empty')
+          if [ -z "$RELEASE_ID" ]; then
+            echo "No release found for tag '${{ env.GH_REF_SHORT }}' — nothing to delete"
+            exit 0
+          fi
+
+          # find asset id
+          ASSET_ID=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets" \
+            | jq -r '.[] | select(.name=="'"$ASSET_NAME"'") | .id // empty')
+
+          if [ -n "$ASSET_ID" ]; then
+            echo "Deleting existing asset '$ASSET_NAME' (id: $ASSET_ID)"
+            curl -s -X DELETE -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/${ASSET_ID}"
+          else
+            echo "No existing asset named '$ASSET_NAME' found"
+          fi
+
+      - name: Get upload URL
+        run: |
+          echo UPLOAD_URL=${{ steps.create_release.outputs.upload_url }} | cut -d ' ' -f 1 >> $GITHUB_ENV
+
+      - name: Upload tarball
+        id: upload_tarball_after_release
+        run: |
+          curl \
+            -f \
+            -sSL \
+            -XPOST \
+            -H 'Authorization: token ${{ secrets.GITHUB_TOKEN }}' \
+            -H 'Content-Type: application/gzip' \
+            --upload-file 'netdisco-mibs.tar.gz' \
+            '${{ env.UPLOAD_URL }}=netdisco-mibs.tar.gz'
+
+      - name: Setup tmate session
+        uses: mxschmitt/action-tmate@v3.24
+        if: always() && github.event.inputs.debug == 'true'
+        with:
+          sudo: true

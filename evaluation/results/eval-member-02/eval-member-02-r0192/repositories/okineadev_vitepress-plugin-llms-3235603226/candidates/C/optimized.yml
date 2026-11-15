@@ -1,0 +1,49 @@
+name: CodeQL # zizmor: ignore[concurrency-limits]
+
+on: [workflow_dispatch]
+
+permissions: {}
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+
+    concurrency:
+      group: codeql-${{ matrix.language }}-${{ github.ref }}
+      cancel-in-progress: true
+
+    permissions:
+      contents: read
+      security-events: write # Required for uploading CodeQL security findings
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: actions
+            build-mode: none
+          - language: javascript-typescript
+            build-mode: none
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+        with:
+          sparse-checkout-cone-mode: false
+          persist-credentials: true
+          sparse-checkout: |
+            .github/workflows/
+            src/
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@f959778b39f110f7919139e242fa5ac47393c877
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@f959778b39f110f7919139e242fa5ac47393c877
+        with:
+          category: '/language:${{matrix.language}}'

@@ -1,0 +1,319 @@
+name: build
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - "**"
+      - "!.github/**"
+      - ".github/workflows/build.yaml"
+      - "!docs/**"
+      - "!examples/**"
+      - "!images/**"
+      - "!**.md"
+      - "!**.ipynb"
+      - "resources/**"
+  pull_request:
+    paths:
+      - "**"
+      - "!.github/**"
+      - ".github/workflows/build.yaml"
+      - "!docs/**"
+      - "!examples/**"
+      - "!images/**"
+      - "!**.md"
+      - "!**.ipynb"
+      - "resources/**"
+  # manual trigger
+  workflow_dispatch: { }
+env:
+  # Decide crate freshness by file checksums, not mtimes, so that unchanged workspace crates
+  # restored from the cache are reused after `actions/checkout` resets all mtimes
+  CARGO_UNSTABLE_CHECKSUM_FRESHNESS: "true"
+  RUST_LOG: "debug"
+  RUST_LOG_SPAN_EVENTS: "new,close"
+  RUST_BACKTRACE: "1"
+  # Note: embed a tiny folder only to test the "web-ui" feature building
+  KAMU_WEB_UI_DIR: "../../../.github"
+jobs:
+  lint_fmt:
+    name: Lint / Code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt, clippy
+          cache: false
+      - uses: cargo-bins/cargo-binstall@main
+      - name: cargo fmt
+        run: cargo fmt --check
+      - name: cargo sort
+        run: |
+          cargo binstall cargo-sort -y
+          cargo sort -g -w -n -c
+      - name: taplo fmt
+        run: |
+          cargo binstall taplo-cli -y
+          taplo fmt --check
+      - name: Lint dividing lines
+        run: cargo test -p kamu-repo-tools -- dividing_lines
+      - name: Lint license headers
+        run: cargo test -p kamu-repo-tools -- license_header
+      - name: Lint OpenAPI spec
+        run: make lint-openapi
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  lint_codegen:
+    name: Lint / Codegen
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: kamu-data/kamu-cli
+          path: kamu-cli
+      - name: Copy rust-toolchain file
+        run: cp kamu-cli/rust-toolchain.toml ./rust-toolchain.toml
+      - name: Read pinned ODF spec version
+        id: odf
+        run: echo "ref=$(make -s -C kamu-cli print-odf-spec-ref)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v5
+        with:
+          repository: open-data-fabric/open-data-fabric
+          ref: ${{ steps.odf.outputs.ref }}
+          path: open-data-fabric
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt
+          cache: false
+      # We use nix flake to install flatc, protoc and other tools needed for codegen
+      - uses: cachix/install-nix-action@v31
+      - uses: cachix/cachix-action@v16
+        with:
+          name: kamu
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+      - name: Generate artifacts
+        run: |
+          cd kamu-cli
+          nix develop ./images/nix-dev -c make codegen
+      - name: Check generated files
+        run: cd kamu-cli && git diff && git diff-index --quiet HEAD
+
+  lint_deps:
+    name: Lint / Dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: cargo-bins/cargo-binstall@main
+      - run: cargo binstall cargo-deny -y
+      - run: cargo deny check --hide-inclusion-graph
+      - run: cargo binstall cargo-udeps -y
+      - run: cargo udeps --all-targets
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux / x86_64
+            runs-on: ubuntu-latest
+            cargo-flags: --profile ci --features ingest-ftp,web-ui
+            nextest-flags: --cargo-profile ci --features ingest-ftp,web-ui
+            # TODO: Engine tests are currently disabled
+            # See: https://github.com/kamu-data/kamu-cli/issues/1624
+            nextest-exclusions-main-set-tests: -E '!(test(::database::) | test(::elasticsearch::) | test(::spark::) | test(::flink::) | test(::risingwave::) | test(::examples::))'
+            nextest-exclusions-database-set-part: ''
+            nextest-exclusions-elasticsearch-set-part: ''
+            container-runtime: podman
+            ipfs: true
+            database: true
+            elasticsearch: true
+            maximize-space: true
+          # TODO: M1 cannot run docker due to lack of nested virtualization
+          # See: https://github.com/marketplace/actions/setup-docker-on-macos#arm64-processors-m1-m2-m3-series-used-on-macos-14-images-are-unsupported
+          - name: MacOS / aarch64
+            runs-on: macos-26
+            cargo-flags: --profile ci
+            nextest-flags: --cargo-profile ci
+            nextest-exclusions-main-set-tests: -E '!(test(::containerized::) | test(::database::) | test(::elasticsearch::) | test(::examples::))'
+            nextest-exclusions-database-set-part: '& !(test(::containerized::))'
+            nextest-exclusions-elasticsearch-set-part: '& !(test(::containerized::))'
+            container-runtime: ''
+            ipfs: false
+            database: false
+            elasticsearch: false
+            maximize-space: false
+          # TODO: Restore Windows support later avoiding its slowness from blocking the main CI flow
+          # TODO: DataFusion tests are temporarily disabled
+          # See: https://github.com/kamu-data/kamu-cli/issues/226
+          # - name: Windows / x86_64
+          #   runs-on: windows-latest
+          #   cargo-flags: --profile ci
+          #   nextest-flags: --cargo-profile ci
+          #   # platform(target) is a workaround for Windows only issue in cargo-nextest upon proc macro crates
+          #   nextest-exclusions-main-set-tests: -E 'platform(target) & !(test(::containerized::) | test(::datafusion::) | test(::database::) | test(::elasticsearch::) | test(::examples::))'
+          #   nextest-exclusions-database-set-part: '& !(test(::datafusion::))'
+          #   nextest-exclusions-elasticsearch-set-part: '& !(test(::datafusion::))'
+          #   container-runtime: ''
+          #   ipfs: false
+          #   database: false
+          #   elasticsearch: false
+          #   maximize-space: false
+    name: Test / ${{ matrix.name }}
+    runs-on: ${{ matrix.runs-on }}
+    services:
+      postgres:
+        # Keep in sync with `POSTGRES_IMAGE` in `Makefile`
+        image: ${{ matrix.database && 'postgres:18' || '' }}
+        env:
+          POSTGRES_USER: root
+          POSTGRES_PASSWORD: root
+          POSTGRES_DB: kamu-test
+        ports:
+          - 5432:5432
+      elasticsearch:
+        image: ${{ matrix.elasticsearch && 'elasticsearch:9.2.1' || '' }}
+        env:
+          discovery.type: single-node
+          ES_JAVA_OPTS: -Xms1g -Xmx1g
+          xpack.security.enabled: "false"
+          xpack.security.http.ssl.enabled: "false"
+          xpack.security.transport.ssl.enabled: "false"
+          xpack.ml.enabled: "false"
+          ingest.geoip.downloader.enabled: "false"
+          node.store.allow_mmap: "false"
+          cluster.routing.allocation.disk.threshold_enabled: "false"
+        ports:
+          - 9200:9200
+          - 9300:9300
+    steps:
+      - name: Setup IPFS
+        if: matrix.ipfs
+        uses: ipfs/download-ipfs-distribution-action@v2
+        with:
+          name: kubo
+          version: v0.43.1
+
+      - name: Maximize build space
+        if: matrix.maximize-space
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - uses: actions/checkout@v5
+
+      - name: Install mold linker
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y mold
+          echo 'RUSTFLAGS=-C linker=clang -C link-arg=-fuse-ld=mold' >> $GITHUB_ENV
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: true
+          # Prevents branch builds from evicting master cache
+          cache-save-if: ${{ github.ref == 'refs/heads/master' }}
+          # Requires CARGO_UNSTABLE_CHECKSUM_FRESHNESS
+          cache-workspace-crates: true
+          cache-on-failure: true
+
+      - uses: cargo-bins/cargo-binstall@main
+
+      - name: Install cargo tools
+        run: |
+          cargo binstall cargo-nextest -y --force --github-token ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure runtime
+        if: matrix.container-runtime != ''
+        run: |
+          echo '{ "kind": "CLIConfig", "version": 1, "content": {"engine": { "runtime": "${{ matrix.container-runtime }}" } } }' > ~/.kamuconfig
+          echo "KAMU_CONTAINER_RUNTIME_TYPE=${{ matrix.container-runtime }}" >> $GITHUB_ENV
+          echo "KAMU_CONTAINER_RUNTIME_TYPE_DB=docker" >> $GITHUB_ENV
+          echo "KAMU_POSTGRES_IMAGE=postgres:18" >> $GITHUB_ENV
+
+      - name: Build
+        run: |
+          cargo test ${{ matrix.cargo-flags }} --no-run
+    
+          # Features used only by downstream (e.g. kamu-node) are not compiled by the workspace build
+          cargo check -p observability --all-features
+
+      - name: Assert mold linker was used
+        if: runner.os == 'Linux'
+        run: |
+          binary="target/ci/kamu-cli"
+          echo "Checking: $binary"
+          readelf -p .comment "$binary"
+          readelf -p .comment "$binary" | grep mold
+
+      - name: Pull test images
+        if: matrix.container-runtime != ''
+        run: cargo nextest run ${{ matrix.nextest-flags }} -E 'test(::setup::)' --no-capture
+
+      - name: Run main set of tests
+        run: cargo nextest run ${{ matrix.nextest-flags }} ${{ matrix.nextest-exclusions-main-set-tests }} -v
+
+      - name: Wait for Elasticsearch (stable)
+        if: matrix.elasticsearch
+        run: |
+          set -euo pipefail
+
+          # Require 5 consecutive successful responses.
+          ok=0
+          for i in {1..180}; do
+            if curl -fsS --max-time 2 "http://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=1s" >/dev/null; then
+              ok=$((ok+1))
+              echo "ES health ok ($ok/5) at attempt $i"
+              if [ "$ok" -ge 5 ]; then
+                echo "ES is stable and healthy"
+                exit 0
+              fi
+            else
+              ok=0
+            fi
+            sleep 1
+          done
+
+          echo "ES did not become stable"
+          docker logs --tail 300 "${{ job.services.elasticsearch.id }}" || true
+          exit 1
+
+      - name: Elasticsearch tests
+        if: matrix.elasticsearch
+        env:
+          ELASTICSEARCH_URL: http://127.0.0.1:9200
+        run: |
+          # Show actual disk headroom ES sees
+          curl -fsS 'http://127.0.0.1:9200/_cat/nodes?v&h=name,ip,disk.used_percent,disk.avail,disk.total'
+
+          # Run ES related tests
+          cargo nextest run ${{ matrix.nextest-flags }} -E 'test(::elasticsearch::)' ${{ matrix.nextest-exclusions-elasticsearch-set-part }}
+
+      - name: Postgres database tests
+        if: matrix.database
+        env:
+          DATABASE_URL: postgres://root:root@127.0.0.1:5432/kamu-test
+        run: cargo nextest run ${{ matrix.nextest-flags }} -E 'test(::postgres::) ${{ matrix.nextest-exclusions-database-set-part }}'
+
+      # Note: Not running on windows due to line ending differences
+      - name: Check generated files
+        if: "!contains(matrix.runs-on, 'windows')"
+        run: git diff && git diff-index --quiet HEAD
+
+      - name: Report disk space
+        if: always()
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            wmic logicaldisk get size,freespace,caption
+          else
+            df -h
+          fi

@@ -1,0 +1,137 @@
+#* Variables
+SHELL := /bin/bash
+PYTHON := .venv/bin/python
+
+.PHONY: help
+help:
+	@echo "Commands:"
+	@echo "uv-download     : downloads and installs the uv package manager"
+	@echo "install         : installs required dependencies"
+	@echo "install-dev     : installs the dev dependencies for the project"
+	@echo "fix-style       : run checks on files and potentially modifies them."
+	@echo "check-style     : run checks on files without modifying them."
+	@echo "lint            : run linting on all files"
+	@echo "test            : run all tests."
+	@echo "test-cpu        : run all tests that do not depend on Torch GPU support."
+	@echo "fast-test       : run all quick tests."
+	@echo "build-docs      : build mkdocs documentation."
+	@echo "serve-docs      : serve documentation locally."
+	@echo "deploy-docs     : deploy documentation to https://FOR-sight-ai.github.io/interpreto (gh-pages branch)"
+	@echo "docs            : shortcut to build and serve generated documentation locally."
+	@echo "codecov         : check coverage of all the code."
+	@echo "clean           : cleans all unecessary files."
+	@echo "bump-version    : bump the project version. Usage: make bump-version PART={major,minor,patch}"
+
+#* UV
+uv-download:
+	@echo "Downloading uv package manager..."
+	@if [[ $OS == "Windows_NT" ]]; then \
+		irm https://astral.sh/uv/install.ps1 | iex; \
+	else \
+		curl -LsSf https://astral.sh/uv/install.sh | sh; \
+	fi
+	uv venv
+
+
+.PHONY: uv-activate
+uv-activate:
+	@if [[ "$(OS)" == "Windows_NT" ]]; then \
+		./uv/Scripts/activate.ps1 \
+	else \
+		source .venv/bin/activate; \
+	fi
+
+#* Installation
+
+.PHONY: install
+install:
+	make uv-activate && uv pip install -e .
+
+.PHONY: install-dev
+install-dev:
+	if [ ! -f .venv/bin/python ]; then uv venv; fi && \
+		source .venv/bin/activate && \
+		uv pip install -e ".[docs,lint,notebook]" && \
+		pre-commit install
+
+#* Linting
+.PHONY: fix-style
+fix-style:
+	$(PYTHON) -m ruff format --config pyproject.toml ./
+	$(PYTHON) -m ruff check --config pyproject.toml ./
+
+.PHONY: check-style
+check-style:
+	$(PYTHON) -m ruff format --check --config pyproject.toml ./
+	$(PYTHON) -m ruff check --no-fix --config pyproject.toml ./
+
+.PHONY: lint
+lint: fix-style
+
+#* Testing
+.PHONY: test
+test:
+	$(PYTHON) -m pytest -n auto -c pyproject.toml -v
+
+.PHONY: test-cpu
+test-cpu:
+	$(PYTHON) -m pytest -n auto -c pyproject.toml -v -m "not require_cuda_gpu"
+
+.PHONY: fast-test
+fast-test:
+	$(PYTHON) -m pytest -n auto -c pyproject.toml -v -m "not slow"
+
+# Limits the number of threads to 4 to avoid overloading the CI
+.PHONY: fast-test-ci
+fast-test-ci:
+	$(PYTHON) -m pytest -n 4 -c pyproject.toml -v -m "not slow"
+
+.PHONY: codecov
+codecov:
+	$(PYTHON) -m pytest -n auto --cov interpreto --cov-report html
+
+#* Docs
+build-docs serve-docs deploy-docs: export DISABLE_MKDOCS_2_WARNING := true
+build-docs serve-docs deploy-docs: export NO_MKDOCS_2_WARNING := 1
+
+.PHONY: build-docs
+build-docs:
+	uv run --extra docs mkdocs build
+
+.PHONY: serve-docs
+serve-docs:
+	uv run --extra docs mkdocs serve
+
+.PHONY: deploy-docs
+deploy-docs:
+	uv run --extra docs mkdocs gh-deploy
+
+.PHONY: docs
+docs: serve-docs
+
+#* Cleaning
+.PHONY: pycache-remove
+pycache-remove:
+	find . | grep -E "(__pycache__|\.pyc|\.pyo$$)" | xargs rm -rf
+
+.PHONY: build-remove
+build-remove:
+	rm -rf build/
+
+.PHONY: clean
+clean: pycache-remove build-remove # docker-remove
+
+.PHONY: bump-version
+bump-version:
+	@if [[ -z "$(PART)" ]]; then \
+		echo "PART is required. Usage: make bump-version PART={major,minor,patch}"; \
+		exit 1; \
+	fi
+	@.github/bump_version.sh $(PART)
+
+# If you are a coding agent reading this file, like codex or cursor
+# To run tests, you first need to install the dependencies
+# If you want to run a single test, you can use the following command:
+# 	make install-dev; python -m pytest -n auto -c pyproject.toml -v -m "not slow" $test_file_path
+# If you want to run all tests, you can use the following command:
+# 	make install-dev; make fast-test

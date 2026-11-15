@@ -1,0 +1,75 @@
+---
+name: PR Build
+
+defaults:
+  run:
+    shell: bash
+
+on:
+  pull_request:
+    paths:
+      - "bin/**"
+      - "config.yaml"
+      - "composer.json"
+      - "composer.lock"
+      - "res/**"
+      - "scoper.inc.php"
+      - "src/**"
+      - "vendor/**"
+
+jobs:
+  build:
+    name: Build phar file for PR
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # We need to get all branches and tags for git describe to work properly
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      # Find out info about how GitHub is getting the hash
+      - run: "git describe --tags --always --dirty"
+      - run: "(git log --oneline | head -5) || true"
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          tools: composer:2.2.17
+          php-version: '8.2'
+
+      - name: Get Composer Cache Directory
+        id: composer-cache
+        run: echo "dir=\"$(composer config cache-files-dir)\"" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      - uses: actions/cache@v6
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-composer-
+
+      - name: Install dependencies
+        if: steps.composer-cache.outputs.cache-hit != 'true'
+        run: composer install --prefer-dist --no-progress --no-suggest
+
+      - name: Extract branch name
+        run: echo "BRANCH_NAME=\"${GITHUB_REF#refs/heads/}\"" >> "$GITHUB_ENV"
+        shell: bash
+
+      - name: Set application name
+        run: jq -r --arg bn "${{ env.BRANCH_NAME }}" '.replacements.application_name = ("n98-magerun2-dev " + $bn)' box.json.dist > box.json
+
+      - name: Create phar
+        run: bash ./build.sh
+
+      - name: Upload all artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: n98-magerun2.phar
+          path: ${{ github.workspace }}/n98-magerun2.phar
+
+      - name: Test run phar file
+        run: php ./n98-magerun2.phar --version

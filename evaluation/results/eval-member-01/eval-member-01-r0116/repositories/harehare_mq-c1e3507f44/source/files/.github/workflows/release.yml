@@ -1,0 +1,304 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            ext: ""
+            asset_name: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            ext: ""
+            asset_name: x86_64-unknown-linux-musl
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            ext: ""
+            asset_name: aarch64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+            ext: ""
+            asset_name: aarch64-unknown-linux-musl
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: ".exe"
+            asset_name: x86_64-pc-windows-msvc
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            ext: ".exe"
+            asset_name: aarch64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            ext: ""
+            asset_name: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v2.0.0
+        with:
+          target: ${{ matrix.target }}
+          cache: false
+      - uses: extractions/setup-just@v4.0.0
+        with:
+          just-version: 1.58.0
+      - name: Install musl-tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        run: just build-target ${{ matrix.target }}
+      - name: Rename artifact
+        run: |
+          mv target/${{ matrix.target }}/release/mq${{ matrix.ext }} target/${{ matrix.target }}/release/mq-${{ matrix.asset_name}}${{ matrix.ext }}
+          mv target/${{ matrix.target }}/release/mq-dbg${{ matrix.ext }} target/${{ matrix.target }}/release/mq-dbg-${{ matrix.asset_name}}${{ matrix.ext }}
+          mv target/${{ matrix.target }}/release/mq-lsp${{ matrix.ext }} target/${{ matrix.target }}/release/mq-lsp-${{ matrix.asset_name}}${{ matrix.ext }}
+          mv target/${{ matrix.target }}/release/mq-check${{ matrix.ext }} target/${{ matrix.target }}/release/mq-check-${{ matrix.asset_name}}${{ matrix.ext }}
+          mv target/${{ matrix.target }}/release/mq-lint${{ matrix.ext }} target/${{ matrix.target }}/release/mq-lint-${{ matrix.asset_name}}${{ matrix.ext }}
+          mv target/${{ matrix.target }}/release/mq-crawl${{ matrix.ext }} target/${{ matrix.target }}/release/mq-crawl-${{ matrix.asset_name}}${{ matrix.ext }}
+          mv target/${{ matrix.target }}/release/mq-test${{ matrix.ext }} target/${{ matrix.target }}/release/mq-test-${{ matrix.asset_name}}${{ matrix.ext }}
+          mv target/${{ matrix.target }}/release/mq-fmt${{ matrix.ext }} target/${{ matrix.target }}/release/mq-fmt-${{ matrix.asset_name}}${{ matrix.ext }}
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: mq-${{ matrix.asset_name }}
+          path: |
+            target/${{ matrix.target }}/release/mq-${{ matrix.asset_name}}${{ matrix.ext }}
+            target/${{ matrix.target }}/release/mq-dbg-${{ matrix.asset_name}}${{ matrix.ext }}
+            target/${{ matrix.target }}/release/mq-lsp-${{ matrix.asset_name }}${{ matrix.ext }}
+            target/${{ matrix.target }}/release/mq-check-${{ matrix.asset_name }}${{ matrix.ext }}
+            target/${{ matrix.target }}/release/mq-lint-${{ matrix.asset_name }}${{ matrix.ext }}
+            target/${{ matrix.target }}/release/mq-crawl-${{ matrix.asset_name }}${{ matrix.ext }}
+            target/${{ matrix.target }}/release/mq-test-${{ matrix.asset_name }}${{ matrix.ext }}
+            target/${{ matrix.target }}/release/mq-fmt-${{ matrix.asset_name }}${{ matrix.ext }}
+          if-no-files-found: error
+          retention-days: 1
+
+  deb:
+    name: Build deb (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v2.0.0
+        with:
+          target: ${{ matrix.target }}
+          cache: false
+      - uses: extractions/setup-just@v4.0.0
+        with:
+          just-version: 1.58.0
+      - name: Install cargo-deb
+        uses: taiki-e/install-action@v2.88.1
+        with:
+          tool: cargo-deb
+      - name: Install musl-tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        run: just build-target ${{ matrix.target }}
+      - name: Build deb package
+        run: cargo deb -p mq-run --no-build --target ${{ matrix.target }} --output target/${{ matrix.target }}/debian/mq-${{ matrix.target }}.deb
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: mq-${{ matrix.target }}-deb
+          path: target/${{ matrix.target }}/debian/*.deb
+          if-no-files-found: error
+          retention-days: 1
+
+  rpm:
+    name: Build rpm (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v2.0.0
+        with:
+          target: ${{ matrix.target }}
+          cache: false
+      - uses: extractions/setup-just@v4.0.0
+        with:
+          just-version: 1.58.0
+      - name: Install cargo-generate-rpm
+        uses: taiki-e/install-action@v2.88.1
+        with:
+          tool: cargo-generate-rpm
+      - name: Install musl-tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        run: just build-target ${{ matrix.target }}
+      - name: Build rpm package
+        run: cargo generate-rpm -p crates/mq-run --target ${{ matrix.target }} -o target/${{ matrix.target }}/generate-rpm/mq-${{ matrix.target }}.rpm
+      - name: Upload rpm artifact
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: mq-${{ matrix.target }}-rpm
+          path: target/${{ matrix.target }}/generate-rpm/*.rpm
+          if-no-files-found: error
+          retention-days: 1
+
+  docker:
+    name: Build Docker image (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      packages: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux/amd64
+          - os: ubuntu-22.04-arm
+            platform: linux/arm64
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.4.1
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+      - name: Prepare platform pair
+        run: |
+          platform=${{ matrix.platform }}
+          echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
+      - name: Build and push Docker image by digest
+        id: build
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+      - name: Upload digest
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  docker-merge:
+    name: Push multi-arch Docker manifest
+    needs: [docker]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v8.0.2
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.4.1
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
+      - name: Inspect image
+        env:
+          IMAGE_REF: ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.version }}
+        run: docker buildx imagetools inspect "$IMAGE_REF"
+
+  release:
+    name: Create Release
+    needs: [build, deb, rpm]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8.0.2
+        with:
+          pattern: mq*
+          path: target
+      - name: Generate checksums
+        run: |
+          cd target
+          for file in mq*/*; do
+            sha256sum "$file" >> checksums.txt
+          done
+          mkdir checksums
+          mv checksums.txt ./checksums/checksums.txt
+      - name: Create Release
+        run: |
+          gh release create "$TAG_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --generate-notes \
+            target/*/*
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}

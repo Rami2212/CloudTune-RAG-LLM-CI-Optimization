@@ -1,0 +1,58 @@
+name: build
+
+on:
+  push:
+    branches: [main, next]
+  pull_request:
+
+jobs:
+  build:
+    name: build
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ endsWith(matrix.ruby, 'head') || matrix.ruby == 'debug' || matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ruby: "3.3"
+            os: ubuntu-latest
+            gemfile: "Gemfile-rails.7.2.x"
+            experimental: false
+          - ruby: "3.4"
+            os: ubuntu-latest
+            gemfile: "Gemfile-rails.8.0.x"
+            experimental: false
+          - ruby: "4.0.6"
+            os: ubuntu-latest
+            gemfile: "Gemfile-rails.8.1.x"
+            experimental: false
+          - ruby: ruby-head
+            os: ubuntu-latest
+            gemfile: Gemfile-rails-edge
+            experimental: true
+
+    env: # $BUNDLE_GEMFILE must be set at the job level, so it is set for all steps
+      BUNDLE_GEMFILE: ${{ github.workspace }}/gemfiles/${{ matrix.gemfile }}
+      SECRET_KEY_BASE_DUMMY: 1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+
+      - name: Ruby Tests
+        run: bin/rake test
+
+      - name: Upload coverage to Qlty
+        if: ${{ contains(github.ref, 'main') }}
+        uses: qltysh/qlty-action/coverage@main
+        with:
+          token: ${{secrets.QLTY_COVERAGE_TOKEN}}
+          files: coverage/.resultset.json

@@ -1,0 +1,181 @@
+name: release
+on:
+  # Situation: CI error during build release,
+  #            and you want to reanimate it by restarting manually.
+  #
+  # If so, please prefer a different strategy:
+  # 1) Fix the build error (via PR)
+  # 2) Remove the version tag from the revision causing the breakage
+  # 3) Put the version tag on the corrected revision
+  #
+  #  # Manual trigger
+  #  workflow_dispatch: { }
+  push:
+    tags:
+      - v[0-9]+.[0-9]+.[0-9]+*
+env:
+  PACKAGE_NAME: kamu-cli
+  BINARY_NAME: kamu
+  KAMU_WEB_UI_VERSION: "0.73.0"
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Keep in sync with artifact upload matrix below
+          #
+          # TODO: Add minimal targets that are stripped and do not embed WebUI
+          - name: Linux / x86_64 / glibc
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            use-cross: true
+            features: ingest-ftp,web-ui
+          - name: Linux / x86_64 / musl
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            use-cross: true
+            features: ingest-ftp,web-ui
+          - name: Linux / aarch64 / glibc
+            runs-on: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            use-cross: true
+            features: ingest-ftp,web-ui
+          - name: Linux / aarch64 / musl
+            runs-on: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            use-cross: true
+            features: ingest-ftp,web-ui
+          - name: MacOS / aarch64
+            runs-on: macos-15
+            target: aarch64-apple-darwin
+            use-cross: false
+            features: ingest-ftp,web-ui
+          # - name: Windows / x86_64
+          #   runs-on: windows-latest
+          #   target: x86_64-pc-windows-msvc
+          #   use-cross: false
+          #   features: ingest-ftp
+          #   binary-ext: '.exe'
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.runs-on }}
+    env:
+      # This will be replaced with `cross` for cross-compilation targets
+      CARGO: cargo
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+          cache: false
+
+      - uses: cargo-bins/cargo-binstall@main
+
+      - name: Install cross
+        if: matrix.use-cross
+        shell: bash
+        run: |
+          cargo binstall cross -y
+          echo "CARGO=cross" >> $GITHUB_ENV
+
+      - name: Fetch web UI artifacts
+        if: contains(matrix.features, 'web-ui')
+        shell: bash
+        run: |
+          wget https://github.com/kamu-data/kamu-web-ui/releases/download/v${{ env.KAMU_WEB_UI_VERSION }}/kamu-web-ui-any.tar.gz
+          tar -xf kamu-web-ui-any.tar.gz
+          echo "KAMU_WEB_UI_DIR=../../../kamu-web-ui-any" >> $GITHUB_ENV
+
+      - name: Build
+        shell: bash
+        run: |
+          ${{ env.CARGO }} build \
+            -p kamu-cli \
+            --release \
+            --target=${{ matrix.target }} \
+            --features=${{ matrix.features }}
+
+      - name: Rename binary
+        shell: bash
+        run: |
+          mv \
+            target/${{ matrix.target }}/release/${{ env.PACKAGE_NAME }}${{ matrix.binary-ext }} \
+            target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}${{ matrix.binary-ext }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE_NAME }}-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}${{ matrix.binary-ext }}
+          if-no-files-found: error
+
+  create_release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [ build ]
+    steps:
+      - uses: actions/checkout@v5
+
+      # Sets the header for the release description
+      - run: echo "" > RELEASE_HEAD.md
+
+      # Extracts relevant section from CHANGELOG.md and outputs it into RELEASE.md
+      - uses: CSchoel/release-notes-from-changelog@v1
+
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --verify-tag \
+            --title "Release ${{ github.ref_name }}" \
+            --notes-file RELEASE.md
+
+  upload_assets:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            format: tar.gz
+          - target: x86_64-unknown-linux-musl
+            format: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            format: tar.gz
+          - target: aarch64-unknown-linux-musl
+            format: tar.gz
+          - target: aarch64-apple-darwin
+            format: tar.gz
+          # - target: x86_64-pc-windows-msvc
+          #   format: zip
+    name: Upload Assets (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    needs: [ create_release ]
+    steps:
+      - name: Download Artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: ${{ env.PACKAGE_NAME }}-${{ matrix.target }}
+          path: ${{ env.PACKAGE_NAME }}-${{ matrix.target }}
+
+      - name: Archive (tar.gz)
+        if: matrix.format == 'tar.gz'
+        run: |
+          tar -czvf \
+            ${{ env.PACKAGE_NAME }}-${{ matrix.target }}.tar.gz \
+            ${{ env.PACKAGE_NAME }}-${{ matrix.target }}
+
+      - name: Archive (zip)
+        if: matrix.format == 'zip'
+        run: |
+          zip -r \
+            ${{ env.PACKAGE_NAME }}-${{ matrix.target }}.zip \
+            ${{ env.PACKAGE_NAME }}-${{ matrix.target }}
+
+      - name: Upload Asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release upload "${{ github.ref_name }}" \
+            ${{ env.PACKAGE_NAME }}-${{ matrix.target }}.${{ matrix.format }}

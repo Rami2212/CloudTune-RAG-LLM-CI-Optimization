@@ -1,0 +1,173 @@
+<?xml version="1.0"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+	<modelVersion>4.0.0</modelVersion>
+	<parent>
+		<groupId>com.graphql-java-generator</groupId>
+		<artifactId>graphql-maven-plugin-samples</artifactId>
+		<version>0-SNAPSHOT</version>
+	</parent>
+
+	<artifactId>graphql-maven-plugin-samples-CustomTemplates-resttemplate</artifactId>
+	<description>
+		This maven module contain a custom templates, to check in integration
+		tests that custom templates coming
+		from an external jar can actually be used.
+		It also contains a type that is used in Custom Scalar, to check the
+		correction of the issues 184 and 198.
+	</description>
+
+	<scm>
+		<tag>graphql-maven-plugin-project-4.0.2</tag>
+		<connection>
+			scm:git:https://github.com/graphql-java-generator/graphql-maven-plugin-project.git</connection>
+		<developerConnection>
+			scm:git:https://github.com/graphql-java-generator/graphql-maven-plugin-project.git</developerConnection>
+		<url>
+			https://github.com/graphql-java-generator/graphql-maven-plugin-project/tree/master</url>
+	</scm>
+
+	<properties>
+		<!--Parameters to pass to the buildScript, as it seems unable to get the maven native "project.basedir" property -->
+		<cloned_project_basedir>${project.basedir}</cloned_project_basedir>
+	</properties>
+
+	<build>
+		<plugins>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-dependency-plugin</artifactId>
+				<executions>
+					<execution>
+						<!-- Extraction of the templates from graphql-maven-plugin-logic -->
+						<id>unpack</id>
+						<phase>initialize</phase>
+						<goals>
+							<goal>unpack</goal>
+						</goals>
+						<configuration>
+							<artifactItems>
+								<artifactItem>
+									<groupId>com.graphql-java-generator</groupId>
+									<artifactId>graphql-maven-plugin-logic</artifactId>
+									<version>${project.version}</version>
+									<type>jar</type>
+									<overWrite>false</overWrite>
+									<outputDirectory>
+										${project.build.directory}/graphql-maven-plugin-logic.templates</outputDirectory>
+									<includes>**/*.vm.java</includes>
+								</artifactItem>
+							</artifactItems>
+						</configuration>
+					</execution>
+				</executions>
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-compiler-plugin</artifactId>
+				<executions>
+					<execution>
+						<!-- Compilation of the GenerateCustomTemplate class, to be used in the generate-resources phase -->
+						<phase>initialize</phase>
+						<goals>
+							<goal>compile</goal>
+						</goals>
+					</execution>
+				</executions>
+				<configuration>
+					<compileSourceRoots>${project.basedir}/src/buildScript/java</compileSourceRoots>
+				</configuration>
+			</plugin>
+			<plugin>
+				<groupId>org.codehaus.mojo</groupId>
+				<artifactId>exec-maven-plugin</artifactId>
+				<executions>
+					<execution>
+						<!-- Generation of a custom template, based on the original template. This is is used by the
+						com.graphql_java_generator.customtemplates.ValidateCustomQueryIT class of the
+						graphql-maven-plugin-samples-allGraphQLCases-client maven module, to test the custom templates behavior -->
+						<id>generate-custom-template</id>
+						<phase>generate-resources</phase>
+						<goals>
+							<goal>java</goal>
+						</goals>
+					</execution>
+				</executions>
+				<configuration>
+					<sourceRoot>${project.basedir}/src/buildScript/java</sourceRoot>
+					<mainClass>
+						com.graphql_java_generator.custom_template.GenerateCustomTemplate</mainClass>
+				</configuration>
+			</plugin>
+			<plugin>
+				<groupId>org.codehaus.mojo</groupId>
+				<artifactId>build-helper-maven-plugin</artifactId>
+				<executions>
+					<execution>
+						<id>add-source</id>
+						<phase>generate-sources</phase>
+						<goals>
+							<goal>add-source</goal>
+						</goals>
+						<configuration>
+							<sources>
+								<source>${project.basedir}/src/buildScript/java</source>
+							</sources>
+						</configuration>
+					</execution>
+				</executions>
+			</plugin>
+		</plugins>
+	</build>
+
+	<dependencies>
+		<dependency>
+			<groupId>com.graphql-java-generator</groupId>
+			<artifactId>graphql-java-client-runtime</artifactId>
+			<scope>provided</scope>
+		</dependency>
+
+		<!-- Dependencies for tests -->
+		<dependency>
+			<groupId>org.springframework</groupId>
+			<artifactId>spring-test</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.junit.jupiter</groupId>
+			<artifactId>junit-jupiter-api</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.junit.jupiter</groupId>
+			<artifactId>junit-jupiter-engine</artifactId>
+			<scope>test</scope>
+		</dependency>
+	</dependencies>
+
+	<reporting>
+		<plugins>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-javadoc-plugin</artifactId>
+				<reportSets>
+					<reportSet>
+						<id>non-aggregate</id>
+						<reports>
+							<report>javadoc-no-fork</report>
+							<report>test-javadoc-no-fork</report>
+						</reports>
+					</reportSet>
+				</reportSets>
+				<configuration>
+					<source>${java.majorVersion}</source>
+				</configuration>
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-project-info-reports-plugin</artifactId>
+				<version>${maven-project-info-reports-plugin.version}</version>
+			</plugin>
+		</plugins>
+	</reporting>
+
+</project>

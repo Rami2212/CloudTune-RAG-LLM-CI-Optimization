@@ -1,0 +1,108 @@
+name: Sync Forks with Upstream
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  sync-forks:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Sync forks with upstream
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const UPSTREAM_OWNER = 'fossasia';
+            const UPSTREAM_REPO = 'scrum_helper';
+
+            let syncedCount = 0;
+            let skippedCount = 0;
+            let upToDateCount = 0;
+            let errorCount = 0;
+
+            const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+            try {
+              const { data: upstreamRepo } = await github.rest.repos.get({
+                owner: UPSTREAM_OWNER,
+                repo: UPSTREAM_REPO
+              });
+
+              const upstreamBranch = upstreamRepo.default_branch;
+
+              console.log(`Fetching forks...`);
+
+              const forks = await github.paginate(
+                github.rest.repos.listForks,
+                {
+                  owner: UPSTREAM_OWNER,
+                  repo: UPSTREAM_REPO,
+                  per_page: 100
+                }
+              );
+
+              console.log(`Found ${forks.length} forks`);
+
+              for (const fork of forks) {
+                try {
+                  console.log(`Processing: ${fork.full_name}`);
+
+                  const comparison =
+                    await github.rest.repos.compareCommitsWithBasehead({
+                      owner: fork.owner.login,
+                      repo: fork.name,
+                      basehead: `${UPSTREAM_OWNER}:${upstreamBranch}...${fork.default_branch}`
+                    });
+
+                  const status = comparison.data.status;
+
+                  if (status === 'identical') {
+                    console.log(`${fork.full_name} is up to date`);
+                    upToDateCount++;
+                    continue;
+                  }
+
+                  if (status === 'ahead' || status === 'diverged') {
+                    console.log(`${fork.full_name} skipped (${status})`);
+                    skippedCount++;
+                    continue;
+                  }
+
+                  if (status === 'behind') {
+                    await github.rest.repos.mergeUpstream({
+                      owner: fork.owner.login,
+                      repo: fork.name,
+                      branch: fork.default_branch
+                    });
+
+                    console.log(`Synced successfully`);
+                    syncedCount++;
+                  }
+
+                  // Small delay to reduce rate-limit risk
+                  await delay(500);
+
+                } catch (error) {
+                  console.log(
+                    `Error processing ${fork.full_name}: ${String(error?.message || error)}`
+                  );
+                  errorCount++;
+                }
+              }
+
+              console.log(`Summary:`);
+              console.log(`Synced: ${syncedCount}`);
+              console.log(`Up to date: ${upToDateCount}`);
+              console.log(`Skipped: ${skippedCount}`);
+              console.log(`Errors: ${errorCount}`);
+
+            } catch (error) {
+              console.error(`Workflow failed: ${String(error?.message || error)}`);
+              throw error;
+            }
+            

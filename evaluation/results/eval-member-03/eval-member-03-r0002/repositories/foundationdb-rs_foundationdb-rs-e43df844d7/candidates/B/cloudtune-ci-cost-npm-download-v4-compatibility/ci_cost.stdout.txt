@@ -1,0 +1,94 @@
+[2mAnalyzing workflows in C:\Users\USER\AppData\Local\Temp\cloudtune-ci-cost-lmpctxn_\.github\workflows...[0m
+[2mFound 1 workflow file[0m
+
+[1m[36mci-cost[0m â€” GitHub Actions Cost Analyzer
+
+[2mAnalyzed 1 workflow Â· 4 jobs Â· 4 recommendations[0m
+
+[1mSEVERITY  RECOMMENDATION                                        ESTIMATED SAVINGS[0m
+[2mâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€[0m
+[31m[1mHIGH  [0m  Add cargo dependency cache to "compatibility" job     [32m~8 min per run[0m
+[31m[1mHIGH  [0m  Add cargo dependency cache to "test" job              [32m~8 min per run[0m
+[33m[1mMEDIUM[0m  Add concurrency group to "ci.yml"                     [32m~2 min per run[0m
+[34m[1mLOW   [0m  Explicitly set fail-fast for large matrix job "co...  [32m~2 min per run[0m
+
+[2mâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€[0m
+
+[1mRecommendations:[0m
+
+[1m1. [31m[HIGH][0m[1m Add cargo dependency cache to "compatibility" job[0m
+   [2mFile: ci.yml Â· Job: compatibility[0m
+   Job "compatibility" installs cargo dependencies without caching. Add `actions/cache` before the install step to restore the cargo cache across runs. This is one of the highest-impact optimizations for most CI workflows.
+
+   [36mFix:[0m
+   [2m# Add before your cargo install step in job "compatibility":[0m
+   [2m      - name: Cache cargo registry[0m
+   [2m        uses: actions/cache@v4[0m
+   [2m        with:[0m
+   [2m          path: |[0m
+   [2m            ~/.cargo/registry[0m
+   [2m            ~/.cargo/git[0m
+   [2m            target[0m
+   [2m          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}[0m
+   [2m          restore-keys: |[0m
+   [2m            ${{ runner.os }}-cargo-[0m
+
+[1m2. [31m[HIGH][0m[1m Add cargo dependency cache to "test" job[0m
+   [2mFile: ci.yml Â· Job: test[0m
+   Job "test" installs cargo dependencies without caching. Add `actions/cache` before the install step to restore the cargo cache across runs. This is one of the highest-impact optimizations for most CI workflows.
+
+   [36mFix:[0m
+   [2m# Add before your cargo install step in job "test":[0m
+   [2m      - name: Cache cargo registry[0m
+   [2m        uses: actions/cache@v4[0m
+   [2m        with:[0m
+   [2m          path: |[0m
+   [2m            ~/.cargo/registry[0m
+   [2m            ~/.cargo/git[0m
+   [2m            target[0m
+   [2m          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}[0m
+   [2m          restore-keys: |[0m
+   [2m            ${{ runner.os }}-cargo-[0m
+
+[1m3. [33m[MEDIUM][0m[1m Add concurrency group to "ci.yml"[0m
+   [2mFile: ci.yml[0m
+   "ci.yml" runs on pull requests but has no `concurrency` setting. Without it, every push to a PR branch queues a new run while the previous one is still running â€” wasting runner minutes. A concurrency group cancels stale runs automatically.
+
+   [36mFix:[0m
+   [2m# Add at the top level of your workflow (after 'on:'):[0m
+   [2mconcurrency:[0m
+   [2m  group: ${{ github.workflow }}-${{ github.ref }}[0m
+   [2m  cancel-in-progress: true[0m
+   [2m[0m
+   [2m# For deployment workflows where you want to queue instead of cancel:[0m
+   [2m# concurrency:[0m
+   [2m#   group: deploy-${{ github.ref }}[0m
+   [2m#   cancel-in-progress: false[0m
+
+[1m4. [34m[LOW][0m[1m Explicitly set fail-fast for large matrix job "compatibility" (42 combinations)[0m
+   [2mFile: ci.yml Â· Job: compatibility[0m
+   Matrix job "compatibility" has 42 combinations. Explicitly setting `fail-fast: true` ensures the workflow cancels remaining combinations as soon as one fails, saving up to 41 runner-minutes per broken run.
+
+   [36mFix:[0m
+   [2m# In job "compatibility", explicitly set fail-fast:[0m
+   [2m  compatibility:[0m
+   [2m    strategy:[0m
+   [2m      fail-fast: true[0m
+   [2m      matrix:[0m
+   [2m        # ... your matrix config[0m
+
+[2mâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€[0m
+
+[1mSummary[0m
+
+  Estimated monthly cost:   [33m~$51.20/month[0m
+  Time savings per run:     [32m~20 min/run[0m
+  Estimated monthly savings: [32m~$32.00/month[0m
+
+  Issues:  [31m2 HIGH[0m  [33m1 MEDIUM[0m  [34m1 LOW[0m
+
+  [2mRun with [0m[36m--fix[0m[2m to generate optimized workflow files[0m
+
+[2mGenerating optimized workflow files in C:\Users\USER\AppData\Local\Temp\cloudtune-ci-cost-lmpctxn_\.github\workflows\optimized...[0m
+[32mGenerated 1 optimized workflow file:[0m
+  [36mC:\Users\USER\AppData\Local\Temp\cloudtune-ci-cost-lmpctxn_\.github\workflows\optimized\ci.yml[0m

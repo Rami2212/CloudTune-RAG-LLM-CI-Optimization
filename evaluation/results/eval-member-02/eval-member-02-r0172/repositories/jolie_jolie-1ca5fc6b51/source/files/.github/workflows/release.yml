@@ -1,0 +1,94 @@
+# Copyright (C) 2021-2022 Fabrizio Montesi <famontesi@gmail.com>
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public
+# License as published by the Free Software Foundation; either
+# version 2.1 of the License, or (at your option) any later version.
+#
+# This library is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# Lesser General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public
+# License along with this library; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+# MA 02110-1301 USA
+
+name: Publish Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  release:
+
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+    - name: Checkout Jolie
+      uses: actions/checkout@v4
+      with:
+        path: jolie-git
+
+    - name: Set up JDK
+      uses: actions/setup-java@v4
+      with:
+        java-version: 21
+        distribution: 'temurin'
+        cache: 'maven'
+        server-id: central
+        server-username: MAVEN_USERNAME
+        server-password: MAVEN_PASSWORD
+        gpg-private-key: ${{ secrets.OSSRH_GPG_SECRET_KEY }}
+        gpg-passphrase: MAVEN_GPG_PASSPHRASE # env variable for GPG private key passphrase
+
+    - name: Build prerequisites
+      run: mvn -f jolie-git/pom.xml -DskipTests install -pl build-tools
+
+    - name: Compile Jolie
+      run: mvn -f jolie-git/pom.xml -DskipTests install -Dmaven.test.skip
+
+    - name: Compile Jolie installer
+      run: |
+        mvn -f jolie-git/release-tools/installer/pom.xml install
+    
+#    - name: Install zip (for the installer)
+#      run: sudo apt-get install zip
+
+    - name: Package the installer
+      run: |
+        mkdir jolie-bin \
+        && export JOLIE_HOME=$(pwd)/jolie-bin/jolie-dist \
+        && cd jolie-git \
+        && sh scripts/dev-setup.sh ../jolie-bin \
+        && cd release-tools \
+        && export JOLIE_VERSION=$(git --git-dir ../.git describe --abbrev=0 --tags) \
+        && ../../jolie-bin/jolie release.ol .. \
+        && mv release/jolie-installer.jar ../../jolie-${JOLIE_VERSION:1}.jar \
+        && cd ../..
+    
+    - name: Release Jolie on GitHub
+      uses: softprops/action-gh-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+      with:
+        files: jolie-*.jar
+
+    - name: Publish on Maven Central
+      env:
+        MAVEN_USERNAME: ${{ secrets.CENTRAL_TOKEN_USERNAME }}
+        MAVEN_PASSWORD: ${{ secrets.CENTRAL_TOKEN_PASSWORD }}
+        MAVEN_GPG_PASSPHRASE: ${{ secrets.OSSRH_GPG_SECRET_KEY_PASSWORD }}
+      run: |
+        mvn -f jolie-git/pom.xml \
+        --no-transfer-progress --batch-mode \
+        deploy \
+        -pl libjolie,jolie,lib/jolie-js,jolie-cli \
+        -P central
+   

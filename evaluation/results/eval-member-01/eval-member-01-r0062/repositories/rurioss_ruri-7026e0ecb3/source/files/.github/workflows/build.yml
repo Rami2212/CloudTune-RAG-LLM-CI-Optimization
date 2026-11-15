@@ -1,0 +1,189 @@
+name: Build release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'src/**'
+      - 'build/**'
+      - 'build.c'
+      - '.github/**'
+    tags:
+      - "v*"
+  pull_request:
+
+jobs:
+  update:
+    name: Fetch Latest Version
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.fetch_version.outputs.release }}
+      version: ${{ steps.fetch_version.outputs.version }}
+      release_name: ${{ steps.fetch_version.outputs.release_name }}
+      build_time: ${{ steps.fetch_version.outputs.build_time }}
+    steps:
+      - name: fetch latest version
+        id: fetch_version
+        run: |
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref_type }}" == "tag" ]]; then
+            version="${{ github.ref_name }}"
+            release_name="ruri ${{ github.ref_name }} Release"
+          else
+            response=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" -L "https://api.github.com/repos/${{ github.repository }}/releases/latest")
+            version=$(echo "$response" | jq -r .tag_name)
+            release_name=$(echo "$response" | jq -r .name)
+          fi
+
+          if [[ -n "$version" && "$version" != "null" && -n "$release_name" && "$release_name" != "null" ]]; then
+            echo "release=true" >> $GITHUB_OUTPUT
+          else
+            echo "release=false" >> $GITHUB_OUTPUT
+          fi
+          build_time="UTC $(TZ=UTC date '+%Y%m%d%H%M')"
+          echo "version=$version" >> $GITHUB_OUTPUT
+          echo "release_name=$release_name" >> $GITHUB_OUTPUT
+          echo "build_time=$build_time" >> $GITHUB_OUTPUT
+
+  build-arch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        arch: [x86_64, x86, aarch64, armhf, armv7, ppc64le, loongarch64, riscv64, s390x]
+    env:
+      ARCHITECTURE: ${{ matrix.arch }}
+    steps:
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get --no-install-recommends -y install \
+            binutils build-essential libcap-dev libseccomp-dev make qemu-user xz-utils
+          git clone https://github.com/RuriOSS/qemu-user-static-x86_64
+          chmod 777 qemu-user-static-x86_64/*
+          sudo cp qemu-user-static-x86_64/* /usr/bin/
+
+      - name: Build ruri for containers
+        run: |
+          mkdir -p build && cd build
+          git clone --depth 1 https://github.com/rurioss/ruri.git
+          cd ruri
+          cc -w src/*.c src/easteregg/*.c -o ruri -lcap -lseccomp -lpthread
+          cp ./ruri ../../
+          ./ruri -v||exit 1
+
+      - name: Download alpine rootfs for ${{ matrix.arch }}
+        env:
+          URL: https://dl-cdn.alpinelinux.org/alpine/v3.22/releases
+        run: |
+          cd build
+          mkdir -p $ARCHITECTURE
+
+          wget -q https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O yq
+          sudo mv yq /usr/local/bin/yq
+          sudo chmod +x /usr/local/bin/yq
+
+          FILE=$(curl -s "$URL/$ARCHITECTURE/latest-releases.yaml" | yq '.[] | select(.flavor == "alpine-minirootfs") | .file')
+          wget "$URL/$ARCHITECTURE/$FILE"
+          tar -xzf "$FILE" -C "$ARCHITECTURE"
+
+      - name: Build for ${{ matrix.arch }}
+        shell: bash
+        run: |
+          set -x
+          cd build
+          cp ruri/.github/build.sh "$ARCHITECTURE/build.sh"
+          sudo chmod +x ../ruri
+          sudo chmod +x "$ARCHITECTURE/build.sh"
+
+          case "$ARCHITECTURE" in
+            x86_64|x86)
+              sudo ../ruri ./$ARCHITECTURE /bin/sh /build.sh
+              ;;
+            aarch64|armhf|ppc64le|armv7|riscv64|s390x|loongarch64)
+              if [ "$ARCHITECTURE" = "armv7" ]; then
+                sudo ../ruri -a armv7 -q /usr/bin/qemu-arm-static ./$ARCHITECTURE /bin/sh /build.sh
+              else
+                sudo ../ruri -a $ARCHITECTURE -q /usr/bin/qemu-$ARCHITECTURE-static ./$ARCHITECTURE /bin/sh /build.sh
+              fi
+              ;;
+          esac
+          PATH_BK=$(pwd)
+          case "$ARCHITECTURE" in
+            x86_64|x86)
+              cd $ARCHITECTURE/output&&./ruri -v||exit 1
+              cd $PATH_BK
+              ;;
+            aarch64|armhf|ppc64le|armv7|riscv64|s390x|loongarch64)
+              if [ "$ARCHITECTURE" = "armv7" ]; then
+                cd $ARCHITECTURE/output&&/usr/bin/qemu-arm-static ./ruri -v||exit 1
+                cd $PATH_BK
+              else
+                cd $ARCHITECTURE/output&& /usr/bin/qemu-$ARCHITECTURE-static ./ruri -v||exit 1
+                cd $PATH_BK
+              fi
+              ;;
+          esac
+          cd $PATH_BK
+
+          (cd $ARCHITECTURE/output && tar -cf ../../../$ARCHITECTURE.tar .)
+          (cd $ARCHITECTURE/output3 && tar -cf ../../../$ARCHITECTURE-core.tar .)
+          if [[ "$ARCHITECTURE" =~ ^(x86_64|x86|aarch64|armhf|ppc64le|armv7)$ ]]; then
+            (cd $ARCHITECTURE/output2 && tar -cf ../../../$ARCHITECTURE-upx.tar .)
+          fi
+
+          cd $GITHUB_WORKSPACE
+          if [[ "$ARCHITECTURE" == "x86" ]]; then
+            mv $ARCHITECTURE.tar i386.tar
+            mv $ARCHITECTURE-upx.tar i386-upx.tar
+            mv $ARCHITECTURE-core.tar i386-core.tar
+          fi
+
+      - name: Upload artifacts
+        if: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: ruri-${{ matrix.arch }}
+          path: |
+            ./*.tar
+          retention-days: 7
+
+  release:
+    name: Push Release
+    needs: [update,  build-arch]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    if: |
+      (github.event_name == 'push' && needs.update.outputs.release == 'true') ||
+      startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download All Build
+        uses: actions/download-artifact@v8
+        with:
+          path: ./all
+
+      - name: Move all .tar files
+        run: |
+          find ./all -type f -name "*.tar" -exec mv {} ./ \;
+          # Upload only when file > 50kb
+          for file in ./*.tar; do
+            if [ ! -s "$file" ] || [ $(stat -c%s "$file") -lt 51200 ]; then
+              echo "Removing $file as it is smaller than 50kb"
+              rm "$file"
+              exit 1
+            fi
+          done
+          curl -s -o News.md "https://raw.githubusercontent.com/${{ github.repository }}/main/News.md"
+
+      - name: Release
+        uses: softprops/action-gh-release@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ needs.update.outputs.version }}
+          name: ${{ needs.update.outputs.release_name }}
+          body_path: ${{ github.workspace }}/News.md
+          files: |
+            *.tar

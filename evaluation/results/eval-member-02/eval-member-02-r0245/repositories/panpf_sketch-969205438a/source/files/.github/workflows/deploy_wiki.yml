@@ -1,0 +1,61 @@
+name: Deploy Wiki
+
+on:
+  workflow_dispatch:
+  push:
+    branches: main
+
+env:
+  JAVA_VERSION: 21
+  JAVA_DISTRIBUTION: zulu
+
+jobs:
+  deploy-web-app:
+    name: Deploy Wiki
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        continue-on-error: true
+        timeout-minutes: 5
+        with:
+          cache-overwrite-existing: true
+
+      - name: Build wiki
+        run: |
+          pip3 install --upgrade pip && pip3 install --upgrade mkdocs-material mkdocs-material-extensions mkdocs-minify-plugin mkdocs-static-i18n
+          ./build_docs.sh
+
+      - name: Check out the gh-pages branch
+        run: |
+          git fetch origin gh-pages:gh-pages
+          git checkout gh-pages
+
+      - name: Remove old app directory
+        run: rm -rf wiki/*
+
+      - name: Create app directory
+        run: mkdir -p wiki
+
+      - name: Move build artifacts to wiki directory
+        run: mv site/* wiki/
+
+      - name: Commit and push changes
+        uses: stefanzweifel/git-auto-commit-action@v4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          commit_message: "Update wiki"
+          branch: gh-pages
+          file_pattern: wiki/*

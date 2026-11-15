@@ -1,0 +1,31 @@
+name: lint
+on:
+  push:
+    branches: [ "main", "privatedial" ]
+  pull_request:
+    branches: [ "main", "privatedial" ]
+permissions:
+  contents: read
+  # Optional: allow read access to pull request. Use with `only-new-issues` option.
+  # pull-requests: read
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 2
+      - uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b # v27
+      - uses: HatsuneMiku3939/direnv-action@fe6ca688de409566c44001c1e65ad6925f0e9cbb # v1
+      - name: direnv allow
+        run: direnv allow .
+      - name: Run goimports
+        run: direnv exec . make -f scripts/Makefile fmt
+      - name: Lint
+        run: direnv exec . make -f scripts/Makefile lint
+      - name: Gen proto
+        run: direnv exec . make -f scripts/Makefile gen-proto
+      - name: Check diff
+        shell: bash
+        run: git diff --exit-code

@@ -1,0 +1,297 @@
+name: Armbian
+on:
+  workflow_dispatch:
+    inputs:
+      all:
+        description: 'Build ALL assets?'
+        type: boolean
+        default: false
+      asset:
+        description: 'Asset'
+        type: choice
+        options: [kernel, uboot, firmware]
+        default: kernel
+        required: true
+      branch:
+        description: 'Branch'
+        type: choice
+        options: [legacy, vendor, current, edge]
+        default: current
+        required: true
+      board:
+        description: 'Board'
+        default: rock64
+        required: true
+      gitbranch:
+        description: 'Override Git branch of Armbian repo'
+      gitowner:
+        description: 'Override Git owner of Armbian repo'
+      rebase:
+        description: 'Rebase onto latest armbian/main'
+        type: boolean
+        default: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.inputs.asset }}-${{ github.event.inputs.branch }}-${{ github.event.inputs.board }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  prep:
+    runs-on: ubuntu-26.04
+    outputs:
+      assets: ${{ steps.assets.outputs.assets }}
+    steps:
+    - name: Generate build matrix
+      id: assets
+      run: |
+        if [ '${{ github.event.inputs.all }}' == 'true' ]
+        then
+            echo assets=[\
+        '"firmware rock64 current",'\
+        '"kernel meson current",'\
+        '"kernel meson64 current",'\
+        '"kernel meson-s7d vendor",'\
+        '"kernel rockchip current",'\
+        '"kernel rockchip64 current",'\
+        '"kernel rockchip64 edge",'\
+        '"kernel rockchip64 vendor",'\
+        '"kernel sunxi current",'\
+        '"kernel sunxi64 current",'\
+        '"kernel sunxi64 edge",'\
+        '"kernel sun60iw2 vendor",'\
+        '"kernel odroidxu4 current",'\
+        '"kernel cix-pi current",'\
+        '"kernel cix-pi edge",'\
+        '"uboot lubancat-4 current",'\
+        '"uboot nanopct4 current",'\
+        '"uboot nanopct6 current",'\
+        '"uboot nanopct6 edge",'\
+        '"uboot nanopct6 vendor",'\
+        '"uboot nanopi-m5 current",'\
+        '"uboot nanopi-m5 edge",'\
+        '"uboot nanopi-m5 vendor",'\
+        '"uboot nanopi-m6 current",'\
+        '"uboot nanopi-m6 edge",'\
+        '"uboot nanopi-m6 vendor",'\
+        '"uboot nanopi-r1 current",'\
+        '"uboot nanopi-r2s current",'\
+        '"uboot nanopi-r3s current",'\
+        '"uboot nanopi-r3s-lts current",'\
+        '"uboot nanopi-r4s current",'\
+        '"uboot nanopi-r4s edge",'\
+        '"uboot nanopi-r5c current",'\
+        '"uboot nanopi-r5s current",'\
+        '"uboot nanopi-r6c current",'\
+        '"uboot nanopi-r6c edge",'\
+        '"uboot nanopi-r6c vendor",'\
+        '"uboot nanopi-r6s current",'\
+        '"uboot nanopi-r6s edge",'\
+        '"uboot nanopi-r6s vendor",'\
+        '"uboot nanopi-r76s current",'\
+        '"uboot nanopi-r76s edge",'\
+        '"uboot nanopi-r76s vendor",'\
+        '"uboot nanopi-zero2 current",'\
+        '"uboot nanopi-zero2 edge",'\
+        '"uboot nanopi-zero2 vendor",'\
+        '"uboot nanopiair current",'\
+        '"uboot nanopik1plus current",'\
+        '"uboot nanopik2-s905 current",'\
+        '"uboot nanopim1 current",'\
+        '"uboot nanopim1plus current",'\
+        '"uboot nanopim4 current",'\
+        '"uboot nanopim4v2 current",'\
+        '"uboot nanopineo current",'\
+        '"uboot nanopineo2 current",'\
+        '"uboot nanopineo2black current",'\
+        '"uboot nanopineo3 current",'\
+        '"uboot nanopineo4 current",'\
+        '"uboot nanopineoplus2 current",'\
+        '"uboot odroidc1 current",'\
+        '"uboot odroidc2 current",'\
+        '"uboot odroidc4 current",'\
+        '"uboot odroidc5 vendor",'\
+        '"uboot odroidhc4 current",'\
+        '"uboot odroidhc4 edge",'\
+        '"uboot odroidm1 current",'\
+        '"uboot odroidm1 edge",'\
+        '"uboot odroidm1s current",'\
+        '"uboot odroidm1s edge",'\
+        '"uboot odroidm2 current",'\
+        '"uboot odroidm2 edge",'\
+        '"uboot odroidn2 current",'\
+        '"uboot odroidxu4 current",'\
+        '"uboot orangepi3 current",'\
+        '"uboot orangepi3-lts current",'\
+        '"uboot orangepi3b current",'\
+        '"uboot orangepi3b edge",'\
+        '"uboot orangepi4-lts current",'\
+        '"uboot orangepi4-lts edge",'\
+        '"uboot orangepi-4a edge",'\
+        '"uboot orangepi4pro vendor",'\
+        '"uboot orangepi5 current",'\
+        '"uboot orangepi5 edge",'\
+        '"uboot orangepi5 vendor",'\
+        '"uboot orangepi5b current",'\
+        '"uboot orangepi5b edge",'\
+        '"uboot orangepi5b vendor",'\
+        '"uboot orangepi5-max current",'\
+        '"uboot orangepi5-max edge",'\
+        '"uboot orangepi5-max vendor",'\
+        '"uboot orangepi5-plus current",'\
+        '"uboot orangepi5-plus edge",'\
+        '"uboot orangepi5-plus vendor",'\
+        '"uboot orangepi5-ultra current",'\
+        '"uboot orangepi5-ultra edge",'\
+        '"uboot orangepi5-ultra vendor",'\
+        '"uboot orangepi5pro current",'\
+        '"uboot orangepi5pro edge",'\
+        '"uboot orangepi5pro vendor",'\
+        '"uboot orangepicm5 vendor",'\
+        '"uboot orangepizero2w current",'\
+        '"uboot orangepizero3 current",'\
+        '"uboot orangepizero3w vendor",'\
+        '"uboot pine64 current",'\
+        '"uboot pinebook-a64 current",'\
+        '"uboot pinebook-pro current",'\
+        '"uboot pineh64-b current",'\
+        '"uboot radxa-zero current",'\
+        '"uboot radxa-zero3 current",'\
+        '"uboot radxa-zero3 edge",'\
+        '"uboot rock-3a current",'\
+        '"uboot rock-4se current",'\
+        '"uboot rock-5a current",'\
+        '"uboot rock-5a edge",'\
+        '"uboot rock-5a vendor",'\
+        '"uboot rock-5b current",'\
+        '"uboot rock-5b edge",'\
+        '"uboot rock-5b vendor",'\
+        '"uboot rock64 current",'\
+        '"uboot rock64 edge",'\
+        '"uboot rockpi-4b current",'\
+        '"uboot rockpi-4cplus current",'\
+        '"uboot rockpi-s current",'\
+        '"uboot rockpro64 current",'\
+        '"uboot rockpro64 edge",'\
+        '"uboot tinkerboard-2 current",'\
+        '"uboot tinkerboard current",'\
+        '"uboot zeropi current"'\
+        ] >> "$GITHUB_OUTPUT"
+        else
+            echo assets='["${{ github.event.inputs.asset }} ${{ github.event.inputs.board }} ${{ github.event.inputs.branch }}"]' >> "$GITHUB_OUTPUT"
+        fi
+  build:
+    needs: prep
+    strategy:
+      matrix:
+        assets: ${{ fromJson(needs.prep.outputs.assets) }}
+      fail-fast: false
+    name: ${{ matrix.assets }}
+    runs-on: ubuntu-24.04-arm
+    steps:
+    - name: Create build variables
+      run: |
+        read -r ASSET BOARD BRANCH <<< '${{ matrix.assets }}'
+        echo "ASSET=$ASSET" >> "$GITHUB_ENV"
+        case $BOARD in
+            'meson') BOARD='odroidc1';;
+            'meson64') BOARD='odroidn2';;
+            'rockchip') BOARD='tinkerboard';;
+            'rockchip64') BOARD='nanopi-m6';;
+            'sunxi') BOARD='nanopim1';;
+            'sunxi64') BOARD='orangepizero3';;
+            'sun60iw2') BOARD='orangepizero3w';;
+            'meson-s7d') BOARD='odroidc5';;
+            'cix-p1') BOARD='cix-acpi';;
+        esac
+        echo "BOARD=$BOARD" >> "$GITHUB_ENV"
+        echo "BRANCH=$BRANCH" >> "$GITHUB_ENV"
+    - name: Clone Armbian repo
+      run: |
+        owner='${{ github.event.inputs.gitowner }}'
+        [ "$owner" ] || owner='MichaIng'
+        branch='${{ github.event.inputs.gitbranch }}'
+        [ "$branch" ] || branch='dietpi'
+        git clone -b "$branch" "https://github.com/$owner/build"
+        [ '${{ github.event.inputs.rebase }}' == 'false' ] && exit 0 || :
+        cd build
+        git config user.name "$GITHUB_REPOSITORY_OWNER"
+        git config user.email '${{ github.repository.owner.email }}'
+        if [ "$owner" != 'MichaIng' ]
+        then
+            git remote add dietpi https://github.com/MichaIng/build
+            git fetch dietpi dietpi
+            git rebase dietpi/dietpi
+        elif [ "$branch" != 'dietpi' ]
+        then
+            git fetch origin dietpi
+            git rebase origin/dietpi
+        fi
+        if [ "$owner" != 'armbian' ]
+        then
+            git remote add upstream https://github.com/armbian/build
+            git fetch upstream main
+            git rebase upstream/main
+        elif [ "$branch" != 'main' ]
+        then
+            git fetch origin main
+            git rebase origin/main
+        fi
+    - name: Obtain version suffix
+      run: |
+        cd build
+        read -r version < VERSION
+        case $ASSET in
+            firmware) package='armbian-firmware';;
+            uboot) package="linux-u-boot-$BOARD-$BRANCH";;
+            kernel)
+                family=$(. "config/boards/$BOARD."* > /dev/null; echo "$BOARDFAMILY")
+                echo "Board family is:             $family"
+                family=$(. "config/sources/families/$family.conf" > /dev/null; echo "${LINUXFAMILY:-$family}")
+                echo "Linux family is:             $family"
+                package="linux-image-$BRANCH-$family"
+            ;;
+            *) echo "ERROR: Invalid asset \"$ASSET\""; exit 1;;
+        esac
+        if curl -fO "https://dietpi.com/downloads/binaries/$package.deb"
+        then
+            cur_version=$(dpkg-deb -f "$package.deb" Version)
+            rm "$package.deb"
+            cur_suffix=${cur_version#*-dietpi}
+            echo "Current package version is:  $cur_version"
+        fi
+        echo "New Armbian version is:      $version"
+        [ "$version-dietpi$cur_suffix" = "$cur_version" ] && version="$version-dietpi$((cur_suffix+1))" || version="$version-dietpi1"
+        echo "New package version will be: $version"
+        echo "$version" > VERSION
+    - name: Build asset
+      run: |
+        cd build
+        exec sudo ALLOW_ROOT='yes' SKIP_LOG_ARCHIVE='yes' SHOW_LOG='yes' DEB_COMPRESS='xz' PATH="$PATH" ./compile.sh "$ASSET" "BRANCH=$BRANCH" "BOARD=$BOARD" # CI='true' skip this as I am no fans of the grouped logs
+    - name: Upload
+      run: |
+        # Generate file lists
+        files=
+        urls='"https://dietpi.com/downloads/binaries/testing/"'
+        cd build/output/debs
+        for i in *.deb
+        do
+          # Remove version string from filename
+          sudo mv -v "$i" "${i%%_*}.deb"
+          i="${i%%_*}.deb"
+          files="$files,$i"
+          urls="$urls,\"https://dietpi.com/downloads/binaries/testing/$i\""
+        done
+        files=${files#,}
+        echo "Uploading file(s) $files to URL(s) $urls ..."
+
+        # Upload
+        trap 'rm -Rf ~/.ssh' EXIT
+        mkdir -m 0700 ~/.ssh
+        umask 377
+        echo '${{ secrets.KNOWN_HOSTS }}' > ~/.ssh/known_hosts
+        echo '${{ secrets.SSH_KEY }}' > ~/.ssh/id_ed25519
+        curl -T "{$files}" --key ~/.ssh/id_ed25519 '${{ secrets.UPLOAD_URL }}all/'
+        rm -R ~/.ssh
+        curl 'https://api.cloudflare.com/client/v4/zones/${{ secrets.CF_ZONE }}/purge_cache' -H 'Authorization: Bearer ${{ secrets.CF_TOKEN }}' -H 'Content-Type: application/json' -d "{\"files\":[$urls]}"

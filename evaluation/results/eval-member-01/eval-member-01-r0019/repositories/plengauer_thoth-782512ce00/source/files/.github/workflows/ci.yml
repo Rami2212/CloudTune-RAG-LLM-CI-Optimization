@@ -1,0 +1,88 @@
+name: CI
+on:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: true
+concurrency: # this is to not exhaust GitHub API rate-limits
+  group: ci
+  queue: max
+jobs:
+  build:
+    permissions:
+      actions: read
+      contents: read
+    uses: $/.github/workflows/build.yml
+    with:
+      ref: ${{ inputs.ref }}
+    secrets: inherit
+  shell:
+    needs: build
+    permissions:
+      actions: read
+      contents: read
+    uses: $/.github/workflows/test_shell.yml
+    with:
+      ref: ${{ inputs.ref }}
+    secrets: inherit
+  github:
+    needs: build
+    permissions:
+      actions: read
+      attestations: none
+      checks: none
+      contents: read
+      deployments: none
+      discussions: none
+      id-token: none
+      issues: none
+      # models: none
+      packages: read
+      pages: none
+      pull-requests: none
+      security-events: none
+      statuses: none
+    uses: $/.github/workflows/test_github.yml
+    with:
+      ref: ${{ inputs.ref }}
+    secrets: inherit
+  join:
+    needs: [shell, github]
+    runs-on: ubuntu-slim
+    outputs:
+      success: ${{ steps.tests.outputs.success }}
+    permissions:
+      contents: none
+      actions: read
+    env:
+      OTEL_KILL_SWITCH: ${{ vars.OTEL_KILL_SWITCH }}
+    steps:
+      - uses: plengauer/opentelemetry-github/actions/instrument/job@5d34a21816f798c24f19857225b018a7f2af731f # v5.66.0
+        env:
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.OTEL_EXPORTER_OTLP_ENDPOINT }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+        with:
+          secrets_to_redact: '["${{ github.token }}"]'
+      - id: tests
+        run: echo "success=true" >> "$GITHUB_OUTPUT"
+  all:
+    if: ${{ success() || failure() }} # this is because we need this to fail and not skipped to avoid PRs getting merged without this passing
+    needs: join
+    runs-on: ubuntu-slim
+    permissions:
+      contents: none
+      actions: read
+    env:
+      OTEL_KILL_SWITCH: ${{ vars.OTEL_KILL_SWITCH }}
+    steps:
+      - uses: plengauer/opentelemetry-github/actions/instrument/job@5d34a21816f798c24f19857225b018a7f2af731f # v5.66.0
+        env:
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.OTEL_EXPORTER_OTLP_ENDPOINT }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+        with:
+          secrets_to_redact: '["${{ github.token }}"]'
+      - env:
+          SUCCESS: ${{ needs.join.outputs.success }}
+        run: |
+          [ "$SUCCESS" = 'true' ]

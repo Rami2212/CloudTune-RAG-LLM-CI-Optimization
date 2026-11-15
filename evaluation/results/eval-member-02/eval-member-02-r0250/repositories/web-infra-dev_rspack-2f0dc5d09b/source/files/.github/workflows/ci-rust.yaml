@@ -1,0 +1,42 @@
+name: CI-Rust
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+  merge_group:
+    types: [checks_requested]
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - release/2.3.0
+      - v1.x
+    paths:
+      - '.github/workflows/**'
+      - 'crates/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'rust-toolchain.toml'
+    tags-ignore:
+      - '**'
+jobs:
+  rust_tests:
+    name: Run Rust Tests
+    uses: ./.github/workflows/reusable-rust-test.yml
+
+  test_required_check:
+    # this job will be used for GitHub actions to determine required job success or not;
+    # When code changed, it will check if any of the test jobs failed.
+    # When *only* doc changed, it will run as success directly
+    name: Rust Test Required Check
+    needs: [rust_tests]
+    if: ${{ always() && !cancelled() }}
+    runs-on: ${{ fromJSON(vars.CI_LINUX_MINI_RUNNER || '"ubuntu-latest"') }}
+    steps:
+      - name: Log
+        run: echo ${{ needs.*.result }}
+      - name: Test check
+        if: ${{ needs.rust_tests.result != 'success' }}
+        run: echo "Tests Failed" && exit 1
+      - name: No check to Run test
+        run: echo "Success"

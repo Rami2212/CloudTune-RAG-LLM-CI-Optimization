@@ -1,0 +1,53 @@
+name: Book
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+permissions:
+  contents: write
+# Adapted from:
+# https://github.com/rust-lang/mdBook/wiki/Automated-Deployment%3A-GitHub-Actions#github-pages-deploy
+jobs:
+  deploy:
+    if: github.repository == 'rust-osdev/uefi-rs'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Install mdbook
+        run: |
+          mkdir mdbook
+          curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.4.21/mdbook-v0.4.21-x86_64-unknown-linux-gnu.tar.gz | tar -xz --directory=./mdbook
+          echo `pwd`/mdbook >> $GITHUB_PATH
+      - name: Deploy GitHub Pages
+        run: |
+          # Configure git user so that `git commit` works.
+          git config user.name "Deploy from CI"
+          git config user.email ""
+
+          # Get the highest `uefi` release tag.
+          highest_tag="$(git tag --list | grep uefi-v | sort -V | tail -1)"
+
+          # Create a worktree for the tag.
+          git worktree add wt-tag refs/tags/"${highest_tag}"
+
+          # Create a worktree for the `gh-pages` branch.
+          git worktree add wt-gh-pages gh-pages
+
+          # Delete the ref to avoid keeping history.
+          git -C wt-gh-pages update-ref -d refs/heads/gh-pages
+
+          # Build the book for the tag. Don't use `--dest-dir` because it will
+          # delete the destination directory including the worktree checkout's
+          # ".git".
+          mdbook build wt-tag/book
+          # Copy output to the destination directory. Note the "/." is needed at
+          # the end of the source path so that hidden files are included.
+          cp -r wt-tag/book/book/. wt-gh-pages
+
+          # Commit and push.
+          cd wt-gh-pages
+          git add .
+          git commit -m "Deploy $GITHUB_SHA to gh-pages"
+          git push --force

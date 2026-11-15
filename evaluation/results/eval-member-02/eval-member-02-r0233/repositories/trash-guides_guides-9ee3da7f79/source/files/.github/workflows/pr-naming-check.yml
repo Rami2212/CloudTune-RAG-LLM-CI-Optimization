@@ -1,0 +1,45 @@
+# Validate: PR Title - checks that a pull request title matches the conventional-commit naming pattern.
+# Triggers: pull request opened, reopened, edited, or synchronized.
+name: "Validate: PR Title"
+run-name: "${{ github.workflow }} · ${{ github.event_name }}"
+
+on:
+  pull_request:
+    types: [opened, reopened, edited, synchronize]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  pull-requests: write
+
+jobs:
+  pull-request-title-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Validate Pull Request Title
+        id: check_title
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const titleRegex = /^(Revert \")?(feat|fix|chore)\((((radarr|sonarr|starr)(-(german|french|anime))?)|(prowlarr|lidarr|bazarr|hardlinks|downloaders|plex|guide(-sync)?|misc|glossary|gha|mkdocs|docs|style|refactor|perf|test|update|build|ci|deps))\):\s.+$/;
+            const title = context.payload.pull_request.title;
+            const isValid = titleRegex.test(title);
+            if (!isValid) {
+              if ((context.payload.action === 'opened') || (context.payload.action === 'reopened')) {
+                const prNumber = context.payload.pull_request.number;
+                const author = context.payload.pull_request.user.login;
+                const message = `@${author} your pull request title "${context.payload.pull_request.title}" does not conform to our [naming conventions](https://www.conventionalcommits.org/en/v1.0.0/).\n\nPlease update the title to match the pattern: "feat|chore|fix(\\<area\\>): \\<description\\>\n\nYou can check your title at this [regex101 link](https://regex101.com/r/ppDr7P/1)."`;
+                github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  body: message
+                });
+              }
+              core.setFailed(`PR title "${title}" doesn't match the required format.`)
+            }

@@ -1,0 +1,115 @@
+# Copyright (C) 2021-2022 Fabrizio Montesi <famontesi@gmail.com>
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public
+# License as published by the Free Software Foundation; either
+# version 2.1 of the License, or (at your option) any later version.
+#
+# This library is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# Lesser General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public
+# License along with this library; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+# MA 02110-1301 USA
+
+name: Docker Hub (Build and Push)
+
+on:
+  push:
+    branches:
+      - 'master'
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+jobs:
+  dockerhub:
+    if: github.repository == 'jolie/jolie'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        platform:
+          - linux/amd64
+          # - linux/arm64
+        
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Docker meta (runtime images)
+        id: meta_rt
+        uses: docker/metadata-action@v4
+        with:
+          images: jolielang/jolie
+          flavor: |
+            latest=true
+          tags: |
+            type=edge
+            type=semver,pattern={{version}}
+      
+      - name: Docker meta (runtime Alpine images)
+        id: meta_alpine
+        uses: docker/metadata-action@v4
+        with:
+          images: jolielang/jolie
+          flavor: |
+            latest=false
+          tags: |
+            type=edge,suffix=-alpine
+            type=semver,pattern={{version}},suffix=-alpine
+      
+      - name: Docker meta (development images)
+        id: meta_dev
+        uses: docker/metadata-action@v4
+        with:
+          images: jolielang/jolie
+          flavor: |
+            latest=false
+          tags: |
+            type=edge,suffix=-dev
+            type=semver,pattern={{version}},suffix=-dev
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push (runtime images)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta_rt.outputs.tags }}
+          labels: ${{ steps.meta_rt.outputs.labels }}
+        
+      - name: Build and push (runtime Alpine images)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.alpine
+          platforms: ${{ matrix.platform }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta_alpine.outputs.tags }}
+          labels: ${{ steps.meta_alpine.outputs.labels }}
+      
+      - name: Build and push (dev images)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.dev
+          platforms: ${{ matrix.platform }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta_dev.outputs.tags }}
+          labels: ${{ steps.meta_dev.outputs.labels }}

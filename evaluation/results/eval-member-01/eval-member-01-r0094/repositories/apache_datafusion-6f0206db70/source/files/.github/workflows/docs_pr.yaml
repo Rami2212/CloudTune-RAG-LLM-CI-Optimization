@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
+# SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
+
+# Tests for Docs that runs on PRs
+name: Docs
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.head_ref || github.sha }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+on:
+  push:
+    paths:
+      - "docs/**"
+      - "ci/scripts/check_docs_html.sh"
+    branches:
+      - main
+      - branch-*
+  pull_request:
+    paths:
+      - "docs/**"
+      - "ci/scripts/check_docs_html.sh"
+  # manual trigger
+  # https://docs.github.com/en/actions/managing-workflow-runs/manually-running-a-workflow
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Test doc build
+  linux-test-doc-build:
+    name: Test doc build
+    runs-on: ubuntu-slim
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          submodules: true
+          fetch-depth: 1
+      - name: Setup docs builder
+        uses: ./.github/actions/setup-docs-builder
+      - name: Build docs html and check for warnings
+        run: ./ci/scripts/check_docs_html.sh # fails on errors

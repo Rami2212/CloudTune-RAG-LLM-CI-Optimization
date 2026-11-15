@@ -1,0 +1,226 @@
+<?xml version="1.0"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+	<modelVersion>4.0.0</modelVersion>
+	<parent>
+		<groupId>com.graphql-java-generator</groupId>
+		<artifactId>graphql-maven-plugin-samples</artifactId>
+		<version>0-SNAPSHOT</version>
+	</parent>
+
+	<artifactId>graphql-maven-plugin-samples-StarWars-client</artifactId>
+
+	<build>
+		<plugins>
+			<plugin>
+				<groupId>com.graphql-java-generator</groupId>
+				<artifactId>graphql-maven-plugin</artifactId>
+				<executions>
+					<execution>
+						<goals>
+							<goal>generateClientCode</goal>
+						</goals>
+						<configuration>
+							<copyRuntimeSources>true</copyRuntimeSources>
+						</configuration>
+					</execution>
+				</executions>
+			</plugin>
+			<plugin>
+				<groupId>org.codehaus.mojo</groupId>
+				<artifactId>build-helper-maven-plugin</artifactId>
+				<executions>
+					<execution>
+						<id>add-test-source</id>
+						<phase>generate-sources</phase>
+						<goals>
+							<goal>add-source</goal>
+						</goals>
+						<configuration>
+							<sources>
+								<source>${project.build.directory}/generated-sources/graphql-maven-plugin</source>
+							</sources>
+						</configuration>
+					</execution>
+				</executions>
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-dependency-plugin</artifactId>
+				<executions>
+					<execution>
+						<goals>
+							<goal>properties</goal>
+						</goals>
+					</execution>
+				</executions>
+			</plugin>
+			<plugin>
+				<!-- Execution of the integration tests -->
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-failsafe-plugin</artifactId>
+				<executions>
+					<execution>
+						<goals>
+							<goal>integration-test</goal>
+							<goal>verify</goal>
+						</goals>
+					</execution>
+				</executions>
+				<configuration>
+					<argLine>
+-javaagent:${org.mockito:mockito-core:jar} 
+--add-opens com.graphql_java_generator.graphql_maven_plugin_project.graphql_maven_plugin_samples_StarWars_client/com.generated.graphql=tools.jackson.databind,spring.beans,spring.context,spring.core
+--add-opens com.graphql_java_generator.graphql_maven_plugin_project.graphql_maven_plugin_samples_StarWars_client/com.generated.graphql.util=tools.jackson.databind,spring.beans,spring.context,spring.core
+--add-opens com.graphql_java_generator.graphql_maven_plugin_project.graphql_maven_plugin_samples_StarWars_client/com.graphql_java_generator.mavenplugin.samples=tools.jackson.databind,spring.beans,spring.context,spring.core
+--add-opens com.graphql_java_generator.graphql_maven_plugin_project.graphql_maven_plugin_samples_StarWars_client/com.graphql_java_generator.mavenplugin.samples.simple.client.subscription=tools.jackson.databind,spring.beans,spring.context,spring.core
+					</argLine>
+				</configuration>
+			</plugin>
+			<plugin>
+				<!--  cd graphql-maven-plugin-samples\graphql-maven-plugin-samples-StarWars-client -->
+				<!-- mvn cargo:run -->
+				<groupId>org.codehaus.cargo</groupId>
+				<artifactId>cargo-maven3-plugin</artifactId>
+				<version>1.10.21</version>
+				<executions>
+					<execution>
+						<id>start-tomcat</id>
+						<phase>pre-integration-test</phase>
+						<goals>
+							<goal>start</goal>
+						</goals>
+					</execution>
+					<execution>
+						<id>stop-tomcat</id>
+						<phase>post-integration-test</phase>
+						<goals>
+							<goal>stop</goal>
+						</goals>
+					</execution>
+				</executions>
+				<configuration>
+					<skip>${skipTests}</skip>
+					<container>
+						<containerId>tomcat11x</containerId>
+						<log>target/cargo.log</log>
+						<logLevel>debug</logLevel>
+						<output>target/server.log</output>
+						<timeout>300000</timeout> <!-- 5 minutes: McAfee is such a sh..., up to 98% of CPU, and I can't configure it as it's an enterprise computer -->
+						<zipUrlInstaller>
+							<url>https://repo.maven.apache.org/maven2/org/apache/tomcat/tomcat/11.0.9/tomcat-11.0.9.zip</url>
+							<downloadDir>${project.basedir}/downloads</downloadDir>
+						</zipUrlInstaller>
+		                <dependencies>
+		                    <dependency>
+		                        <groupId>org.slf4j</groupId>
+		                        <artifactId>slf4j-api</artifactId>
+		                    </dependency>
+		                    <dependency>
+		                        <groupId>org.slf4j</groupId>
+		                        <artifactId>jul-to-slf4j</artifactId>
+		                    </dependency>
+		                    <dependency>
+		                        <groupId>ch.qos.logback</groupId>
+		                        <artifactId>logback-classic</artifactId>
+		                    </dependency>
+		                    <dependency>
+		                        <groupId>ch.qos.logback</groupId>
+		                        <artifactId>logback-core</artifactId>
+		                    </dependency>
+		                </dependencies>
+					</container>
+					<configuration>
+						<properties>
+							<cargo.logging>medium</cargo.logging>
+							<!--cargo.protocol>https</cargo.protocol -->
+							<cargo.servlet.port>8443</cargo.servlet.port>
+							<cargo.servlet.users>admin:tomcat:manager-gui</cargo.servlet.users>
+							<cargo.tomcat.connector.keyAlias>graphql</cargo.tomcat.connector.keyAlias>
+							<cargo.tomcat.connector.keystoreFile>${project.basedir}/src/main/resources/keystore.jks</cargo.tomcat.connector.keystoreFile>
+							<cargo.tomcat.connector.keystorePass>graphql</cargo.tomcat.connector.keystorePass>
+							<cargo.tomcat.connector.keystoreType>JKS</cargo.tomcat.connector.keystoreType>
+						</properties>
+						<files>
+							<copy>
+								<!-- 
+									This allows to copy the catalina.properties provided by the project, and use it instead of the one generated by cargo.
+									This provided file is actually one generated by cargo (without this copy command), that is updated for this project.
+									The main update is actually to update the jarsToSkip and jarsToScan parameters, to avoid Tomcat to search for TLDs.
+									This accelerate (a little) the start of the tomcat server
+								-->
+								<file>${basedir}/../graphql-maven-plugin-samples-StarWars-server/src/main/resources/tomcat/catalina.properties</file>
+								<tofile>conf/catalina.properties</tofile>
+							</copy>
+						</files>
+					</configuration>
+					<deployables>
+						<deployable>
+							<location>${basedir}/../graphql-maven-plugin-samples-StarWars-server/target/graphql-maven-plugin-samples-StarWars-server-${project.version}.war</location>
+							<type>war</type>
+							<properties>
+								<context>/starwars</context>
+							</properties>
+						</deployable>
+					</deployables>
+				</configuration>
+			</plugin>
+			<plugin>
+				<!-- We don't want to spam the repository with test/sample artefacts -->
+				<artifactId>maven-deploy-plugin</artifactId>
+				<configuration>
+					<skip>true</skip>
+				</configuration>
+			</plugin>
+		</plugins>
+	</build>
+
+	<dependencies>
+		<!-- Dependencies for tests -->
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-test</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.awaitility</groupId>
+			<artifactId>awaitility</artifactId>
+			<scope>test</scope>
+		</dependency>
+
+
+		<!-- Dependencies for graphql-java-generator -->
+		<dependency>
+			<groupId>com.graphql-java-generator</groupId>
+			<artifactId>graphql-java-client-dependencies</artifactId>
+			<type>pom</type>
+		</dependency>
+
+	</dependencies>
+
+	<reporting>
+		<plugins>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-javadoc-plugin</artifactId>
+				<reportSets>
+					<reportSet>
+						<id>non-aggregate</id>
+						<reports>
+							<report>javadoc-no-fork</report>
+							<report>test-javadoc-no-fork</report>
+						</reports>
+					</reportSet>
+				</reportSets>
+				<configuration>
+					<source>${java.majorVersion}</source>
+				</configuration>
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-project-info-reports-plugin</artifactId>
+				<version>${maven-project-info-reports-plugin.version}</version>
+			</plugin>
+		</plugins>
+	</reporting>
+
+</project>

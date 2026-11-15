@@ -1,0 +1,140 @@
+name: Test-Publish
+
+on:
+  push:
+    branches: ['master']
+    tags:
+      - 'v*'   # only publish when pushing version tags (e.g., v1.0.0)
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      pytest_args:
+        description: 'Extra pytest arguments'
+        required: false
+        default: ''
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      matrix:
+        # test for:
+        # * oldest supported version
+        # * latest available Python version
+        python-version: ['3.10', '3.14']
+        # * Linux using ubuntu-latest
+        # * Windows using windows-latest
+        os: ['ubuntu-latest', 'windows-latest']
+        # * OM stable - latest stable version
+        # * OM nightly - latest nightly build
+        omc-version: ['stable', 'nightly']
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          architecture: 'x64'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip build setuptools wheel twine
+          pip install . pytest pytest-md pytest-emoji pre-commit
+
+      - name: Set timezone
+        uses: szenius/set-timezone@v2.0
+        with:
+          timezoneLinux: 'Europe/Berlin'
+
+      - name: Run pre-commit linters
+        run: 'pre-commit run --all-files'
+
+      - name: "Set up OpenModelica Compiler"
+        uses: OpenModelica/setup-openmodelica@v1.2.0
+        with:
+          version: ${{ matrix.omc-version }}
+          packages: |
+            omc
+          libraries: |
+            'Modelica 4.0.0'
+      - run: "omc --version"
+
+      - name: Pull OpenModelica docker image
+        if: runner.os != 'Windows'
+        run: docker pull openmodelica/openmodelica:v1.25.0-minimal
+
+      - name: Build wheel and sdist packages
+        run: python -m build --wheel --sdist --outdir dist
+
+      - name: OMPython version
+        id: ompython_version
+        shell: bash
+        run: |
+          V=$(python -c "
+          import OMPython
+          v = OMPython.__version__
+          assert v != 'unknown', 'Version resolution failed'
+          print(v)
+          ")
+          echo "Resolved OMPython version: $V"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "### OMPython Version" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$V\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check twine
+        run: python -m twine check dist/*
+
+      - name: Run pytest
+        uses: pavelzw/pytest-action@v2
+        with:
+          verbose: true
+          emoji: true
+          job-summary: true
+          custom-arguments: '-v ${{ inputs.pytest_args }} ./tests'
+          click-to-expand: true
+          report-title: 'Test Report'
+
+      - name: Run pytest based on v4.0.0 compatibility layer
+        uses: pavelzw/pytest-action@v2
+        with:
+          verbose: true
+          emoji: true
+          job-summary: true
+          custom-arguments: '-v ${{ inputs.pytest_args }} ./tests_v400'
+          click-to-expand: true
+          report-title: 'Test Report (v4.0.0 compatibility layer)'
+
+  Publish:
+    name: Publish to PyPI
+    runs-on: ${{ matrix.os }}
+    needs: test
+    strategy:
+      matrix:
+        python-version: ['3.10']
+        os: ['ubuntu-latest']
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          architecture: 'x64'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip build setuptools wheel twine
+
+      - name: Build wheel and sdist packages
+        run: python -m build --wheel --sdist --outdir dist
+
+      - name: Publish wheel and sdist packages to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_OMPYTHON_API_TOKEN }}
+        run: |
+          python -m twine upload dist/* --skip-existing

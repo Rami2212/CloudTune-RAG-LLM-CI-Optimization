@@ -1,0 +1,388 @@
+name: lce-release
+
+on:
+  release:
+    types: [published]
+    tags:
+      - v*
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version of the form 1.0.0(.devYYYYMMDD)"
+        required: true
+
+env:
+  IMAGE_NAME: dev
+
+jobs:
+  benchmark-binaries:
+    name: Build Benchmark Binaries for AArch64 and Android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: 3.12
+      - uses: actions/cache@v6
+        id: cache
+        with:
+          path: /tmp/lce_android
+          key: ${{ runner.os }}-${{ hashFiles('**/third_party/install_android.sh') }}
+      - name: Install pip dependencies
+        run: pip install numpy six --no-cache-dir
+      - name: Set Java version
+        run: echo "JAVA_HOME=${JAVA_HOME_8_X64}" >> $GITHUB_ENV
+      - name: Download and install Android NDK/SDK
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: ./third_party/install_android.sh
+      - name: Configure Bazel
+        run: LCE_SET_ANDROID_WORKSPACE=1 ANDROID_SDK_HOME="/tmp/lce_android" ANDROID_API_LEVEL=30 ANDROID_NDK_HOME="/tmp/lce_android/ndk/25.2.9519653" ANDROID_NDK_API_LEVEL=30 ANDROID_BUILD_TOOLS_VERSION=31.0.0 ./configure.py
+        shell: bash
+      - run: mkdir benchmark-binaries
+      - name: Build Benchmark utility for AArch64
+        run: |
+          bazelisk build //larq_compute_engine/tflite/benchmark:lce_benchmark_model --config=aarch64 -c opt --copt=-O3
+          cp bazel-bin/larq_compute_engine/tflite/benchmark/lce_benchmark_model benchmark-binaries/lce_benchmark_model_aarch64
+      - name: Build Benchmark utility for AArch32
+        run: |
+          bazelisk build //larq_compute_engine/tflite/benchmark:lce_benchmark_model --config=rpi3 -c opt --copt=-O3
+          cp bazel-bin/larq_compute_engine/tflite/benchmark/lce_benchmark_model benchmark-binaries/lce_benchmark_model_aarch32
+      - name: Build Benchmark utility for Android
+        run: |
+          bazelisk build //larq_compute_engine/tflite/benchmark:lce_benchmark_model --config=android_arm64 -c opt --copt=-O3
+          cp bazel-bin/larq_compute_engine/tflite/benchmark/lce_benchmark_model benchmark-binaries/lce_benchmark_model_android_arm64
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Benchmark-Binaries
+          path: benchmark-binaries
+      - name: Upload Release Asset AArch64
+        if: github.event_name == 'release'
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: benchmark-binaries/lce_benchmark_model_aarch64
+          asset_name: lce_benchmark_model_aarch64
+          asset_content_type: application/octet-stream
+      - name: Upload Release Asset AArch32
+        if: github.event_name == 'release'
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: benchmark-binaries/lce_benchmark_model_aarch32
+          asset_name: lce_benchmark_model_aarch32
+          asset_content_type: application/octet-stream
+      - name: Upload Release Asset Android
+        if: github.event_name == 'release'
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: benchmark-binaries/lce_benchmark_model_android_arm64
+          asset_name: lce_benchmark_model_android_arm64
+          asset_content_type: application/octet-stream
+
+  android-aar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: 3.12
+      - uses: actions/cache@v6
+        id: cache
+        with:
+          path: /tmp/lce_android
+          key: ${{ runner.os }}-${{ hashFiles('**/third_party/install_android.sh') }}
+      - name: Install pip dependencies
+        run: pip install numpy six --no-cache-dir
+      - name: Set Java version
+        run: echo "JAVA_HOME=${JAVA_HOME_8_X64}" >> $GITHUB_ENV
+      - name: Download and install Android NDK/SDK
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: ./third_party/install_android.sh
+      - name: Configure Bazel
+        run: LCE_SET_ANDROID_WORKSPACE=1 ANDROID_SDK_HOME="/tmp/lce_android" ANDROID_API_LEVEL=30 ANDROID_NDK_HOME="/tmp/lce_android/ndk/25.2.9519653" ANDROID_NDK_API_LEVEL=30 ANDROID_BUILD_TOOLS_VERSION=31.0.0 ./configure.py
+        shell: bash
+      - name: Build LCE AAR
+        run: BUILDER=bazelisk ./larq_compute_engine/tflite/java/build_lce_aar.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Android-AAR
+          path: lce-lite-*.aar
+      - name: Get Name of Artifact
+        if: github.event_name == 'release'
+        run: |
+          ASSET_NAME=$(ls lce-lite-*.aar | head -n 1)
+          echo "ASSET_NAME=${ASSET_NAME}" >> $GITHUB_ENV
+      - name: Upload Release Asset
+        if: github.event_name == 'release'
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: ${{ env.ASSET_NAME }}
+          asset_name: ${{ env.ASSET_NAME }}
+          asset_content_type: application/octet-stream
+
+  macos-release-wheel:
+    name: Build release wheels for macOS
+    runs-on: macos-13
+    strategy:
+      matrix:
+        python-version: ["3.10", 3.11, 3.12]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: google-github-actions/auth@v3
+        continue-on-error: true
+        with:
+          credentials_json: ${{ secrets.gcs_bazel_cache }}
+      - name: Build macOS wheels
+        run: |
+          python --version
+          python -m pip install delocate wheel setuptools numpy six pip-tools --no-cache-dir
+          # This is needed because the requirements are different on every OS and Python version
+          pip-compile --strip-extras --no-emit-index-url --allow-unsafe larq_compute_engine/requirements.in
+
+          ./configure.py
+          # This matches `release_macox_x86` in .tensorflow.bazelrc
+          export MACOSX_DEPLOYMENT_TARGET=10.15
+
+          if [[ -n $GOOGLE_APPLICATION_CREDENTIALS ]]; then
+            echo -e 'build --remote_cache=https://storage.googleapis.com/plumerai-bazel-cache/lce-release-macos-python${{ matrix.python-version }}' >> .bazelrc.user
+            echo -e 'build --google_default_credentials' >> .bazelrc.user
+          fi
+
+          bazelisk build :build_pip_pkg --config=release_macos_x86 --config=release_cpu_macos --copt=-fvisibility=hidden --linkopt=-dead_strip
+          bazel-bin/build_pip_pkg artifacts --plat-name macosx_10_15_x86_64
+
+          for f in artifacts/*.whl; do
+            delocate-wheel -w wheelhouse $f
+          done
+        env:
+          LCE_RELEASE_VERSION: ${{ github.event.inputs.version }}
+          TF_PYTHON_VERSION: ${{ matrix.python-version }}
+        shell: bash
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ runner.os }}-wheels-${{ matrix.python-version }}
+          path: wheelhouse
+
+  macos-arm-release-wheel:
+    name: Build release arm wheels for macOS
+    runs-on: macos-14
+    strategy:
+      matrix:
+        python-version: ["3.10", 3.11, 3.12]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: google-github-actions/auth@v3
+        continue-on-error: true
+        with:
+          credentials_json: ${{ secrets.gcs_bazel_cache }}
+      - name: Build macOS wheels
+        run: |
+          python --version
+          python -m pip install delocate wheel setuptools numpy six pip-tools --no-cache-dir
+          # This is needed because the requirements are different on every OS and Python version
+          pip-compile --strip-extras --no-emit-index-url --allow-unsafe larq_compute_engine/requirements.in
+
+          ./configure.py
+          # This matches `release_macox_arm64` in .tensorflow.bazelrc
+          export MACOSX_DEPLOYMENT_TARGET=12.0
+
+          if [[ -n $GOOGLE_APPLICATION_CREDENTIALS ]]; then
+            echo -e 'build --remote_cache=https://storage.googleapis.com/plumerai-bazel-cache/lce-release-macos-arm-python${{ matrix.python-version }}' >> .bazelrc.user
+            echo -e 'build --google_default_credentials' >> .bazelrc.user
+          fi
+
+          bazelisk build :build_pip_pkg --config=release_macos_arm64 --copt=-fvisibility=hidden --linkopt=-dead_strip
+          bazel-bin/build_pip_pkg artifacts --plat-name macosx_12_0_arm64
+
+          for f in artifacts/*.whl; do
+            delocate-wheel -w wheelhouse $f
+          done
+        env:
+          LCE_RELEASE_VERSION: ${{ github.event.inputs.version }}
+          TF_PYTHON_VERSION: ${{ matrix.python-version }}
+        shell: bash
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ runner.os }}-arm-wheels-${{ matrix.python-version }}
+          path: wheelhouse
+
+  manylinux-release-wheel:
+    name: Build release wheels for manylinux2014
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", 3.11, 3.12]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: google-github-actions/auth@v3
+        continue-on-error: true
+        with:
+          credentials_json: ${{ secrets.gcs_bazel_cache }}
+      - name: Generate requirements.txt
+        run: |
+          python -m pip install pip-tools --no-cache-dir
+          # This is needed because the requirements are different on every OS and Python version
+          pip-compile --strip-extras --no-emit-index-url --allow-unsafe larq_compute_engine/requirements.in
+      - name: Build manylinux2014 wheels
+        run: |
+          if [[ -n $GOOGLE_APPLICATION_CREDENTIALS ]]; then
+            echo -e 'build --remote_cache=https://storage.googleapis.com/plumerai-bazel-cache/lce-release-manylinux-python${{ matrix.python-version }}' >> .bazelrc.user
+            echo -e 'build --google_default_credentials' >> .bazelrc.user
+          fi
+
+          docker run -e LCE_RELEASE_VERSION=${{ github.event.inputs.version }} \
+            -e GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcloud-credentials.json \
+            -e TF_PYTHON_VERSION=${{ matrix.python-version }} \
+            -v $GOOGLE_APPLICATION_CREDENTIALS:/tmp/gcloud-credentials.json:ro \
+            -v ${PWD}:/compute-engine -w /compute-engine \
+            -v /mnt:/github_disk \
+            tensorflow/build:2.16-python${{ matrix.python-version }} \
+            .github/tools/release_linux.sh
+
+          sudo apt-get -y -qq install patchelf --no-install-recommends
+          python -m pip install auditwheel --no-cache-dir
+
+          for f in artifacts/*.whl; do
+            auditwheel repair --plat manylinux2014_x86_64 $f
+          done
+
+          ls -al wheelhouse/
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ runner.os }}-wheels-${{ matrix.python-version }}
+          path: wheelhouse
+
+  windows-release-wheel:
+    name: Build release wheels for Windows
+    runs-on: windows-2019
+    strategy:
+      matrix:
+        python-version: ["3.10", 3.11, 3.12]
+      fail-fast: false
+    steps:
+      - name: Configure Pagefile
+        uses: al-cheb/configure-pagefile-action@v1.5
+        with:
+          minimum-size: 8GB
+      - name: Pagefile size
+        run: |
+          (Get-CimInstance Win32_PageFileUsage).AllocatedBaseSize
+        shell: pwsh
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: google-github-actions/auth@v3
+        continue-on-error: true
+        with:
+          credentials_json: ${{ secrets.gcs_bazel_cache }}
+      - name: Build Windows wheels
+        run: |
+          $Env:BAZEL_VC = "C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC"
+          set PreferredToolArchitecture=x64
+
+          # The default is "/arch:AVX", which we don't want.
+          $Env:CC_OPT_FLAGS = "/O2"
+
+          python --version
+          python -m pip install wheel setuptools numpy six pip-tools --no-cache-dir
+          # This is needed because the requirements are different on every OS and Python version
+          pip-compile --strip-extras --no-emit-index-url --allow-unsafe larq_compute_engine/requirements.in
+
+          # Fix for path length limit: replace workspace name by 'lce'
+          (Get-Content WORKSPACE).Replace('workspace(name = "larq_compute_engine")', 'workspace(name = "lce")') | Set-Content WORKSPACE
+
+          "" | python configure.py
+
+          bazelisk --output_base=C:\bzl build :build_pip_pkg --enable_runfiles --local_ram_resources=4096 --remote_cache=https://storage.googleapis.com/plumerai-bazel-cache/lce-release-windows-python${{ matrix.python-version }} --google_default_credentials
+          bazel-bin/build_pip_pkg wheelhouse
+        env:
+          LCE_RELEASE_VERSION: ${{ github.event.inputs.version }}
+          TF_PYTHON_VERSION: ${{ matrix.python-version }}
+        shell: pwsh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ runner.os }}-wheels-${{ matrix.python-version }}
+          path: wheelhouse
+
+  upload-wheels:
+    name: Publish wheels to PyPi
+    if: always() && github.event_name == 'release'
+    needs:
+      [
+        manylinux-release-wheel,
+        macos-release-wheel,
+        macos-arm-release-wheel,
+        windows-release-wheel,
+      ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: "*wheels*"
+          path: dist
+          merge-multiple: true
+      - run: |
+          set -x
+          ls -la dist/
+          sha256sum dist/*.whl
+      - uses: pypa/gh-action-pypi-publish@master
+        with:
+          user: __token__
+          password: ${{ secrets.pypi_token }}
+
+  push-docker-image:
+    name: Push Docker image to GitHub Package Registry
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build image
+        run: docker build . --file Dockerfile --tag $IMAGE_NAME
+      - name: Log into registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login docker.pkg.github.com -u ${{ github.actor }} --password-stdin
+      - name: Push image
+        run: |
+          IMAGE_ID=docker.pkg.github.com/${{ github.repository }}/$IMAGE_NAME
+
+          # Change all uppercase to lowercase
+          IMAGE_ID=$(echo $IMAGE_ID | tr '[A-Z]' '[a-z]')
+
+          # Strip git ref prefix from version
+          VERSION=$(echo "${{ github.ref }}" | sed -e 's,.*/\(.*\),\1,')
+
+          # Strip "v" prefix from tag name
+          [[ "${{ github.ref }}" == "refs/tags/"* ]] && VERSION=$(echo $VERSION | sed -e 's/^v//')
+
+          # Use Docker `latest` tag convention
+          [ "$VERSION" == "main" ] && VERSION=latest
+
+          echo IMAGE_ID=$IMAGE_ID
+          echo VERSION=$VERSION
+
+          docker tag $IMAGE_NAME $IMAGE_ID:$VERSION
+          docker push $IMAGE_ID:$VERSION
