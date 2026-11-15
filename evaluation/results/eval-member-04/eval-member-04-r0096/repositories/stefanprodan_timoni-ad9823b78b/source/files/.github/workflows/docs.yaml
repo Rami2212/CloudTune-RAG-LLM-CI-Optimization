@@ -1,0 +1,75 @@
+name: docs
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ 'docs*' ]
+    tags: [ 'v*' ]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.x
+          check-latest: true
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Resolve Timoni version
+        id: ver
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME}"
+          else
+            version=$(gh release view --repo "${GITHUB_REPOSITORY}" --json tagName -q '.tagName')
+          fi
+          version="${version#v}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid Timoni version '${version}'"
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+      - name: Set Timoni version in docs
+        env:
+          TIMONI_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          grep -rl --include='*.mdx' '{{TIMONI_VERSION}}' docs | xargs perl -i -pe 's/\{\{TIMONI_VERSION\}\}/$ENV{TIMONI_VERSION}/g'
+          echo "Set Timoni version ${TIMONI_VERSION} in docs"
+      - name: Generate CLI reference
+        run: make docgen
+      - name: Add agent skills
+        run: make docs-skills
+      - name: Validate site
+        working-directory: docs
+        run: |
+          npx --yes mint validate
+          npx --yes mint broken-links
+      - name: Publish website branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          site=$(mktemp -d)
+          cp -R docs/. "$site"/
+          cd "$site"
+          git init -q -b website
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Publish docs from ${GITHUB_REF_NAME} (${GITHUB_SHA})"
+          git push --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" website

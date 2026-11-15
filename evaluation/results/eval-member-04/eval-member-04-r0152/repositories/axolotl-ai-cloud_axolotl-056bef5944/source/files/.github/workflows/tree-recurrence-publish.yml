@@ -1,0 +1,58 @@
+name: publish tree-recurrence
+
+# Runs only for a tree-recurrence/v<version> tag, which pypi.yml's "v*" filter does not
+# match. The tag sets the published version, as pypi.yml does for axolotl.
+on:
+  push:
+    tags:
+      - "tree-recurrence/v*"
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build tree-recurrence
+    runs-on: ubuntu-latest
+    if: github.repository == 'axolotl-ai-cloud/axolotl'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: false
+
+      - name: Update version in VERSION file
+        env:
+          TAG: ${{ github.ref_name }}
+        run: echo "${TAG#tree-recurrence/v}" > packages/tree-recurrence/VERSION
+
+      - name: Build sdist and wheel
+        run: uv build packages/tree-recurrence --out-dir dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tree-recurrence-dist
+          path: dist/
+
+  publish:
+    name: Upload tree-recurrence to PyPI
+    runs-on: ubuntu-latest
+    needs: [build]
+    environment:
+      name: pypi-tree-recurrence
+      url: https://pypi.org/p/tree-recurrence
+    permissions:
+      id-token: write # trusted publishing
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tree-recurrence-dist
+          path: dist/
+
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3

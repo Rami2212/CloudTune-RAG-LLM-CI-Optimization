@@ -1,0 +1,63 @@
+name: test
+on:
+  pull_request:
+    branches:
+      - '*'
+  push:
+    branches:
+      - 'dev'
+      - 'master'
+
+jobs:
+  go-generate:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v3
+      - name: Go Version
+        uses: actions/setup-go@v3
+        with:
+          go-version: '1.24.11'
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('go.mod', 'go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+      - name: go generate
+        run: go generate ./...
+      - name: check generated files
+        run: |
+          git diff --exit-code
+          if [ -n "$(git status --porcelain)" ]; then
+            git status --porcelain
+            echo "::error::go generate ./... produced untracked files"
+            exit 1
+          fi
+
+  unit-tests:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v3
+      - name: Go Version
+        uses: actions/setup-go@v3
+        with:
+          go-version: '1.24.11'
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('go.mod', 'go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+      - name: test
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/libs
+          LITE_SERVERS: ${{ secrets.LITE_SERVERS }}
+        run: |
+          sudo apt-get install -y libsecp256k1-0
+          mkdir -p ${{ env.LD_LIBRARY_PATH}}
+          wget https://github.com/tonkeeper/tongo/raw/master/lib/linux/libemulator.so -O ${{ env.LD_LIBRARY_PATH}}/libemulator.so
+          make test

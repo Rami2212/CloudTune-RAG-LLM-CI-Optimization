@@ -1,0 +1,215 @@
+name: Build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: cachix/install-nix-action@v31
+      with:
+        github_access_token: ${{ secrets.GITHUB_TOKEN }}
+    - run: nix build
+    # - run: nix flake check
+
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    # It seems that occasionally things get stuck. Not sure why since I'm unable to
+    # reproduce locally. But this stops the jobs from running for 6 hours.
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+
+      - name: Remove sync feature from build
+        run: sed -i 's/"stacker", "sync"/"stacker"/' Cargo.toml
+
+      - name: Set the STEEL_HOME environment variable
+        run: echo STEEL_HOME=${PWD}/.steel >> $GITHUB_ENV 
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "build"
+
+      - name: Build
+        run: cargo build --no-default-features --verbose
+        
+      - name: install steel dylib installer
+        env:
+          STEEL_HOME: ${{ env.STEEL_HOME }}
+        run: mkdir -p $STEEL_HOME/native && cd crates/cargo-steel-lib && cargo install --path . --force
+
+      - name: Install cogs
+        env:
+          STEEL_HOME: ${{ env.STEEL_HOME }}
+        run: |
+          echo $STEEL_HOME
+          mkdir -p .steel/cogs
+          cd cogs/
+          cargo run -- install.scm
+
+      - uses: actions-rs/cargo@v1
+        env:
+          STEEL_HOME: ${{ env.STEEL_HOME }}
+        with:
+          command: test
+          args: --all
+
+      - name: install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin --force
+
+      - name: run code coverage
+        run: cargo tarpaulin --exclude steel-derive --all --no-default-features -o "lcov" --engine llvm --timeout 600
+
+      - name: Coveralls GitHub Action
+        uses: coverallsapp/github-action@v1.1.2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path-to-lcov: ./lcov.info
+
+
+  sync-build:
+    name: Test Suite (sync)
+    strategy:
+      matrix:
+        os: [ 
+              { os: ubuntu-latest, arch: x86_64-unknown-linux-gnu }, 
+              { os: macos-latest, arch: aarch64-apple-darwin },
+              { os: windows-latest, arch: x86_64-pc-windows-msvc }
+            ]
+    runs-on: ${{ matrix.os.os }}
+    # It seems that occasionally things get stuck. Not sure why since I'm unable to
+    # reproduce locally. But this stops the jobs from running for 6 hours.
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+
+      - name: Set the STEEL_HOME environment variable
+        run: echo STEEL_HOME=${PWD}/.steel-sync >> $GITHUB_ENV 
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "build"
+
+      - name: Build
+        run: cargo build --verbose
+        
+      - name: Install steel dylib installer and package manager
+        env:
+          STEEL_HOME: ${{ env.STEEL_HOME }}
+        # run: mkdir -p $STEEL_HOME/native && cd crates/cargo-steel-lib && cargo install --path .
+        run: cargo install --path crates/cargo-steel-lib --force && cargo install --path crates/forge --force
+
+      - name: Install cogs
+        env:
+          STEEL_HOME: ${{ env.STEEL_HOME }}
+        run: |
+          echo $STEEL_HOME
+          mkdir -p .steel/cogs
+          cd cogs/
+          cargo run -- install.scm
+
+      - uses: actions-rs/cargo@v1
+        env:
+          STEEL_HOME: ${{ env.STEEL_HOME }}
+        with:
+          command: test
+          args: --all
+
+      # We also want to test the JIT stuff as well
+      - uses: actions-rs/cargo@v1
+        env:
+          STEEL_HOME: ${{ env.STEEL_HOME }}
+          STEEL_JIT: false
+        with:
+          command: test
+          args: --all
+
+      - name: Install shared libraries
+        env:
+          STEEL_HOME: ${{ env.STEEL_HOME }}
+        run: |
+          cd cogs/
+          cargo run -- install.scm ../contrib/slack
+
+
+  # redox-build:
+  #   name: redox build
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Checkout repository
+  #       uses: actions/checkout@v2
+  #     - name: Install Rust toolchain
+  #       uses: actions-rs/toolchain@v1
+  #       with:
+  #         toolchain: stable
+  #         profile: minimal
+  #         override: true
+  #     - name: Build x86_64-unknown-redox
+  #       run: |
+  #         sudo apt-get update -y && sudo apt-get install fuse3 libfuse3-dev pkg-config -y
+  #         cargo install redoxer --locked
+  #         redoxer build
+  
+  wasm-build:
+    name: Wasm32 build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+      - name: Build wasm32-unknown-unknown
+        run: |
+          cd crates/steel-core/
+          rustup target add wasm32-unknown-unknown
+          cargo build --target wasm32-unknown-unknown
+
+  rustfmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+          components: rustfmt
+      - name: Check formatting
+        uses: actions-rs/cargo@v1
+        with:
+          command: fmt
+          args: --all -- --check
+

@@ -1,0 +1,59 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 4 optimizations:
+# - [HIGH] Add pip dependency cache to "build" job
+# - [HIGH] Add pip dependency cache to "examples" job
+# - [MEDIUM] Add concurrency group to "test_package.yml"
+# - [LOW] Explicitly set fail-fast for large matrix job "build" (5 combinations)
+# Estimated savings: ~10 min/run
+#
+name: Tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
+    steps:
+    - uses: actions/checkout@v2
+    - name: Set up Python ${{matrix.python-version}}
+      uses: actions/setup-python@v2
+      with:
+        python-version: ${{matrix.python-version}}
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install .[test]
+    - name: Test with pytest
+      run: |
+        pytest tests
+
+  examples:
+        runs-on: ubuntu-latest
+        steps:
+        - uses: actions/checkout@v2
+        - name: Set up Python
+          uses: actions/setup-python@v2
+          with:
+            python-version: '3.12'
+        - name: Install dependencies
+          run: |
+            python -m pip install --upgrade pip
+            python -m pip install .
+        - name: Run examples
+          env:
+            MPLBACKEND: Agg
+          run: |
+            for f in examples/ex_*.py; do
+              echo "Running $f"
+              python "$f"
+            done

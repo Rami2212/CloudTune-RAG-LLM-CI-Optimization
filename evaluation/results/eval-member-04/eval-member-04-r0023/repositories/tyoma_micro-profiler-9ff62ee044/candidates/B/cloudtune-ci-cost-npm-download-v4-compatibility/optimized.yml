@@ -1,0 +1,54 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [MEDIUM] Add concurrency group to "cmake.yml"
+# Estimated savings: ~2 min/run
+#
+name: Build / Test
+
+on:
+  push:
+    branches: [ '**', '!pre.*' ]
+  pull_request:
+    branches: [ master ]
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build:
+    permissions: write-all
+    runs-on: ${{ matrix.config.os }}
+    strategy:
+      matrix:
+        config:
+#          - os: ubuntu-22.04
+          - os: windows-2022
+          - os: macos-15-intel
+
+    steps:
+    - uses: actions/checkout@v2
+      with:
+        submodules: true
+
+    - name: Select Python 3.10 # otherwise turtlebrowser/get-conan@v1.1 fails on macos-12
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install Conan
+      id: conan
+      uses: turtlebrowser/get-conan@main
+
+    - name: Configure CMake
+      run: cmake -B ${{github.workspace}}/_build -S ${{github.workspace}} -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES=${{github.workspace}}/build.props/conan_provider.cmake -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}}
+
+    - name: Build
+      run: cmake --build ${{github.workspace}}/_build --config ${{env.BUILD_TYPE}} --parallel 4
+
+    - name: Test
+      working-directory: ${{github.workspace}}/_build
+      run: ctest -C ${{env.BUILD_TYPE}} -VV

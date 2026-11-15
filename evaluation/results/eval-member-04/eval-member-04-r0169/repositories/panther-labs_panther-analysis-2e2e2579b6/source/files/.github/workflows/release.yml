@@ -1,0 +1,90 @@
+name: Panther Analysis Release (Internal)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to release from"
+        required: true
+        default: "main"
+      bump:
+        description: "Version bump type"
+        required: true
+        default: "minor"
+        type: choice
+        options:
+          - major
+          - minor
+          - patch
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    if: github.repository == 'panther-labs/panther-analysis'
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout token action
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          path: bootstrap
+          sparse-checkout: .github/actions/github-automation-token
+          persist-credentials: false
+      - name: Request GitHub automation token
+        id: github-automation
+        uses: ./bootstrap/.github/actions/github-automation-token
+        with:
+          token_url: ${{ secrets.APP_TOKEN_SERVICE_URL }}
+          permissions: '{"contents":"write"}'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          ref: ${{ github.event.inputs.branch }}
+          fetch-depth: 0
+          # Separate from bootstrap/ so the token action survives for its post hook.
+          path: release
+          # Nothing here talks to a git remote (gh uses GH_TOKEN from the env),
+          # so don't leave credentials in .git/config for `make install` to reach.
+          persist-credentials: false
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          role-session-name: panther-analysis-release
+      - name: Install Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 #v7.1.0
+        with:
+          python-version: "3.11"
+      - name: Create new panther-analysis release
+        env:
+          BUMP: ${{ github.event.inputs.bump }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
+          KMS_KEY_ARN: ${{ secrets.KMS_KEY_ARN }}
+          SIGNING_ALGORITHM: ${{ secrets.SIGNING_ALGORITHM }}
+          DIGEST_FILE: ${{ secrets.DIGEST_FILE }}
+          GH_TOKEN: ${{ steps.github-automation.outputs.token }}
+        working-directory: release
+        run: |
+          OLD_VERSION=$(gh release list | grep Latest | awk '{print $1}')
+          NEW_VERSION=$(echo "$OLD_VERSION" | awk -F. -v bump="$BUMP" '{
+            major=substr($1,2)+0; minor=$2+0; patch=$3+0;
+            if (bump=="major") { major++; minor=0; patch=0 }
+            else if (bump=="patch") { patch++ }
+            else { minor++; patch=0 }
+            printf "v%d.%d.%d", major, minor, patch
+          }')
+          RELEASE_SHA=$(git rev-parse HEAD)
+          pip3 install --user pipenv
+          # pipenv --venv exits non-zero when no venv exists yet; don't let that abort the step
+          VENV_PATH=$(pipenv --venv 2>/dev/null || true)
+          if [ -n "$VENV_PATH" ]; then rm -rf "$VENV_PATH"; fi
+          make install
+          pipenv run panther_analysis_tool release --kms-key "$KMS_KEY_ARN"
+          openssl dgst -binary -sha512 panther-analysis-all.zip > "$DIGEST_FILE"
+          aws kms verify --key-id "$KMS_KEY_ARN" --signing-algorithm "$SIGNING_ALGORITHM" --message "fileb://$DIGEST_FILE" --message-type DIGEST --output json --signature "$(cat panther-analysis-all.sig)" | jq '.SignatureValid'
+          gh release create "$NEW_VERSION" panther-analysis-all.* --title "$NEW_VERSION" --target "$RELEASE_SHA" --latest --generate-notes

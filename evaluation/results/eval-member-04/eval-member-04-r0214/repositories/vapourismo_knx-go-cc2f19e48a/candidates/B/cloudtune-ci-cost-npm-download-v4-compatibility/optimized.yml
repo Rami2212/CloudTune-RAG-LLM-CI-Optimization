@@ -1,0 +1,77 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [LOW] Explicitly set fail-fast for large matrix job "Build" (9 combinations)
+# Estimated savings: ~2 min/run
+#
+name: Check
+on:
+  push:
+    branches:
+      - master
+      - feature/*
+  pull_request:
+    branches:
+      - master
+  schedule:
+    - cron: "0 8 * * *"
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_name != 'main' }}
+jobs:
+  Build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go:
+          - stable
+          - "~1.24.0"
+          - "~1.23.0"
+          - "~1.22.0"
+          - "~1.21.0"
+          - "~1.20.0"
+          - "~1.19.0"
+          - "~1.18.0"
+          - "~1.17.0"
+        may-fail:
+          - false
+    continue-on-error: ${{ matrix.may-fail }}
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-go@v5.5.0
+        with:
+          go-version: "${{ matrix.go }}"
+          check-latest: true
+      - run: go version
+      - run: go build -v ./...
+      - run: go test -race -parallel 4 -timeout 30s -v ./...
+  Format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-go@v5.5.0
+        with:
+          go-version: stable
+      - run: |
+          unformatted=$(gofmt -l .)
+          if [[ ! -z "$unformatted" ]]; then
+            echo "Files need formatting!"
+            gofmt -w .
+            git diff
+            exit 1
+          fi
+  Lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          fetch-depth: 1
+      - uses: golangci/golangci-lint-action@v8.0.0
+  Vet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-go@v5.5.0
+        with:
+          go-version: stable
+      - run: go vet ./...

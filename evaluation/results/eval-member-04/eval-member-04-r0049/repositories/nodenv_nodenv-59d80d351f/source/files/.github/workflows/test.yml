@@ -1,0 +1,53 @@
+name: Test
+on:
+  push:
+  pull_request:
+  schedule: [{ cron: "0 0 10 * *" }] # monthly https://crontab.guru/#0_0_10_*_*
+  workflow_dispatch:
+
+permissions: {}
+jobs:
+  build:
+    permissions: { contents: read }
+    runs-on: ubuntu-latest
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with: { egress-policy: audit }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - run: npm ci
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - run: npm run prepare && git diff --exit-code
+
+  test:
+    uses: nodenv/.github/.github/workflows/test.yml@bd27009d5f178c0a88d42f7b07e6a3c7623ed768 # v7.0.8
+    with: { superlinter: false } # TODO re-enable superlinter
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+      security-events: write
+      statuses: write
+
+  super-lint:
+    permissions: { contents: read, packages: read, statuses: write }
+    runs-on: ubuntu-latest
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with: { egress-policy: audit }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { fetch-depth: 0, persist-credentials: false }
+      - uses: super-linter/super-linter/slim@2da136927bd4a73596db63044b504547c62cb854 # v9.0.0
+        env: # FIXME resolve failures for linters below and re-enable
+          GITHUB_TOKEN: ${{ github.token }}
+          BASH_EXEC_IGNORE_LIBRARIES: true # superlinter bug
+          FILTER_REGEX_EXCLUDE: node_modules
+          VALIDATE_BIOME_FORMAT: false # conflicts with prettier
+          VALIDATE_BIOME_LINT: false # conflicts with prettier
+          VALIDATE_GIT_COMMITLINT: false # commitlint is bad
+          VALIDATE_JSCPD: false # jscpd is false-positive prone and generally not useful
+          VALIDATE_SPELL_CODESPELL: false # codespell is buggy
+          # TODO remove deviations from reusable superlinter config
+          VALIDATE_BASH: false
+          VALIDATE_SHELL_SHFMT: false

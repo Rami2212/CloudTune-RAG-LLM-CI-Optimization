@@ -1,0 +1,84 @@
+on:
+  push:
+    tags:
+      - "v*"
+
+name: Build and Release apk
+jobs:
+  build:
+    name: Release
+    runs-on: macos-latest
+    steps:
+#      - name: Setup Xcode version
+#        uses: maxim-lobanov/setup-xcode@v1.6.0
+#        with:
+#          xcode-version: latest-stable
+
+      - uses: actions/checkout@v4
+      - name: Set version
+        id: version
+        run: |
+          VERSION=$(echo ${{ github.ref }} | sed -e "s#refs/tags/##g")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: 17
+          distribution: temurin
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          cache: true
+          flutter-version-file: pubspec.yaml
+
+      - name: Flutter Info
+        run: flutter doctor
+
+      - run: flutter pub get
+
+      - name: dart run build_runner
+        run: dart run build_runner build --delete-conflicting-outputs
+
+      - name: Create the Keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEY_PROPERTIES: ${{ secrets.KEY_PROPERTIES }}
+          FIREBASE_OPTIONS: ${{ secrets.FIREBASE_OPTIONS }}
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+          GOOGLESERVICE_INFO_PLIST: ${{ secrets.GOOGLESERVICE_INFO_PLIST }}
+          FIREBASE_APP_ID_FILE_JSON: ${{ secrets.FIREBASE_APP_ID_FILE_JSON }}
+        run: |
+          # import keystore from secrets
+          echo $KEYSTORE_BASE64 | base64 -d > android/app/upload-keystore.jks
+          echo $KEY_PROPERTIES | base64 -d > android/key.properties
+          echo $FIREBASE_OPTIONS | base64 -d > lib/firebase_options.dart
+          echo $GOOGLE_SERVICES_JSON | base64 -d > android/app/google-services.json
+          echo $GOOGLESERVICE_INFO_PLIST | base64 -d > ios/Runner/GoogleService-Info.plist
+          echo $FIREBASE_APP_ID_FILE_JSON | base64 -d > ios/firebase_app_id_file.json
+
+      - name: Build IPA
+        uses: cedvdb/action-flutter-build-ios@v1
+        with:
+          build-cmd: flutter build ipa --release --export-options-plist=ios/GithubActionsExportOptions.plist
+          certificate-base64: ${{ secrets.IOS_BUILD_CERTIFICATE_BASE64 }}
+          certificate-password: ${{ secrets.IOS_BUILD_CERTIFICATE_PASSWORD }}
+          provisioning-profile-base64: ${{ secrets.IOS_MOBILE_PROVISIONING_PROFILE_BASE64 }}
+          keychain-password: ${{ secrets.IOS_GITHUB_KEYCHAIN_PASSWORD }}
+
+      - name: Rename IPA
+        run: mv build/ios/ipa/conning_tower.ipa build/ios/ipa/ConningTower-${{ steps.version.outputs.version }}.ipa
+
+      - name: Build APK
+        run: flutter build apk
+      - name: Rename APK    
+        run: mv build/app/outputs/flutter-apk/app-release.apk build/app/outputs/flutter-apk/ConningTower-${{ steps.version.outputs.version }}-release.apk
+
+      - name: Create Release
+        uses: ncipollo/release-action@v1.14.0
+        with:
+          allowUpdates: true
+          artifacts: "build/app/outputs/flutter-apk/*release.apk,build/ios/ipa/*.ipa"
+          token: ${{ secrets.ACTIONS_TOKEN }}
+          generateReleaseNotes: true

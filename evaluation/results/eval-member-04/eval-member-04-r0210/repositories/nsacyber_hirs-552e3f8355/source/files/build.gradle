@@ -1,0 +1,172 @@
+import com.github.spotbugs.snom.SpotBugsTask
+
+import java.util.concurrent.TimeUnit
+
+plugins {
+    // Apply the application plugin to add support for building a CLI application in Java.
+    id 'io.github.ben-manes.versions' version '0.66.0'
+    id 'application'
+    id 'com.github.spotbugs' version '6.5.6' apply false
+    id 'org.owasp.dependencycheck' version '12.2.2'
+    id 'com.palantir.git-version' version '5.0.0'
+}
+
+// Global checkstyle file
+ext.checkstyleConfigFile = new File(rootDir, "/config/checkstyle/sun_checks.xml")
+
+subprojects {
+    if (project.name == 'HIRS_Provisioner.NET') {
+        return
+    }
+    apply plugin: "checkstyle"
+    apply plugin: "com.github.spotbugs"
+    apply plugin: "java"
+    apply plugin: "jacoco"
+    apply plugin: "org.owasp.dependencycheck"
+
+    java {
+        toolchain {
+            languageVersion = JavaLanguageVersion.of(25)
+        }
+    }
+
+    jacoco {
+        toolVersion = '0.8.14'
+    }
+
+    tasks.withType(Test).configureEach {
+        useJUnitPlatform()
+        finalizedBy(tasks.named('jacocoTestReport'))
+    }
+
+    jacocoTestReport {
+        dependsOn test // tests are required to run before generating the report
+    }
+
+    checkstyle {
+        toolVersion = '12.3.1'
+        configFile = file("${rootDir}/config/checkstyle/checkstyle.xml")
+    }
+
+    checkstyleMain {
+        source = 'src/main/java'
+    }
+
+    checkstyleTest {
+        source = 'src/test/java'
+    }
+
+    dependencyCheck {
+        // Read API key from a system property 'nvd.apiKey'
+        nvd {
+            apiKey = System.getProperty("nvd.apiKey") ?: ""
+            delay = 16000
+        }
+    }
+
+//    Uncomment the lines right after this comment, if you wish to see all the places
+//    in the application that are using deprecated features
+//    tasks.withType(JavaCompile).configureEach {
+//        options.deprecation = true
+//    }
+
+    tasks.withType(Javadoc).configureEach {
+        if (project.name == 'HIRS_AttestationCA') {
+            // Remove the generated files from the source set
+            source = source.filter { file ->
+                !file.path.contains('build/generated/sources/proto/main/java')
+            }
+        }
+        
+        // Uncomment this line if you wish to see all the warning signs produced by the JavaDoc command
+        // options.addStringOption('Xmaxwarns', '0')
+    }
+
+    tasks.withType(Checkstyle).configureEach {
+        reports {
+            xml.required = false
+            html.required = true
+        }
+    }
+
+    tasks.withType(SpotBugsTask).configureEach {
+        excludeFilter = file('config/spotbugs/spotbugs-exclude.xml')
+
+        reports {
+            html.required = true
+        }
+    }
+
+    // Global dependency resolution strategy for all subprojects
+    configurations.configureEach {
+        // Boot's logging starter includes a Log4j-to-SLF4J bridge. HIRS uses SLF4J
+        // directly, so neither the bridge nor any other Log4j artifact is needed.
+        exclude group: 'org.apache.logging.log4j'
+
+        resolutionStrategy.eachDependency { DependencyResolveDetails details ->
+            if (details.requested.group == 'org.apache.commons' &&
+                    details.requested.name == 'commons-lang3') {
+                details.useVersion '3.20.0'  // Force patched Commons Lang version
+            }
+
+            if (details.requested.group == 'org.apache.httpcomponents' &&
+                    details.requested.name == 'httpclient') {
+                details.useVersion '4.5.14'  // Force patched Apache Http Client version
+            }
+
+            if (details.requested.group == 'org.assertj' &&
+                    details.requested.name == 'assertj-core') {
+                details.useVersion '3.27.7'  // Force patched Assert Core version
+            }
+        }
+    }
+
+    tasks.register('verifyLoggingDependencies') {
+        group = 'verification'
+        description = 'Verify Log4j is absent and library dependencies stay scoped to their modules.'
+        doLast {
+            ['compileClasspath', 'runtimeClasspath', 'testCompileClasspath', 'testRuntimeClasspath'].each { name ->
+                def dependencies = configurations.getByName(name).resolvedConfiguration.resolvedArtifacts
+                dependencies.each { artifact ->
+                    def id = artifact.moduleVersion.id
+                    if (id.group == 'org.apache.logging.log4j' || id.group == 'log4j') {
+                        throw new GradleException("${project.path}:${name} must not contain ${id}")
+                    }
+                    if (project.name == 'HIRS_Utils' &&
+                            (id.group.startsWith('org.springframework') || id.group.startsWith('org.apache.tomcat'))) {
+                        throw new GradleException("${project.path}:${name} must not contain ${id}")
+                    }
+                    if (name in ['compileClasspath', 'runtimeClasspath'] &&
+                            project.name in ['HIRS_Utils', 'HIRS_AttestationCA'] &&
+                            (id.group == 'ch.qos.logback' || id.name == 'slf4j-simple' ||
+                                    id.group.startsWith('org.apache.tomcat'))) {
+                        throw new GradleException("${project.path}:${name} must not contain ${id}")
+                    }
+                }
+            }
+        }
+    }
+    tasks.named('check') {
+        dependsOn tasks.named('verifyLoggingDependencies')
+    }
+}
+
+def projectVersion = rootProject.file('VERSION').text.trim()
+project.ext["projVersion"] = projectVersion
+
+def details = versionDetails()
+def gitHash = details.gitHash
+long buildTimeInSecs = TimeUnit.MILLISECONDS.toSeconds(new Date().getTime())
+
+project.ext["jarVersion"] = "${projectVersion}.${buildTimeInSecs}.${gitHash}"
+project.ext["packageVersion"] = "${projectVersion}.${buildTimeInSecs}.${gitHash}.el8"
+
+tasks.register('release') {
+    group = 'distribution'
+    description = 'Build ACA, Provisioner, and tcg_eventLog_tool RPM/DEB packages and the Provisioner MSI on Windows.'
+    dependsOn ':HIRS_AttestationCAPortal:buildRpm',
+            ':HIRS_AttestationCAPortal:buildDeb',
+            ':tools:tcg_eventlog_tool:buildRpm',
+            ':tools:tcg_eventlog_tool:buildDeb',
+            ':HIRS_Provisioner.NET:release'
+}

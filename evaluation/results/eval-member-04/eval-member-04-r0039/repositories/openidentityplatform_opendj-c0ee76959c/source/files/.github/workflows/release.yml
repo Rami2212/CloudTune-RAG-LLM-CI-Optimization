@@ -1,0 +1,342 @@
+# The contents of this file are subject to the terms of the Common Development and
+# Distribution License (the License). You may not use this file except in compliance with the
+# License.
+#
+# You can obtain a copy of the License at legal/CDDLv1.0.txt. See the License for the
+# specific language governing permission and limitations under the License.
+#
+# When distributing Covered Software, include this CDDL Header Notice in each file and include
+# the License file at legal/CDDLv1.0.txt. If applicable, add the following below the CDDL
+# Header, with the fields enclosed by brackets [] replaced by your own identifying
+# information: "Portions copyright [year] [name of copyright owner]".
+#
+# Copyright 2022-2026 3A Systems, LLC.
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      releaseVersion:
+        description: "Default version to use when preparing a release."
+        required: true
+        default: "X.Y.Z"
+      developmentVersion:
+        description: "Default version to use for new local working copy."
+        required: true
+        default: "X.Y.Z-SNAPSHOT"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release-maven:
+    runs-on: 'ubuntu-latest'
+    # contents: write is required to push the release commits and tags produced by
+    # maven-release-plugin, to create the GitHub release and to update the wiki.
+    permissions:
+      contents: write
+    steps:
+      - name: Print github context
+        env:
+          GITHUB_CONTEXT: ${{ toJSON(github) }}
+        run: echo "$GITHUB_CONTEXT"
+      - name: Install rpm for distribution
+        shell: bash
+        run:   |
+          sudo apt-get update
+          sudo apt-get install -y rpm
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Set up Java for publishing to Maven Central Repository OSS
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          java-version: ${{ github.event.workflow_run.head_branch == 'sustaining/4.10.x' && '8' || '11'}}
+          distribution: 'temurin'
+          server-id: ossrh
+          server-username: MAVEN_USERNAME
+          server-password: MAVEN_PASSWORD
+      - name: Cache Maven packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+         path: ~/.m2/repository
+         key: ${{ runner.os }}-m2-repository-${{ hashFiles('**/pom.xml') }}
+         restore-keys: ${{ runner.os }}-m2-repository
+      - name: Install gpg secret key
+        env:
+           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        if: ${{ env.GPG_PRIVATE_KEY!=''}}
+        run: |
+           cat <(echo -e "${{ secrets.GPG_PRIVATE_KEY }}") | gpg --batch --import
+           gpg --list-secret-keys --keyid-format LONG
+           git config --global user.signingkey B02611B009E5302EB58D102D6C2EDF3C90D33841
+      - name: Configure Git User
+        run: |
+          git config --global user.name "Open Identity Platform Community"
+          git config --global user.email "open-identity-platform-opendj@googlegroups.com"
+      - name: Release and publish to the Maven Central Repository
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ github.token }}
+          MAVEN_USERNAME: ${{ secrets.OSSRH_USERNAME }}
+          MAVEN_PASSWORD: ${{ secrets.OSSRH_TOKEN }}
+          MAVEN_OPTS: -Dhttps.protocols=TLSv1.2 -Dmaven.wagon.httpconnectionManager.ttlSeconds=120 -Dmaven.wagon.http.retryHandler.requestSentEnabled=true -Dmaven.wagon.http.retryHandler.count=10
+        if: ${{ env.MAVEN_USERNAME!='' && env.MAVEN_PASSWORD!='' }}
+        run: mvn --batch-mode -Darguments="-Dgpg.passphrase=${{ secrets.GPG_PASSPHRASE }}" -DsignTag=true -DtagNameFormat="${{ github.event.inputs.releaseVersion }}" -DreleaseVersion=${{ github.event.inputs.releaseVersion }} -DdevelopmentVersion=${{ github.event.inputs.developmentVersion }} release:prepare release:perform --file pom.xml
+      # Hand the just-released server zip to the release-msi job (the MSI can only be
+      # built on Windows), so it does not have to rebuild opendj-server-legacy.
+      - name: Upload the server zip for the MSI job
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-server-zip
+          retention-days: 1
+          path: target/checkout/opendj-server-legacy/target/package/*.zip
+          # A missing zip means release-msi cannot build: fail this step (the job keeps
+          # going thanks to continue-on-error, but the loss is visible).
+          if-no-files-found: error
+      - name: Release on GitHub
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          name: ${{ github.event.inputs.releaseVersion }}
+          tag_name: ${{ github.event.inputs.releaseVersion }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: false
+          generate_release_notes: true
+          files: |
+            target/checkout/opendj-server-legacy/target/package/*.zip
+            target/checkout/opendj-ldap-toolkit/target/*.zip
+            target/checkout/opendj-packages/opendj-deb/opendj-deb-standard/target/*.deb
+            target/checkout/opendj-packages/opendj-rpm/opendj-rpm-standard/target/rpm/opendj/RPMS/noarch/*.rpm
+            target/checkout/opendj-packages/opendj-docker/target/Dockerfile.zip
+            target/checkout/opendj-packages/opendj-openshift-template/*.yaml
+            target/checkout/opendj-doc-generated-ref/target/*.zip
+            target/checkout/opendj-dsml-servlet/target/*.war
+            target/checkout/opendj-rest2ldap-servlet/target/*.war
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        continue-on-error: true
+        with:
+          repository: ${{ github.repository }}.wiki
+          path: ${{ github.event.repository.name }}.wiki
+          fetch-depth: 0
+      - name: Publish docs to wiki
+        continue-on-error: true
+        shell: bash
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run:   |
+           cd ${{ github.event.repository.name }}.wiki
+           rm -rf asciidoc
+           mkdir asciidoc
+           cp -R ../target/checkout/opendj-doc-generated-ref/target/asciidoc/pdf ../${{ github.event.repository.name }}.wiki/asciidoc
+           git add -A
+           git commit -a -m "upload docs after release ${{ github.event.inputs.releaseVersion }}"
+           git tag -f ${{ github.event.inputs.releaseVersion }}
+           git push --quiet --force
+           git push --quiet --force origin ${{ github.event.inputs.releaseVersion }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        continue-on-error: true
+        with:
+          repository: OpenIdentityPlatform/doc.openidentityplatform.org
+          path: doc.openidentityplatform.org
+          token: ${{ secrets.OIP_PAT_GH_TOKEN }}
+      - name: Publish docs to site
+        continue-on-error: true
+        shell: bash
+        run: |
+          export REPO_NAME_LC=$(echo '${{github.event.repository.name}}' | tr '[:upper:]' '[:lower:]')
+          export SITE_DOC_FOLDER=${REPO_NAME_LC}-doc-generated-ref
+          export TAG_NAME='${{github.event.repository.name}}-${{ github.event.inputs.releaseVersion }}'
+          cd doc.openidentityplatform.org
+          git tag -f ${TAG_NAME}
+          git push --quiet --force origin ${TAG_NAME}
+
+  # The MSI can only be built on Windows. Reuses the server zip built by release-maven
+  # (installed into the local repo), so only the opendj-msi-standard module is built here.
+  # continue-on-error: an MSI failure must not break the release.
+  release-msi:
+    name: Windows MSI release
+    runs-on: 'windows-latest'
+    continue-on-error: true
+    # contents: write is required by action-gh-release to attach the MSI to the release;
+    # the workflow-level default above is contents: read.
+    permissions:
+      contents: write
+    needs:
+      - release-maven
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.releaseVersion }}
+          submodules: recursive
+      - name: Set up Java
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+      # restore, not the full cache action: the install:install-file below puts a
+      # dependency-less generated pom for opendj-server-legacy into the local repository,
+      # and saving that under the key build-maven restores from would seed every later
+      # Windows build with it.
+      - name: Cache Maven packages
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+         path: ~/.m2/repository
+         key: ${{ runner.os }}-m2-repository-${{ hashFiles('**/pom.xml') }}
+         restore-keys: ${{ runner.os }}-m2-repository
+      - name: Setup WiX (.NET tool)
+        shell: bash
+        run: |
+          echo "DOTNET_ROLL_FORWARD=Major" >> "$GITHUB_ENV"
+          export DOTNET_ROLL_FORWARD=Major
+          dotnet tool install --global wix --version 5.0.2 || dotnet tool update --global wix --version 5.0.2
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+          export PATH="$HOME/.dotnet/tools:$PATH"
+          wix --version
+          wix extension add -g WixToolset.UI.wixext/5.0.2 || true
+      - name: Download the server zip built by release-maven
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-server-zip
+          path: server-zip
+      - name: Install the server zip into the local Maven repository
+        shell: bash
+        run: |
+          # The artifact carries both zips and the slim one sorts first ('-' < '.'), so
+          # filter it out: the slim zip lacks the JDBC/Cassandra backend drivers and the
+          # MSI must be packaged from the full server zip.
+          ZIP=$(ls server-zip/*.zip | grep -v -- '-slim\.zip$' | head -1)
+          echo "Installing $ZIP as opendj-server-legacy:${{ github.event.inputs.releaseVersion }}:zip"
+          mvn --batch-mode install:install-file -Dfile="$ZIP" \
+            -DgroupId=org.openidentityplatform.opendj -DartifactId=opendj-server-legacy \
+            -Dversion=${{ github.event.inputs.releaseVersion }} -Dpackaging=zip
+      - name: Build the MSI (packaging only, no rebuild)
+        env:
+          MAVEN_OPTS: -Dhttps.protocols=TLSv1.2 -Dmaven.wagon.httpconnectionManager.ttlSeconds=120 -Dmaven.wagon.http.retryHandler.requestSentEnabled=true -Dmaven.wagon.http.retryHandler.count=10
+        # -P: do not rely on the wix.exe file-activation of distribution-windows-msi. The
+        # profile now lives in opendj-msi-standard and wraps its <build>, and the module is
+        # part of every reactor, so -pl always resolves it; what -P buys is forcing the
+        # plugins on when wix.exe is not under %USERPROFILE%\.dotnet\tools. Without it this
+        # builds a pom that produces nothing, and fail_on_unmatched_files below is the only
+        # symptom - the job's continue-on-error swallows everything else.
+        run: mvn --batch-mode --errors -DskipTests package -pl :opendj-msi-standard -Pdistribution-windows-msi --file pom.xml
+      - name: Attach the MSI to the GitHub release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ github.event.inputs.releaseVersion }}
+          fail_on_unmatched_files: true
+          files: opendj-packages/opendj-msi/opendj-msi-standard/target/*.msi
+
+  release-docker:
+    name: Docker release
+    runs-on: 'ubuntu-latest'
+    needs:
+      - release-maven
+    # packages: write is required for the GHCR login that authenticates with GITHUB_TOKEN.
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.releaseVersion }}
+          fetch-depth: 1
+          submodules: recursive
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: |
+            ${{ github.repository }}
+            ghcr.io/${{ github.repository }}/${{ github.event.repository.name }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ github.event.inputs.releaseVersion }}
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Login to DockerHub
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Login to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        continue-on-error: true
+        with:
+          context: ./opendj-packages/opendj-docker
+          file: ./opendj-packages/opendj-docker/Dockerfile
+          build-args: |
+            VERSION=${{ github.event.inputs.releaseVersion }}
+          platforms: linux/amd64, linux/arm64/8, linux/ppc64le, linux/s390x, linux/riscv64 #, linux/arm/v7
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+  release-docker-alpine:
+    name: Docker release
+    runs-on: 'ubuntu-latest'
+    needs:
+      - release-maven
+    # packages: write is required for the GHCR login that authenticates with GITHUB_TOKEN.
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.releaseVersion }}
+          fetch-depth: 1
+          submodules: recursive
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: |
+            ${{ github.repository }}
+            ghcr.io/${{ github.repository }}/${{ github.event.repository.name }}
+          tags: |
+            type=raw,value=alpine
+            type=raw,value=${{ github.event.inputs.releaseVersion }}-alpine
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Login to DockerHub
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Login to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push image
+        continue-on-error: true
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ./opendj-packages/opendj-docker
+          file: ./opendj-packages/opendj-docker/Dockerfile-alpine
+          build-args: |
+            VERSION=${{ github.event.inputs.releaseVersion }}
+          platforms: linux/amd64, linux/arm64/8, linux/s390x, linux/ppc64le, linux/386, linux/riscv64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
