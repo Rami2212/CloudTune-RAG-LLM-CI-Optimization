@@ -35,3 +35,15 @@ This list contains sources used for the project's 16 literature-derived CI optim
 | Efron, B., & Tibshirani, R. (1986). [Bootstrap Methods for Standard Errors, Confidence Intervals, and Other Measures of Statistical Accuracy](https://doi.org/10.1214/ss/1177013815). | Provides the statistical basis for bootstrap uncertainty intervals when aggregating repository-level evaluation results. |
 
 These methodological sources inform the study but do not prescribe or validate its exact three-arm design. The evaluation protocol and archived run records define the actual procedures and local results. Cite those records for outcomes; literature-reported estimates are not local measurements.
+
+## Research gaps addressed
+
+The following gaps motivate this study within the cited literature. They describe the scope of the present comparison and are not a claim that no other work addresses these questions.
+
+| Gap | Related sources | How this research addresses it |
+|---|---|---|
+| Identifying an optimization mechanism does not establish its suitability for a particular repository. | S01–S05 | Combines the 16 patterns' conditions and limitations with relevant workflow, dependency, and build context when generating a candidate. |
+| Historical estimates, replay results, and build-specific findings do not directly establish improvements for a newly generated GitHub Actions workflow. | S01–S04 | Measures original and generated workflow variants through repeated GitHub Actions executions on the same pinned repository source. |
+| A pattern catalog or a general RAG method does not establish whether retrieved research evidence helps produce useful CI workflow changes. | S01–S05; Lewis et al. (2020); Chen et al. (2024) | Evaluates the combined repository-aware RAG + LLM method against original workflows and pinned, source-corrected CI-Cost. Without an LLM-only arm, retrieval's individual contribution remains unresolved. |
+| Timing improvements alone do not describe applicability or execution reliability. | S02; S04; Kitchenham et al. (2002); Jedlitschka & Pfahl (2005) | Reports no-change decisions, generation and validation failures, execution outcomes, and regressions alongside timing savings. Successful runs provide limited evidence of preserved behavior. |
+| Findings across different CI settings need a clear sampling and measurement basis for comparison. | Cardoen et al. (2024); Cardoen (2026); Kitchenham et al. (2002) | Documents candidate sampling and development/evaluation separation, and compares per-repository median active time and summed job runtime while recording queue delay separately. |
