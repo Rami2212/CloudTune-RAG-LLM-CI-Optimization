@@ -1,0 +1,64 @@
+name: Snapshot
+on:
+  push:
+    branches:
+      - develop
+jobs:
+  # Build distribution package and upload S3
+  dist:
+    if: github.repository == 'dita-ot/dita-ot'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+      - name: Build distribution package
+        run: |
+          ./gradlew --no-daemon
+          ./gradlew dist -Pcommit=${GITHUB_SHA} -PskipGenerateDocs=true --no-daemon
+      - name: Rename distribution file
+        run: |
+          rm build/distributions/org.dita.*
+          mv build/distributions/dita-ot-* build/distributions/dita-ot-develop.zip
+      - name: Deploy distribution package to S3
+        uses: jakejarvis/s3-sync-action@v0.5.1
+        with:
+          args: --acl public-read --follow-symlinks
+        env:
+          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: 'eu-west-1'
+          SOURCE_DIR: 'build/distributions'
+  # Publish snapshot to Maven
+  maven:
+    if: github.repository == 'dita-ot/dita-ot'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+      - name: Maven snapshot deployment
+        run: |
+          echo "$GPG_ASC" > 24AC15F2.asc
+          gpg --dearmor 24AC15F2.asc
+          ./gradlew --no-daemon
+          ./gradlew --no-daemon publish \
+            -PossrhUsername=$OSSRH_USERNAME \
+            -PossrhPassword=$OSSRH_PASSWORD \
+            -Psigning.password=$SIGNING_PASSWORD \
+            -Psigning.keyId=24AC15F2 \
+            -Psigning.secretKeyRingFile=24AC15F2.asc.gpg
+        env:
+          OSSRH_USERNAME: ${{ secrets.OSSRH_USERNAME }}
+          OSSRH_PASSWORD: ${{ secrets.OSSRH_PASSWORD }}
+          SIGNING_PASSWORD: ${{ secrets.GPG_PASSPHRASE }}
+          GPG_ASC: ${{ secrets.GPG_ASC }}

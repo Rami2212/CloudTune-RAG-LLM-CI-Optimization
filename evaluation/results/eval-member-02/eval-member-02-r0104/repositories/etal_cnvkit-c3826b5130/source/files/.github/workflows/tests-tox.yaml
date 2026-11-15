@@ -1,0 +1,71 @@
+name: Tests
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - 'doc/**'
+      - '*.md'
+      - '*.rst'
+  pull_request:
+    paths-ignore:
+      - 'doc/**'
+      - '*.md'
+      - '*.rst'
+jobs:
+  tests:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: '3.14', python: '3.14', os: ubuntu-latest, tox: py314}
+          - {name: '3.14-MacOS', python: '3.14', os: macos-latest, tox: py314}
+          - {name: '3.12-MacOS', python: '3.12', os: macos-latest, tox: py312}
+          - {name: '3.11', python: '3.11', os: ubuntu-latest, tox: py311}
+          - {name: '3.11-min', python: '3.11', os: ubuntu-latest, tox: "py311-min"}
+          - {name: Linting, python: '3.12', os: ubuntu-latest, tox: lint}
+          - {name: Type check, python: '3.12', os: ubuntu-latest, tox: typecheck}
+          - {name: Security, python: '3.12', os: ubuntu-latest, tox: security}
+          - {name: Coverage, python: '3.12', os: ubuntu-latest, tox: coverage}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+          cache: 'pip'
+          cache-dependency-path: 'requirements/*.txt'
+      - name: Cache tox environments
+        uses: actions/cache@v5
+        with:
+          path: .tox
+          key: tox-${{ matrix.tox }}-${{ matrix.python }}-${{ hashFiles('requirements/*.txt', 'pyproject.toml') }}
+          restore-keys: |
+            tox-${{ matrix.tox }}-${{ matrix.python }}-
+            tox-${{ matrix.tox }}-
+      - name: Install dependencies and tools
+        run: |
+          python -m pip install -U pip setuptools wheel tox
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liblzma-dev python3-dev r-bioc-dnacopy zlib1g-dev
+      - name: Install Mac OS dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install r
+          Rscript --no-environ -e "install.packages('BiocManager', repos='https://cloud.r-project.org'); BiocManager::install('DNAcopy')"
+      - name: Run the unit test suite
+        run: tox -e ${{ matrix.tox }}
+      - name: Upload coverage to Codecov
+        if: matrix.tox == 'coverage'
+        uses: codecov/codecov-action@v6
+        with:
+          files: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+          disable_search: true

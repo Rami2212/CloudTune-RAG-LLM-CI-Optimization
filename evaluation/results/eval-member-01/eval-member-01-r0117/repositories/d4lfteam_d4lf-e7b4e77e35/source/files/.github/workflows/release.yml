@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  pull_request:
+    types: [closed]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+
+jobs:
+  release:
+    if: |
+      github.event_name != 'pull_request' ||
+        (
+          github.event.pull_request.merged == true &&
+          contains(github.event.pull_request.labels.*.name, 'release')
+        )
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Setup env
+        uses: ./.github/actions/setup_env
+      - name: Build & Zip exe
+        id: build_zip
+        uses: ./.github/actions/build_zip
+      - name: Check if beta
+        id: check_beta
+        shell: powershell
+        run: |
+          $version = "${{ steps.build_zip.outputs.version }}"
+          if ($version -like "*beta*" -or $version -like "*alpha*") {
+            echo "IS_BETA=true" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+          } else {
+            echo "IS_BETA=false" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+          }
+      - uses: softprops/action-gh-release@v3.0.3
+        id: create_release
+        with:
+          files: ${{ steps.build_zip.outputs.zip_path }}
+          generate_release_notes: ${{ env.IS_BETA == 'false' }}
+          name: "v${{ steps.build_zip.outputs.version }}"
+          prerelease: ${{ env.IS_BETA == 'true' }}
+          tag_name: "v${{ steps.build_zip.outputs.version }}"
+          token: "${{ secrets.RELEASE_TOKEN }}"
+      - name: Fetch release meta data
+        uses: actions/github-script@v9.0.0
+        id: release_metadata
+        with:
+          github-token: ${{ secrets.RELEASE_TOKEN }}
+          script: |
+            const { data } = await github.rest.repos.getReleaseByTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag: 'v${{ steps.build_zip.outputs.version }}',
+            });
+            core.setOutput('body', data.body ?? '');
+      - uses: SethCohen/github-releases-to-discord@v1.20.0
+        with:
+          color: "2105893"
+          release_body: ${{ steps.release_metadata.outputs.body }}
+          release_html_url: ${{ steps.create_release.outputs.url }}
+          release_name: "v${{ steps.build_zip.outputs.version }}"
+          username: "D4LF Release"
+          webhook_url: ${{ secrets.DISCORD_WEBHOOK }}

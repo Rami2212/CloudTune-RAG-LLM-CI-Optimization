@@ -1,0 +1,161 @@
+plugins {
+    id 'net.neoforged.moddev' version '2.0.141'
+}
+
+group = project.factions_group_id
+version = project.factions_version
+
+base {
+    archivesName = project.factions_mod_name
+}
+
+apply from: file('integrations.gradle')
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(project.java_version)
+    }
+    withSourcesJar()
+}
+
+sourceSets {
+    main {
+        resources.srcDirs += file('src/generated/resources')
+    }
+}
+
+for (var integration : integrations) {
+    if (integration.included) {
+        sourceSets.create(integration.name) {
+            java.srcDir "src/integrations/${integration.name}/java"
+
+            compileClasspath += sourceSets.main.output + configurations.compileClasspath
+            runtimeClasspath += output + compileClasspath + sourceSets.main.output
+        }
+    }
+}
+
+integrations.each {
+    if (it.included) {
+        sourceSets.main.runtimeClasspath += sourceSets[it.name].output
+    }
+}
+
+apply from: file('dependencies.gradle')
+
+neoForge {
+    version = project.neoforge_version
+
+//    validateAccessTransformers = true
+
+    interfaceInjectionData {
+        from project.file("src/main/resources/META-INF/interfaceinjection.json")
+        publish project.file("src/main/resources/META-INF/interfaceinjection.json")
+    }
+
+    accessTransformers {
+        from project.file("src/main/resources/META-INF/accesstransformer.cfg")
+        publish project.file("src/main/resources/META-INF/accesstransformer.cfg")
+    }
+
+    runs {
+        configureEach {
+            logLevel = org.slf4j.event.Level.WARN
+            jvmArgument '-XX:+AllowEnhancedClassRedefinition'
+            jvmArgument '-XX:+IgnoreUnrecognizedVMOptions'
+            systemProperty 'mixin.debug.export', 'true'
+        }
+
+        client { client() }
+        server { server(); programArgument '--nogui' }
+        data {
+            clientData()
+
+            programArguments.addAll '--mod', project.factions_mod_id, '--all', '--output', project.file('src/generated/resources/').getAbsolutePath(), '--existing', project.file('src/main/resources/').getAbsolutePath()
+        }
+    }
+
+    mods {
+        "${factions_mod_id}" {
+            sourceSet(sourceSets.main)
+            sourceSet(project(':faction-api').sourceSets.main)
+            integrations.each {
+                if (it.included) {
+                    sourceSet(sourceSets[it.name])
+                }
+            }
+        }
+    }
+}
+
+
+// Mod metadata generation (templates located in root/src/main/templates)
+def generateModMetadata = tasks.register("generateModMetadata", ProcessResources) {
+    def replaceProperties = [
+            minecraft_version           : minecraft_version,
+            minecraft_version_range     : minecraft_version_range,
+            neoforge_version            : neoforge_version,
+            mod_id                      : factions_mod_id,
+            mod_name                    : factions_mod_name,
+            mod_license                 : factions_license,
+            mod_version                 : factions_version,
+            mod_authors                 : factions_authors,
+            mod_description             : factions_description,
+            mod_issue_tracker           : factions_issue_tracker,
+            mod_update_url           : factions_update_url,
+    ]
+    inputs.properties replaceProperties
+    expand replaceProperties
+    from file("src/main/templates")
+    into layout.buildDirectory.dir("generated/sources/modMetadata")
+}
+
+// Add generated metadata dir as resource root
+sourceSets.main.resources.srcDir generateModMetadata
+
+neoForge.ideSyncTask generateModMetadata
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    javaToolchains {
+        compilerFor{
+            languageVersion = JavaLanguageVersion.of(project.java_version)
+        }
+    }
+}
+
+tasks.jar {
+    from (sourceSets.main.output)
+    from (project(':faction-api').sourceSets.main.output)
+
+    integrations.each {
+        if (it.included) {
+            from(sourceSets[it.name].output)
+        }
+    }
+
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+tasks.named("sourcesJar", Jar) {
+    from(sourceSets.main.allJava)
+    from (project(':faction-api').sourceSets.main.allJava)
+
+    integrations.each {
+        if (it.included) {
+            from(sourceSets[it.name].allJava)
+        }
+    }
+
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    archiveClassifier.set("sources")
+}
+
+publishing {
+    publications {
+        maven(MavenPublication) {
+            from components.java
+            artifactId = project.factions_mod_name
+        }
+    }
+}

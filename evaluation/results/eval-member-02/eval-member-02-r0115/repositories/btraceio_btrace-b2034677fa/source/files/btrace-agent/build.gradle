@@ -1,0 +1,214 @@
+import java.nio.file.Files
+import java.nio.file.Paths
+
+compileJava {
+    javaCompiler = javaToolchains.compilerFor {
+        languageVersion.set(JavaLanguageVersion.of(8))
+    }
+}
+
+compileTestJava {
+    options.fork = true
+    options.forkOptions.executable = "${getJavac(8)}"
+}
+
+// Test sources use sun.misc.Unsafe#defineClass, an overload only present up to JDK 8,
+// so compileTestJava above is forked against a JDK 8 javac. junit-jupiter 6.x requires
+// JDK 17+ to compile against, so pin this module's test dependency to the last JDK
+// 8-compatible release instead of the repo-wide catalog version.
+configurations.testCompileClasspath {
+    resolutionStrategy.force 'org.junit.jupiter:junit-jupiter:5.14.4'
+}
+configurations.testRuntimeClasspath {
+    resolutionStrategy.force 'org.junit.jupiter:junit-jupiter:5.14.4'
+}
+
+sourceSets {
+    java24 {
+        java {
+            srcDirs = ['src/main/java24']
+        }
+    }
+}
+
+compileJava24Java {
+    sourceCompatibility = 24
+    targetCompatibility = 24
+    javaCompiler = javaToolchains.compilerFor {
+        languageVersion.set(JavaLanguageVersion.of(24))
+    }
+}
+
+javadoc {
+    // Javadoc also needs access to internal APIs - but Java 8 javadoc doesn't support --add-exports
+    // So we exclude the file that uses internal APIs from javadoc generation
+    exclude '**/PerfReaderImpl.java'
+}
+
+dependencies {
+    implementation libs.slf4j
+    implementation libs.asm
+    implementation libs.asm.tree
+    implementation libs.asm.util
+    implementation libs.autoService
+    implementation libs.jctools
+
+    def toolsJar = getToolsJar();
+    if (toolsJar.getAsFile().exists()) {
+        compileOnly files("${toolsJar}")
+        runtimeOnly files("${toolsJar}")
+    }
+    implementation project(':btrace-core')
+    implementation project(':btrace-runtime')
+    implementation project(':btrace-compiler')
+
+    java24Implementation files(sourceSets.main.output.classesDirs) {
+        builtBy compileJava
+    }
+    java24Implementation project(':btrace-core')
+    java24Implementation project(':btrace-runtime')
+    java24Implementation libs.asm
+    java24Implementation libs.slf4j
+
+    testImplementation libs.asm.util
+    testImplementation libs.slf4j.simple
+    testImplementation libs.junit.jupiter
+    testImplementation project(':btrace-extensions:btrace-statsd')
+    testImplementation project(':btrace-extensions:btrace-utils')
+}
+
+jar {
+    into('') {
+        from sourceSets.java24.output
+    }
+}
+
+// Exclude sources that rely on JDK-internal modules from Javadoc to avoid missing-package errors
+tasks.named('javadoc').configure {
+    exclude 'io/btrace/agent/PerfReaderImpl.java'
+}
+
+task compileTestProbes {
+    // Mirror the integration-tests compiler invocation so dependent project outputs and extension
+    // API JARs are available before the compiler classpath is resolved.
+    dependsOn compileTestJava, processTestResources,
+            ':btrace-agent:jar',
+            ':btrace-boot:jar',
+            ':btrace-compiler:jar',
+            ':btrace-extensions:btrace-utils:buildApiJar',
+            ':btrace-extensions:btrace-statsd:buildApiJar'
+    doLast {
+        def path = project(':btrace-agent').sourceSets.main.runtimeClasspath
+
+        def loader = new URLClassLoader(path.collect { f -> f.toURL() } as URL[])
+        def compiler = loader.loadClass('io.btrace.compiler.Compiler')
+        // Use test runtime classpath so test-only extension APIs are available
+        def rtCp = sourceSets.test.runtimeClasspath
+
+        def extraCp = files(
+                buildDir.toPath().resolve("classes/java/test"),
+                buildDir.toPath().resolve("classes/java/java11_dummy"),
+                buildDir.toPath().resolve("resources/test")
+        )
+        // Resolve API JARs via archiveFile (not files(task)) so the path is concrete and
+        // the task dependency above guarantees they exist.
+        def utilsApi = files(project(':btrace-extensions:btrace-utils').tasks.named('buildApiJar').get().archiveFile.get().asFile)
+        def statsdApi = files(project(':btrace-extensions:btrace-statsd').tasks.named('buildApiJar').get().archiveFile.get().asFile)
+        def fullCp = rtCp.plus(extraCp).plus(utilsApi).plus(statsdApi)
+        def cpPath = fullCp.getAsPath()
+        def args = [
+                "-cp", cpPath,
+                "-d", buildDir.toPath().resolve("classes")
+        ]
+
+        def files = fileTree(dir: "src/test/btrace", include: '**/*.java', exclude: 'verifier/**/*.java').findAll {
+            it != null
+        }.collect { it }
+
+        args.addAll(files)
+
+        // Keep compiler resource lookups aligned with the loader that resolved the compiler classes.
+        def prev = Thread.currentThread().contextClassLoader
+        def oldCp = System.getProperty('java.class.path')
+        try {
+            Thread.currentThread().contextClassLoader = loader
+            System.setProperty('btrace.allow.undeclared.services', 'true')
+            System.setProperty('java.class.path', cpPath)
+            compiler.main(args as String[])
+        } finally {
+            Thread.currentThread().contextClassLoader = prev
+            if (oldCp != null) System.setProperty('java.class.path', oldCp)
+            System.clearProperty('btrace.allow.undeclared.services')
+        }
+    }
+}
+
+def configureAgentTestTask = { Test testTask ->
+    testTask.inputs.files compileTestProbes.outputs
+    testTask.testLogging.showStandardStreams = true
+
+    def props = new Properties()
+    def javaHome = System.getenv("JAVA_HOME") ?: System.getProperty("java.home")
+    def releaseFile = Paths.get(javaHome.replace("/jre", ""), "release")
+    if (Files.exists(releaseFile)) {
+        props.load(Files.newInputStream(releaseFile))
+    }
+    if (!props.getProperty("JAVA_VERSION")?.contains("1.8")) {
+        testTask.jvmArgs '-XX:+IgnoreUnrecognizedVMOptions',
+                '--add-opens', 'java.base/java.lang=ALL-UNNAMED',
+                '--add-opens', 'java.base/jdk.internal.reflect=ALL-UNNAMED',
+                '--add-opens', 'java.base/java.lang=ALL-UNNAMED', '--add-exports', 'java.base/jdk.internal.reflect=ALL-UNNAMED'
+    }
+    if (project.hasProperty("updateTestData")) {
+        testTask.jvmArgs '-Dupdate.test.data=true'
+    }
+    testTask.jvmArgs "-Dtest.resources=${projectDir}/src/test/resources"
+    testTask.jvmArgs "-Dproject.version=${project.version}"
+    // Seeded property tests: forward -Dbtrace.prop.seed / -Dbtrace.prop.iterations when given.
+    ['btrace.prop.seed', 'btrace.prop.iterations'].each { name ->
+        def value = System.getProperty(name)
+        if (value != null) {
+            testTask.systemProperty name, value
+        }
+    }
+}
+
+test {
+    dependsOn cleanTest
+    configureAgentTestTask(delegate)
+}
+
+tasks.register('classFileApiBackendTest', Test) {
+    group = 'verification'
+    description = 'Runs ClassFileApiBackendTest on JDK 28 (EA) so version-72 fixtures execute.'
+    dependsOn testClasses, compileTestProbes
+    useJUnitPlatform()
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    shouldRunAfter test
+    outputs.upToDateWhen { false }
+    def jdk28 = javaToolchains.launcherFor {
+        languageVersion.set(JavaLanguageVersion.of(28))
+    }
+    javaLauncher = jdk28
+    // CI installs JDK 28 and must fail without it, or these tests would silently stop running
+    onlyIf('a JDK 28 toolchain is available') {
+        if (System.getenv('CI')) {
+            return true
+        }
+        try {
+            jdk28.get()
+            return true
+        } catch (Exception e) {
+            logger.lifecycle('Skipping classFileApiBackendTest: no JDK 28 toolchain found. ' +
+                    'Install one to run the ClassFile API backend tests on version-72 class files.')
+            return false
+        }
+    }
+    filter {
+        includeTestsMatching 'io.btrace.instr.ClassFileApiBackendTest'
+    }
+    configureAgentTestTask(delegate)
+}
+
+check.dependsOn tasks.named('classFileApiBackendTest')

@@ -1,0 +1,1469 @@
+# BTrace Release Workflow
+#
+# This workflow handles the complete release process:
+# 1. Validates inputs and prerequisites
+# 2. Runs full test suite (unit + integration tests)
+# 3. Creates release branch and tag
+# 4. Stages artifacts to Maven Central (requires manual release)
+# 5. Waits for Maven Central availability (up to 30 minutes)
+# 6. Creates GitHub release with artifacts
+# 6b. Publishes the container images to ghcr.io
+# 7. Updates SDKMan
+# 8. Updates version numbers for next development cycle
+# 9. Manages milestones
+#
+# Release candidates (release_type 'rc', version X.Y.Z-RCn) run the same build, test, Maven
+# Central, distribution and smoke stages and are published as a GitHub pre-release, so the
+# artifacts can be tried under their final coordinates' shape before X.Y.Z. They are kept out of
+# every channel that tracks "the latest release": no Gradle Plugin Portal, JBang catalog, SDKMAN
+# or `latest` container tags, no release branch, version bumps or milestones.
+#
+# IMPORTANT: Maven artifacts are STAGED, not released automatically.
+# After staging, go to https://central.sonatype.com/publishing/deployments
+# to review and release. The workflow will wait up to 30 minutes.
+#
+# Triggered by scripts/release.sh or manually via workflow_dispatch
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: 'Release type'
+        required: true
+        type: choice
+        options:
+          - major
+          - minor
+          - patch
+          - rc
+      release_version:
+        description: 'Release version (e.g., 2.3.0, or 3.0.0-RC1 for release_type rc)'
+        required: true
+        type: string
+      commit_sha:
+        description: 'Source commit SHA'
+        required: true
+        type: string
+      release_branch:
+        description: 'Release branch (e.g., release/2.3._); not used for rc'
+        required: false
+        type: string
+      next_snapshot:
+        description: 'Next snapshot version (e.g., 2.4.0-SNAPSHOT); not used for rc'
+        required: false
+        type: string
+      dry_run:
+        description: 'Dry run (skip publishing and tagging)'
+        required: false
+        type: boolean
+        default: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RELEASE_VERSION: ${{ inputs.release_version }}
+  RELEASE_TAG: v${{ inputs.release_version }}
+  RC_TAG: v${{ inputs.release_version }}_RC
+  IS_RC: ${{ inputs.release_type == 'rc' }}
+
+jobs:
+  # ============================================================
+  # Job 1: Validate inputs and prerequisites
+  # ============================================================
+  validate:
+    name: Validate Release
+    runs-on: ubuntu-latest
+    outputs:
+      branch_exists: ${{ steps.check-branch.outputs.exists }}
+      create_branch: ${{ steps.check-branch.outputs.create }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 0
+
+      - name: Validate inputs
+        run: |
+          echo "Validating release inputs..."
+          echo "  Release Type: ${{ inputs.release_type }}"
+          echo "  Release Version: ${{ inputs.release_version }}"
+          echo "  Commit SHA: ${{ inputs.commit_sha }}"
+          echo "  Release Branch: ${{ inputs.release_branch }}"
+          echo "  Next Snapshot: ${{ inputs.next_snapshot }}"
+          echo "  Dry Run: ${{ inputs.dry_run }}"
+
+          # Validate release type
+          if [[ ! "${{ inputs.release_type }}" =~ ^(major|minor|patch|rc)$ ]]; then
+            echo "::error::Invalid release type. Expected major, minor, patch, or rc"
+            exit 1
+          fi
+
+          # Validate version format: X.Y.Z for releases, X.Y.Z-RCn for release candidates
+          if [[ "${IS_RC}" == "true" ]]; then
+            if [[ ! "${{ inputs.release_version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-RC[1-9][0-9]*$ ]]; then
+              echo "::error::Invalid release candidate version. Expected X.Y.Z-RCn (e.g., 3.0.0-RC1)"
+              exit 1
+            fi
+          else
+            if [[ ! "${{ inputs.release_version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Invalid version format. Expected X.Y.Z (use release_type rc for X.Y.Z-RCn)"
+              exit 1
+            fi
+            if [[ -z "${{ inputs.release_branch }}" || -z "${{ inputs.next_snapshot }}" ]]; then
+              echo "::error::release_branch and next_snapshot are required for ${{ inputs.release_type }} releases"
+              exit 1
+            fi
+          fi
+
+          # Validate commit exists
+          if ! git cat-file -e "${{ inputs.commit_sha }}^{commit}" 2>/dev/null; then
+            echo "::error::Commit ${{ inputs.commit_sha }} does not exist"
+            exit 1
+          fi
+
+          echo "All inputs validated successfully"
+
+      - name: Check if tag exists
+        run: |
+          if git rev-parse "v${{ inputs.release_version }}" >/dev/null 2>&1; then
+            echo "::error::Tag v${{ inputs.release_version }} already exists"
+            exit 1
+          fi
+          if git ls-remote --tags origin "refs/tags/v${{ inputs.release_version }}" | grep -q .; then
+            echo "::error::Tag v${{ inputs.release_version }} already exists on remote"
+            exit 1
+          fi
+          # Check for leftover RC tag
+          if git rev-parse "${RC_TAG}" >/dev/null 2>&1; then
+            echo "::error::RC tag ${RC_TAG} already exists locally. Clean up with: git tag -d ${RC_TAG}"
+            exit 1
+          fi
+          if git ls-remote --tags origin "refs/tags/${RC_TAG}" | grep -q .; then
+            echo "::error::RC tag ${RC_TAG} already exists on remote. Clean up with: git push origin :refs/tags/${RC_TAG}"
+            exit 1
+          fi
+          echo "Tag does not exist - OK"
+
+      - name: Check if release branch exists
+        id: check-branch
+        run: |
+          BRANCH="${{ inputs.release_branch }}"
+          if git show-ref --verify --quiet "refs/remotes/origin/${BRANCH}"; then
+            echo "Release branch ${BRANCH} already exists"
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "create=false" >> $GITHUB_OUTPUT
+          else
+            echo "Release branch ${BRANCH} will be created"
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "create=true" >> $GITHUB_OUTPUT
+          fi
+
+  # ============================================================
+  # Job 2: Build and run unit tests
+  # ============================================================
+  build-and-test:
+    name: Build and Test
+    needs: validate
+    runs-on: ubuntu-latest
+    outputs:
+      cache-key: ${{ steps.cache-key.outputs.key }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.commit_sha }}
+
+      - name: Set up JDK 24 (toolchain for the btrace-agent java24 source set)
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        with:
+          java-version: 24
+          distribution: temurin
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        with:
+          java-version: 21
+          distribution: temurin
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6
+
+      - name: Generate cache key
+        id: cache-key
+        run: |
+          key="${{ runner.os }}-gradle-release-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}"
+          echo "key=${key}" >> $GITHUB_OUTPUT
+
+      - name: Cache Gradle
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.gradle/caches/modules-2
+            ~/.gradle/wrapper
+          key: ${{ steps.cache-key.outputs.key }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Focused core, agent, and client tests
+        run: |
+          scripts/run-release-gate.sh focused-modules release-gate-logs -- \
+            ./gradlew --no-daemon --parallel --build-cache --continue \
+            :btrace-core:test :btrace-agent:test :btrace-client:test
+
+      - name: Focused Gradle plugin tests
+        run: |
+          scripts/run-release-gate.sh gradle-plugin release-gate-logs \
+            --working-directory btrace-gradle-plugin -- \
+            ../gradlew --no-daemon test
+
+      - name: Assert unpublished Maven fat-agent module remains removed
+        run: |
+          scripts/run-release-gate.sh maven-fat-agent-removed release-gate-logs -- \
+            bash -c 'test ! -e btrace-maven-plugin/build.gradle'
+
+      - name: Spotless
+        run: |
+          scripts/run-release-gate.sh spotless release-gate-logs -- \
+            ./gradlew --no-daemon --parallel --build-cache spotlessCheck
+
+      - name: Clean masked JAR
+        run: |
+          scripts/run-release-gate.sh clean-masked-jar release-gate-logs -- \
+            ./gradlew --no-daemon --parallel --build-cache clean :btrace-dist:btraceJar
+          find btrace-dist/build/resources/main -path '*/libs/btrace.jar' -type f | grep -q .
+
+      - name: Full distribution build
+        run: |
+          scripts/run-release-gate.sh full-distribution release-gate-logs -- \
+            ./gradlew --no-daemon --parallel --build-cache :btrace-dist:build
+
+      - name: Add filtered release-gate logs to summary
+        if: always()
+        run: |
+          shopt -s nullglob
+          for summary in release-gate-logs/*-summary.md; do
+            cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Upload release-gate logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-gate-build-logs
+          retention-days: 7
+          if-no-files-found: ignore
+          path: release-gate-logs/
+
+      - name: Upload dist build data
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: dist-build
+          retention-days: 1
+          path: |
+            btrace-dist/build
+            btrace-agent/build/classes/traces
+
+      - name: Upload test trace data
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: test-trace
+          retention-days: 1
+          path: |
+            btrace-agent/build/classes/traces
+
+      - name: Archive test reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: unit-test-reports
+          path: |
+            **/reports/**/*
+
+  # ============================================================
+  # Job 3: Integration tests on multiple JDK versions
+  # ============================================================
+  integration-tests:
+    name: Integration Tests (JDK ${{ matrix.java }})
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # See continuous.yml: newest Temurin build of each major from actions/setup-java (never a
+        # pinned build, SDKMAN retires those); `sdkman: true` lanes resolve the newest GA build
+        # SDKMAN lists instead (scripts/resolve-sdkman-java.sh) while Temurin 27 is unpublished.
+        java: ['8', '11', '17', '21', '25', '27', '28-ea']
+        include:
+          - java: '27'
+            sdkman: true
+    env:
+      # TEST_JAVA_HOME is exported by the "Prepare target JDK" step once the lane JDK is installed.
+      # Runners are ephemeral, so the Testcontainers Ryuk reaper is unnecessary. Disabling it
+      # removes a Docker Hub image pull that intermittently times out and fails Docker-based tests.
+      TESTCONTAINERS_RYUK_DISABLED: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.commit_sha }}
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Set up Temurin ${{ matrix.java }} (target JDK)
+        # Runs before the JDK 24/21 steps so that JAVA_HOME still points at JDK 21 for Gradle.
+        if: matrix.sdkman != true
+        id: lane-jdk
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        with:
+          java-version: ${{ matrix.java }}
+          distribution: temurin
+          check-latest: true
+
+      - name: Set up JDK 24 (toolchain for the btrace-agent java24 source set)
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        with:
+          java-version: 24
+          distribution: temurin
+
+      - name: Set up JDK 21 for Gradle
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        with:
+          java-version: 21
+          distribution: temurin
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6
+
+      - name: Prepare OS
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl zip unzip
+
+      - name: Prepare target JDK ${{ matrix.java }}
+        run: |
+          if [[ "${{ matrix.sdkman }}" == "true" ]]; then
+            curl -s "https://get.sdkman.io" | bash
+            source "$HOME/.sdkman/bin/sdkman-init.sh"
+            JAVA_ID=$(scripts/resolve-sdkman-java.sh "${{ matrix.java }}")
+            echo "Lane ${{ matrix.java }} -> SDKMAN java ${JAVA_ID}"
+            echo 'n' | sdk install java "${JAVA_ID}"
+            TARGET_JAVA_HOME="${HOME}/.sdkman/candidates/java/${JAVA_ID}"
+          else
+            TARGET_JAVA_HOME="${{ steps.lane-jdk.outputs.path }}"
+            echo "Lane ${{ matrix.java }} -> Temurin ${{ steps.lane-jdk.outputs.version }} at ${TARGET_JAVA_HOME}"
+          fi
+          echo "TEST_JAVA_HOME=${TARGET_JAVA_HOME}" >> "$GITHUB_ENV"
+          "${TARGET_JAVA_HOME}/bin/java" -version
+
+      - name: Cache Gradle
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.gradle/caches/modules-2
+            ~/.gradle/wrapper
+          key: ${{ needs.build-and-test.outputs.cache-key }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Download build data
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: dist-build
+          path: btrace-dist/build
+
+      - name: Download test trace data
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: test-trace
+          path: btrace-agent/build/classes/traces
+
+      - name: Build btrace-agent jar
+        run: |
+          ./gradlew --no-daemon --parallel --build-cache :btrace-agent:jar
+
+      - name: Verify target-JDK deprecation warning policy
+        run: |
+          DIST_DIR=$(find btrace-dist/build/resources/main -mindepth 1 -maxdepth 1 \
+            -type d -print -quit)
+          test -n "$DIST_DIR"
+          scripts/run-release-gate.sh jdk-warning-${{ matrix.java }} release-gate-logs -- \
+            scripts/verify-jdk-warning.sh \
+            --java-home "${TEST_JAVA_HOME}" \
+            --distribution "$DIST_DIR"
+
+      - name: Run integration tests
+        run: |
+          find btrace-dist/build/resources/main -path '*/libs/btrace.jar' -type f | grep -q .
+          scripts/run-release-gate.sh integration-${{ matrix.java }} release-gate-logs -- \
+            ./gradlew --no-daemon --parallel --build-cache \
+            -Pintegration :integration-tests:test
+
+      - name: Add filtered JDK-lane logs to summary
+        if: always()
+        run: |
+          shopt -s nullglob
+          for summary in release-gate-logs/*-summary.md; do
+            cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Upload JDK-lane release-gate logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-gate-jdk-${{ matrix.java }}
+          retention-days: 7
+          if-no-files-found: ignore
+          path: release-gate-logs/
+
+      - name: Integration test reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: integration-test-reports-${{ matrix.java }}
+          path: |
+            integration-tests/build/reports/**/*
+
+  # ============================================================
+  # Job 4: Prepare release (create branch, update version, tag)
+  # ============================================================
+  prepare-release:
+    name: Prepare Release
+    needs: [validate, integration-tests]
+    runs-on: ubuntu-latest
+    outputs:
+      release_sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Create or checkout release branch
+        # A release candidate is tagged on a detached commit; it creates no release branch
+        if: ${{ inputs.release_type != 'rc' }}
+        run: |
+          BRANCH="${{ inputs.release_branch }}"
+          if git show-ref --verify --quiet "refs/remotes/origin/${BRANCH}"; then
+            echo "Checking out existing branch ${BRANCH}"
+            git checkout -b "${BRANCH}" "origin/${BRANCH}"
+          else
+            echo "Creating new branch ${BRANCH}"
+            git checkout -b "${BRANCH}"
+          fi
+
+      - name: Update the project version
+        run: |
+          VERSION="${{ inputs.release_version }}"
+          # `version = '...'` lives in build.gradle since c354f12b; 2.2.x release branches keep
+          # `project.version = '...'` in common.gradle. Edit whichever file the checkout carries.
+          VERSION_FILE=build.gradle
+          grep -qE "^[[:space:]]*version = '" build.gradle || VERSION_FILE=common.gradle
+          sed -i -E "s/^([[:space:]]*(project\.)?version = )'[^']*'/\1'${VERSION}'/" "${VERSION_FILE}"
+          echo "VERSION_FILE=${VERSION_FILE}" >> "$GITHUB_ENV"
+          echo "Updated version to ${VERSION} in ${VERSION_FILE}"
+          grep -E "^[[:space:]]*(project\.)?version = '" "${VERSION_FILE}"
+
+      - name: Commit version change
+        id: commit
+        run: |
+          git add "${VERSION_FILE}"
+          git commit -m "Release ${RELEASE_TAG}"
+          SHA=$(git rev-parse HEAD)
+          echo "sha=${SHA}" >> $GITHUB_OUTPUT
+          echo "Release commit: ${SHA}"
+
+      - name: Create RC tag
+        if: ${{ inputs.dry_run != true }}
+        run: |
+          git tag -a "${RC_TAG}" -m "Release candidate ${RELEASE_TAG}"
+          echo "Created RC tag ${RC_TAG}"
+
+      - name: Push branch and RC tag
+        if: ${{ inputs.dry_run != true }}
+        run: |
+          if [[ "${IS_RC}" != "true" ]]; then
+            git push origin "${{ inputs.release_branch }}"
+          fi
+          git push origin "${RC_TAG}"
+          echo "Pushed release commit and RC tag"
+
+      - name: Dry run summary
+        if: ${{ inputs.dry_run == true }}
+        run: |
+          echo "::warning::DRY RUN - Branch and tag NOT pushed"
+          echo "Would have pushed:"
+          echo "  - Branch: ${{ inputs.release_branch }}"
+          echo "  - RC Tag: ${RC_TAG}"
+
+  # ============================================================
+  # Job 5: Stage to Maven Central (does NOT release)
+  # ============================================================
+  stage-maven:
+    name: Stage to Maven Central
+    needs: [prepare-release, build-and-test]
+    runs-on: ubuntu-latest
+    if: ${{ inputs.dry_run != true }}
+    steps:
+      - name: Checkout RC tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.RC_TAG }}
+
+      - name: Set up JDK 24 (toolchain for the btrace-agent java24 source set)
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        with:
+          java-version: 24
+          distribution: temurin
+
+      - name: Set up JDK 21 (Gradle 9 requires Java 17+)
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        with:
+          java-version: 21
+          distribution: temurin
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6
+
+      - name: Cache Gradle
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.gradle/caches/modules-2
+            ~/.gradle/wrapper
+          key: ${{ needs.build-and-test.outputs.cache-key }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Stage to Maven Central
+        env:
+          GPG_SIGNING_KEY: ${{ secrets.GPG_SIGNING_KEY }}
+          GPG_SIGNING_PWD: ${{ secrets.GPG_SIGNING_PWD }}
+          SONATYPE_USER: ${{ secrets.SONATYPE_USERNAME }}
+          SONATYPE_PASSWORD: ${{ secrets.SONATYPE_PASSWORD }}
+        run: |
+          echo "Staging artifacts to Central Portal..."
+          echo "After this job completes, go to https://central.sonatype.com/publishing/deployments"
+          echo "to review and release the staged artifacts."
+          # One invocation, so the distribution and the release extensions share a deployment
+          ./gradlew :btrace-dist:publishAllPublicationsToSonatypeRepository publishReleaseExtensionsToSonatype --no-daemon
+
+      - name: Staging complete
+        run: |
+          echo "=============================================="
+          echo "ARTIFACTS STAGED - MANUAL RELEASE REQUIRED"
+          echo "=============================================="
+          echo ""
+          echo "Staged artifacts:"
+          echo "  - io.btrace:btrace:${{ inputs.release_version }}"
+          echo "  - io.btrace:<extension-id>:${{ inputs.release_version }} for each release extension"
+          echo ""
+          echo "Next steps:"
+          echo "  1. Go to https://central.sonatype.com/publishing/deployments"
+          echo "  2. Review the staged repository"
+          echo "  3. Click 'Publish' to release to Maven Central"
+          echo ""
+          echo "The workflow will wait up to 30 minutes for artifacts to appear."
+          echo "If you don't want to proceed, let the workflow timeout or cancel it."
+
+  # ============================================================
+  # Job 5b: Wait for Maven Central availability
+  # ============================================================
+  wait-for-maven:
+    name: Wait for Maven Central
+    needs: stage-maven
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Wait for artifacts on Maven Central
+        run: |
+          VERSION="${{ inputs.release_version }}"
+          ARTIFACT_URL="https://repo1.maven.org/maven2/io/btrace/btrace/${VERSION}/btrace-${VERSION}.pom"
+
+          echo "Waiting for Maven Central to have: ${ARTIFACT_URL}"
+          echo "This requires manual release from Central Portal."
+          echo ""
+          echo "Go to: https://central.sonatype.com/publishing/deployments"
+          echo ""
+
+          MAX_ATTEMPTS=60  # 30 minutes with 30s intervals
+          ATTEMPT=0
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            echo "Attempt ${ATTEMPT}/${MAX_ATTEMPTS}: Checking Maven Central..."
+
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${ARTIFACT_URL}")
+
+            if [ "$HTTP_STATUS" = "200" ]; then
+              echo ""
+              echo "SUCCESS: Artifacts are available on Maven Central!"
+              echo "Proceeding with GitHub release and SDKMan announcement..."
+              exit 0
+            fi
+
+            echo "  Status: ${HTTP_STATUS} - Not available yet. Waiting 30s..."
+            sleep 30
+          done
+
+          echo ""
+          echo "TIMEOUT: Artifacts did not appear on Maven Central within 30 minutes."
+          echo "The release was NOT finalized."
+          echo ""
+          echo "To complete the release manually:"
+          echo "  1. Release artifacts via Central Portal"
+          echo "  2. Create GitHub release manually"
+          echo "  3. Run: ./gradlew :btrace-dist:sdkMinorRelease"
+          exit 1
+
+  # ============================================================
+  # Job 5c: Publish Gradle plugins to the Gradle Plugin Portal
+  # ============================================================
+  publish-gradle-plugins:
+    name: Publish Gradle Plugins
+    needs: [prepare-release, wait-for-maven]
+    runs-on: ubuntu-latest
+    if: ${{ inputs.dry_run != true }}
+    steps:
+      - name: Checkout RC tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.RC_TAG }}
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        with:
+          java-version: 17
+          distribution: temurin
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6
+
+      - name: Skip Plugin Portal for release candidates
+        if: ${{ inputs.release_type == 'rc' }}
+        # Plugin Portal versions cannot be withdrawn and the newest becomes the default
+        run: echo "::notice::Release candidate ${{ inputs.release_version }}; Gradle plugins are not published"
+
+      - name: Validate Plugin Portal publications
+        if: ${{ inputs.release_type != 'rc' }}
+        env:
+          GRADLE_PUBLISH_KEY: ${{ secrets.GRADLE_PUBLISH_KEY }}
+          GRADLE_PUBLISH_SECRET: ${{ secrets.GRADLE_PUBLISH_SECRET }}
+        run: |
+          ./gradlew -p btrace-gradle-plugin -PbtraceVersion=${{ inputs.release_version }} \
+            publishPlugins --validate-only --no-daemon
+
+      - name: Publish Plugin Portal artifacts
+        if: ${{ inputs.release_type != 'rc' }}
+        env:
+          GRADLE_PUBLISH_KEY: ${{ secrets.GRADLE_PUBLISH_KEY }}
+          GRADLE_PUBLISH_SECRET: ${{ secrets.GRADLE_PUBLISH_SECRET }}
+        run: |
+          ./gradlew -p btrace-gradle-plugin -PbtraceVersion=${{ inputs.release_version }} \
+            publishPlugins --no-daemon
+
+      - name: Verify Plugin Portal availability
+        if: ${{ inputs.release_type != 'rc' }}
+        run: |
+          mkdir -p plugin-portal-smoke
+          cat > plugin-portal-smoke/settings.gradle <<'EOF'
+          pluginManagement {
+            repositories { gradlePluginPortal() }
+          }
+          rootProject.name = 'btrace-plugin-portal-smoke'
+          EOF
+          cat > plugin-portal-smoke/build.gradle <<EOF
+          plugins {
+            id 'io.btrace.extension' version '${{ inputs.release_version }}'
+            id 'io.btrace.fat-agent' version '${{ inputs.release_version }}'
+          }
+          EOF
+          ./gradlew -p plugin-portal-smoke tasks --no-daemon
+          echo "Verified Plugin Portal IDs io.btrace.extension and io.btrace.fat-agent at ${{ inputs.release_version }}"
+
+  # ============================================================
+  # Job 5d: Update JBang catalog
+  # ============================================================
+  update-jbang-catalog:
+    name: Update JBang Catalog
+    needs: [prepare-release, wait-for-maven]
+    runs-on: ubuntu-latest
+    if: ${{ inputs.dry_run != true }}
+    steps:
+      - name: Skip the JBang catalog for release candidates
+        if: ${{ inputs.release_type == 'rc' }}
+        # The catalog's btrace and btrace-latest aliases point at the latest release
+        run: echo "::notice::Release candidate ${{ inputs.release_version }}; JBang catalog unchanged"
+
+      - name: Checkout jbang-catalog
+        if: ${{ inputs.release_type != 'rc' }}
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: btraceio/jbang-catalog
+          token: ${{ secrets.JBANG_CATALOG_PAT || secrets.GITHUB_TOKEN }}
+          path: catalog
+
+      - name: Update catalog files
+        if: ${{ inputs.release_type != 'rc' }}
+        continue-on-error: true
+        run: |
+          VERSION="${{ inputs.release_version }}"
+
+          if [ ! -d catalog ]; then
+            echo "⚠️ Catalog checkout failed - skipping update"
+            echo "Add JBANG_CATALOG_PAT secret to enable automatic catalog updates"
+            exit 0
+          fi
+
+          cd catalog
+
+          # Update btrace.java dependency
+          sed -i.bak -E "s|//DEPS io.btrace:btrace(-client)?:.*|//DEPS io.btrace:btrace:${VERSION}|g" btrace.java
+
+          # Update btrace-latest.java dependency
+          sed -i.bak -E "s|//DEPS io.btrace:btrace(-client)?:.*|//DEPS io.btrace:btrace:${VERSION}|g" btrace-latest.java
+
+          # Clean up backup files
+          rm -f *.bak
+
+          # Show changes
+          git diff
+
+      - name: Commit and push catalog updates
+        if: ${{ inputs.release_type != 'rc' }}
+        continue-on-error: true
+        run: |
+          VERSION="${{ inputs.release_version }}"
+
+          if [ ! -d catalog ]; then
+            echo "⚠️ Catalog checkout failed - skipping update"
+            echo "Add JBANG_CATALOG_PAT secret to enable automatic catalog updates"
+            exit 0
+          fi
+
+          cd catalog
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add btrace.java btrace-latest.java
+          if git commit -m "Update btrace to version ${VERSION}"; then
+            git push || echo "⚠️ Push failed - update catalog manually at https://github.com/btraceio/jbang-catalog"
+          fi
+
+  # ============================================================
+  # Job 5d: Finalize release tag (RC -> final)
+  # ============================================================
+  finalize-tag:
+    name: Finalize Release Tag
+    needs: [prepare-release, release-smoke]
+    runs-on: ubuntu-latest
+    if: ${{ inputs.dry_run != true }}
+    steps:
+      - name: Checkout at release SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.prepare-release.outputs.release_sha }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch tags
+        run: git fetch origin --tags
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Create final tag
+        run: |
+          git tag -a "${RELEASE_TAG}" -m "Release ${RELEASE_TAG}"
+          echo "Created final tag ${RELEASE_TAG}"
+
+      - name: Push final tag
+        run: |
+          git push origin "${RELEASE_TAG}"
+          echo "Pushed final tag ${RELEASE_TAG}"
+
+      - name: Delete RC tag
+        run: |
+          git tag -d "${RC_TAG}" || true
+          git push origin ":refs/tags/${RC_TAG}" || true
+          echo "Deleted RC tag ${RC_TAG}"
+
+  # ============================================================
+  # Job 6: Build distribution packages
+  # ============================================================
+  build-distributions:
+    name: Build Distributions
+    needs: prepare-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.dry_run == true && inputs.commit_sha || env.RC_TAG }}
+
+      - name: Set up JDK 24 (toolchain for the btrace-agent java24 source set)
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        with:
+          java-version: 24
+          distribution: temurin
+
+      - name: Set up JDK 21 (Gradle 9 requires Java 17+)
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        with:
+          java-version: 21
+          distribution: temurin
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6
+
+      - name: Update version for dry run
+        if: ${{ inputs.dry_run == true }}
+        run: |
+          VERSION="${{ inputs.release_version }}"
+          # `version = '...'` lives in build.gradle since c354f12b; 2.2.x release branches keep
+          # `project.version = '...'` in common.gradle. Edit whichever file the checkout carries.
+          VERSION_FILE=build.gradle
+          grep -qE "^[[:space:]]*version = '" build.gradle || VERSION_FILE=common.gradle
+          sed -i -E "s/^([[:space:]]*(project\.)?version = )'[^']*'/\1'${VERSION}'/" "${VERSION_FILE}"
+          echo "VERSION_FILE=${VERSION_FILE}" >> "$GITHUB_ENV"
+          grep -E "^[[:space:]]*(project\.)?version = '" "${VERSION_FILE}"
+
+      - name: Build distribution packages from a clean tree
+        run: |
+          ./gradlew clean :btrace-dist:build --no-daemon
+
+      - name: List artifacts
+        run: |
+          echo "Distribution artifacts:"
+          ls -la btrace-dist/build/distributions/
+
+      - name: Upload distribution artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-distributions
+          retention-days: 7
+          path: |
+            btrace-dist/build/distributions/btrace-v${{ inputs.release_version }}-bin.tar.gz
+            btrace-dist/build/distributions/btrace-v${{ inputs.release_version }}-bin.zip
+            btrace-dist/build/distributions/btrace-v${{ inputs.release_version }}-sdkman-bin.zip
+            btrace-dist/build/distributions/*.deb
+            btrace-dist/build/distributions/*.rpm
+
+  # ============================================================
+  # Job 6b: Acquisition paths and first-trace release smoke tests
+  # ============================================================
+  release-smoke:
+    name: Release Acquisition and First Trace
+    needs: [prepare-release, wait-for-maven, publish-gradle-plugins, update-jbang-catalog, build-distributions]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    if: ${{ inputs.dry_run != true }}
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.prepare-release.outputs.release_sha }}
+
+      - name: Set up JDK 24 (toolchain for the btrace-agent java24 source set)
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        with:
+          java-version: 24
+          distribution: temurin
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        with:
+          java-version: 21
+          distribution: temurin
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6
+
+      - name: Download release distributions
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release-distributions
+          path: release-distributions
+
+      - name: Extract binary distribution
+        run: |
+          mkdir -p release-candidate
+          unzip -q "release-distributions/btrace-v${RELEASE_VERSION}-bin.zip" -d release-candidate
+
+      - name: Build fat agent from the release commit
+        run: |
+          ./gradlew clean :btrace-dist:fatAgentJar :btrace-dist:explodeExtensions --no-daemon
+
+      - name: Download Maven release metadata
+        run: |
+          mkdir -p release-metadata
+          curl --fail --show-error --silent --retry 6 --retry-delay 10 \
+            "https://repo1.maven.org/maven2/io/btrace/btrace/${RELEASE_VERSION}/btrace-${RELEASE_VERSION}.pom" \
+            --output release-metadata/btrace.pom
+
+      - name: Build release container from the candidate distribution
+        run: |
+          mkdir -p release-container/btrace
+          cp -R release-candidate/. release-container/btrace/
+          cp docker/docker-entrypoint.sh release-container/
+          docker build \
+            --build-arg "BTRACE_VERSION=${RELEASE_VERSION}" \
+            --tag "btrace-release-smoke:${RELEASE_VERSION}" \
+            --file docker/Dockerfile \
+            release-container
+
+      - name: Verify archive, Maven, manifest, version, and container metadata
+        run: |
+          scripts/verify-release-artifacts.sh \
+            --distribution release-candidate \
+            --sdkman-archive "release-distributions/btrace-v${RELEASE_VERSION}-sdkman-bin.zip" \
+            --maven-pom release-metadata/btrace.pom \
+            --container-image "btrace-release-smoke:${RELEASE_VERSION}" \
+            --version "${RELEASE_VERSION}"
+
+      - name: Run built-distribution smoke matrix
+        run: |
+          TMPDIR="${RUNNER_TEMP}" scripts/release-smoke.sh \
+            --distribution release-candidate \
+            --fat-agent btrace-dist/build/fat-agent/btrace-agent-fat.jar \
+            --version "${RELEASE_VERSION}" \
+            --keep-work
+
+      - name: Verify Maven coordinate and JBang catalog alias
+        run: |
+          curl -Ls https://sh.jbang.dev | bash -s - app setup
+          export PATH="$HOME/.jbang/bin:$PATH"
+          jbang "io.btrace:btrace:${RELEASE_VERSION}" --version | tee jbang-coordinate.log
+          grep -F "${RELEASE_VERSION}" jbang-coordinate.log
+          if [[ "${IS_RC}" == "true" ]]; then
+            echo "Release candidate: the JBang catalog alias still points at the latest release"
+            exit 0
+          fi
+          jbang catalog add --name btraceio \
+            https://raw.githubusercontent.com/btraceio/jbang-catalog/main/jbang-catalog.json
+          jbang btrace@btraceio --version | tee jbang-catalog.log
+          grep -F "${RELEASE_VERSION}" jbang-catalog.log
+
+      - name: Upload release-smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-smoke-diagnostics
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/btrace-release-smoke.*/logs
+            jbang-*.log
+
+  # ============================================================
+  # Job 7: Create GitHub Release
+  # ============================================================
+  create-github-release:
+    name: Create GitHub Release
+    needs: [build-distributions, finalize-tag]
+    runs-on: ubuntu-latest
+    if: ${{ inputs.dry_run != true }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - name: Download distribution artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release-distributions
+          path: distributions
+
+      - name: Download Maven artifact
+        run: |
+          VERSION="${{ inputs.release_version }}"
+          BASE_URL="https://repo1.maven.org/maven2/io/btrace/btrace/${VERSION}"
+          mkdir -p maven-artifacts
+          MAX_ATTEMPTS=40
+          for i in $(seq 1 $MAX_ATTEMPTS); do
+            if curl -fSL "${BASE_URL}/btrace-${VERSION}.jar" \
+              -o maven-artifacts/btrace-${VERSION}.jar; then
+              echo "Downloaded btrace-${VERSION}.jar"
+              ls -la maven-artifacts/
+              exit 0
+            fi
+            echo "Attempt ${i}/${MAX_ATTEMPTS} failed, retrying in 30s..."
+            sleep 30
+          done
+          echo "::error::Failed to download Maven JAR after ${MAX_ATTEMPTS} attempts (~20 minutes)."
+          exit 1
+
+      - name: Check for no-release-notes label
+        id: check-label
+        run: |
+          # Check if this release should skip auto-generated notes
+          SKIP_NOTES="false"
+          # This would check PRs merged since last release for the label
+          # For now, always generate release notes
+          echo "skip_notes=${SKIP_NOTES}" >> $GITHUB_OUTPUT
+
+      - name: Resolve curated release notes
+        run: |
+          # Curated notes live in the tagged commit; the auto-generated PR list is appended after them.
+          NOTES=".github/release-notes/v${RELEASE_VERSION}.md"
+          mkdir -p release-body
+          if [[ -f "${NOTES}" ]]; then
+            cp "${NOTES}" release-body/body.md
+            echo "Using curated release notes from ${NOTES}"
+          else
+            : > release-body/body.md
+            echo "::warning::No curated release notes at ${NOTES}; the release body will contain only auto-generated notes"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: BTrace ${{ inputs.release_version }}
+          draft: false
+          prerelease: ${{ inputs.release_type == 'rc' }}
+          make_latest: ${{ inputs.release_type != 'rc' }}
+          body_path: release-body/body.md
+          generate_release_notes: true
+          files: |
+            distributions/btrace-v${{ inputs.release_version }}-bin.tar.gz
+            distributions/btrace-v${{ inputs.release_version }}-bin.zip
+            distributions/btrace-v${{ inputs.release_version }}-sdkman-bin.zip
+            distributions/*.deb
+            distributions/*.rpm
+            maven-artifacts/*
+
+      - name: Verify GitHub release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "${RELEASE_TAG}" --json assets --jq '.assets[].name' \
+            | sort > github-release-assets.log
+          cat github-release-assets.log
+          for asset in \
+            "btrace-v${RELEASE_VERSION}-bin.tar.gz" \
+            "btrace-v${RELEASE_VERSION}-bin.zip" \
+            "btrace-v${RELEASE_VERSION}-sdkman-bin.zip" \
+            "btrace-${RELEASE_VERSION}.jar"; do
+            grep -Fx "$asset" github-release-assets.log
+          done
+          grep -E '\.deb$' github-release-assets.log
+          grep -E '\.rpm$' github-release-assets.log
+
+  # ============================================================
+  # Job 7b: Publish container images to GitHub Container Registry
+  # ============================================================
+  publish-container-images:
+    name: Publish Container Images
+    needs: [prepare-release, create-github-release]
+    runs-on: ubuntu-latest
+    if: ${{ inputs.dry_run != true }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE_REPOSITORY: ghcr.io/${{ github.repository_owner }}/btrace
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.prepare-release.outputs.release_sha }}
+
+      - name: Download release distributions
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release-distributions
+          path: release-distributions
+
+      - name: Prepare the image build context from the candidate distribution
+        run: |
+          # Same layout release-smoke builds its verification image from: the extracted
+          # distribution under btrace/ (bin/, libs/, ...) plus the entrypoint script.
+          mkdir -p release-container/btrace
+          unzip -q "release-distributions/btrace-v${RELEASE_VERSION}-bin.zip" -d release-container/btrace
+          cp docker/docker-entrypoint.sh release-container/
+          test -f release-container/btrace/libs/btrace.jar
+          test -x release-container/btrace/bin/btrace
+
+      - name: Set up QEMU (linux/arm64 builds)
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push the three image variants
+        run: |
+          image="${IMAGE_REPOSITORY,,}"   # registry paths must be lowercase
+          for variant in "" "-alpine" "-distroless"; do
+            # A release candidate gets its version tags only; `latest` stays on the last release
+            latest_tag=()
+            if [[ "${IS_RC}" != "true" ]]; then
+              latest_tag=(--tag "${image}:latest${variant}")
+            fi
+            case "${variant}" in
+              "")          dockerfile=docker/Dockerfile ;;
+              -alpine)     dockerfile=docker/Dockerfile.alpine ;;
+              -distroless) dockerfile=docker/Dockerfile.distroless ;;
+            esac
+            docker buildx build \
+              --platform linux/amd64,linux/arm64 \
+              --build-arg "BTRACE_VERSION=${RELEASE_VERSION}" \
+              --file "${dockerfile}" \
+              --tag "${image}:${RELEASE_VERSION}${variant}" \
+              "${latest_tag[@]}" \
+              --provenance=false \
+              --push \
+              release-container
+          done
+
+      - name: Verify the published manifests and OCI labels
+        run: |
+          image="${IMAGE_REPOSITORY,,}"
+          tags=("${RELEASE_VERSION}" "${RELEASE_VERSION}-alpine" "${RELEASE_VERSION}-distroless")
+          if [[ "${IS_RC}" != "true" ]]; then
+            tags+=(latest latest-alpine latest-distroless)
+          fi
+          for tag in "${tags[@]}"; do
+            docker buildx imagetools inspect "${image}:${tag}" | tee "manifest-${tag}.log"
+            grep -q 'linux/amd64' "manifest-${tag}.log"
+            grep -q 'linux/arm64' "manifest-${tag}.log"
+          done
+          docker pull --quiet "${image}:${RELEASE_VERSION}"
+          version_label=$(docker image inspect \
+            --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' \
+            "${image}:${RELEASE_VERSION}")
+          license_label=$(docker image inspect \
+            --format '{{ index .Config.Labels "org.opencontainers.image.licenses" }}' \
+            "${image}:${RELEASE_VERSION}")
+          test "${version_label}" = "${RELEASE_VERSION}"
+          test "${license_label}" = "Apache-2.0"
+          echo "Published ${image}: ${tags[*]} for linux/amd64 and linux/arm64"
+
+  # ============================================================
+  # Job 8: Update SDKMan
+  # ============================================================
+  update-sdkman:
+    name: Update SDKMan
+    needs: create-github-release
+    runs-on: ubuntu-latest
+    # SDKMAN makes an announced version the default for `sdk install btrace`
+    if: ${{ inputs.dry_run != true && inputs.release_type != 'rc' }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Set up JDK 24 (toolchain for the btrace-agent java24 source set)
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        with:
+          java-version: 24
+          distribution: temurin
+
+      - name: Set up JDK 21 (Gradle 9 requires Java 17+)
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        with:
+          java-version: 21
+          distribution: temurin
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6
+
+      - name: Announce to SDKMan
+        env:
+          SDKMAN_KEY: ${{ secrets.SDKMAN_KEY }}
+          SDKMAN_TOKEN: ${{ secrets.SDKMAN_TOKEN }}
+        run: |
+          ./gradlew :btrace-dist:sdkMajorRelease --no-daemon
+
+  # ============================================================
+  # Job 9: Update develop branch (major/minor only)
+  # ============================================================
+  update-develop:
+    name: Update Develop Branch
+    needs: prepare-release
+    runs-on: ubuntu-latest
+    if: ${{ inputs.release_type != 'patch' && inputs.release_type != 'rc' && inputs.dry_run != true }}
+    steps:
+      - name: Checkout develop
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: develop
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Update version in develop
+        run: |
+          NEXT_VERSION="${{ inputs.next_snapshot }}"
+          # `version = '...'` lives in build.gradle since c354f12b; 2.2.x release branches keep
+          # `project.version = '...'` in common.gradle. Edit whichever file the checkout carries.
+          VERSION_FILE=build.gradle
+          grep -qE "^[[:space:]]*version = '" build.gradle || VERSION_FILE=common.gradle
+          sed -i -E "s/^([[:space:]]*(project\.)?version = )'[^']*'/\1'${NEXT_VERSION}'/" "${VERSION_FILE}"
+          echo "VERSION_FILE=${VERSION_FILE}" >> "$GITHUB_ENV"
+          echo "Updated develop to ${NEXT_VERSION} in ${VERSION_FILE}"
+          grep -E "^[[:space:]]*(project\.)?version = '" "${VERSION_FILE}"
+
+      - name: Commit and push
+        run: |
+          git add "${VERSION_FILE}"
+          git commit -m "Bump version to ${{ inputs.next_snapshot }} after ${RELEASE_TAG} release"
+          git push origin develop
+
+  # ============================================================
+  # Job 10: Update release branch to next patch snapshot
+  # ============================================================
+  update-release-branch:
+    name: Update Release Branch
+    needs: [prepare-release, create-github-release]
+    runs-on: ubuntu-latest
+    if: ${{ inputs.dry_run != true && inputs.release_type != 'rc' }}
+    steps:
+      - name: Checkout release branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.release_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Calculate next patch snapshot
+        id: next-version
+        run: |
+          CURRENT="${{ inputs.release_version }}"
+          MAJOR=$(echo $CURRENT | cut -d. -f1)
+          MINOR=$(echo $CURRENT | cut -d. -f2)
+          PATCH=$(echo $CURRENT | cut -d. -f3)
+          NEXT_PATCH=$((PATCH + 1))
+          NEXT_VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}-SNAPSHOT"
+          echo "version=${NEXT_VERSION}" >> $GITHUB_OUTPUT
+          echo "Next patch version: ${NEXT_VERSION}"
+
+      - name: Update version in release branch
+        run: |
+          NEXT_VERSION="${{ steps.next-version.outputs.version }}"
+          # `version = '...'` lives in build.gradle since c354f12b; 2.2.x release branches keep
+          # `project.version = '...'` in common.gradle. Edit whichever file the checkout carries.
+          VERSION_FILE=build.gradle
+          grep -qE "^[[:space:]]*version = '" build.gradle || VERSION_FILE=common.gradle
+          sed -i -E "s/^([[:space:]]*(project\.)?version = )'[^']*'/\1'${NEXT_VERSION}'/" "${VERSION_FILE}"
+          echo "VERSION_FILE=${VERSION_FILE}" >> "$GITHUB_ENV"
+          echo "Updated release branch to ${NEXT_VERSION} in ${VERSION_FILE}"
+          grep -E "^[[:space:]]*(project\.)?version = '" "${VERSION_FILE}"
+
+      - name: Commit and push
+        run: |
+          git add "${VERSION_FILE}"
+          git commit -m "Bump version to ${{ steps.next-version.outputs.version }} for next patch release"
+          git push origin ${{ inputs.release_branch }}
+
+  # ============================================================
+  # Job 11: Manage milestones
+  # ============================================================
+  update-milestones:
+    name: Update Milestones
+    needs: create-github-release
+    runs-on: ubuntu-latest
+    # The X.Y.Z milestone closes with X.Y.Z, not with one of its candidates
+    if: ${{ inputs.dry_run != true && inputs.release_type != 'rc' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Create and close milestone
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          MILESTONE_TITLE="${{ inputs.release_version }}"
+
+          # Check if milestone exists
+          MILESTONE=$(gh api repos/${{ github.repository }}/milestones --jq ".[] | select(.title == \"${MILESTONE_TITLE}\")")
+
+          if [[ -z "${MILESTONE}" ]]; then
+            echo "Creating milestone ${MILESTONE_TITLE}..."
+            gh api repos/${{ github.repository }}/milestones \
+              -X POST \
+              -f title="${MILESTONE_TITLE}" \
+              -f state="closed" \
+              -f description="Released as ${RELEASE_TAG}"
+          else
+            MILESTONE_NUMBER=$(echo "${MILESTONE}" | jq -r '.number')
+            echo "Closing existing milestone ${MILESTONE_TITLE} (#${MILESTONE_NUMBER})..."
+            gh api repos/${{ github.repository }}/milestones/${MILESTONE_NUMBER} \
+              -X PATCH \
+              -f state="closed"
+          fi
+
+      - name: Associate merged PRs with milestone
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Get the milestone number
+          MILESTONE_TITLE="${{ inputs.release_version }}"
+          MILESTONE_NUMBER=$(gh api repos/${{ github.repository }}/milestones --jq ".[] | select(.title == \"${MILESTONE_TITLE}\") | .number")
+
+          if [[ -z "${MILESTONE_NUMBER}" ]]; then
+            echo "Warning: Could not find milestone ${MILESTONE_TITLE}"
+            exit 0
+          fi
+
+          # Find the previous release tag
+          # Release candidates are not releases: the X.Y.Z milestone spans back to the last X.Y.Z
+          PREV_TAG=$(git describe --tags --abbrev=0 --exclude '*-RC*' "${RELEASE_TAG}^" 2>/dev/null || echo "")
+
+          if [[ -z "${PREV_TAG}" ]]; then
+            echo "No previous tag found, skipping PR association"
+            exit 0
+          fi
+
+          echo "Finding PRs merged between ${PREV_TAG} and ${RELEASE_TAG}..."
+
+          # Get commits between tags
+          COMMITS=$(git log "${PREV_TAG}..${RELEASE_TAG}" --pretty=format:"%H" 2>/dev/null || echo "")
+
+          for COMMIT in ${COMMITS}; do
+            # Find PR associated with this commit
+            PR_NUMBER=$(gh api repos/${{ github.repository }}/commits/${COMMIT}/pulls --jq '.[0].number' 2>/dev/null || echo "")
+
+            if [[ -n "${PR_NUMBER}" && "${PR_NUMBER}" != "null" ]]; then
+              echo "Associating PR #${PR_NUMBER} with milestone ${MILESTONE_TITLE}..."
+              gh api repos/${{ github.repository }}/issues/${PR_NUMBER} \
+                -X PATCH \
+                -f milestone="${MILESTONE_NUMBER}" 2>/dev/null || true
+            fi
+          done
+
+  # ============================================================
+  # Job 12: Release summary
+  # ============================================================
+  summary:
+    name: Release Summary
+    needs: [validate, build-and-test, integration-tests, prepare-release, stage-maven, wait-for-maven, publish-gradle-plugins, update-jbang-catalog, build-distributions, release-smoke, finalize-tag, create-github-release, publish-container-images, update-sdkman, update-milestones]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Generate summary
+        run: |
+          echo "# Release Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Release Details" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | ${{ inputs.release_version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tag | ${RELEASE_TAG} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Release Type | ${{ inputs.release_type }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Source Commit | ${{ inputs.commit_sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Release Branch | ${{ inputs.release_branch }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dry Run | ${{ inputs.dry_run }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "${{ inputs.dry_run }}" != "true" ]]; then
+            echo "## Links" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "- [GitHub Release](https://github.com/${{ github.repository }}/releases/tag/${RELEASE_TAG})" >> $GITHUB_STEP_SUMMARY
+            echo "- [Maven Central](https://central.sonatype.com/search?q=io.btrace&version=${{ inputs.release_version }})" >> $GITHUB_STEP_SUMMARY
+            echo "- [SDKMan](https://sdkman.io/sdks#btrace)" >> $GITHUB_STEP_SUMMARY
+            echo "- JBang: \`jbang btrace@${{ inputs.release_version }}\` (uses Maven Central)" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "## Maven Coordinates" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo '```xml' >> $GITHUB_STEP_SUMMARY
+            echo '<dependency>' >> $GITHUB_STEP_SUMMARY
+            echo '    <groupId>io.btrace</groupId>' >> $GITHUB_STEP_SUMMARY
+            echo '    <artifactId>btrace</artifactId>' >> $GITHUB_STEP_SUMMARY
+            echo "    <version>${{ inputs.release_version }}</version>" >> $GITHUB_STEP_SUMMARY
+            echo '</dependency>' >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## Dry Run Mode" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> **Note:** This was a dry run. No artifacts were published or tags created." >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Job Status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Validate | ${{ needs.validate.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build & Test | ${{ needs.build-and-test.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Integration Tests | ${{ needs.integration-tests.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Prepare Release | ${{ needs.prepare-release.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage Maven | ${{ needs.stage-maven.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Wait for Maven | ${{ needs.wait-for-maven.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Publish Gradle Plugins | ${{ needs.publish-gradle-plugins.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Distributions | ${{ needs.build-distributions.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Release Smoke | ${{ needs.release-smoke.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Finalize Tag | ${{ needs.finalize-tag.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| GitHub Release | ${{ needs.create-github-release.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SDKMan | ${{ needs.update-sdkman.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| JBang Catalog | ${{ needs.update-jbang-catalog.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Container images (ghcr.io) | ${{ needs.publish-container-images.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Milestones | ${{ needs.update-milestones.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================================
+  # Job 13: Cleanup
+  # ============================================================
+  cleanup:
+    name: Cleanup Artifacts
+    needs: [summary]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Cleanup temporary artifacts
+        uses: geekyeggo/delete-artifact@176a747ab7e287e3ff4787bf8a148716375ca118 # v6
+        with:
+          name: |
+            dist-build
+            test-trace

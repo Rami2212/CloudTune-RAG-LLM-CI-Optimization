@@ -1,0 +1,95 @@
+---
+name: Phar build and update test
+
+defaults:
+  run:
+    shell: bash
+
+on:
+  push:
+    paths:
+      - "bin/**"
+      - "config.yaml"
+      - "composer.json"
+      - "composer.lock"
+      - "res/**"
+      - "scoper.inc.php"
+      - "src/**"
+      - "version.txt"
+      - ".github/workflows/phar_build_and_update.yml"
+  pull_request:
+    paths:
+      - "bin/**"
+      - "config.yaml"
+      - "composer.json"
+      - "composer.lock"
+      - "res/**"
+      - "scoper.inc.php"
+      - "src/**"
+      - "version.txt"
+  workflow_dispatch:
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v7
+        if: github.event_name == 'pull_request'
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Manually triggered checkout
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@cf4cade2721270509d5b1c766ab3549210a39a2a # 2.33.0
+        with:
+          tools: 'composer:2'
+          php-version: '8.2'
+          extensions: 'intl'
+          ini-values: 'memory_limit=-1, phar.readonly=0'
+
+      - name: Checkout HEAD
+        uses: actions/checkout@v7
+        if: github.event_name == 'push'
+
+      - name: Check Security
+        uses: symfonycorp/security-checker-action@v5
+
+      - name: Validate composer.json and composer.lock
+        run: composer validate --strict
+
+      - name: Get Composer Cache Directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      - uses: actions/cache@v6
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-composer-
+
+      - name: Install dependencies
+        if: steps.composer-cache.outputs.cache-hit != 'true'
+        run: composer install --prefer-dist --no-progress --no-suggest
+
+      - name: Create phar
+        run: bash ./build.sh && ./n98-magerun2.phar --version && mv ./n98-magerun2.phar ./n98-magerun2.phar.original
+
+      - name: Update to the unstable version
+        run: cp ./n98-magerun2.phar.original ./n98-magerun2.phar && ./n98-magerun2.phar self-update --unstable && ./n98-magerun2.phar --version
+
+      - name: Update to the latest version
+        run: cp ./n98-magerun2.phar.original ./n98-magerun2.phar && ./n98-magerun2.phar self-update && ./n98-magerun2.phar --version
+
+      - name: Rollback phar to a specific version
+        run: cp ./n98-magerun2.phar.original ./n98-magerun2.phar && ./n98-magerun2.phar self-update 7.5.0 && ./n98-magerun2.phar --version

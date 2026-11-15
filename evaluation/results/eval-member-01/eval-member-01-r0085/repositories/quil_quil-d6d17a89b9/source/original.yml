@@ -1,0 +1,42 @@
+name: Clojars Snapshot Release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  clojars-snapshot-release:
+    name: Clojars Snapshot Release
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # Java 17 generates class file version 61.0, which is what processing has
+      # been compiled with.
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Clojure
+        uses: DeLaGuardo/setup-clojure@13.6.0
+        with:
+          cli: latest
+          bb: latest
+
+      - name: System Info
+        run: bb system-info
+
+      - name: Build release jar
+        run: clojure -T:build release :snapshot true
+
+      - name: Deploy JAR
+        run: clojure -T:build deploy :clojars true :snapshot true
+        env:
+          CLOJARS_USERNAME: ${{secrets.CLOJARS_USERNAME}}
+          CLOJARS_PASSWORD: ${{secrets.CLOJARS_DEPLOY_TOKEN}}

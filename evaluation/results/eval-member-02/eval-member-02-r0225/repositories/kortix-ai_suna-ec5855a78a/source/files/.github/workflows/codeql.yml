@@ -1,0 +1,52 @@
+name: CodeQL
+
+# Static application security testing (SAST). Supports SOC 2 CC7.1 / CC8.1.
+# Findings appear under the repo's Security > Code scanning tab.
+
+on:
+  # One scan per release tree: the release pull request into `prod`, and the
+  # merge push into `prod` so prod-ref alerts close when the fix ships
+  # (2026-10-23, SOC 2 CC7.1). Not on the pull request into `staging`, which
+  # runs nothing (2026-10-16). `dev` is scanned weekly.
+  push:
+    branches: [prod]
+  pull_request:
+    branches: [prod]
+  schedule:
+    - cron: "27 3 * * 1" # weekly, Monday 03:27 UTC
+  # Measure a change to this workflow without opening a release PR.
+  workflow_dispatch:
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (javascript-typescript)
+    runs-on: ${{ vars.CI_RUNNER_L || 'ubuntu-24.04' }}
+    timeout-minutes: 30
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          languages: javascript-typescript
+          # security-extended: every security query of security-and-quality.
+          # The dropped half is maintainability ("quality") queries: no SOC 2
+          # control rests on them. With test code excluded too
+          # (.github/codeql/codeql-config.yml) the analysis step went from
+          # 1136 s (run 38935179266) to 502 s (run 38943876690).
+          queries: security-extended
+          config-file: ./.github/codeql/codeql-config.yml
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          category: "/language:javascript-typescript"

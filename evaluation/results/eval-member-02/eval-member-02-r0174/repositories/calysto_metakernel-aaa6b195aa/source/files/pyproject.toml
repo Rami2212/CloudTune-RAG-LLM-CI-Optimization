@@ -1,0 +1,156 @@
+[build-system]
+requires = ["poetry-core>=2.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[project]
+name = "metakernel"
+description = "A Jupyter/IPython Kernel base class in Python"
+authors = [{name = "Metakernel Developers", email = "steven.silvester@ieee.org"}]
+license = "BSD-3-Clause"
+classifiers = [
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Programming Language :: Python :: Free Threading :: 3 - Stable",
+    "Framework :: IPython",
+    "Topic :: System :: Shells",
+]
+urls = {Homepage = "https://github.com/Calysto/metakernel"}
+requires-python = ">=3.11"
+dependencies = [
+    "comm >=0.1.3",
+    "ipykernel >=6.22.0",
+    "jupyter_core >=5.3.1",
+    "pexpect >=4.9.0",
+    "jedi >=0.19.0",
+]
+version = "1.0.8.dev0"
+readme = "README.md"
+
+[project.optional-dependencies]
+activity = ["portalocker >=2.8.0"] # activity magic
+parallel = ["ipyparallel >=8.5.1"] # parallel magic
+
+[dependency-groups]
+dev-extra = ["pre-commit", "jupyter-console (>=6.6.3,<7.0.0)"]
+dev = [{ include-group = "test" }, { include-group = "dev-extra" }]
+test = [
+    "ipython >=9.16",
+    "jupyter_kernel_test >=0.6.0",
+    "ipywidgets >=8.0.5",
+    "pytest >=9.0",
+    "pytest-timeout >=2.2.0",
+    "requests >=2.29.0",
+]
+test-all-extra = [
+    "calysto >=1.0.6",        # brain magic, activity magic (BarChart)
+    "calysto-scheme >=1.4.8", # scheme magic
+    "ipyparallel >=8.5.1",    # parallel magic
+    "matplotlib >=3.7.2",     # matplotlib magic
+    "nbconvert >=7.17.2",      # notebook execution
+    "portalocker >=2.8.0",    # activity magic
+    "pydot >=2.0.0",          # dot magic
+]
+test-all = [{ include-group = "test" }, { include-group = "test-all-extra" }]
+docs = [
+    "poetry-core>=2.0.0; python_version < '4.0'",
+    "mkdocs>=1.4.3",
+    "mkdocs-material>=9.1.4",
+    "mkdocs-jupyter>=0.24.1",
+    "mkdocstrings[python]>=0.21.0",
+]
+coverage-extra = ["coverage[toml] >=7.2.3", "pytest-cov >=4.1.0"]
+coverage = [{ include-group = "test-all" }, { include-group = "coverage-extra" }]
+typing-extra = ["pip >=23.1", "mypy >=1.2.0", "ipywidgets >=8.0.5"]
+typing = [{ include-group = "test-all" }, { include-group = "typing-extra" }]
+
+[tool.poetry]
+include = [
+    { path = "tests", format = "sdist" },
+    { path = "data_kernelspec", format = "wheel" },
+]
+
+[tool.poetry.group.test.dependencies]
+metakernel_python = {path = "./metakernel_python", develop = true}
+ipython = {version = ">=9.16"}
+
+[tool.pytest.ini_options]
+minversion = "9.0"
+addopts= "-raXs  --durations 10 --color=yes --doctest-modules"
+testpaths = ["tests"]
+norecursedirs = ["images"]
+strict = true
+log_level = "INFO"
+timeout = 300
+# Restore this setting to debug failures
+# timeout_method = "thread"
+filterwarnings= [
+  # Fail on warnings
+  "error",
+  "ignore:unclosed event loop:ResourceWarning",
+  "ignore:There is no current event loop:DeprecationWarning",
+  # When we run ipcluster and then run the tests we get this warning
+  "ignore:Widget.* is deprecated:DeprecationWarning",
+  "module:datetime.datetime.utc:DeprecationWarning:dateutil",
+  "module:datetime.datetime.utc:DeprecationWarning:ipyparallel",
+  "module:Parsing dates involving a day of month without a year:DeprecationWarning",
+  "module:'setParseAction' deprecated - use 'set_parse_action':DeprecationWarning",
+  # This is resolved in newer versions of Jupyter Core that removed the warning.
+  "module:Jupyter is migrating its paths:DeprecationWarning",
+  # Warning from Python 3.15 (/usr/lib64/python3.15/pty.py)
+  "module:This process \\(pid=.*\\) is multi-threaded, use of forkpty\\(\\) may lead to deadlocks in the child:DeprecationWarning:pty",
+]
+
+[tool.coverage.report]
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "def __repr__",
+]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
+warn_unreachable = true
+exclude = [
+    "hatch_build.*\\.py",
+    "metakernel_echo/.*",
+    "site/.*",
+]
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+disable_error_code = ["no-untyped-def"]
+
+[tool.ruff]
+exclude = ["examples/echo_kernel.ipynb"]
+
+[tool.ruff.lint]
+extend-select = [
+  "B",      # flake8-bugbear
+  "I",      # isort
+  "RUF",    # Ruff-specific
+  "S",      # flake8-bandit (security)
+  "UP",     # pyupgrade
+]
+ignore = [
+  "RUF005",
+  "RUF012",
+  "S102",    # exec() is fundamental to a Python kernel/REPL
+  "S307",    # eval() is fundamental to a kernel/REPL system
+  "S310",    # URL open with user-provided URLs is intentional
+  "S603",    # subprocess with trusted internal input
+  "S604",    # shell= as a dict key is not a security issue (false positive)
+  "S607",    # partial executable path is intentional
+  "BLE001",  # kernels/magics must catch arbitrary exceptions from user code and report them, not crash
+  "TRY002",  # small library with no existing exception hierarchy; not worth introducing one just for this
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["UP031", "E402", "RUF012", "F841", "S101", "S108"]
+"metakernel/pexpect.py" = ["F401"]

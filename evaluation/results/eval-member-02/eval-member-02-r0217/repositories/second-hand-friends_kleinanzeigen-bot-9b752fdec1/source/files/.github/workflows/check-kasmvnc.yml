@@ -1,0 +1,85 @@
+# SPDX-FileCopyrightText: © Jens Bergmann and contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-ArtifactOfProjectHomePage: https://github.com/Second-Hand-Friends/kleinanzeigen-bot/
+name: Update KasmVNC
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  update:
+    if: github.repository == 'Second-Hand-Friends/kleinanzeigen-bot'
+    # The merge job shares this lock so it cannot merge while this job replaces the PR head.
+    concurrency:
+      group: kasmvnc-update
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - name: Generate update token
+      uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+      id: token
+      with:
+        client-id: ${{ vars.DEPS_UPDATER_CLIENT_ID }}
+        private-key: ${{ secrets.DEPS_UPDATER_PRIVATE_KEY }}
+        permission-contents: write
+        permission-pull-requests: write
+
+    - name: Check out current main
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: main
+        token: ${{ steps.token.outputs.token }}
+        persist-credentials: false
+
+    - name: Update pinned release assets
+      id: update
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        gh api repos/kasmtech/KasmVNC/releases/latest > "$RUNNER_TEMP/kasmvnc-release.json"
+        version=$(python3 scripts/update_kasmvnc.py "$RUNNER_TEMP/kasmvnc-release.json")
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+
+    - name: Create or update the KasmVNC PR
+      uses: peter-evans/create-pull-request@15733dbdfeedb4f7fdb73d13c6f5ac83b710fab8 # v7.0.5
+      with:
+        token: ${{ steps.token.outputs.token }}
+        base: main
+        branch: chore/update-kasmvnc
+        delete-branch: true
+        add-paths: docker/image/Dockerfile
+        author: "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
+        committer: "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
+        commit-message: "chore: update KasmVNC to ${{ steps.update.outputs.version }}"
+        title: "chore: update KasmVNC to ${{ steps.update.outputs.version }}"
+        body: |
+          ## ℹ️ Description
+          Update the Docker desktop to KasmVNC ${{ steps.update.outputs.version }}.
+          Release: https://github.com/kasmtech/KasmVNC/releases/tag/v${{ steps.update.outputs.version }}
+          Related issues: none.
+
+          ## 📋 Changes Summary
+          - Update the version, download URLs and SHA-256 pins together for AMD64 and ARM64.
+          - Keep a single update PR; a newer release replaces the pending update.
+          - The merge workflow checks the current commit's full Build result and repository rules.
+
+          ### ⚙️ Type of Change
+          - [x] 🐞 Bug fix (dependency update)
+          - [ ] ✨ New feature
+          - [ ] 💥 Breaking change
+
+          ## ✅ Checklist
+          - [x] Release assets and the scope of generated changes have been validated.
+          - [ ] Tests pass (`pdm run test`); CI must verify this commit, including both Docker architectures.
+          - [ ] Formatting passes (`pdm run format`); verified by CI.
+          - [ ] Lint passes (`pdm run lint`); verified by CI.
+          - [x] No user-facing configuration or documentation changes are required.
+
+          By submitting this pull request, I confirm that you can use, modify, copy, and redistribute this contribution, under the terms of your choice.

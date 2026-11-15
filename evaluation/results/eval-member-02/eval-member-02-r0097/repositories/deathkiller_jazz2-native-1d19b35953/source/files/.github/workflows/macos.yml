@@ -1,0 +1,94 @@
+name: 'MacOS'
+
+on:
+  push:
+    branches:
+      - 'master'
+  pull_request:
+    types: [ opened, synchronize ]
+  workflow_dispatch:
+
+concurrency: 
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  Build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - BuildType: Release
+          Platform: ARM64
+          Backend: GLFW
+          RHI: OpenGL
+
+        - BuildType: Release
+          Platform: ARM64
+          Backend: SDL2
+          RHI: OpenGL
+
+        # The Metal backend presents through the SDL2 window, so it is only built with that backend (the
+        # configure forces SDL2 for it anyway); the offline MSL is compiled on the machine at load time
+        - BuildType: Release
+          Platform: ARM64
+          Backend: SDL2
+          RHI: Metal
+          
+        - BuildType: Release
+          Platform: x64
+          Backend: GLFW
+          RHI: OpenGL
+
+        - BuildType: Release
+          Platform: x64
+          Backend: SDL2
+          RHI: OpenGL
+
+        - BuildType: Release
+          Platform: x64
+          Backend: SDL2
+          RHI: Metal
+
+    runs-on: 'macos-latest'
+
+    steps:
+    - name: 'Checkout Repository'
+      uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+
+    - name: 'Configure CMake'
+      run: |
+        case "${{ matrix.Platform }}" in
+          ARM64 ) architecture="arm64"
+                  withVorbis="OFF" ;;
+          x64 ) architecture="x86_64"
+                withVorbis="ON" ;;
+          * ) exit 1 ;;
+        esac
+        
+        rm -f ./Content/Translations/*.po
+        
+        cmake -B ./_build/ -D CMAKE_BUILD_TYPE=${{ matrix.BuildType }} -D NCINE_STRIP_BINARIES=ON -D CMAKE_OSX_ARCHITECTURES="$architecture" -D NCINE_PREFERRED_BACKEND=${{ matrix.Backend }} -D NCINE_PREFERRED_RHI=${{ matrix.RHI }} -D NCINE_WITH_VORBIS=$withVorbis
+
+    - name: 'Build'
+      run: |
+        make -j 3 -C ./_build/
+
+    - name: 'Create Package'
+      run: |
+        make package -C ./_build/
+        mkdir ./_package/
+        cp -f ./_build/*.dmg ./_package/
+        cp -f ./LICENSE ./_package/LICENSE
+        
+        rhiSuffix=""
+        if [ "${{ matrix.RHI }}" != "OpenGL" ]; then rhiSuffix="_${{ matrix.RHI }}"; fi
+        echo "rhiSuffix=$rhiSuffix" >> $GITHUB_ENV
+        
+    - name: 'Upload Package'
+      uses: actions/upload-artifact@v7
+      with:
+        name: Jazz2_MacOS_${{ matrix.Platform }}_${{ matrix.Backend }}${{ env.rhiSuffix }}
+        path: ./_package/

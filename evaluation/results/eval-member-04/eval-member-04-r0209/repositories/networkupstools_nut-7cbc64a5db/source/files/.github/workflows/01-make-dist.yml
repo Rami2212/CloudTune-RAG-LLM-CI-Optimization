@@ -1,0 +1,67 @@
+# Build NUT dist and docs tarballs, and upload them as an artifact.
+#
+# This workflow has no write permissions: for PRs it runs on pull_request
+# (not pull_request_target), so PR code (from forks too) builds with a
+# read-only token and in the PR's own cache scope. The PR comment, commit
+# status and artifact clean-up are done by the "GHA-01: Tarballs Report"
+# workflow (01-make-dist-report.yml), triggered by runs of this one.
+#
+# See also:
+#   https://github.com/actions/upload-artifact
+#   https://docs.github.com/en/actions/reference/workflows-and-actions/variables
+#   https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax
+
+name: "GHA-01: Tarballs"
+
+on:
+  push:
+    branches: [ "master", "FTY", "fightwarn", "FTY-obs" ]
+    tags:
+      - v*
+  pull_request:
+    # The branches below must be a subset of the branches above
+    branches: [ "master", "FTY", "fightwarn", "FTY-obs" ]
+  schedule:
+    - cron: '15 12 * * 0'
+  workflow_dispatch:
+    # Allow manually running the action, e.g. if disabled after some quietness in the source
+
+permissions: {}
+
+jobs:
+  name-dist-tarballs:
+    name: "Name Dist and Docs Tarballs"
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      artifact_name: ${{ steps.set-artifact-name.outputs.artifact_name }}
+
+    steps:
+
+    # Name the artifact by PR number, or by branch/tag name (with characters
+    # that are not valid in artifact names, like "/", replaced by "_").
+    # The report workflow computes the same name to find the artifact.
+    # Values are passed via env, not expanded into the script.
+    - name: Define Artifact Name
+      id: set-artifact-name
+      env:
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REF_NAME: ${{ github.ref_name }}
+      run: |
+        if [ -n "${PR_NUMBER}" ] ; then
+            NAME="PR-${PR_NUMBER}"
+        else
+            NAME="${REF_NAME}"
+        fi
+        NAME="`printf '%s' "${NAME}" | tr -c 'A-Za-z0-9._+-' '_'`"
+        echo "artifact_name=NUT-tarballs-${NAME}" >> "$GITHUB_OUTPUT"
+
+  build-dist-tarballs:
+    name: "Build"
+    needs: name-dist-tarballs
+    permissions:
+      contents: read
+    uses: ./.github/workflows/01-make-dist-worker.yml
+    with:
+      ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      artifact_name: ${{ needs.name-dist-tarballs.outputs.artifact_name }}

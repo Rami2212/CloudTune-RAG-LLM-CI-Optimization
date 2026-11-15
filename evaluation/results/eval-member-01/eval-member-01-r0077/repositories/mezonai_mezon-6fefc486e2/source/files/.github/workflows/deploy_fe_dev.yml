@@ -1,0 +1,67 @@
+name: Deploy Mezon FE Dev
+permissions:
+  contents: read
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: mezone-fe-dev
+    name: Build Mezon FE
+    environment: dev
+    env:
+      NODE_ENV: 'development'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      #- name: Setup Node.js
+      #  uses: actions/setup-node@v6
+      #  with:
+      #    node-version: '24.5.0'   
+
+      - name: Install dependencies
+        run: |
+          export PATH="$HOME/.nvm/versions/node/v24.5.0/bin:$HOME/.yarn/bin:$HOME/.config/yarn/global/node_modules/.bin:$PATH"
+          echo "Environments"
+          echo "NODE_ENV: ${{ env.NODE_ENV }}"
+          export nv=$(node -v)
+          echo "Node version: $nv"
+          echo "Installing dependencies"
+          yarn config set nodedir ~/.cache/node-gyp/24.5.0/
+          echo "Node directory: ${nv:1}"
+          yarn
+
+      # - name: Reset Nx cache
+      #   run: |
+      #     echo "Resetting Nx cache"
+      #     yarn nx reset
+
+      - name: Build
+        env:
+          NODE_ENV: 'production'
+        run: |
+          export PATH="$HOME/.nvm/versions/node/v24.5.0/bin:$HOME/.yarn/bin:$HOME/.config/yarn/global/node_modules/.bin:$PATH"
+          echo "Build"
+          echo NX_CHAT_APP_API_GW_HOST="${{ secrets.NX_CHAT_APP_API_GW_HOST_DEV }}" >> apps/chat/.env
+          echo NX_CHAT_APP_API_GW_PORT="${{ secrets.NX_CHAT_APP_API_GW_PORT_DEV }}" >> apps/chat/.env
+          echo NX_CHAT_APP_STREAMING_URL="https://streaming.nccsoft.vn" >> apps/chat/.env
+          echo NX_CHAT_APP_FILE_INGEST="cdn-api-dev.nccsoft.vn=https://streaming.nccsoft.vn" >> apps/chat/.env
+          yarn build:chat
+
+  deploy:
+    runs-on: mezone-fe-dev
+    name: Deploy Mezon FE
+    environment: dev
+    needs:
+      - build
+    steps:
+      - name: Clear www folder
+        run: |
+          echo "Clearing /var/www/mezon/"
+          rm -rf /var/www/mezon/*
+
+      - name: Copy files to www
+        run: |
+          echo "Copying files to /var/www/mezon/"
+          cp -r ./dist/apps/chat/* /var/www/mezon/

@@ -1,0 +1,142 @@
+# Description: this is a reusable workflow that runs unit tests.
+#
+# See `./test-prs.yml` to see an example usage.
+
+on:
+  workflow_call:
+    inputs:
+      commit:
+        # commit to run tests against
+        required: true
+        type: string
+      repository:
+        # repository to run tests against (possibly a fork of amplify-ui)
+        required: true
+        type: string
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # See supported Node.js release schedule at https://nodejs.org/en/about/releases/
+        package:
+          - angular
+          - react
+          - react-ai
+          - react-core
+          - react-core-notifications
+          - react-geo
+          - react-liveness
+          - react-native
+          - react-notifications
+          - react-storage
+          - ui
+          - vue
+          - svelte
+
+    steps:
+      - name: Checkout Amplify UI
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.commit }}
+          repository: ${{ inputs.repository }}
+          persist-credentials: false
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: 'yarn'
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 2
+
+      - name: Restore node_modules cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        id: restore-cache
+        with:
+          path: |
+            ./node_modules
+            **/node_modules
+          key: ${{ runner.os }}-node24-nodemodules-${{ hashFiles('yarn.lock') }}
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 3
+
+      - name: Restore ui/dist cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        id: restore-ui-cache
+        with:
+          path: ./packages/ui/dist
+          key: ${{ runner.os }}-ui-${{ inputs.commit }}
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 1
+
+      - name: Install packages
+        if: steps.restore-cache.outputs.cache-hit != 'true'
+        uses: ./.github/actions/install-with-retries
+        with:
+          skip-cypress-binary: true # unit test doesn't need cypress
+
+      - name: Build ui package
+        if: ${{ steps.restore-ui-cache.outputs.cache-hit != 'true' && matrix.package == 'ui' }}
+        run: yarn ui build
+
+      - name: Build react-core package
+        if: |
+          matrix.package == 'react' ||
+          matrix.package == 'react-ai' ||
+          matrix.package == 'react-core-notifications' ||
+          matrix.package == 'react-geo' ||
+          matrix.package == 'react-liveness' ||
+          matrix.package == 'react-native' ||
+          matrix.package == 'react-notifications' ||
+          matrix.package == 'react-storage'
+        run: yarn react-core build
+
+      - name: Build react-core-notifications package
+        if: |
+          matrix.package == 'react-native' ||
+          matrix.package == 'react-notifications'
+        run: yarn react-core-notifications build
+
+      - name: Build react package
+        if: |
+          matrix.package == 'react-ai' ||
+          matrix.package == 'react-geo' ||
+          matrix.package == 'react-liveness' ||
+          matrix.package == 'react-notifications' ||
+          matrix.package == 'react-storage'
+        run: yarn react build
+
+      - name: Build ${{ matrix.package }} package
+        if: ${{ matrix.package != 'ui' }}
+        run: yarn ${{ matrix.package }} build
+
+      - name: Run ${{ matrix.package }} package unit tests
+        run: yarn ${{ matrix.package }} test
+
+      - name: Lint ${{ matrix.package }} package
+        run: yarn ${{ matrix.package }} lint
+
+      - name: Validate ${{ matrix.package }} package esm modules
+        if: |
+          matrix.package != 'angular' &&
+          matrix.package != 'svelte' &&
+          matrix.package != 'react-native'
+        run: yarn ${{ matrix.package }} check:esm
+
+      - name: Check ${{ matrix.package }} bundle size
+        if: |
+          matrix.package == 'react' ||
+          matrix.package == 'react-ai' ||
+          matrix.package == 'react-geo' ||
+          matrix.package == 'react-liveness' ||
+          matrix.package == 'react-notifications' ||
+          matrix.package == 'react-storage'
+        run: yarn ${{ matrix.package }} size
+
+      - name: Cache ${{ matrix.package }}/dist
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ./packages/${{ matrix.package }}/dist
+          key: ${{ runner.os }}-${{ matrix.package }}-${{ inputs.commit }}

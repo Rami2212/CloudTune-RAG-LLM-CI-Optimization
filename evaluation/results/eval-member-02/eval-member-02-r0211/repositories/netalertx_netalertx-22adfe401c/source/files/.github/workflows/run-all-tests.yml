@@ -1,0 +1,124 @@
+name: 🧪 Test Suite
+
+on:
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: '0 2 * * *' # Daily at 02:00 UTC
+  workflow_dispatch:
+    inputs:
+      run_all:
+        description: '✅ Run ALL tests (overrides individual selectors)'
+        type: boolean
+        default: true
+      run_scan:
+        description: '📂 scan/ (Scan, Logic, Locks, IPs)'
+        type: boolean
+        default: false
+      run_api:
+        description: '📂 api_endpoints/ & server/ (Endpoints & Server)'
+        type: boolean
+        default: false
+      run_backend:
+        description: '📂 backend/ & db/ (SQL Builder, Security & Migration)'
+        type: boolean
+        default: false
+      run_docker_env:
+        description: '📂 docker_tests/ (Environment & PUID/PGID)'
+        type: boolean
+        default: false
+      run_ui:
+        description: '📂 ui/ (Selenium & Dashboard)'
+        type: boolean
+        default: false
+      run_plugins:
+        description: '📂 plugins/ (Sync insert schema-aware logic)'
+        type: boolean
+        default: false
+      run_root_files:
+        description: '📄 Root Test Files (WOL, Atomicity, etc.)'
+        type: boolean
+        default: false
+
+jobs:
+  comprehensive-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Environment
+        run: sudo apt-get update && sudo apt-get install -y sqlite3
+
+      - name: Build Test Path Command
+        id: builder
+        env:
+          INPUT_EVENT_NAME: ${{ github.event_name }}
+          INPUT_RUN_ALL: ${{ github.event.inputs.run_all }}
+          INPUT_RUN_SCAN: ${{ github.event.inputs.run_scan }}
+          INPUT_RUN_API: ${{ github.event.inputs.run_api }}
+          INPUT_RUN_BACKEND: ${{ github.event.inputs.run_backend }}
+          INPUT_RUN_DOCKER_ENV: ${{ github.event.inputs.run_docker_env }}
+          INPUT_RUN_UI: ${{ github.event.inputs.run_ui }}
+          INPUT_RUN_PLUGINS: ${{ github.event.inputs.run_plugins }}
+          INPUT_RUN_ROOT_FILES: ${{ github.event.inputs.run_root_files }}
+        run: |
+          PATHS=""
+
+          # pull_request and scheduled runs always execute the full test suite
+          if [ "$INPUT_EVENT_NAME" == "pull_request" ] || [ "$INPUT_EVENT_NAME" == "schedule" ]; then
+            echo "📅 Scheduled/PR run - executing full test suite"
+            echo "final_paths=test/" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Manual 'Run ALL' overrides individual selectors
+          if [ "$INPUT_RUN_ALL" == "true" ]; then
+            echo "🧪 Manual 'Run ALL' selected"
+            echo "final_paths=test/" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Folder Mapping with 'test/' prefix
+          if [ "$INPUT_RUN_SCAN" == "true" ]; then PATHS="$PATHS test/scan/"; fi
+          if [ "$INPUT_RUN_API" == "true" ]; then PATHS="$PATHS test/api_endpoints/ test/server/"; fi
+          if [ "$INPUT_RUN_BACKEND" == "true" ]; then PATHS="$PATHS test/backend/ test/db/"; fi
+          if [ "$INPUT_RUN_DOCKER_ENV" == "true" ]; then PATHS="$PATHS test/docker_tests/"; fi
+          if [ "$INPUT_RUN_UI" == "true" ]; then PATHS="$PATHS test/ui/"; fi
+          if [ "$INPUT_RUN_PLUGINS" == "true" ]; then PATHS="$PATHS test/plugins/"; fi
+
+          # Root Files Mapping (files sitting directly in /test/)
+          if [ "$INPUT_RUN_ROOT_FILES" == "true" ]; then
+            PATHS="$PATHS test/test_device_atomicity.py test/test_mcp_disablement.py test/test_plugin_helper.py test/test_wol_validation.py"
+          fi
+
+          # If nothing is selected, default to the whole test folder
+          if [ -z "$PATHS" ]; then
+            echo "ℹ️ No test groups selected - defaulting to full test suite"
+            PATHS="test/"
+          fi
+
+          echo "🎯 Selected test paths: $PATHS"
+          echo "final_paths=$PATHS" >> $GITHUB_OUTPUT
+
+      - name: Run Docker Integration Script
+        run: |
+          chmod +x ./scripts/run_tests_in_docker_environment.sh
+
+          # We update the pytest command to use the specific paths built above.
+          # Note: We still keep your 'not' filter to skip E2E tests unless you want them.
+          TARGET_PATHS="${{ steps.builder.outputs.final_paths }}"
+          SED_COMMAND="pytest $TARGET_PATHS -m 'not (docker or compose or feature_complete)'"
+
+          echo "🚀 Targeted Pytest Command: $SED_COMMAND"
+
+          sed -i "s|pytest -m 'not (docker or compose or feature_complete)'|$SED_COMMAND|g" ./scripts/run_tests_in_docker_environment.sh
+
+          ./scripts/run_tests_in_docker_environment.sh
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop netalertx-test-container || true
+          docker rm netalertx-test-container || true

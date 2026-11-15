@@ -1,0 +1,121 @@
+name: Scheduled — All Heavy Suites
+
+# Orchestrator that fans out the heavy, normally-manual test suites across
+# BOTH long-lived branches (`main` and `dev`) on a nightly cadence.
+#
+# What it does:
+#   For each (branch x suite) pair it calls `gh workflow run <suite>.yaml
+#   --ref <branch>` with that suite's sensible default inputs. It only
+#   DISPATCHES the suites — it does not wait for them and does not report
+#   their pass/fail. Each dispatched run shows up under its OWN workflow
+#   (Test Cluster / Integration Tests CI / TS Integration Tests / Simtest)
+#   on the targeted branch, with its own logs and artifacts. This job
+#   succeeds as long as the dispatch calls themselves succeed.
+#
+# Cadence:
+#   - schedule: nightly at 03:00 UTC (off-peak; well clear of typical
+#     working-hours merges into dev). Each suite is 35-60 min, so a
+#     per-push trigger on the frequently-merged `dev` branch would be
+#     wasteful — nightly + on-demand is the intended cadence.
+#   - workflow_dispatch: run on demand at any time.
+#
+# IMPORTANT — scheduled triggers only fire from the repository DEFAULT
+# branch. The default branch here is `main`. A `schedule:` defined on a
+# workflow that exists only on `dev` will NOT fire on cron until this file
+# also lands on `main` (or the default branch is changed). The
+# `workflow_dispatch` path works as soon as this file is merged to either
+# branch. See the PR body for the follow-up needed to activate the cron.
+
+on:
+  schedule:
+    # 03:00 UTC nightly. (cron is UTC; GitHub has no per-workflow tz.)
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+# Dispatching another workflow requires `actions: write`; nothing here
+# touches repo contents beyond reading the checked-out workflow list.
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    name: dispatch ${{ matrix.suite }} on ${{ matrix.branch }}
+    runs-on: ubuntu-latest
+    strategy:
+      # Never let one suite's dispatch failure cancel the rest of the fan-out.
+      fail-fast: false
+      matrix:
+        branch: [main, dev]
+        suite:
+          - integration-tests-ci.yaml
+          - test-cluster.yaml
+          - ts-integration-tests.yaml
+          - simtest.yaml
+    steps:
+      # The `gh` CLI is preinstalled on GitHub-hosted ubuntu-latest runners.
+      # `github.token` (a.k.a. secrets.GITHUB_TOKEN) carries the
+      # `actions: write` permission granted above, which is all `gh workflow
+      # run` needs to dispatch a sibling workflow.
+      #
+      # GH_REPO is REQUIRED: there is no checkout step, so without it `gh`
+      # tries to infer the repo from a local git checkout and dies with
+      # "fatal: not a git repository" before dispatching anything (which
+      # silently killed every nightly fan-out).
+      - name: Dispatch ${{ matrix.suite }} against ${{ matrix.branch }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BRANCH: ${{ matrix.branch }}
+          SUITE: ${{ matrix.suite }}
+        run: |
+          set -euo pipefail
+          # A branch in the matrix may not exist right now — `dev` is created
+          # and deleted as release trains come and go, and from 2026-07-29 to
+          # 2026-08-03 its absence failed half the fan-out every single night,
+          # which is exactly how a nightly turns into noise nobody reads.
+          # Skip a missing ref with a notice instead: the dispatch matrix
+          # self-heals when the branch reappears, and a MAIN dispatch failure
+          # still fails the job loudly, which is the half that must never be
+          # silent.
+          #
+          # The check must use the exact-ref endpoint (`git/ref/heads/...`):
+          # the "get a branch" endpoint (`branches/...`) fuzzy-resolves the
+          # name, so with no `dev` branch it happily returns `dev-v1.2.x`
+          # and the guard waves through a dispatch that then 422s with
+          # "No ref found for: dev".
+          if ! gh api "repos/$GH_REPO/git/ref/heads/$BRANCH" --silent 2>/dev/null; then
+            echo "::notice::branch '$BRANCH' does not exist; skipping $SUITE dispatch"
+            exit 0
+          fi
+          # Per-suite default inputs mirror each suite's own documented
+          # defaults (see dev-docs/playbooks/ci-suites.md). Threads stay at
+          # the validated 4-way for the memory-bound suites.
+          case "$SUITE" in
+            integration-tests-ci.yaml)
+              gh workflow run "$SUITE" --ref "$BRANCH" \
+                -f scope=integration \
+                -f test_threads=4
+              ;;
+            test-cluster.yaml)
+              gh workflow run "$SUITE" --ref "$BRANCH" \
+                -f package=ika-test-cluster \
+                -f test_threads=4
+              ;;
+            ts-integration-tests.yaml)
+              gh workflow run "$SUITE" --ref "$BRANCH" \
+                -f epoch_duration_ms=900000
+              ;;
+            simtest.yaml)
+              gh workflow run "$SUITE" --ref "$BRANCH"
+              ;;
+            *)
+              echo "unknown suite: $SUITE" >&2
+              exit 1
+              ;;
+          esac
+          echo "dispatched $SUITE against $BRANCH"

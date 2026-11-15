@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
+# SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .asf.yaml
+      - .github/workflows/docs.yaml
+      - docs/**
+
+name: Deploy DataFusion site
+
+# run the publishing workflows one at a time.
+concurrency:
+  group: publish-asf-site
+  cancel-in-progress: false
+
+jobs:
+  build-docs:
+    permissions:
+      contents: write
+    name: Build docs
+    runs-on: ubuntu-slim
+    steps:
+      - name: Checkout docs sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Checkout asf-site branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: asf-site
+          path: asf-site
+
+      - name: Setup docs builder
+        uses: ./.github/actions/setup-docs-builder
+
+      - name: Build docs
+        run: |
+          set -x
+          cd docs
+          uv run --package datafusion-docs ./build.sh
+
+      - name: Copy & push the generated HTML
+        run: |
+          set -x
+          cd asf-site/
+          # don't delete old versions of the docs (see versions/ in asf-site)
+          rsync \
+            -a \
+            --delete \
+            --exclude '/.git/' \
+            --exclude '/versions/' \
+            ../docs/build/html/ \
+            ./
+          cp ../.asf.yaml .
+          touch .nojekyll
+          git status --porcelain
+          if [ "$(git status --porcelain)" != "" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add --all
+            git commit -m 'Publish built docs triggered by ${{ github.sha }}'
+            git push || git push --force
+          fi

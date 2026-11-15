@@ -1,0 +1,58 @@
+name: Mobile TestFlight
+
+# Explicitly requested automatic beta builds after mobile changes merge to dev.
+# Production API, isolated OTA channel, iOS TestFlight upload only.
+on:
+  push:
+    branches: [dev]
+    paths:
+      - 'apps/mobile/**'
+      - '.github/workflows/mobile-testflight.yml'
+      - '!**/*.md'
+      - '!**/*.test.ts'
+      - '!**/*.test.tsx'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: mobile-testflight
+  cancel-in-progress: false
+
+jobs:
+  testflight:
+    # Manual retries also use dev. PRs and other branches cannot submit.
+    if: github.repository == 'kortix-ai/CompanyOS' && github.ref == 'refs/heads/dev'
+    runs-on: ${{ vars.CI_RUNNER_M || 'ubuntu-24.04' }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Install dependencies and EAS CLI
+        run: |
+          corepack enable pnpm
+          pnpm install --frozen-lockfile
+          pnpm --dir apps/mobile exec patch-package --error-on-fail
+          export PNPM_HOME="$RUNNER_TEMP/pnpm-global"
+          export PATH="$PNPM_HOME:$PATH"
+          pnpm add --global eas-cli@20.3.0
+          echo "$PNPM_HOME" >> "$GITHUB_PATH"
+        env:
+          npm_config_engine_strict: "false"
+
+      - name: Read Expo credentials
+        uses: ./.github/actions/aws-env
+        with:
+          keys: EXPO_TOKEN
+
+      - name: Build iOS and upload to TestFlight
+        run: node apps/mobile/scripts/testflight-publish.mjs

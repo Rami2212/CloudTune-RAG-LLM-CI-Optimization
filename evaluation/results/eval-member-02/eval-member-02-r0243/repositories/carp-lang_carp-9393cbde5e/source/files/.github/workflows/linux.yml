@@ -1,0 +1,58 @@
+name: Linux CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+
+    - uses: haskell-actions/setup@v2
+      with:
+        enable-stack: true
+        stack-version: 'latest'
+
+    - name: Install SDL dependency (for SDL tests)
+      run: |
+        sudo apt-get update && sudo apt-get install libsdl2-dev       \
+                                                    libsdl2-gfx-dev   \
+                                                    libsdl2-image-dev \
+                                                    libsdl2-mixer-dev \
+                                                    libsdl2-ttf-dev
+
+    - uses: actions/cache@v4
+      name: Cache ~/.stack
+      with:
+        path: ~/.stack
+        key: ${{ runner.os }}-stack-${{ github.sha }}
+        restore-keys: ${{ runner.os }}-stack-
+
+    - name: Build
+      run: stack build
+
+    - name: Run Compiler Tests
+      run: stack test
+
+    - name: Run Carp Tests
+      run: ./scripts/run_carp_tests.sh -j 4
+
+    - name: List Contents of Docs Directory
+      run: ls ./docs/core
+
+    - name: Copy Docs to carp-docs Repository
+      uses: cpina/github-action-push-to-another-repository@master
+      if: github.ref == 'refs/heads/master'
+      env:
+        API_TOKEN_GITHUB: ${{ secrets.PERSONAL_TOKEN }}
+      with:
+        source-directory: './docs'
+        destination-github-username: 'carp-lang'
+        destination-repository-name: 'carp-docs'
+        user-email: 'bot@carp-lang.github.io'
+        commit-message: "Docs generated from: ${{ github.event.head_commit.message}}"

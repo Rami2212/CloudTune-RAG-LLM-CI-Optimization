@@ -1,0 +1,79 @@
+name: DietPi-Software test
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: 'Target architecture'
+        type: choice
+        options: [armv6l, armv7l, aarch64, x86_64, riscv64, all]
+        default: all
+        required: true
+      dist:
+        description: 'Target Debian version'
+        type: choice
+        options: [bookworm, trixie, forky, all]
+        default: all
+        required: true
+      soft:
+        description: 'Software ID(s) to test (space separated, e.g. "nodered")'
+        required: true
+      rpi:
+        description: 'Emulate RPi on ARM targets'
+        type: boolean
+        default: false
+      branch:
+        description: 'Override target repo branch'
+      owner:
+        description: 'Override target repo owner'
+      test:
+        description: 'Install test builds from dietpi.com'
+        type: boolean
+        default: false
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.inputs.arch }}-${{ github.event.inputs.dist }}-${{ github.event.inputs.soft }}
+  cancel-in-progress: true
+permissions: {}
+jobs:
+  prep:
+    runs-on: ubuntu-26.04
+    steps:
+    - id: arch
+      run: |
+        if [ '${{ github.event.inputs.arch }}' = 'all' ]
+        then
+          echo arch='["armv6l", "armv7l", "aarch64", "x86_64", "riscv64"]' >> "$GITHUB_OUTPUT"
+        else
+          echo arch='["${{ github.event.inputs.arch }}"]' >> "$GITHUB_OUTPUT"
+        fi
+    - id: dist
+      run: |
+        if [ '${{ github.event.inputs.dist }}' = 'all' ]
+        then
+          echo dist='["bookworm", "trixie", "forky"]' >> "$GITHUB_OUTPUT"
+        else
+          echo dist='["${{ github.event.inputs.dist }}"]' >> "$GITHUB_OUTPUT"
+        fi
+    outputs:
+      arch: ${{ steps.arch.outputs.arch }}
+      dist: ${{ steps.dist.outputs.dist }}
+  install:
+    needs: prep
+    strategy:
+      matrix:
+        arch: ${{ fromJson(needs.prep.outputs.arch) }}
+        dist: ${{ fromJson(needs.prep.outputs.dist) }}
+        exclude:
+        - { arch: riscv64, dist: bookworm }
+      fail-fast: false
+    name: "${{ matrix.arch }} - ${{ matrix.dist }} - ${{ github.event.inputs.soft }}"
+    runs-on: ${{ matrix.arch == 'x86_64' && 'ubuntu-26.04' || 'ubuntu-26.04-arm' }}
+    steps:
+    - name: Install
+      run: |
+        owner='${{ github.event.inputs.owner }}'
+        [ $owner ] || owner=$GITHUB_REPOSITORY_OWNER
+        branch='${{ github.event.inputs.branch }}'
+        [ $branch ] || branch=$GITHUB_REF_NAME
+        sudo systemctl --now mask ssh ssh.socket systemd-resolved azure-proxy-agent
+        echo 'nameserver 1.1.1.1' | sudo tee /etc/resolv.conf > /dev/null
+        sudo bash -c "G_GITOWNER=$owner G_GITBRANCH=$branch; $(curl -sSf "https://raw.githubusercontent.com/$owner/DietPi/$branch/.github/workflows/dietpi-software.bash" || echo false)" -- -a '${{ matrix.arch }}' -d '${{ matrix.dist }}' -s '${{ github.event.inputs.soft }}' -rpi '${{ github.event.inputs.rpi }}' -t '${{ github.event.inputs.test }}'

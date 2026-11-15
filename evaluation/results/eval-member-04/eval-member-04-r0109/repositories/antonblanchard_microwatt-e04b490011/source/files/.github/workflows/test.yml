@@ -1,0 +1,110 @@
+name: 'test'
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '0 0 * * 5'
+  workflow_dispatch:
+
+jobs:
+
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend:
+        - llvm
+        - gcc
+    container: ghdl/vunit:${{ matrix.backend }}
+    steps:
+    - uses: actions/checkout@v2
+    - run: make GNATMAKE='gnatmake -j'$(nproc)
+
+  py:
+    needs: [build]
+    runs-on: ubuntu-latest
+    container: ghdl/vunit:llvm
+    steps:
+    - uses: actions/checkout@v2
+    - run: |
+        apt update
+        apt install -y python3-pexpect
+        make -j$(nproc) test_micropython test_micropython_long
+
+  test:
+    needs: [build]
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        task: [
+          "tests_console",
+          "{1..99}",
+          "{100..199}",
+          "{200..299}",
+          "{300..399}",
+          "{400..499}",
+          "{500..599}",
+          "{600..699}",
+          "{700..799}",
+          "{800..899}",
+          "{900..999}",
+        ]
+    runs-on: ubuntu-latest
+    container: ghdl/vunit:llvm
+    steps:
+    - uses: actions/checkout@v2
+    - run: bash -c "make -j$(nproc) ${{ matrix.task }}"
+
+  VUnit:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - run: make git.vhdl
+    - uses: docker://ghdl/vunit:llvm
+      with:
+        args: python3 ./run.py -p10
+
+  symbiflow:
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        task: [ ECP5-EVN, ORANGE-CRAB, ORANGE-CRAB-0.21 ]
+    runs-on: ubuntu-latest
+    env:
+      DOCKER: 1
+      FPGA_TARGET: ${{matrix.task}}
+    steps:
+    - uses: actions/checkout@v2
+    - run: make microwatt.json
+    - run: make microwatt.bit
+    - run: make microwatt.svf
+    - uses: actions/upload-artifact@v4
+      with:
+        name: ${{matrix.task}}-bitstream
+        path: microwatt.svf
+
+# test building verilog target from yosys/nextpnr
+  verilog:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - run: make DOCKER=1 microwatt.v
+
+  verilator:
+    runs-on: ubuntu-latest
+    env:
+      DOCKER: 1
+      FPGA_TARGET: verilator
+      RAM_INIT_FILE: micropython/firmware.hex
+      MEMORY_SIZE: 524288
+    steps:
+    - uses: actions/checkout@v2
+    - run: |
+        sudo apt update
+        sudo apt install -y python3-pexpect
+        make -j$(nproc) test_micropython_verilator test_micropython_verilator_long

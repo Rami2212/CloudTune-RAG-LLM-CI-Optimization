@@ -1,0 +1,190 @@
+name: Reusable Rust Test
+
+on:
+  workflow_call:
+
+jobs:
+  check-changed:
+    runs-on: ${{ fromJSON(vars.CI_LINUX_MINI_RUNNER || '"ubuntu-latest"') }}
+    name: Check Source Changed
+    outputs:
+      code_changed: ${{ steps.filter.outputs.code_changed == 'true' }}
+      document_changed: ${{ steps.filter.outputs.document_changed == 'true' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
+        id: filter
+        with:
+          predicate-quantifier: 'every'
+          filters: |
+            code_changed:
+              - "!**/*.md"
+              - "!**/*.mdx"
+              - "!.agents/**"
+              - "!website/**"
+            document_changed:
+              - "website/**"
+
+  rust_check:
+    name: Rust check
+    needs: [check-changed]
+    if: ${{ needs.check-changed.outputs.code_changed == 'true' }}
+    runs-on: ${{ fromJSON(vars.LINUX_SELF_HOSTED_RUNNER_LABELS ||  '"ubuntu-22.04"') }}
+    env:
+      CARGO_INCREMENTAL: 0
+      RUSTC: rustc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Rust Toolchain
+        uses: ./.github/actions/rustup
+        with:
+          save-if: true
+          key: check
+
+      - name: Run Cargo codegen
+        run: cargo codegen
+
+      - name: Install cargo-binstall
+        if: ${{ github.ref == 'refs/heads/main' }}
+        uses: cargo-bins/cargo-binstall@81df5c23b0dc775b009efdfc9895c5965b7a4e40 # v1.26.1
+
+      - name: Install cargo-workspaces
+        if: ${{ github.ref == 'refs/heads/main' }}
+        run: cargo binstall --no-confirm cargo-workspaces@0.4.0 --force
+
+      # Check standalone published crates on main; Clippy checks the workspace on every branch.
+      - name: Run Cargo Check (per crate)
+        if: ${{ github.ref == 'refs/heads/main' }}
+        run: cargo workspaces exec --ignore-private cargo check --lib --locked
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --tests --locked -- -D warnings
+
+      - name: Run rustfmt
+        run: cargo fmt --all -- --check
+
+  rust_unused_dependencies:
+    needs: [check-changed]
+    if: ${{ needs.check-changed.outputs.code_changed == 'true' }}
+    name: Check Rust Dependencies
+    runs-on: ${{ fromJSON(vars.LINUX_SELF_HOSTED_RUNNER_LABELS || '"ubuntu-22.04"') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/rustup
+        with:
+          key: check
+
+      - name: Run Cargo codegen
+        run: cargo codegen
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2
+        with:
+          tool: cargo-deny@0.18.3
+      - name: Check licenses
+        run: |
+          cargo deny --all-features check license bans
+          cargo xtask deny-ext
+
+      - uses: cargo-bins/cargo-binstall@81df5c23b0dc775b009efdfc9895c5965b7a4e40 # v1.26.1
+      - run: cargo binstall --no-confirm cargo-shear@1.11.2 --force
+      - run: cargo shear
+
+  rust_test:
+    name: Rust test
+    runs-on: ${{ fromJSON(vars.LINUX_SELF_HOSTED_RUNNER_LABELS || '"ubuntu-22.04"') }}
+    needs: [check-changed]
+    if: ${{ needs.check-changed.outputs.code_changed == 'true' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Rust Toolchain
+        uses: ./.github/actions/rustup
+        with:
+          save-if: true
+          key: test
+
+      - name: Run Cargo codegen
+        run: cargo codegen
+
+      # Compile test without debug info for reducing the CI cache size
+      - name: Change profile.test
+        shell: bash
+        run: |
+          echo '[profile.test]' >> Cargo.toml
+          echo 'debug = false' >> Cargo.toml
+      - name: Run rspack test
+        run: |
+          cargo test --workspace \
+            --exclude rspack_binding_api \
+            --exclude rspack_node \
+            --exclude rspack_binding_builder \
+            --exclude rspack_binding_builder_macros \
+            --exclude rspack_binding_builder_testing \
+            --exclude rspack_binding_build \
+            --exclude rspack_napi \
+            --exclude rspack_watcher \
+            --exclude rspack_watcher_testing \
+            --exclude rspack_resolver \
+            -- --nocapture
+
+  rust_watcher_test:
+    name: Rust watcher test - ${{ matrix.array.runner }}
+    runs-on: ${{ fromJSON(matrix.array.runner) }}
+    strategy:
+      fail-fast: false # run all tests even if some fail
+      matrix:
+        array:
+          - runner: ${{ vars.LINUX_SELF_HOSTED_RUNNER_LABELS || '"ubuntu-22.04"' }}
+          - runner: ${{ '"windows-latest"' }}
+          - runner: ${{ '"macos-latest"' }}
+    needs: [check-changed]
+    if: ${{ needs.check-changed.outputs.code_changed == 'true' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Disable CPU hogs (Windows)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        uses: ./.github/actions/windows-disable-cpu-hogs
+
+      - name: Install Rust Toolchain
+        uses: ./.github/actions/rustup
+        with:
+          save-if: true
+          key: test-os-${{ matrix.array.runner }}
+
+      # Compile test without debug info for reducing the CI cache size
+      - name: Change profile.test
+        shell: bash
+        run: |
+          echo '[profile.test]' >> Cargo.toml
+          echo 'debug = false' >> Cargo.toml
+
+      - name: Run watcher tests
+        run: cargo test -p rspack_watcher -- --nocapture
+
+      - name: Run directory analyzer regression tests
+        run: cargo test -p rspack_watcher_testing -- --nocapture
+
+  test_required_check:
+    name: Rust Test Required Check
+    needs:
+      [
+        rust_test,
+        rust_check,
+        rust_unused_dependencies,
+        rust_watcher_test,
+        check-changed,
+      ]
+    if: ${{ always() && !cancelled() }}
+    runs-on: ${{ fromJSON(vars.CI_LINUX_MINI_RUNNER || '"ubuntu-latest"') }}
+    steps:
+      - name: Log
+        run: echo ${{ join(needs.*.result, ',') }}
+      - name: Test check
+        if: ${{ needs.check-changed.outputs.code_changed == 'true' && join(needs.*.result, ',')!='success,success,success,success,success' }}
+        run: echo "Tests Failed" && exit 1
+      - name: No check to Run test
+        run: echo "Success"

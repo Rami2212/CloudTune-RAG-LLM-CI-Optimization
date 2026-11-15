@@ -1,0 +1,68 @@
+name: Quality Gate
+
+# Builds the ccsh of the change itself: the staging image is only published after a merge to main, so it
+# would check a PR with the gate of the main before it.
+
+on:
+  workflow_call:
+    inputs:
+      part:
+        description: 'the folder to gate, with its .codecharta.yml'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: Quality Gate (${{ inputs.part }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PART: ${{ inputs.part }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup the JDK to build and run ccsh with
+        uses: actions/setup-java@v5.2.0
+        with:
+          distribution: 'temurin'
+          java-version: 25
+          cache: 'gradle'
+
+      - name: Build ccsh
+        working-directory: ./analysis
+        run: |
+          chmod +x ./gradlew
+          ./gradlew installDist
+          echo "$PWD/build/install/codecharta-analysis/bin" >> "$GITHUB_PATH"
+
+      # pipefail because the default shell reports tee's exit code, which would hide a broken rule
+      - name: Run the quality gate
+        shell: bash
+        run: |
+          set -o pipefail
+          ccsh gate "$PART" --quiet 2>&1 | tee "$RUNNER_TEMP/gate.log"
+
+      - name: Write the report to the job summary
+        if: always()
+        run: |
+          {
+            echo "## Quality gate: $PART"
+            echo '```text'
+            cat "$RUNNER_TEMP/gate.log" 2>/dev/null || echo "The gate did not run."
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the report and the map
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: quality-gate-${{ inputs.part }}
+          path: ${{ inputs.part }}/.codecharta-gate-output/
+          include-hidden-files: true
+          if-no-files-found: warn

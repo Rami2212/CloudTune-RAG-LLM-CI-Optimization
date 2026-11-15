@@ -1,0 +1,35 @@
+name: Windows MSVC
+
+on: [push, pull_request]
+
+env:
+  QTVER: 6.10.2
+  FFMPEG_VERSION: 8.0.1
+  CMAKE_GENERATOR: Visual Studio 17 2022
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: true
+        token: ${{ secrets.UPLOAD_TOKEN }}
+    - name: Install dependencies
+      run: ./ports/ci/windows-msvc/install_deps.bat
+    - name: Release Build
+      if: ${{ startsWith(github.ref, 'refs/tags/') }}
+      run: ./ports/ci/windows-msvc/build.bat
+    - name: Release Deploy
+      if: ${{ startsWith(github.ref, 'refs/tags/') }}
+      run: ./ports/ci/windows-msvc/deploy.bat
+    - name: Daily Build
+      if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      env:
+        DAILY_BUILD: 1
+      run: ./ports/ci/windows-msvc/build.bat
+    - name: Daily Deploy
+      if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      env:
+        DAILY_BUILD: 1
+      run: ./ports/ci/windows-msvc/deploy.bat

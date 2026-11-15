@@ -1,0 +1,148 @@
+name: Sanitizers
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    types: [opened, synchronize, reopened]
+jobs:
+  build:
+    name: SPRAL/${{ matrix.os }}/${{ matrix.compiler }}/${{ matrix.compiler_version }}/METIS ${{ matrix.metis }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        compiler_version: ['13']
+        arch: ['x64']
+        metis: [32, 64]
+        include:
+          - compiler: gcc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out SPRAL
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Meson and Ninja
+        run: pip install meson ninja
+
+      - name: Cache build dependencies
+        id: cache-deps
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/../deps
+          key: deps-${{ runner.os }}-${{ matrix.metis }}-metis-5.1.2-blas-3.12.0-lapack-3.12.0-hwloc-2.12.0
+
+      - name: Install dependencies
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          DEPS="$GITHUB_WORKSPACE/.."
+          cd $DEPS
+          mkdir deps
+          DLEXT="so"
+          LIBDIR="lib"
+          PLATFORM="x86_64-linux-gnu"
+          METIS_VERSION="5.1.2"
+          BLAS_VERSION="3.12.0"
+          LAPACK_VERSION="3.12.0"
+          HWLOC_VERSION="2.12.0"
+          wget https://github.com/JuliaBinaryWrappers/METIS_jll.jl/releases/download/METIS-v${METIS_VERSION}%2B0/METIS.v${METIS_VERSION}.$PLATFORM.tar.gz
+          tar -xzvf METIS.v${METIS_VERSION}.$PLATFORM.tar.gz -C deps
+          if [[ "${{matrix.metis}}" == "64" ]]; then
+            rm deps/include/metis.h
+            rm deps/$LIBDIR/libmetis.$DLEXT
+            cp deps/$LIBDIR/metis/metis_Int64_Real32/include/metis.h deps/include/metis.h
+            cp deps/$LIBDIR/metis/metis_Int64_Real32/$LIBDIR/libmetis_Int64_Real32.$DLEXT deps/$LIBDIR/libmetis_Int64_Real32.$DLEXT
+          fi
+          wget https://github.com/JuliaBinaryWrappers/ReferenceBLAS32_jll.jl/releases/download/ReferenceBLAS32-v${BLAS_VERSION}%2B0/ReferenceBLAS32.v${BLAS_VERSION}.$PLATFORM-libgfortran5.tar.gz
+          tar -xzvf ReferenceBLAS32.v${BLAS_VERSION}.$PLATFORM-libgfortran5.tar.gz -C deps
+          wget https://github.com/amontoison/LAPACK32_jll.jl/releases/download/LAPACK32-v${LAPACK_VERSION}%2B2/LAPACK32.v${LAPACK_VERSION}.$PLATFORM-libgfortran5.tar.gz
+          tar -xzvf LAPACK32.v${LAPACK_VERSION}.$PLATFORM-libgfortran5.tar.gz -C deps
+          wget https://github.com/JuliaBinaryWrappers/Hwloc_jll.jl/releases/download/Hwloc-v${HWLOC_VERSION}%2B0/Hwloc.v${HWLOC_VERSION}.$PLATFORM.tar.gz
+          tar -xzvf Hwloc.v${HWLOC_VERSION}.$PLATFORM.tar.gz -C deps
+          rm *.tar.gz
+
+      - name: Install compilers
+        uses: fortran-lang/setup-fortran@main
+        with:
+          compiler: ${{ matrix.compiler }}
+          version: ${{ matrix.compiler_version }}
+
+      # Uncomment this section to obtain ssh access to VM
+      # - name: Setup tmate session
+      # if: matrix.os == 'windows-latest'
+      # uses: mxschmitt/action-tmate@v3
+
+      - name: Setup SPRAL
+        shell: bash
+        run: |
+          DEPS="$GITHUB_WORKSPACE/.."
+          LIBDIR="lib"
+          LIBHWLOC="hwloc"
+          LIBMETIS="metis"
+          METIS64="false"
+          LIBBLAS="blas32"
+          LIBLAPACK="lapack32"
+          CSTD="c99"
+          CPPSTD="c++11"
+          LD_CLASSIC=""
+          if [[ "${{matrix.metis}}" == "64" ]]; then
+            LIBMETIS="metis_Int64_Real32"
+            METIS64="true"
+          fi
+          meson setup builddir --prefix=$GITHUB_WORKSPACE/../meson \
+                               --buildtype=debug \
+                               -Db_sanitize=address,undefined \
+                               -Dexamples=true \
+                               -Dtests=true \
+                               -Dlibmetis_path=$DEPS/deps/$LIBDIR \
+                               -Dlibmetis=$LIBMETIS \
+                               -Dmetis64=$METIS64 \
+                               -Dlibblas_path=$DEPS/deps/$LIBDIR \
+                               -Dlibblas=$LIBBLAS \
+                               -Dlibblas_include=../deps/include \
+                               -Dliblapack_path=$DEPS/deps/$LIBDIR \
+                               -Dliblapack=$LIBLAPACK \
+                               -Dlibhwloc_path=$DEPS/deps/$LIBDIR \
+                               -Dlibhwloc=$LIBHWLOC \
+                               -Dlibhwloc_include=../deps/include \
+                               -Dc_std=$CSTD \
+                               -Dcpp_std=$CPPSTD \
+                               -Dfortran_link_args=${LD_CLASSIC} \
+                               -Dcpp_link_args=${LD_CLASSIC}
+
+      - name: Build SPRAL
+        shell: bash
+        run: |
+          meson compile -C builddir
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: ${{ matrix.os }}_${{ matrix.compiler }}_${{ matrix.compiler_version }}_METIS_${{ matrix.metis }}_meson-log.txt
+          path: builddir/meson-logs/meson-log.txt
+
+      - name: Install SPRAL
+        shell: bash
+        run: |
+          meson install -C builddir
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: ${{ matrix.os }}_${{ matrix.compiler }}_${{ matrix.compiler_version }}_METIS_${{ matrix.metis }}_install-log.txt
+          path: builddir/meson-logs/install-log.txt
+
+      - name: Test SPRAL
+        shell: bash
+        run: |
+          meson test -C builddir ssidst ssmfet lsmrt randomt random_matrixt rutherford_boeingt scalingt rb_writes rb_reads auction_syms auction_unsyms equilib_syms equilib_unsyms hungarian_syms hungarian_unsyms hermitians precond_cores precond_experts precond_ssmfes shift_inverts lsmrs randoms random_matrixs ssidss rb_reads_c rb_writes_c auction_syms_c auction_unsyms_c equilib_syms_c equilib_unsyms_c hungarian_syms_c hungarian_unsyms_c lsmrs_c randoms_c random_matrixs_c ssidss_c ssids_topologys_c
+          # meson test -C builddir ssmfet_c hermitians_c precond_cores_c precond_experts_c precond_ssmfes_c shift_inverts_c
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: ${{ matrix.os }}_${{ matrix.compiler }}_${{ matrix.compiler_version }}_METIS_${{ matrix.metis }}_testlog.txt
+          path: builddir/meson-logs/testlog.txt

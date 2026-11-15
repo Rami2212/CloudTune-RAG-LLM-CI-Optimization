@@ -1,0 +1,44 @@
+name: create_release
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Cleanup disk
+        run: |
+          # Cleaning up unused tools based on the suggested workaround:
+          # https://github.com/actions/runner-images/issues/2840#issuecomment-790492173
+
+          # Partial cleanup from the suggested workaround.
+          # If we continue running out of space, we can remove everything listed in the workaround.
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+
+      - name: Harden Runner
+        uses: step-security/harden-runner@eb238b55efaa70779f274895e782ed17c84f2895 # v2.6.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # v4.1.2
+        with:
+          submodules: true
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5.0.0
+        with:
+          go-version: "1.27"
+          check-latest: true
+      - name: Goreleaser
+        uses: goreleaser/goreleaser-action@336e29918d653399e599bfca99fadc1d7ffbc9f7 # v4.3.0
+        with:
+          version: "~> v2"
+          args: release --clean --fail-fast --timeout 150m --verbose
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,44 @@
+name: Fuzz
+
+on:
+  schedule:
+    - cron: '0 6 * * 3'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [interpreter, mqc, markdown, stdlib]
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v2.0.0
+        with:
+          toolchain: nightly
+          cache: false
+          # nightly adds new lints; do not let them fail the fuzz build
+          rustflags: ""
+      - uses: extractions/setup-just@v4.0.0
+        with:
+          just-version: 1.58.0
+      - uses: taiki-e/install-action@v2.88.1
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          workspaces: fuzz
+      - name: Fuzz ${{ matrix.target }}
+        env:
+          CARGO_BUILD_WARNINGS: warn
+          # fat LTO breaks sancov symbols at link time under ASAN
+          CARGO_PROFILE_RELEASE_LTO: "off"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+        run: just test-fuzz ${{ matrix.target }} --target x86_64-unknown-linux-gnu -- -max_total_time=900

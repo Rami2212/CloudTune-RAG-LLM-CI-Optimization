@@ -1,0 +1,30 @@
+module github.com/gost-dom/browser
+
+go 1.25
+
+require (
+	github.com/gost-dom/css v0.1.0
+	github.com/gost-dom/fixture v0.1.0
+	github.com/onsi/gomega v1.38.2
+	github.com/stretchr/testify v1.11.1
+	golang.org/x/net v0.47.0
+)
+
+require (
+	github.com/davecgh/go-spew v1.1.1 // indirect
+	github.com/google/go-cmp v0.7.0 // indirect
+	github.com/kr/pretty v0.3.0 // indirect
+	github.com/mitranim/gg v0.1.29 // indirect
+	github.com/mitranim/gow v0.0.0-20250926091427-aad163e590a8 // indirect
+	github.com/pmezard/go-difflib v1.0.0 // indirect
+	github.com/rjeczalik/notify v0.9.3 // indirect
+	github.com/rogpeppe/go-internal v1.14.1 // indirect
+	go.yaml.in/yaml/v3 v3.0.4 // indirect
+	golang.org/x/sys v0.38.0 // indirect
+	golang.org/x/term v0.37.0 // indirect
+	golang.org/x/text v0.31.0 // indirect
+	gopkg.in/check.v1 v1.0.0-20180628173108-788fd7840127 // indirect
+	gopkg.in/yaml.v3 v3.0.1 // indirect
+)
+
+tool github.com/mitranim/gow

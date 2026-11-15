@@ -1,0 +1,159 @@
+name: lint
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to lint
+        required: false
+        type: string
+
+concurrency:
+  group: lint-${{ inputs.ref || github.head_ref || github.ref }}
+  # Runs on main finish so they can save the caches pull requests restore.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_COLOR: "1"
+  PYTHONUNBUFFERED: "1"
+  UV_CACHE_DIR: ${{ github.workspace }}/.cache/uv
+
+jobs:
+  should-run:
+    if: "${{ github.event_name != 'push' || startsWith(github.ref, 'refs/tags/') || !contains(github.event.head_commit.message, ':bookmark: bump version') }}"
+    runs-on: ubuntu-latest
+    steps:
+      - run: true
+
+  pre-commit:
+    needs: should-run
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: $/.github/actions/setup
+        with:
+          tools: uv prek just
+          uv-cache-key: ${{ runner.os }}-${{ runner.arch }}-uv-lint-${{ hashFiles('uv.lock', 'mise.toml', 'noxfile.py') }}
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/prek/
+          key: prek-1|${{ hashFiles('.pre-commit-config.yaml') }}
+
+      - name: Run pre-commit
+        env:
+          SKIP: no-commit-to-branch,cargo-fmt,cargo-clippy
+        run: just lint
+
+  release-metadata:
+    needs: should-run
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: $/.github/actions/setup
+        with:
+          tools: uv
+
+      - name: Check release metadata
+        run: uv run tools/release.py check
+
+  rust-changes:
+    needs: should-run
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ inputs.ref != '' && 'true' || steps.filter.outputs.rust }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        if: inputs.ref == ''
+        id: filter
+        with:
+          filters: |
+            rust:
+              - '.github/actions/setup/action.yml'
+              - '.github/workflows/lint.yml'
+              - '.rustfmt.toml'
+              - 'crates/**'
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - 'clippy.toml'
+              - 'hawk.toml'
+              - 'Justfile'
+              - 'mise.toml'
+              - 'rust-toolchain.toml'
+              - 'tools/hawk/rust-toolchain.toml'
+              - 'tools/rustfmt/rust-toolchain.toml'
+
+  rustfmt:
+    runs-on: ubuntu-24.04
+    needs: rust-changes
+    if: needs.rust-changes.outputs.rust == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: $/.github/actions/setup
+        with:
+          tools: rust just
+          working-directory: tools/rustfmt
+
+      - name: Run rustfmt
+        run: just fmt --check
+
+  clippy:
+    runs-on: ubuntu-24.04
+    needs: rust-changes
+    if: needs.rust-changes.outputs.rust == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: $/.github/actions/setup
+        with:
+          tools: rust just
+          rust-cache: clippy
+
+      - name: Run clippy
+        run: just clippy
+
+  hawk:
+    runs-on: ubuntu-24.04
+    needs: rust-changes
+    if: needs.rust-changes.outputs.rust == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: $/.github/actions/setup
+        with:
+          tools: rust just github:astral-sh/hawk
+          working-directory: tools/hawk
+          rust-cache: hawk
+
+      - name: Run hawk
+        run: just hawk

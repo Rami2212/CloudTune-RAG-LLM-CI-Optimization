@@ -1,0 +1,228 @@
+name: CI
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+  push:
+    branches:
+    - main
+    - v*-main
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+  CLICOLOR: 1
+  CARGO_INCREMENTAL: 0
+  RUST_TOOLCHAIN_STABLE: "1.99"  # STABLE
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    permissions:
+      contents: none
+    name: CI
+    needs: [test, msrv, lockfile, docs, rustfmt, clippy, minimal-versions]
+    runs-on: ubuntu-latest
+    if: "always()"
+    steps:
+      - name: Failed
+        run: exit 1
+        if: "contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')"
+  test:
+    name: Test
+    strategy:
+      matrix:
+        os: ["ubuntu-latest", "windows-latest", "macos-latest"]
+        rust: ["stable"]
+    continue-on-error: ${{ matrix.rust != 'stable' }}
+    runs-on: ${{ matrix.os }}
+    env:
+      # Reduce amount of data cached
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Install Rust
+      run: rustup update --no-self-update ${{ matrix.rust }} && rustup default ${{ matrix.rust }}
+    - name: Initialize cache
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+    - name: Install cargo-hack
+      uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32  # v2.88.0
+      with:
+        tool: cargo-hack
+    - name: Build
+      run: cargo test --workspace --no-run
+    - name: Test
+      run: cargo hack test --each-feature --skip debug --workspace
+  miri:
+    name: Miri
+    runs-on: ubuntu-latest
+    env:
+      MIRIFLAGS: "-Zmiri-disable-isolation"
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Install Rust
+      run: rustup update --no-self-update nightly && rustup default nightly
+    - name: Install miri
+      run: rustup component add miri
+    - name: Initialize cache
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+    # no-default features is a subset, not needed
+    # all-features is `debug` which is extremely slow
+    - name: Default features
+      run: cargo miri test --workspace
+  msrv:
+    name: "Check MSRV"
+    strategy:
+      matrix:
+        os: ["ubuntu-latest"]
+    runs-on: ${{ matrix.os }}
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Install Rust
+      run: rustup update --no-self-update stable && rustup default stable
+    - name: Initialize cache
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+    - name: Install cargo-hack
+      uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32  # v2.88.0
+      with:
+        tool: cargo-hack
+    - name: Default features
+      run: cargo hack check --each-feature --locked --rust-version --ignore-private --workspace --all-targets --keep-going
+  minimal-versions:
+    name: Minimal versions
+    strategy:
+      matrix:
+        os: ["ubuntu-latest"]
+    runs-on: ${{ matrix.os }}
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Install stable Rust
+      run: rustup update --no-self-update stable && rustup default stable
+    - name: Install nightly Rust
+      run: rustup update --no-self-update nightly && rustup default nightly
+    - name: Downgrade dependencies to minimal versions
+      run: cargo +nightly generate-lockfile -Z minimal-versions
+    - name: Compile with minimal versions
+      run: cargo +stable check --workspace --all-features --locked --keep-going
+  lockfile:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Install Rust
+      run: rustup update --no-self-update stable && rustup default stable
+    - name: Initialize cache
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+    - name: "Is lockfile updated?"
+      run: cargo update --workspace --locked
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Install Rust
+      run: rustup update --no-self-update $RUST_TOOLCHAIN_STABLE && rustup default $RUST_TOOLCHAIN_STABLE
+    - name: Initialize cache
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+    - name: Check documentation
+      env:
+        CARGO_BUILD_WARNINGS: deny
+      run: cargo doc --workspace --all-features --no-deps --document-private-items --keep-going
+  rustfmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Install Rust
+      run: rustup update --no-self-update $RUST_TOOLCHAIN_STABLE && rustup default $RUST_TOOLCHAIN_STABLE
+    - name: Install rustfmt
+      run: rustup component add rustfmt
+    - name: Initialize cache
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+    - name: Check formatting
+      run: cargo fmt --check
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write # to upload sarif results
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Install Rust
+      run: rustup update --no-self-update $RUST_TOOLCHAIN_STABLE && rustup default $RUST_TOOLCHAIN_STABLE
+    - name: Install clippy
+      run: rustup component add clippy
+    - name: Initialize cache
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+    - name: Install SARIF tools
+      run: cargo install clippy-sarif --locked
+    - name: Install SARIF tools
+      run: cargo install sarif-fmt --locked
+    - name: Check
+      run: >
+        cargo clippy --workspace --all-features --all-targets --message-format=json
+        | clippy-sarif
+        | tee clippy-results.sarif
+        | sarif-fmt
+      continue-on-error: true
+    - name: Upload
+      uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+      with:
+        sarif_file: clippy-results.sarif
+        wait-for-processing: true
+    - name: Report status
+      env:
+        CARGO_BUILD_WARNINGS: deny
+      run: cargo clippy --workspace --all-features --all-targets --keep-going -- --allow deprecated --allow renamed_and_removed_lints
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    permissions:
+      code-quality: write
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Install Rust
+      run: rustup update --no-self-update stable && rustup default stable
+    - name: Initialize cache
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+    - name: Install cargo-tarpaulin
+      run: cargo install cargo-tarpaulin
+    - name: Gather coverage
+      run: cargo tarpaulin --out xml
+    - name: Upload coverage report
+      if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+      uses: actions/upload-code-coverage@2b21a77928be8d5168c2b9581a67f2adbebacc52 # v1.4.4
+      with:
+        file: cobertura.xml
+        language: Rust

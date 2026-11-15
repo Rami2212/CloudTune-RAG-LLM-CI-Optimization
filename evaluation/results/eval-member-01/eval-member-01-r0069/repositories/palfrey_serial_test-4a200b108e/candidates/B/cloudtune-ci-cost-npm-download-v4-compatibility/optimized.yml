@@ -1,0 +1,160 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 6 optimizations:
+# - [HIGH] Add cargo dependency cache to "test" job
+# - [HIGH] Add cargo dependency cache to "multi-os-testing" job
+# - [HIGH] Add cargo dependency cache to "minimal-versions" job
+# - [HIGH] Add cargo dependency cache to "dependency-updates" job
+# - [HIGH] Add cargo dependency cache to "audit" job
+# - [MEDIUM] Add concurrency group to "ci.yml"
+# Estimated savings: ~42 min/run
+#
+on: 
+  push:
+    branches:
+      - main
+  pull_request:
+  schedule:
+    - cron: '0 0 1 * *'
+  workflow_dispatch:
+
+name: Continuous integration
+
+jobs:
+  test:
+    name: Test suite
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        rust:
+          - stable
+          - beta
+          - nightly
+          - 1.93.1
+    steps:
+      - uses: actions/checkout@v3.5.0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2.2.1
+      - name: Check formatting
+        run: cargo fmt -- --check
+        if: ${{ matrix.rust == 'nightly' }}
+      - name: Clippy
+        run: cargo clippy
+        env:
+          RUSTFLAGS: -Dwarnings
+        continue-on-error: ${{ matrix.rust == 'nightly' || matrix.rust == 'beta' }}
+      - name: Install "build all features"
+        run: cargo install cargo-all-features --version 1.12.0 --force --locked
+      - name: Build all features
+        run: cargo build-all-features
+      - name: Test all features
+        run: cargo test-all-features -- -- --nocapture
+        env:
+          RUST_TEST_THREADS: 3 # So the parallel tests have enough threads
+          RUST_LOG: debug
+
+  multi-os-testing:
+    name: Test suite
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+          - windows-latest
+          - macos-latest
+    steps:
+      - uses: actions/checkout@v3.5.0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2.2.1
+      - name: Build and test
+        run: cargo test --all-features -- --nocapture
+        env:
+          RUST_TEST_THREADS: 3 # So the parallel tests have enough threads
+          RUST_LOG: debug
+
+  miri:
+    name: Miri
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v3.5.0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly
+          components: miri
+      - uses: Swatinem/rust-cache@v2.2.1
+      - name: Miri strict provenance
+        run: cargo miri test -p serial_test --all-features -- --skip file_lock
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance
+
+  minimal-versions:
+    name: minimal versions check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v3.5.0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly
+      - name: Remove lock
+        run: rm Cargo.lock
+      - run: cargo build -Z minimal-versions
+    
+  dependency-updates:
+    name: dependency updates
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v3.5.0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - name: Update packages
+        run: cargo update
+      - name: Build and test
+        run: cargo test --all-features -- --nocapture
+        env:
+          RUST_TEST_THREADS: 3 # So the parallel tests have enough threads
+          RUST_LOG: debug
+
+  # As per https://github.com/dtolnay/cargo-docs-rs?tab=readme-ov-file#example
+  doc:
+    name: Documentation
+    runs-on: ubuntu-24.04
+    env:
+      RUSTDOCFLAGS: -Dwarnings
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/install@cargo-docs-rs
+      - run: cargo docs-rs -p serial_test
+      - run: cargo docs-rs -p serial_test_derive
+
+  audit:
+    name: Audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit --deny warnings
+
+  version-lint:
+    name: Version lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: tombi-toml/setup-tombi@v1.5.2
+      - name: Check TOML format
+        run: tombi format --check
+      - name: Validate TOML files
+        run: tombi lint      
+
+  # Placeholder to be marked as required in PRs and which depends on all other steps
+  finish:
+      needs: [test, audit, doc, dependency-updates, minimal-versions, miri, multi-os-testing, version-lint]
+      runs-on: ubuntu-24.04
+      steps:
+          - name: Done
+            run: echo "All finished"

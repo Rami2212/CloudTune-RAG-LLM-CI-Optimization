@@ -1,0 +1,107 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 4 optimizations:
+# - [HIGH] Add pip dependency cache to "typecheck" job
+# - [HIGH] Add pip dependency cache to "build" job
+# - [HIGH] Add pip dependency cache to "test-base-image" job
+# - [MEDIUM] Add concurrency group to "test.yml"
+# Estimated savings: ~11 min/run
+#
+name: unit tests
+
+on:
+  push:
+  pull_request:
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  typecheck:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Install Ubuntu dependencies
+        run: sudo apt update && sudo DEBIAN_FRONTEND=noninteractive apt-get -y install gettext appstream pkg-config libcairo2-dev gir1.2-gtk-3.0 libgirepository1.0-dev libicu-dev gir1.2-pango-1.0
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip wheel setuptools
+          pip install -r requirements-dev.txt
+          pip install .[ai,face]
+      - name: Run type checker
+        run: mypy --install-types --non-interactive --ignore-missing-imports --exclude build .
+
+  build:
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.15"]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo apt-get clean
+          df -h
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install Ubuntu dependencies
+        run: sudo apt update && sudo DEBIAN_FRONTEND=noninteractive apt-get -y install gettext appstream pkg-config libcairo2-dev gir1.2-gtk-3.0 libgirepository1.0-dev libicu-dev tesseract-ocr gir1.2-pango-1.0 poppler-utils
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip wheel setuptools
+          pip install -r requirements-dev.txt
+          pip install .[ai,face]
+          pip list
+      - name: Clean up package caches
+        run: |
+          sudo apt-get clean
+          pip cache purge
+          df -h
+      - name: Check for single alembic head
+        run: |
+          HEAD_COUNT=$(alembic heads | wc -l)
+          if [ "$HEAD_COUNT" -ne 1 ]; then
+            echo "ERROR: Multiple alembic heads detected! Run 'alembic heads' to inspect."
+            alembic heads
+            exit 1
+          fi
+      - name: Test with pytest
+        # loadfile keeps the tests of a module, and its fixtures, on one worker
+        run: pytest -n auto --dist loadfile
+
+  test-base-image:
+    runs-on: ubuntu-26.04
+    container: ghcr.io/gramps-project/gramps-web-base:latest
+    services:
+      # used by tests/test_shared_postgresql.py
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: gramps
+          POSTGRES_PASSWORD: gramps
+          POSTGRES_DB: gramps
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install package
+        run: pip install --no-cache-dir -r requirements-dev.txt && pip install --no-cache-dir .[ai]
+      - name: Test with pytest
+        env:
+          GRAMPSWEB_TEST_POSTGRES_URL: postgresql://gramps:gramps@postgres:5432/gramps
+        # the base image ships the SharedPostgreSQL addon
+        run: GRAMPSWEB_TEST_ADDONS_DIR=/root/gramps/gramps$GRAMPS_VERSION/plugins pytest -n auto --dist loadfile

@@ -1,0 +1,42 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [MEDIUM] Add concurrency group to "dotnet.yml"
+# Estimated savings: ~2 min/run
+#
+name: .NET Core
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+    - name: Setup .NET 6.0
+      uses: actions/setup-dotnet@v1
+      with:
+        dotnet-version: 6.0.x
+    - name: Setup .NET 9.0
+      uses: actions/setup-dotnet@v1
+      with:
+        dotnet-version: 9.0.x
+    - name: Restore
+      run: dotnet restore
+    - name: Peachpie.Runtime.Tests
+      run: dotnet test ./src/Tests/Peachpie.Runtime.Tests --verbosity normal
+    - name: Peachpie.DiagnosticTests
+      run: dotnet test ./src/Tests/Peachpie.DiagnosticTests --verbosity normal
+#    - name: Peachpie.ScriptTests
+#      run: dotnet test ./src/Tests/Peachpie.ScriptTests --verbosity normal
+    - name: Build
+      run: dotnet build ./src/Peachpie.NET.Sdk/ -c Release --no-restore -p:VersionSuffix=ghaction${{github.run_number}}

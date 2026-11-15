@@ -1,0 +1,87 @@
+name: Build
+
+# Build and publish the container image. Push-only triggers: this workflow
+# mints short-lived cloud credentials via OIDC, so it must never run for fork
+# pull requests (no pull_request / pull_request_target trigger).
+on:
+  push:
+    branches: [main, 'release/**']
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-central-1
+  ECR_REGISTRY: 990678687129.dkr.ecr.eu-central-1.amazonaws.com
+  ECR_REPOSITORY: wallets-list
+  ROLE_ARN: arn:aws:iam::990678687129:role/gha-ecr-push-wallets-list
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Image tags are immutable: re-running a build for a sha that is already
+      # published is a success, not a failure. If the tag exists, short-circuit
+      # the rest of the job.
+      - name: Check for existing image
+        id: guard
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          if aws ecr describe-images \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids imageTag="$IMAGE_TAG" >/dev/null 2>&1; then
+            echo "Image for $IMAGE_TAG already published; skipping build."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to registry
+        if: steps.guard.outputs.exists != 'true'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # provenance/sbom attestations off so the pushed artifact is a plain
+      # single-arch manifest, not an OCI image index.
+      - name: Build image
+        if: steps.guard.outputs.exists != 'true'
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          echo "SHORT_SHA=$SHORT_SHA" >> "$GITHUB_ENV"
+          docker build \
+            --provenance=false \
+            --sbom=false \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA" \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$SHORT_SHA" \
+            .
+
+      - name: Test image
+        if: steps.guard.outputs.exists != 'true'
+        env:
+          IMAGE: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          SERVER_NAME: config.ton.org
+        run: docker compose -f docker-compose.test.yml run --rm test
+
+      - name: Test image (runtime SERVER_NAME override)
+        if: steps.guard.outputs.exists != 'true'
+        env:
+          IMAGE: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          SERVER_NAME: override.example.org
+        run: docker compose -f docker-compose.test.yml run --rm test
+
+      - name: Push image
+        if: steps.guard.outputs.exists != 'true'
+        run: |
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$SHORT_SHA"

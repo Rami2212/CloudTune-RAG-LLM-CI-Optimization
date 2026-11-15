@@ -1,0 +1,58 @@
+name: 'API Docs'
+
+on:
+  push:
+    branches:
+      - 'master'
+  pull_request_target:
+    types: [ opened, synchronize ]
+  workflow_dispatch:
+
+concurrency: 
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  Build:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: 'ubuntu-latest'
+    #runs-on: 'ubuntu-22.04'
+    
+    steps:
+    - name: 'Checkout Repository'
+      uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+
+    - name: 'Checkout Repository (m.css)'
+      uses: actions/checkout@v6
+      with:
+        repository: 'deathkiller/m.css'
+        ref: 'death-main'
+        ssh-key: ${{ secrets.DOCS_DEPLOY_KEY }}
+        path: 'm.css'
+
+    - name: 'Create Build Environment'
+      run: |
+        sudo apt update -y
+        #sudo apt install doxygen
+        sudo apt install texlive-base texlive-latex-extra texlive-fonts-extra texlive-fonts-recommended
+        pip3 install jinja2 natsort Pygments
+        
+    - name: 'Install Doxygen'
+      uses: ssciwr/doxygen-install@v1
+      with:
+        version: "1.18.0"
+    
+    - name: 'Build'
+      run: |
+        mkdir -p ./build/docs/
+        ./m.css/documentation/doxygen.py ./Docs/Config.py
+        # Scripting API, needs the Doxygen XML above for links to C++
+        ./m.css/documentation/angelscript.py ./Docs/ConfigScripting.py
+
+    - name: 'Upload Package'
+      uses: actions/upload-artifact@v7
+      with:
+        name: Jazz2_ApiDocs
+        path: ./build/docs/html/

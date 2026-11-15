@@ -1,0 +1,56 @@
+name: Node CI
+
+# trigger on every commit push and PR for all branches
+on:
+  push:
+    branches: ['**']
+    paths-ignore:
+      - '**/*.md'
+  pull_request:
+    branches: ['**']
+    paths-ignore:
+      - '**/*.md'
+
+jobs:
+  test:
+    name: Test
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        node-version: [22.x, 24.x, 26.x]
+        os: [ubuntu-latest, windows-latest, macos-15-intel]
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install
+        run: |
+          npm install
+
+      - name: Setup Yarn
+        run: |
+          npm uninstall -g yarn
+          npm i -g yarn@1.22.10
+# TODO: Uncomment the following block after updating the Codegen to support this linter
+#      - name: Lint
+#        if: matrix.node-version == '16.x'
+#        run: |
+#          yarn lint
+
+      - name: Unit test
+        run: |
+          npm run test:unit
+
+      - name: Acceptance test
+        run: |
+          npm run test:acceptance
+
+      - name: Type Definitions
+        run: |
+          npm run test:types

@@ -1,0 +1,55 @@
+name: Deploy Docs to GitHub Pages
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'docs/**'
+
+jobs:
+  build-docs:
+    name: Build Docs
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+      - name: Set-up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: 'pnpm'
+      - name: Install dependencies
+        run: |
+          cd docs
+          pnpm install
+      - name: Build Docs
+        run: |
+          cd docs
+          pnpm build
+      - name: Upload Build Artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: docs/build/
+
+  deploy-docs:
+    name: Deploy Docs
+    needs: build-docs
+
+    permissions:
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Deployment
+        id: deployment
+        uses: actions/deploy-pages@v5

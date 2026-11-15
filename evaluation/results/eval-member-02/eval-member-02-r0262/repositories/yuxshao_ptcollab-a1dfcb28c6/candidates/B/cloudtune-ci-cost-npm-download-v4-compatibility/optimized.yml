@@ -1,0 +1,320 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [MEDIUM] Add concurrency group to "ci.yml"
+# Estimated savings: ~2 min/run
+#
+name: Build
+
+on:
+  push:
+    branches: master
+    tags: 'v*'
+  pull_request:
+    branches: master
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+defaults:
+  run:
+    shell: bash
+
+env:
+  QT_VERSION: 5.15.2
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        config:
+          - { name: "Windows", os: windows-latest, make: nmake, qt_arch: win64_msvc2019_64, target_arch: amd64 }
+          - { name: "Windows 32-bit", os: windows-latest, make: nmake, qt_arch: win32_msvc2019, target_arch: x86 }
+          - { name: "macOS", os: macos-latest, make: "make -C build -j2", qt_arch: clang_64 }
+          - { name: "Ubuntu", os: ubuntu-22.04, make: "make -j2", qt_arch: gcc_64 }
+      fail-fast: false
+
+    name: ${{ matrix.config.name }}
+    runs-on: ${{ matrix.config.os }}
+
+    steps:
+      - name: Identify build type
+        id: identify-build
+        run: |
+          case ${GITHUB_REF} in
+            refs/tags/* )
+              TAG=${GITHUB_REF#refs/tags/}
+              echo "Release ${TAG}"
+              echo "build-tag=${TAG}" >> $GITHUB_OUTPUT
+              echo "release=true" >> $GITHUB_OUTPUT
+              ;;
+            refs/pull/*)
+              PR=$(echo ${GITHUB_REF} | cut -d/ -f3)
+              echo "Test PR #${PR}"
+              echo "build-tag=pr-${PR}-${GITHUB_SHA}" >> $GITHUB_OUTPUT
+              echo "release=false" >> $GITHUB_OUTPUT
+              ;;
+            refs/heads/* )
+              BRANCH=${GITHUB_REF#refs/heads/}
+              echo "Test ${BRANCH}"
+              echo "build-tag=${BRANCH}-${GITHUB_SHA}" >> $GITHUB_OUTPUT
+              echo "release=false" >> $GITHUB_OUTPUT
+              ;;
+            * )
+              echo "Test (unknown)"
+              echo "build-tag=unknown-${GITHUB_SHA}" >> $GITHUB_OUTPUT
+              echo "release=false" >> $GITHUB_OUTPUT
+              ;;
+          esac
+
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+
+      - name: Install Qt5
+        uses: jurplel/install-qt-action@v3
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: ${{ matrix.config.qt_arch }}
+          cache: true
+
+      - name: Setup MSVC Toolchain [Windows]
+        if: ${{ runner.os == 'Windows' }}
+        #uses: seanmiddleditch/gha-setup-vsdevenv@v4
+        uses: vadz/gha-setup-vsdevenv@avoid-deprecation-warnings # https://github.com/seanmiddleditch/gha-setup-vsdevenv/pull/15
+        with:
+          arch: ${{ matrix.config.target_arch }}
+
+      - name: Cache NSIS [Windows]
+        if: ${{ runner.os == 'Windows' }}
+        id: cache-nsis
+        uses: actions/cache@v3
+        with:
+          path: nsis-install.exe
+          key: NSIS 3.08
+
+      - name: Fetch NSIS [Windows]
+        if: ${{ runner.os == 'Windows' && steps.cache-nsis.outputs.cache-hit != 'true' }}
+        run: curl -Lo nsis-install.exe "https://prdownloads.sourceforge.net/nsis/nsis-3.08-setup.exe?download"
+
+      - name: Install NSIS [Windows]
+        if: ${{ runner.os == 'Windows' }}
+        run: powershell -Command "./nsis-install.exe /S"
+
+      - name: Install Dependencies [Linux]
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          sudo apt update
+          # Building
+          sudo apt install libogg-dev libvorbis-dev librtmidi-dev
+          # Packaging
+          sudo apt install libgstreamer-plugins-base1.0-0
+
+          wget -c -nv \
+            "https://github.com/probonopd/linuxdeployqt/releases/download/continuous/linuxdeployqt-continuous-x86_64.AppImage"
+          chmod +x linuxdeployqt-continuous-x86_64.AppImage
+
+      - name: Configure via QMake [non-macOS]
+        if: ${{ runner.os != 'macOS' }}
+        run: |
+          if [ "${{ runner.os }}" == "Linux" ]; then
+            # Needed for appimage building
+            export BUILD_PREFIX=/usr
+          else
+            export BUILD_PREFIX="${PWD}/target"
+          fi
+
+          qmake ptcollab.pro \
+            PREFIX=${BUILD_PREFIX} \
+            CONFIG+=release CONFIG-=debug
+
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            # /usr/bin/link interferes with MSVC link binary
+            rm -f /usr/bin/link
+          fi
+
+          ${{ matrix.config.make }} qmake_all
+
+      - name: Configure via CMake [macOS]
+        if: ${{ runner.os == 'macOS' }}
+        run: |
+          if [ "${{ runner.os }}" == "Linux" ]; then
+            # Needed for appimage building
+            export BUILD_PREFIX=/usr
+          else
+            export BUILD_PREFIX="${PWD}/target"
+          fi
+
+          if [ "${{ runner.os }}" == "macOS" ]; then
+            export BUILD_ARGS=(
+              # TODO this seems like something the CMake script should handle? This worked fine when using QMake.
+              # Because we later deploy this into an app bundle, make sure it can find the bundled Frameworks
+              "-DCMAKE_INSTALL_RPATH=@executable_path/../Frameworks"
+
+              # Need to set the minimum version to support, used by macOS tooling
+              # current lowest-supported version for Qt 5.15 is 10.13 (on x86_64, but we don't do a universal2 build)
+              # https://doc.qt.io/qt-5/supported-platforms.html#macos
+              "-DCMAKE_OSX_DEPLOYMENT_TARGET=10.13"
+
+              # CI Builder now defaults to arm64, tell it to explicitly only build x86_64 (Rosetta 2 should still allow running on aarch64)
+              "-DCMAKE_OSX_ARCHITECTURES=x86_64"
+
+              # We cannot ship libraries from Homebrew, because they target a higher macOS version than Qt, which produces a borked build
+              "-DENABLE_SYSTEM_LIBS=OFF"
+            )
+          else
+            export BUILD_ARGS=()
+          fi
+
+          cmake -B build \
+            -DCMAKE_INSTALL_PREFIX=${BUILD_PREFIX} \
+            -DCMAKE_BUILD_TYPE=Release \
+            "${BUILD_ARGS[@]}"
+
+      - name: Build
+        run: |
+          ${{ matrix.config.make }}
+
+      - name: Install
+        run: |
+          # TODO when migrating Linux to CMake, export DESTDIR envvar instead
+          # https://cmake.org/cmake/help/latest/envvar/DESTDIR.html
+          if [ "${{ runner.os }}" == "Linux" ]; then
+            export INSTALL_ARGS="INSTALL_ROOT=${PWD}/target/appdir"
+          else
+            export INSTALL_ARGS=""
+          fi
+
+          ${{ matrix.config.make }} ${INSTALL_ARGS} install
+
+      - name: Package
+        id: package
+        run: |
+          # Deployment prep
+          export VERSION="${{ steps.identify-build.outputs.build-tag }}-${{ runner.os }}"
+
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            export PLATFORM_ABBR="win"
+            export DEPLOY_TOOL="windeployqt"
+            export DEPLOY_TARGET="ptcollab.exe"
+            export DEPLOY_OPTS=(
+              "--no-quick-import"
+              "--no-system-d3d-compiler"
+              "--no-webkit2"
+              "--no-opengl-sw"
+              "--no-virtualkeyboard"
+              "--no-angle"
+            )
+            export PACKAGE_EXT="zip"
+          elif [ "${{ runner.os }}" == "macOS" ]; then
+            export PLATFORM_ABBR="mac"
+            export DEPLOY_TOOL="macdeployqt"
+            export DEPLOY_TARGET="bin/ptcollab.app"
+            export DEPLOY_OPTS=("")
+            export PACKAGE_EXT="tar.gz"
+          else
+            export PLATFORM_ABBR="lin"
+            export DEPLOY_TOOL="${PWD}/linuxdeployqt-continuous-x86_64.AppImage"
+            export DEPLOY_TARGET="appdir/usr/share/applications/ptcollab.desktop"
+            export DEPLOY_OPTS=(
+              "-appimage"
+              "-extra-plugins=platforms/libqminimal.so" # So headless doesn't need xcb
+            )
+            export PACKAGE_EXT="tar.gz"
+
+            # We don't need the examples inside the appimage
+            mv -v target/appdir/usr/share/ptcollab ./PACKAGE_examples
+          fi
+
+          if [ "${{ matrix.config.target_arch }}" == "x86" ]; then
+            export ARCH="x86"
+            export PLATFORM_ABBR="${PLATFORM_ABBR}-x86"
+          else
+            export ARCH="x86_64"
+          fi
+
+          export PACKAGE="ptcollab-${VERSION}-${ARCH}"
+          export artifact_dir="${PACKAGE}"
+          export artifact_name="ptcollab-${PLATFORM_ABBR}.${PACKAGE_EXT}"
+          echo "artifact-dir=${artifact_dir}" >> $GITHUB_OUTPUT
+          echo "artifact-name=${artifact_name}" >> $GITHUB_OUTPUT
+
+          # Deployment of binary
+          pushd target
+          ${DEPLOY_TOOL} "${DEPLOY_TARGET}" ${DEPLOY_OPTS[@]} -verbose=2
+          popd
+          mv target "${PACKAGE}"
+
+          # Deployment finalizing
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            7z a -tzip "${artifact_name}" "${PACKAGE}"
+          elif [ "${{ runner.os }}" == "macOS" ]; then
+            pushd "${PACKAGE}"
+
+            # macOS rmdir doesn't have -v flag
+            mv -v {bin,.}/ptcollab.app
+            rmdir bin
+
+            mv -v share/ptcollab/* ./
+            mv -v share/doc/ptcollab/LICENSE-pxtone ./LICENSE-pxtone
+            mv -v share/doc/ptcollab/LICENSE ./LICENSE-ptcollab
+
+            rm -v -rf share/
+
+            popd
+            tar -cvf- "${PACKAGE}" | gzip -9c > "${artifact_name}"
+          else
+            pushd "${PACKAGE}"
+
+            mv -v ../PACKAGE_examples/* ./
+
+            # Inherits verbose name from desktop file
+            mv pxtone_collab*.AppImage "${PACKAGE}".AppImage
+
+            mv -v appdir/usr/share/doc/pxtone/LICENSE-pxtone ./LICENSE-pxtone
+            mv -v appdir/usr/share/doc/ptcollab/LICENSE ./LICENSE-ptcollab
+
+            rm -v -rf appdir/
+
+            popd
+            tar -cvf- "${PACKAGE}" | gzip -9c > "${artifact_name}"
+          fi
+
+      - name: Create Installer [Windows]
+        if: ${{ runner.os == 'Windows' }}
+        id: installer
+        run: |
+          export NSIS_TOOL='C:\Program Files (x86)\NSIS\makensis.exe'
+          export NSIS_OPTS=(
+            "-DVERSION=${{ steps.identify-build.outputs.build-tag }}"
+            "-DARCH=${{ matrix.config.target_arch }}"
+            "-DIN_PATH=${{ steps.package.outputs.artifact-dir }}"
+          )
+
+          cp src/icon.ico res/{header.bmp,ptcollab.nsi} ./
+          "${NSIS_TOOL}" ${NSIS_OPTS[@]} ptcollab.nsi
+
+          export PLATFORM_ABBR="win"
+          if [ "${{ matrix.config.target_arch }}" == "x86" ]; then
+            export PLATFORM_ABBR="${PLATFORM_ABBR}-x86"
+          fi
+          echo "artifact-name=ptcollab-install-${PLATFORM_ABBR}.exe" >> $GITHUB_OUTPUT
+
+      - name: Release
+        if: steps.identify-build.outputs.release == 'true'
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: ${{ steps.package.outputs.artifact-name }}
+          asset_name: ${{ steps.package.outputs.artifact-name }}
+          tag: ${{ github.ref }}
+
+      - name: Release Installer [Windows]
+        if: ${{ runner.os == 'Windows' && steps.identify-build.outputs.release == 'true' }}
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: ${{ steps.installer.outputs.artifact-name }}
+          asset_name: ${{ steps.installer.outputs.artifact-name }}
+          tag: ${{ github.ref }}

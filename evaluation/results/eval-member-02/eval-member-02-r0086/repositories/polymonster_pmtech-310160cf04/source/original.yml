@@ -1,0 +1,120 @@
+name: build
+on: [push, pull_request]
+jobs:
+  macos-metal:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v3
+        with: 
+          submodules: "recursive"
+          lfs: true
+      - run: .ci/mac-metal.sh
+  macos-gl:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v3
+        with: 
+          submodules: "recursive"
+          lfs: true
+      - run: .ci/mac-gl.sh
+  ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v3
+        with: 
+          submodules: "recursive"
+          lfs: true
+      - run: .ci/ios.sh
+  linux-gl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with: 
+          submodules: "recursive"
+          lfs: true
+      - run: sudo -E apt-add-repository -y "ppa:ubuntu-toolchain-r"
+      - run: sudo apt-get install libglew-dev
+      - run: .ci/linux-gl.sh
+  windows-direct3d11:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v3
+        with: 
+          submodules: "recursive"
+          lfs: true
+      - run: |
+          cd examples
+          ..\\pmbuild win32 -libs
+          ..\\pmbuild win32
+          ..\\pmbuild make win32 all /p:Platform=x64 /p:Configuration=Release
+  windows-opengl:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v3
+        with: 
+          submodules: "recursive"
+          lfs: true
+      - run: |
+          cd examples
+          ..\\pmbuild win32-gl -libs
+          ..\\pmbuild win32-gl
+          ..\\pmbuild make win32-gl all /p:Platform=x64 /p:Configuration=Release
+  macos-editor:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v3
+        with: 
+          submodules: "recursive"
+          lfs: true
+      - run: |
+          cd tools
+          ../pmbuild mac-editor -libs
+          ../pmbuild mac-editor
+          ../pmbuild make mac-editor all
+  windows-editor:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v3
+        with: 
+          submodules: "recursive"
+          lfs: true
+      - run: |
+          cd tools
+          ..\\pmbuild win32-editor -libs
+          ..\\pmbuild win32-editor
+          ..\\pmbuild make win32-editor pmtech_editor /p:Platform=x64 /p:Configuration=Release
+          ..\\pmbuild make win32-editor all /p:Platform=x64 /p:Configuration=Release
+  linux-editor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          submodules: "recursive"
+          lfs: true
+      - run: |
+          sudo -E apt-add-repository -y "ppa:ubuntu-toolchain-r"
+          sudo apt-get install libglew-dev
+          cd tools
+          ../pmbuild linux-editor -libs
+          ../pmbuild linux-editor
+          ../pmbuild make linux-editor all
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          submodules: "recursive"
+          lfs: true
+      - uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.14.3
+      - run: |
+          cd examples
+          ../pmbuild android
+          cd build/android
+          gradle wrapper
+          ./gradlew assembleRelease

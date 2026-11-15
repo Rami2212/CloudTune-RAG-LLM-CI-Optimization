@@ -1,0 +1,31 @@
+name: Binary Size Limit
+
+on:
+  workflow_call:
+
+permissions:
+  # Allow commenting on Pull Requests
+  pull-requests: write
+
+jobs:
+  size-limit:
+    name: Binding Size Limit
+    runs-on: ${{ fromJSON(vars.CI_LINUX_MINI_RUNNER || '"ubuntu-latest"') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Download binding artifact
+        uses: ./.github/actions/artifact/download
+        with:
+          name: bindings-x86_64-unknown-linux-gnu
+          path: crates/node_binding/
+
+      # ci profile builds with strip=false, strip here for accurate size comparison
+      - name: Strip binary
+        run: strip crates/node_binding/rspack.linux-x64-gnu.node
+
+      - name: Binary Size-limit
+        uses: ./.github/actions/binary-limit
+        with:
+          # 50k 50*1024
+          size-threshold: ${{ vars.SIZE_LIMIT_THRESHOLD || 51200 }}

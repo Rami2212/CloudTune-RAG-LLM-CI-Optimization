@@ -1,0 +1,287 @@
+[package]
+name = "ros2-client"
+version = "0.12.1" 
+edition = "2024"
+rust-version = "1.88.0"
+authors = ["Juhana Helovuo <juhana.helovuo@atostek.com>"]
+description = "ROS2 client library based on RustDDS"
+readme = "README.md"
+keywords = ["network","protocol","dds","rtps"]
+license = "Apache-2.0"
+homepage = "https://atostek.com/en/products/rustdds/"  
+repository = "https://github.com/Atostek/ros2-client/"
+categories = ["network-programming", "science::robotics"]
+
+# Examples are declared explicitly (below) rather than auto-discovered, so each
+# can carry `required-features`. The bundled examples use the DDS backend API;
+# they are gated on `dds` so a `--no-default-features --features zenoh` build of
+# `--examples` skips them instead of failing. The `zenoh` backend has its own
+# example, `zenoh_demo`.
+autoexamples = false
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+
+# ---------------------------------------------------------------------------
+# Middleware backend selection. See
+# docs/decisions/0002-dual-backend-compile-time-feature-selection.md
+#
+# At least one backend must be enabled; `dds` and `zenoh` may be enabled
+# together. Dual-backend entity APIs are namespaced under `dds::` / `zenoh::`
+# (ADR-0002 / ADR-0010).
+# Build the Zenoh backend with:
+#   cargo build --no-default-features --features zenoh
+# ---------------------------------------------------------------------------
+# `dep:rustix` enables rustix's `time` feature. RustDDS always depends on
+# socketpair, which enables only rustix `net`, and rustix 1.1.5's `net` uses
+# `timespec` without compiling that module unless another API feature is on.
+# Drop this once rustix fixes it.
+dds   = ["dep:rustdds", "dep:cdr-encoding-size", "dep:rustix"]
+zenoh = [
+  "dep:zenoh",
+  "dep:zenoh-ext",
+  "dep:cdr-encoding",
+  "dep:byteorder",
+  "dep:xxhash-rust",
+  "dep:sha2",
+]
+
+# declare the existence of "security" feature (Secure ROS 2 support).
+# Security is a DDS-only capability (RustDDS security); it implies `dds`.
+security = [
+  "dds",
+  "rustdds/security", # Requires "security" in RustDDS also
+]
+
+# Synchronous polling (DDS backend only).
+#
+# Both are in the default set, so 0.12 callers keep compiling.
+# `mio_1`: Subscription, Client and Server implement mio 1.2 `event::Source`.
+# Import mio 1.2 as `rustdds::mio1`. RustDDS 0.15 always exposes that API;
+# `rustdds/mio_1` is a no-op kept for feature compatibility.
+# `mio_06`: they implement the mio 0.6 `Evented` trait, as in 0.12.
+# Import mio 0.6 as `rustdds::mio`. This also enables RustDDS's `mio_06`
+# feature. Omit `mio_06` to build without mio 0.6.
+mio_1  = ["dds", "rustdds/mio_1"]
+mio_06 = ["dds", "rustdds/mio_06"]
+
+# ROS 2 distribution selection.
+#
+# Each distribution feature enables all older distribution features, forming an
+# unbroken chain from the highest activated distribution down to `galactic`.
+# This means `cfg!(feature = "X")` is true whenever the build targets distro X
+# *or any newer one*, i.e. it tests "are we at least on distro X?".
+#
+# Enable exactly the distribution you build/run against, e.g.
+#   cargo build --no-default-features --features kilted
+# The default is `jazzy` (a recent LTS); it keeps the modern 16-byte Gid format
+# (see src/gid.rs), because jazzy transitively enables `iron`.
+#
+# Notes:
+#  - The ROS 2/RMW Gid (global identifier) type (src/gid.rs) changed between
+#    Humble and Iron, so the `iron` link is the threshold for the new Gid format.
+#    See https://github.com/ros2/rmw/commit/8995d9faa8ecb39f62cc4e2cb65abb63489ae4c6
+#    Using a wrong Gid format prevents ROS 2 from seeing Nodes published by
+#    ros2-client (`ros2 node list`/`rqt` show nothing) and typically breaks
+#    Services; topic communication may still work.
+#  - `rolling` is not part of the chain; it is handled at run time (see the
+#    ROS_DISTRO check in src/distributions.rs).
+galactic = []
+humble   = ["galactic"]
+iron     = ["humble"]
+jazzy    = ["iron"]
+kilted   = ["jazzy"]
+lyrical  = ["kilted"]
+
+# Default build: the DDS backend on the jazzy distribution, pollable with both
+# mio 1.2 (`mio_1`) and mio 0.6 (`mio_06`).
+default = ["dds", "jazzy", "mio_1", "mio_06"]
+
+
+[dependencies]
+
+# RustDDS backend (feature `dds`). Optional so the `zenoh` backend can be built
+# without pulling RustDDS in.
+# mio 1.2 is always part of RustDDS. Disable its default `mio_06` feature here
+# so this crate's `mio_06` feature is what opts into mio 0.6.
+
+# rustdds = { path = "../RustDDS", default-features = false, optional = true } # dev setting
+rustdds = { version = "0.15.0", optional = true, default-features = false }
+
+# Direct dependency so `derive(CdrEncodingSize)` on `Gid` can see the crate.
+cdr-encoding-size = { version = "^0.5", optional = true }
+
+# Zenoh backend (feature `zenoh`). Optional; only compiled when `zenoh` is
+# enabled. `unstable` is required for liveliness, advanced pub/sub and matching
+# (see docs/zenoh_study/research/zenoh_api.md).
+zenoh     = { version = "1", optional = true, features = ["unstable"] }
+zenoh-ext = { version = "1", optional = true, features = ["unstable"] }
+# Standalone CDR (de)serialization for the Zenoh backend (the DDS backend gets
+# CDR via RustDDS). Same author as RustDDS, so byte output matches (ADR-0003).
+cdr-encoding = { version = "0.11", optional = true }
+byteorder = { version = "1", optional = true } # CDR byte-order selector
+
+# mio and bytes are consumed via the rustdds::mio (0.6), rustdds::mio1 (1.2)
+# and rustdds::bytes re-exports.
+# Feature unification only. See the `mio_1` feature comment.
+rustix = { version = "1.1.5", features = ["time"], optional = true }
+log = "0.4.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_repr = "0.1"
+lazy_static = "1.4.0"
+uuid = { version = "1.3.1", features = ["v4", "serde"] }
+futures = "0.3.28"
+async-channel = "2.3"
+chrono = { version = ">=0.4.35" } # actions need timestamps (0.4.31+ APIs)
+
+
+nom = {version = "8.0.0", features = ["alloc"] } # for msggen
+clap = "4.4.3" # for msggen
+itertools = "0.15.0" # for msggen
+widestring = "1.0" # msggen
+tracing = "0.1.41"
+
+# Entity GID for the Zenoh backend is XXH3-128 of the liveliness key
+# (docs/decisions/0008).
+xxhash-rust = { version = "0.8", features = ["xxh3"], optional = true }
+# REP-2016 `RIHS01_…` type hashes are SHA-256 over a canonical JSON type
+# description (docs/decisions/0007).
+sha2 = { version = "0.11", optional = true }
+
+[dev-dependencies]
+log = "0.4"
+# The Zenoh wire-format spec modules are also unit-tested on non-zenoh builds.
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+sha2 = "0.11"
+pretty_env_logger = "0.5.0"
+# turtle_teleop
+log4rs = "1.2"
+ctrlc = "3.1.6"
+ratatui = "0.30.2"
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+
+# async examples
+smol = "2.0"
+async-io = "2.2.0"
+async-ctrlc = "1.2"
+tokio = { version = "1", features=["rt", "macros", "time", "sync"]}
+
+
+# ---------------------------------------------------------------------------
+# Examples
+# ---------------------------------------------------------------------------
+# DDS-backend examples (the default build). Gated on `dds` so they are skipped
+# on a `zenoh` build rather than failing to compile.
+
+[[example]]
+name = "talker"
+path = "examples/talker/main.rs"
+required-features = ["mio_1"]
+
+[[example]]
+name = "listener"
+path = "examples/listener/main.rs"
+required-features = ["mio_1"]
+
+# The same listener, polled with mio 0.6 (`Evented`).
+[[example]]
+name = "listener_mio_06"
+path = "examples/listener_mio_06/main.rs"
+required-features = ["mio_06"]
+
+[[example]]
+name = "async_talker"
+path = "examples/async_talker/main.rs"
+required-features = ["dds"]
+
+[[example]]
+name = "async_listener"
+path = "examples/async_listener/main.rs"
+required-features = ["dds"]
+
+[[example]]
+name = "async_smart_talker"
+path = "examples/async_smart_talker/main.rs"
+required-features = ["dds"]
+
+[[example]]
+name = "async_service_client"
+path = "examples/async_service_client/main.rs"
+required-features = ["dds"]
+
+[[example]]
+name = "async_service_server"
+path = "examples/async_service_server/main.rs"
+required-features = ["dds"]
+
+[[example]]
+name = "ros2_service_client"
+path = "examples/ros2_service_client/main.rs"
+required-features = ["mio_1"]
+
+[[example]]
+name = "ros2_service_server"
+path = "examples/ros2_service_server/main.rs"
+required-features = ["mio_1"]
+
+[[example]]
+name = "minimal_action_client"
+path = "examples/minimal_action_client/main.rs"
+required-features = ["dds"]
+
+[[example]]
+name = "minimal_action_server"
+path = "examples/minimal_action_server/main.rs"
+required-features = ["dds"]
+
+[[example]]
+name = "concurrent_action_server"
+path = "examples/concurrent_action_server/main.rs"
+required-features = ["dds"]
+
+[[example]]
+name = "client_get_set_parameters"
+path = "examples/client_get_set_parameters/main.rs"
+required-features = ["dds"]
+
+[[example]]
+name = "client_list_parameters"
+path = "examples/client_list_parameters/main.rs"
+required-features = ["dds"]
+
+[[example]]
+name = "parameter_server"
+path = "examples/parameter_server/main.rs"
+required-features = ["dds"]
+
+[[example]]
+name = "discovery_listener"
+path = "examples/discovery_listener/main.rs"
+required-features = ["dds"]
+
+[[example]]
+name = "time_broadcaster"
+path = "examples/time_broadcaster/main.rs"
+required-features = ["dds"]
+
+[[example]]
+name = "time_reporter"
+path = "examples/time_reporter/main.rs"
+required-features = ["dds"]
+
+[[example]]
+name = "turtle_teleop"
+path = "examples/turtle_teleop/main.rs"
+required-features = ["dds"]
+
+# Zenoh-backend examples.
+[[example]]
+name = "zenoh_demo"
+path = "examples/zenoh_demo/main.rs"
+required-features = ["zenoh"]
+
+[[example]]
+name = "zenoh_interop"
+path = "examples/zenoh_interop/main.rs"
+required-features = ["zenoh"]

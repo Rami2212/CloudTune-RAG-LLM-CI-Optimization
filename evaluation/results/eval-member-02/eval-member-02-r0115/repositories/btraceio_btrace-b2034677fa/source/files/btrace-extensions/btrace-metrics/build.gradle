@@ -1,0 +1,43 @@
+plugins {
+    id 'io.btrace.extension'
+    alias(libs.plugins.shadow)
+}
+
+compileJava {
+    sourceCompatibility = 8
+    targetCompatibility = 8
+    javaCompiler = javaToolchains.compilerFor {
+        languageVersion.set(JavaLanguageVersion.of(11))
+    }
+}
+
+btraceExtension {
+    id = 'btrace-metrics'
+    name = 'BTrace HDR Histogram'
+    description = 'High-performance metrics using HdrHistogram for accurate percentile tracking'
+    services = ['io.btrace.metrics.MetricsService']
+    shadedPackages = [
+        'org.HdrHistogram': 'io.btrace.metrics.shaded.hdrhistogram',
+        'com.clearspring.analytics': 'io.btrace.metrics.shaded.clearspring'
+    ]
+    // Strict lint is enabled by default; API exposes builders instead of public constructors
+}
+
+dependencies {
+    // API dependencies (no legacy services API)
+    apiCompileOnly 'org.jetbrains:annotations:26.1.0'
+    apiCompileOnly project(':btrace-core')
+    implCompileOnly 'org.jetbrains:annotations:26.1.0'
+
+    // Implementation dependencies (will be shaded)
+    implImplementation project(':btrace-core')
+    implImplementation libs.hdrhistogram
+    implImplementation libs.stream.lib
+
+    testImplementation libs.junit.jupiter
+    testImplementation libs.hdrhistogram
+}
+
+test {
+    useJUnitPlatform()
+}

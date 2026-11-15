@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Many color libraries just need this variable to be set to any value.
+  # Set it to 3 to support 8-bit color graphics (256 colors per channel)
+  # for libraries that care about the value set.
+  FORCE_COLOR: 3
+
+jobs:
+  lint:
+    name: Format
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v7
+        with:
+          # The newest Python the checks run on, not "3.x": pylint has to
+          # import vtk, whose wheels reach a new Python release late.
+          python-version: "3.14"
+
+      - uses: astral-sh/setup-uv@v10.3.3
+
+      - uses: j178/prek-action@v2
+
+      - name: Run Pylint
+        run: uvx nox -s pylint -- --output-format=github
+
+  checks:
+    name: Check Python ${{ matrix.python-version }} on ${{ matrix.runs-on }}
+    runs-on: ${{ matrix.runs-on }}
+    permissions:
+      contents: read
+    env:
+      # Pin the interpreter uv resolves to, instead of letting it discover one
+      # off PATH -- a mismatch here would silently test the same version twice.
+      UV_PYTHON: ${{ matrix.python-version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.14"]
+        # macOS on Apple Silicon only: magpylib is pure Python, and the Intel
+        # runner -- GitHub's last, retired in fall 2027 -- took twice as long
+        # as any other job.
+        runs-on: [ubuntu-latest, windows-latest, macos-latest]
+
+        # include:
+        #   - python-version: "pypy-3.11"
+        #     runs-on: ubuntu-latest
+        # Note: Commented out because it fails tests for pyvista due to vtk wheels
+
+    steps:
+      - name: Setup headless display
+        uses: pyvista/setup-headless-display-action@v5
+
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install OpenBLAS
+        if: runner.os == 'Linux' && startsWith(matrix.python-version, 'pypy')
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
+
+      - uses: astral-sh/setup-uv@v10.3.3
+
+      - name: Install package
+        run: uv sync
+
+      - name: Test package
+        run: >-
+          uv run pytest -ra --cov --cov-report=xml --cov-report=term
+          --durations=20
+
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      # A run of its own: collecting src/ next to tests/ imports pyvista
+      # before test_show_with_missing_pyvista can hide it.
+      - name: Test docstring examples
+        run: uv run pytest --doctest-modules src/magpylib -q
+
+  pass:
+    if: always()
+    needs: [lint, checks]
+    runs-on: ubuntu-slim
+    timeout-minutes: 2
+    steps:
+      - name: Decide whether the needed jobs succeeded or failed
+        uses: re-actors/alls-green@release/v1
+        with:
+          jobs: ${{ toJSON(needs) }}

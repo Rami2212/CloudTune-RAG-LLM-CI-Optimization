@@ -1,0 +1,121 @@
+name: Cryptol
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+"
+    branches: [master, "release-**"]
+  pull_request:
+  schedule:
+    - cron: "0 10 * * *" # 10am UTC -> 2/3am PST
+  workflow_dispatch:
+
+jobs:
+  config:
+    runs-on: ubuntu-24.04
+    outputs:
+      name: ${{ steps.config.outputs.name }}
+      version: ${{ steps.config.outputs.version }}
+      event-tag: ${{ steps.config.outputs.tag }}
+      event-schedule: ${{ steps.config.outputs.schedule }}
+      release: ${{ steps.config.outputs.release }}
+      retention-days: ${{ steps.config.outputs.retention-days }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: config
+        id: config
+        env:
+          EVENT_TAG: ${{ startsWith(github.event.ref, 'refs/tags/') }}
+          EVENT_SCHEDULE: ${{ github.event_name == 'schedule' }}
+          EVENT_DISPATCH: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          set -x
+          .github/ci.sh output name cryptol-$(.github/ci.sh ver)
+          .github/ci.sh output version $(.github/ci.sh ver)
+          .github/ci.sh output tag $EVENT_TAG
+          .github/ci.sh output schedule $EVENT_SCHEDULE
+          RELEASE=$( \
+            [[ "refs/heads/release-$(.github/ci.sh ver)" == "${{ github.event.ref }}" ]] && \
+            [[ "refs/heads/release-$(git describe --tags --abbrev=0)" == "${{ github.event.ref }}" ]] && \
+            echo true || echo false)
+          .github/ci.sh output release $RELEASE
+          .github/ci.sh output retention-days $($RELEASE && echo 90 || echo 5)
+
+  platform:
+    needs: [config]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Run the full test suite on the primary Linux configuration.
+          - os: ubuntu-24.04
+            ghc-version: 9.8.4
+            test-kind: full
+          # Build with the other supported GHC versions, but do not repeat tests.
+          - os: ubuntu-24.04
+            ghc-version: 9.6.7
+            test-kind: none
+          - os: ubuntu-24.04
+            ghc-version: 9.12.2
+            test-kind: none
+          # Keep coverage of an older Ubuntu LTS release.
+          - os: ubuntu-22.04
+            ghc-version: 9.8.4
+            test-kind: none
+          # Test the supported Windows and AArch64 macOS builds.
+          - os: windows-2022
+            ghc-version: 9.8.4
+            test-kind: test-lib
+          - os: macos-15
+            ghc-version: 9.8.4
+            test-kind: test-lib
+          # Also produce an x86-64 macOS distribution.
+          - os: macos-15-intel
+            ghc-version: 9.8.4
+            test-kind: none
+    uses: ./.github/workflows/ci-platform.yml
+    with:
+      os: ${{ matrix.os }}
+      ghc-version: ${{ matrix.ghc-version }}
+      cabal: 3.14.1.0
+      test-kind: ${{ matrix.test-kind }}
+      # The solver package snapshot date. If you update this, make sure to also
+      # update it in the following locations:
+      #
+      # - Dockerfile
+      # - cryptol-remote-api/Dockerfile
+      # - README.md
+      # - dev/dev_setup.sh
+      solver-pkg-version: snapshot-20260622
+      name: ${{ needs.config.outputs.name }}
+      version: ${{ needs.config.outputs.version }}
+      release: ${{ needs.config.outputs.release }}
+      event-tag: ${{ needs.config.outputs.event-tag }}
+      retention-days: ${{ fromJSON(needs.config.outputs.retention-days) }}
+    secrets:
+      APPLE_P12_CERTIFICATE: ${{ secrets.APPLE_P12_CERTIFICATE }}
+      APPLE_P12_PASSWORD: ${{ secrets.APPLE_P12_PASSWORD }}
+      APPLE_P12_IDENTITY_NAME: ${{ secrets.APPLE_P12_IDENTITY_NAME }}
+      APPLE_P8_KEY_ID: ${{ secrets.APPLE_P8_KEY_ID }}
+      APPLE_P8_ISSUER_ID: ${{ secrets.APPLE_P8_ISSUER_ID }}
+      APPLE_P8_API_KEY: ${{ secrets.APPLE_P8_API_KEY }}
+      SIGNING_PASSPHRASE: ${{ secrets.SIGNING_PASSPHRASE }}
+      SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+
+  build-push-image:
+    needs: [config]
+    # Do not run this on forks. It seems that you can't stop scheduled
+    # jobs from also running in forks. See
+    # https://github.com/orgs/community/discussions/16109.
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.config.outputs.release == 'true') &&
+        github.repository_owner == 'GaloisInc' &&
+        github.actor != 'dependabot[bot]'
+    uses: ./.github/workflows/ci-images.yml
+    with:
+      version: ${{ needs.config.outputs.version }}
+      release: ${{ needs.config.outputs.release }}
+      event-schedule: ${{ needs.config.outputs.event-schedule }}

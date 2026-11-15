@@ -1,0 +1,257 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+<!--
+
+    Licensed to the Apache Software Foundation (ASF) under one or more
+    contributor license agreements. See the NOTICE file distributed with
+    this work for additional information regarding copyright ownership.
+    The ASF licenses this file to You under the Apache License, Version
+    2.0 (the "License"); you may not use this file except in compliance
+    with the License. You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0 Unless required by
+    applicable law or agreed to in writing, software distributed under the
+    License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+    CONDITIONS OF ANY KIND, either express or implied. See the License for
+    the specific language governing permissions and limitations under the
+    License.
+-->
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.apache</groupId>
+        <artifactId>apache</artifactId>
+        <version>34</version>
+    </parent>
+
+    <groupId>org.apache.tomcat</groupId>
+    <artifactId>tomcat-owb</artifactId>
+    <name>Apache Tomcat CDI 4.1 support</name>
+    <description>Apache Tomcat CDI 4.1 support using Apache OpenWebBeans</description>
+    <!-- This is the Apache OpenWebBeans version -->
+    <version>4.1.1</version>
+    <packaging>jar</packaging>
+
+    <properties>
+        <jakarta-inject.version>2.0.1</jakarta-inject.version>
+        <jakarta-interceptor.version>2.2.0</jakarta-interceptor.version>
+        <jakarta-enterprise-cdi.version>4.1.0</jakarta-enterprise-cdi.version>
+        <jakarta-annotation-api.version>3.0.0</jakarta-annotation-api.version>
+        <jakarta-el.version>6.0.1</jakarta-el.version>
+        <tomcat.version>12.0.0-SNAPSHOT</tomcat.version>
+        <junit.version>5.11.4</junit.version>
+        <ecj.version>3.41.0</ecj.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>jakarta.inject</groupId>
+            <artifactId>jakarta.inject-api</artifactId>
+            <version>${jakarta-inject.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>jakarta.interceptor</groupId>
+            <artifactId>jakarta.interceptor-api</artifactId>
+            <version>${jakarta-interceptor.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>jakarta.enterprise</groupId>
+            <artifactId>jakarta.enterprise.cdi-api</artifactId>
+            <version>${jakarta-enterprise-cdi.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>jakarta.annotation</groupId>
+            <artifactId>jakarta.annotation-api</artifactId>
+            <version>${jakarta-annotation-api.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <!-- Apache OpenWebBeans -->
+        <dependency>
+            <groupId>org.apache.openwebbeans</groupId>
+            <artifactId>openwebbeans-spi</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.openwebbeans</groupId>
+            <artifactId>openwebbeans-impl</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.openwebbeans</groupId>
+            <artifactId>openwebbeans-web</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.openwebbeans</groupId>
+            <artifactId>openwebbeans-el22</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <!-- Allows building integration code, temporarily located here -->
+        <dependency>
+            <groupId>org.apache.tomcat</groupId>
+            <artifactId>tomcat-catalina</artifactId>
+            <version>${tomcat.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <!-- Test dependencies -->
+        <dependency>
+            <groupId>jakarta.el</groupId>
+            <artifactId>jakarta.el-api</artifactId>
+            <version>${jakarta-el.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.tomcat.embed</groupId>
+            <artifactId>tomcat-embed-el</artifactId>
+            <version>${tomcat.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.tomcat.embed</groupId>
+            <artifactId>tomcat-embed-jasper</artifactId>
+            <version>${tomcat.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.eclipse.jdt</groupId>
+            <artifactId>ecj</artifactId>
+            <version>${ecj.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <release>21</release>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <configuration>
+                    <!-- Always rebuild the unshaded JAR before shading so that
+                         repeated builds do not shade the previously shaded JAR. -->
+                    <forceCreation>true</forceCreation>
+                </configuration>
+            </plugin>
+            <!-- Create an empty directory used to keep target/classes off the
+                 integration test runtime classpath. The tests must run against
+                 the shaded JAR. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-antrun-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>create-empty-classes-dir</id>
+                        <phase>pre-integration-test</phase>
+                        <goals>
+                            <goal>run</goal>
+                        </goals>
+                        <configuration>
+                            <target>
+                                <mkdir dir="${project.build.directory}/empty-classes"/>
+                            </target>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ApacheLicenseResourceTransformer"/>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ApacheNoticeResourceTransformer"/>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.properties.OpenWebBeansPropertiesTransformer"/>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer" />
+                            </transformers>
+                            <artifactSet>
+                                <excludes>
+                                    <!-- Already present in Tomcat -->
+                                    <exclude>jakarta.el:*</exclude>
+                                </excludes>
+                            </artifactSet>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/DEPENDENCIES</exclude>
+                                        <exclude>META-INF/LICENSE.txt</exclude>
+                                        <exclude>META-INF/LICENSE</exclude>
+                                        <exclude>META-INF/MANIFEST.MF</exclude>
+                                        <exclude>META-INF/NOTICE.txt</exclude>
+                                        <exclude>META-INF/NOTICE</exclude>
+                                        <!-- Unneeded configuration files -->
+                                        <exclude>module-info.class</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <!-- Integration tests use embedded Tomcat. They run after the
+                 shade plugin has produced the deployable JAR. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>integration-test</goal>
+                            <goal>verify</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <!-- Required by the optional classloader leak checks. -->
+                    <argLine>--add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.rmi/sun.rmi.transport=ALL-UNNAMED</argLine>
+                    <!-- Test the shaded JAR rather than the unshaded classes -->
+                    <classesDirectory>${project.build.directory}/empty-classes</classesDirectory>
+                    <additionalClasspathElements>
+                        <additionalClasspathElement>${project.build.directory}/${project.build.finalName}.jar</additionalClasspathElement>
+                    </additionalClasspathElements>
+                    <!-- Remove unshaded copies of the classes contained in the
+                         shaded JAR so the test validates the deployable JAR. -->
+                    <classpathDependencyExcludes>
+                        <classpathDependencyExclude>org.apache.openwebbeans:openwebbeans-spi</classpathDependencyExclude>
+                        <classpathDependencyExclude>org.apache.openwebbeans:openwebbeans-impl</classpathDependencyExclude>
+                        <classpathDependencyExclude>org.apache.openwebbeans:openwebbeans-web</classpathDependencyExclude>
+                        <classpathDependencyExclude>org.apache.openwebbeans:openwebbeans-el22</classpathDependencyExclude>
+                        <classpathDependencyExclude>org.apache.xbean:xbean-finder-shaded</classpathDependencyExclude>
+                        <classpathDependencyExclude>org.apache.xbean:xbean-asm9-shaded</classpathDependencyExclude>
+                        <classpathDependencyExclude>jakarta.enterprise:jakarta.enterprise.cdi-api</classpathDependencyExclude>
+                        <classpathDependencyExclude>jakarta.enterprise:jakarta.enterprise.lang-model</classpathDependencyExclude>
+                        <classpathDependencyExclude>jakarta.inject:jakarta.inject-api</classpathDependencyExclude>
+                        <classpathDependencyExclude>jakarta.interceptor:jakarta.interceptor-api</classpathDependencyExclude>
+                        <classpathDependencyExclude>jakarta.annotation:jakarta.annotation-api</classpathDependencyExclude>
+                    </classpathDependencyExcludes>
+                    <!-- Test webapp templates and the shaded JAR are passed to
+                         the test JVM explicitly; target/classes is not used. -->
+                    <systemPropertyVariables>
+                        <owb.test.webapp.root>${project.basedir}/src/test/webapp</owb.test.webapp.root>
+                        <owb.test.jar>${project.build.directory}/${project.build.finalName}.jar</owb.test.jar>
+                    </systemPropertyVariables>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

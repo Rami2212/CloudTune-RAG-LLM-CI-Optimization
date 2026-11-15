@@ -1,0 +1,372 @@
+[workspace]
+resolver = "3"
+
+exclude = [
+    "sdk/ika-wasm",
+]
+
+members = [
+    "crates/dwallet-mpc-centralized-party",
+    "crates/dwallet-mpc-types",
+    "crates/dwallet-classgroups-types",
+    "crates/ika",
+    "crates/ika-config",
+    "crates/ika-core",
+    "crates/ika-node",
+    "crates/ika-sui-client",
+    "crates/ika-protocol-config",
+    "crates/ika-protocol-config-macros",
+    "crates/ika-proxy",
+    "crates/ika-swarm",
+    "crates/ika-swarm-config",
+    "crates/ika-telemetry",
+    "crates/ika-types",
+    "crates/ika-move-contracts",
+    "crates/ika-network",
+    "crates/ika-archival",
+    "crates/ika-test-cluster",
+    "crates/ika-upgrade-test",
+]
+[workspace.package]
+# This version string will be inherited by ika-core, ika-node, ika-tools, and ika crates.
+version = "1.4.5"
+
+[profile.release]
+# debug = 1 means line charts only, which is minimum needed for good stack traces
+debug = 1
+# Write debug info into a separate file.
+split-debuginfo = 'packed'
+# Without stripping, ika binary size would be > 1GB.
+strip = 'debuginfo'
+# Exit process with SIGABRT when any thread panics
+panic = 'abort'
+
+# Same as release, but build binary with debug symbols (binary size will be ~ 1GB).
+[profile.release-dbgsym]
+inherits = "release"
+split-debuginfo = 'off'
+strip = 'none'
+
+# Inherits from the release profile above.
+[profile.bench]
+# For convenience.
+strip = 'none'
+
+[profile.test.package.move-compiler]
+# opt-level 2 for move-compiler reduces the size of some of its
+# (recursive) stack frames by up to 10x, avoiding stack overflows.
+opt-level = 2
+
+[profile.simulator]
+inherits = "test"
+# Match `--release` for the simulator profile: class-groups crypto is
+# unusable under debug-assertions / overflow-checks even at opt-level 3.
+# Keep line-table debuginfo for backtraces.
+debug = 1
+debug-assertions = false
+overflow-checks = false
+opt-level = 3
+
+[workspace.lints.rust]
+# CLAUDE.md's "NEVER use unsafe" as a compile error, not a request.
+unsafe_code = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(msim)',
+    'cfg(fail_points)',
+] }
+
+# Dependencies that should be kept in sync through the whole workspace
+[workspace.dependencies]
+# Keep the same Git source and revision as inkrypto for shared bigint types.
+# Stable curve crates independently use the registry crypto-bigint 0.7.5.
+crypto-bigint = { git = "https://github.com/ycscaly/crypto-bigint.git", rev = "c6a32050", default-features = false, features = ["serde"] }
+
+mpc = { git = "https://github.com/dwallet-labs/inkrypto", rev = "8347fd40eb8d95ee6a1f59a0813381b3d81f62c3"}
+proof = { git = "https://github.com/dwallet-labs/inkrypto", rev = "8347fd40eb8d95ee6a1f59a0813381b3d81f62c3"}
+# NOTE: the `parallel` (rayon) feature on class_groups/twopc_mpc is enabled per
+# crate under `[target.'cfg(not(msim))'.dependencies]` (see dwallet-classgroups-types
+# and ika-core), NOT here — workspace-dependency features are inherited regardless of
+# cfg, so enabling `parallel` here would leak rayon into `cargo simtest` (cfg msim),
+# whose rayon workers have no msim node context and break determinism / panic.
+class_groups = { git = "https://github.com/dwallet-labs/inkrypto", rev = "8347fd40eb8d95ee6a1f59a0813381b3d81f62c3", features = ["threshold"] }
+commitment = { git = "https://github.com/dwallet-labs/inkrypto", rev = "8347fd40eb8d95ee6a1f59a0813381b3d81f62c3" }
+twopc_mpc = { git = "https://github.com/dwallet-labs/inkrypto", rev = "8347fd40eb8d95ee6a1f59a0813381b3d81f62c3"}
+group = { git = "https://github.com/dwallet-labs/inkrypto", features = ["os_rng"], rev = "8347fd40eb8d95ee6a1f59a0813381b3d81f62c3"}
+homomorphic_encryption = { git = "https://github.com/dwallet-labs/inkrypto", rev = "8347fd40eb8d95ee6a1f59a0813381b3d81f62c3"}
+
+k256 = { version = "0.14.0", default-features = false }
+p256 = { version = "0.14.0", default-features = false }
+curve25519-dalek = { version = "5.0.0", features = ["rand_core"] }
+
+anyhow = "1.0.71"
+arc-swap = { version = "1.5.1", features = ["serde"] }
+assert_cmd = "2.0.6"
+async-trait = "0.1.61"
+axum = { version = "0.8", default-features = false, features = [
+    "macros",
+    "tokio",
+    "http1",
+    "http2",
+    "json",
+    "matched-path",
+    "original-uri",
+    "form",
+    "query",
+    "ws",
+] }
+axum-extra = { version = "0.12.5", features = ["typed-header"] }
+axum-server = { version = "0.8", default-features = false, features = [
+    "tls-rustls-no-provider",
+] }
+backoff = { version = "0.4.0", features = [
+    "futures",
+    "futures-core",
+    "pin-project-lite",
+    "tokio",
+    "tokio_1",
+] }
+base64 = "0.23.1"
+bcs = "0.2.1"
+byteorder = "1.4.3"
+bytes = { version = "1.5.0", features = ["serde"] }
+cached = "0.43.0"
+chrono = { version = "0.4.39", features = ["clock", "serde"] }
+clap = { version = "4.4", features = ["derive", "wrap_help"] }
+clap_complete = "4.4"
+const-str = "1.0.0"
+colored = "3.0.0"
+count-min-sketch = "0.1.7"
+criterion = { version = "0.8.1", features = [
+    "async",
+    "async_tokio",
+    "html_reports",
+] }
+dashmap = "5.5.3"
+# datatest-stable = "0.1.2"
+datatest-stable = { git = "https://github.com/nextest-rs/datatest-stable.git", rev = "72db7f6d1bbe36a5407e96b9488a581f763e106f" }
+derive_more = "2.0.1"
+dirs = "6.0.0"
+ed25519 = { version = "3.0.0", features = ["pkcs8", "alloc", "zeroize"] }
+ed25519-consensus = { version = "2.0.1", features = ["serde"] }
+either = "1.8.0"
+enum_dispatch = "^0.3"
+expect-test = "1.4.0"
+eyre = "0.6.8"
+flate2 = "1.0.28"
+fs_extra = "1.3.0"
+futures = "0.3.28"
+governor = "0.6.3"
+hex = "0.4.3"
+http = "1"
+humantime = "2.1.0"
+hyper = "1"
+im = "15"
+indexmap = { version = "2.1.0", features = ["serde"] }
+indicatif = "0.18.0"
+insta = { version = "1.21.1", features = ["redactions", "yaml", "json"] }
+itertools = "0.15.0"
+tikv-jemalloc-ctl = "0.5.4"
+# `background_threads` bakes `background_thread:true` into the compiled-in
+# jemalloc malloc_conf so the allocator runs a background purger that proactively
+# returns freed pages to the OS. Without it (jemalloc's default) freed memory —
+# e.g. the transient class-groups MPC working set — is retained as per-arena
+# dirty pages and RSS plateaus at the high-water mark. Supported on every target
+# ika ships (only `musl` is unsupported, and that degrades to a build warning,
+# not an error, because `background_threads_runtime_support` stays enabled).
+tikv-jemallocator = { version = "0.5", features = ["profiling", "disable_initial_exec_tls", "background_threads"] }
+lru = "0.18.2"
+merlin = { version = "3", default-features = false }
+miette = { version = "7", features = ["fancy"] }
+mockall = "0.15.0"
+mime = "0.3"
+moka = { version = "0.12", default-features = false, features = [
+    "sync",
+    "atomic64",
+] }
+more-asserts = "0.3.1"
+msim = { git = "https://github.com/MystenLabs/mysten-sim.git", rev = "6b8e1e8cdce408e73d46538773fc85a56c082db7", package = "msim" }
+multiaddr = "0.18.2"
+nonempty = "0.12.0"
+num-bigint = "0.4.6"
+num_cpus = "1.15.0"
+num_enum = "0.7.4"
+object_store = { version = "0.13.0", features = [
+    "aws",
+    "gcp",
+    "azure",
+    "http",
+] }
+once_cell = "1.18.0"
+parking_lot = "0.12.5"
+pprof = { version = "0.15.0", features = ["cpp", "frame-pointer"] }
+pretty_assertions = "1.3.0"
+proc-macro2 = "1.0.47"
+prometheus = { version = "0.14", features = ["protobuf"] }
+quote = "1.0.23"
+rand = "0.9"
+rand_chacha = { version = "0.9", default-features = false }
+rand_core = { version = "0.9", default-features = false }
+prost = "0.14.3"
+prost-build = "0.14.3"
+prost-types = "0.14.3"
+rayon = "1.11.0"
+protobuf = { version = "3.7", features = ["with-bytes"] }
+regex = "1.7.1"
+reqwest = { version = "0.13.4", default-features = false, features = [
+    "http2",
+    "json",
+    "rustls",
+] }
+sha2 = "0.11.1"
+sysinfo = "0.39.6"
+roaring = "0.11.1"
+rstest = "0.25.0"
+rustls-pemfile = "2"
+schemars = { version = "0.8.21", features = ["either"] }
+scopeguard = "1.1"
+serde = { version = "1.0.144", features = ["derive", "rc"] }
+serde-env = "0.3.0"
+rustls = { version = "0.23", default-features = false, features = [
+    "std",
+    "tls12",
+    "ring",
+] }
+serde-name = "0.3.0"
+serde-reflection = "0.5.0"
+serde_json = { version = "1.0.95", features = ["preserve_order"] }
+serde_repr = "0.1"
+serde_with = "3.17"
+serde_yaml = "0.9.34+deprecated"
+signature = "3.0.0"
+static_assertions = "1.1.0"
+strum = { version = "0.28.0", features = ["derive"] }
+strum_macros = "0.28.0"
+snap = "1.1.0"
+syn = { version = "3.0.3", features = ["full", "derive", "extra-traits"] }
+tap = "1.0.1"
+tempfile = "3.20.0"
+test-fuzz = "7.2.0"
+thiserror = "2.0.12"
+# Pinned exact: simtest patches `tokio` (and `futures-timer`) to mysten-sim's
+# msim-tokio, which ships this exact version. The mysten-sim rev that ships it
+# lives in scripts/simtest/cargo-simtest and tracks the Sui tag — when bumping
+# Sui, update that rev too (and keep this version matching its msim-tokio).
+tokio = "=1.52.1"
+toml_edit = "0.25"
+tokio-retry = "0.3"
+tokio-stream = { version = "0.1.14", features = ["sync", "net"] }
+tonic = { version = "0.14.2", features = [
+    "zstd",
+    "transport",
+    "tls-webpki-roots",
+] }
+tonic-build = { version = "0.14.2", features = ["prost", "transport"] }
+tonic-health = "0.14.2"
+tower = { version = "0.5", features = [
+    "full",
+    "util",
+    "timeout",
+    "load-shed",
+    "limit",
+] }
+twox-hash = "2.1.1"
+tower-http = { version = "0.7.0", features = ["cors", "full", "trace", "set-header", "propagate-header"] }
+tracing = "0.1.37"
+url = "2.3.1"
+zeroize = "1.6.0"
+shlex = "1.3.0"
+
+lazy_static = "1.5.0"
+
+# Move dependencies
+move-binary-format = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+move-bytecode-utils = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+move-compiler = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+move-package = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+move-package-compilation = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+move-symbol-pool = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+move-core-types = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+
+
+fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "da61cd46013fdd65361e57f7b9d4ae2244f86430" }
+fastcrypto-tbls = { git = "https://github.com/MystenLabs/fastcrypto", rev = "da61cd46013fdd65361e57f7b9d4ae2244f86430" }
+fastcrypto-zkp = { git = "https://github.com/MystenLabs/fastcrypto", rev = "da61cd46013fdd65361e57f7b9d4ae2244f86430", package = "fastcrypto-zkp" }
+
+# anemo dependencies
+anemo = { git = "https://github.com/mystenlabs/anemo.git", rev = "68adc31d4ea1f4573f08c2c75317fcb205b823de" }
+anemo-build = { git = "https://github.com/mystenlabs/anemo.git", rev = "68adc31d4ea1f4573f08c2c75317fcb205b823de" }
+anemo-tower = { git = "https://github.com/mystenlabs/anemo.git", rev = "68adc31d4ea1f4573f08c2c75317fcb205b823de" }
+
+### Sui Members ###
+bin-version =  { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+mysten-common = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+mysten-metrics = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+mysten-network = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+mysten-service = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+shared-crypto = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+sui = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+sui-config = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+sui-faucet = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+sui-indexer = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+sui-json = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+sui-keys = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+sui-light-client = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+sui-macros = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+sui-metrics-push-client = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+sui-move = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+sui-move-build = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+sui-package-management = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+sui-protocol-config = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+sui-protocol-config-macros = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+sui-sdk = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+# Client, proto, BCS types, and transaction builder used by Ika's Sui-facing
+# paths. Pin all crates to the sui-rust-sdk revision that
+# sui@mainnet-v1.83.1 itself depends on, so there is exactly one copy of each
+# SDK crate in the dependency graph.
+sui-rpc = { git = "https://github.com/MystenLabs/sui-rust-sdk.git", rev = "8c356d65b1c324590a3fd25990c382af308ea545" }
+sui-crypto = { git = "https://github.com/MystenLabs/sui-rust-sdk.git", rev = "8c356d65b1c324590a3fd25990c382af308ea545", features = ["ed25519", "secp256k1", "secp256r1"] }
+sui-sdk-types = { git = "https://github.com/MystenLabs/sui-rust-sdk.git", rev = "8c356d65b1c324590a3fd25990c382af308ea545" }
+sui-transaction-builder = { git = "https://github.com/MystenLabs/sui-rust-sdk.git", rev = "8c356d65b1c324590a3fd25990c382af308ea545" }
+sui-simulator = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+sui-storage = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+sui-swarm = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+sui-swarm-config = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+sui-test-transaction-builder = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+sui-tls = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+sui-transaction-checks = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+sui-types = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+telemetry-subscribers = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+test-cluster = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+typed-store = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+typed-store-error = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+
+consensus-config = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+consensus-core = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+consensus-types = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.83.1" }
+
+### Workspace Members ###
+dwallet-rng = { path = "crates/dwallet-rng" }
+dwallet-mpc-centralized-party = { path = "crates/dwallet-mpc-centralized-party" }
+dwallet-mpc-types = { path = "crates/dwallet-mpc-types"}
+dwallet-classgroups-types = { path = "crates/dwallet-classgroups-types"}
+ika = { path = "crates/ika" }
+ika-config = { path = "crates/ika-config" }
+ika-core = { path = "crates/ika-core" }
+ika-node = { path = "crates/ika-node" }
+ika-sui-client = { path = "crates/ika-sui-client" }
+ika-porxy = { path = "crates/ika-proxy" }
+ika-protocol-config = { path = "crates/ika-protocol-config" }
+ika-swarm = { path = "crates/ika-swarm" }
+ika-swarm-config = { path = "crates/ika-swarm-config" }
+ika-telemetry = { path = "crates/ika-telemetry" }
+ika-types = { path = "crates/ika-types" }
+ika-move-contracts = { path = "crates/ika-move-contracts" }
+ika-network = { path = "crates/ika-network" }
+ika-archival = { path = "crates/ika-archival" }
+ika-test-cluster = { path = "crates/ika-test-cluster" }
+ika-upgrade-test = { path = "crates/ika-upgrade-test" }
+
+[patch.crates-io]
+async-graphql = { git = "https://github.com/amnn/async-graphql", branch = "v7.0.1-react-18-graphiql-4" }
+async-graphql-axum = { git = "https://github.com/amnn/async-graphql", branch = "v7.0.1-react-18-graphiql-4" }
+async-graphql-value = { git = "https://github.com/amnn/async-graphql", branch = "v7.0.1-react-18-graphiql-4" }

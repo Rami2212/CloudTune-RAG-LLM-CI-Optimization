@@ -1,0 +1,133 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 3 optimizations:
+# - [MEDIUM] Add concurrency group to "ci.yml"
+# - [MEDIUM] 7 jobs clone the repo — consider artifact sharing
+# - [LOW] Use shallow clone in "release-test" job
+# Estimated savings: ~3 min/run
+#
+name: ci
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  gofmt:
+    name: Go Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+      - name: Check Go formatting
+        run: |
+          if [ -n "$(gofmt -s -l .)" ]; then
+            echo "Go code is not formatted. Please run 'gofmt -s -w .'"
+            gofmt -s -d .
+            exit 1
+          fi
+
+  golangci-lint:
+    name: Go Linting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: latest
+          args: --timeout=5m
+
+  go-fix:
+    name: Go Fix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+      - name: Check for suspicious constructs or opportunities for improvement
+        run: go fix -diff ./...
+
+  go-mod-tidy:
+    name: Go Modules Tidy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+      - name: Check if go.mod/go.sum are tidy
+        run: go mod tidy -diff
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+      - name: Test
+        run: go test -v -short ./...
+
+  release-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+      - uses: anchore/sbom-action/download-syft@v0
+      - name: Install GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          install-only: true
+      - name: Check release (dry-run)
+        run: |
+          goreleaser release --snapshot --clean --skip publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GORELEASER_GITHUB_ACCESS_TOKEN }}
+
+  integration-test:
+    runs-on: ubuntu-latest
+    container:
+      image: rootsdev/trellis-cli-dev
+    steps:
+      - run: go version
+      - run: ansible --version
+      - name: Trellis version
+        run: git log -1 --format="%h %s %aD"
+        working-directory: /test/dummy/trellis
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+      - name: Tests
+        run: make test RUN=
+      - name: Store artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: trellis-cli
+          path: /test/trellis-cli

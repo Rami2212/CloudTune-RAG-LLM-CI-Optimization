@@ -1,0 +1,93 @@
+---
+name: Repository dispatch on push or release
+on:
+  push:
+    paths:
+      - "frontend/**"
+      - "backend/**"
+      - "Taskfile.yaml"
+      - "taskfiles/**"
+      - '.github/workflows/repository-dispatch.yml'
+      - '.github/workflows/backend-lint-test.yml'
+      - '.github/workflows/frontend-verify.yml'
+      - 'test-images.json'
+    tags:
+      - '*'
+    branches:
+      - '**'
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  id-token: write
+  contents: read
+  statuses: write
+jobs:
+  backend-verify:
+    uses: ./.github/workflows/backend-lint-test.yml
+    permissions:
+      contents: read
+
+  frontend-verify:
+    uses: ./.github/workflows/frontend-verify.yml
+    permissions:
+      contents: read
+
+  dispatch:
+    needs: [backend-verify, frontend-verify]
+    if: "!failure() && !cancelled()"
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-region: ${{ vars.RP_AWS_CRED_REGION }}
+          role-to-assume: arn:aws:iam::${{ secrets.RP_AWS_CRED_ACCOUNT_ID }}:role/${{ vars.RP_AWS_CRED_BASE_ROLE_NAME }}${{ github.event.repository.name }}
+      - uses: aws-actions/aws-secretsmanager-get-secrets@v3
+        with:
+          secret-ids: |
+            ,sdlc/prod/github/actions_bot_token
+          parse-json-secrets: true
+      - name: Repository Dispatch on Release
+        uses: peter-evans/repository-dispatch@v4
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        with:
+          token: ${{ env.ACTIONS_BOT_TOKEN }}
+          repository: redpanda-data/console-enterprise
+          event-type: release
+          client-payload: '{"branch": "master", "commit_sha": "${{ github.sha }}", "tag_name": "${{ github.event.release.tag_name }}"}'
+      - name: Repository Dispatch on push
+        uses: peter-evans/repository-dispatch@v4
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        with:
+          token: ${{ env.ACTIONS_BOT_TOKEN }}
+          repository: redpanda-data/console-enterprise
+          event-type: push
+          client-payload: '{"branch": "${{ github.ref_name }}", "commit_sha": "${{ github.sha }}"}'
+      - name: Trigger docs quickstart tests on release
+        # The docs repo runs its Doc Detective quickstart (which drives the
+        # Console UI end to end) against this Console version, so UI changes
+        # that break documented procedures and screenshots surface at release
+        # time instead of in the docs repo's next daily run. The docs
+        # workflow takes the version as a workflow_dispatch input; it has no
+        # repository_dispatch trigger.
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        env:
+          GH_TOKEN: ${{ env.ACTIONS_BOT_TOKEN }}
+          CONSOLE_VERSION: ${{ github.ref_name }}
+        run: |
+          gh api repos/redpanda-data/docs/actions/workflows/doc-detective-daily.yml/dispatches \
+            -f ref=main -f "inputs[console_version]=${CONSOLE_VERSION}"
+      - name: Set pending enterprise CI status
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ env.ACTIONS_BOT_TOKEN }}
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: 'redpanda-data',
+              repo: 'console',
+              sha: context.sha,
+              state: 'pending',
+              description: 'Enterprise CI is running...',
+              context: 'Enterprise CI'
+            });

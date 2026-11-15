@@ -1,0 +1,106 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - 'docs/**'
+
+  pull_request:
+
+jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-22.04
+    outputs:
+      docs: ${{ steps.filter.outputs.docs }}
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Filter changes
+        id: filter
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            docs:
+              - 'docs/**'
+            code:
+              - '!docs/**'
+
+  test-docs:
+    name: Test Docs
+    needs: changes
+    if: ${{ needs.changes.outputs.docs == 'true' }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+      - name: Set-up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: 'pnpm'
+      - name: Install dependencies
+        run: |
+          cd docs
+          pnpm install
+      - name: Build Docs
+        run: |
+          cd docs
+          pnpm build
+      - name: Skip Coveralls
+        if: ${{ needs.changes.outputs.code != 'true' && !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) }}
+        uses: LouisBrunner/checks-action@v3.1.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          name: coverage/coveralls
+          conclusion: skipped
+          output: |
+            {
+              "title": "",
+              "summary": "Skipped",
+              "text_description": ""
+            }
+
+  test-code:
+    name: Test Code
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: 'pnpm'
+      - name: Install
+        run: pnpm install
+      - name: E2E tests
+        run: pnpm test:all
+      - name: Create coverage
+        run: pnpm coverage:report
+      - name: Coveralls
+        uses: coverallsapp/github-action@master
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: test-report
+          path: |
+            playwright-report/
+            coverage/
+          retention-days: 30

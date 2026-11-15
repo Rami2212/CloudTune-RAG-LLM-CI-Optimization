@@ -1,0 +1,381 @@
+name: Docker Image CI
+on:
+  push:
+    tags: ['v[0-9].[0-9]+.[0-9]+']
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  security-scan-source:
+    name: Security Scan - Source Code & Dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: github.event_name == 'pull_request'
+    steps:
+    - name: Check out code
+      uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3
+
+    - name: Install Grype
+      run: |
+        curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+
+    - name: Scan source code and dependencies
+      run: |
+        echo "🔍 Scanning source code and dependencies for vulnerabilities..."
+        grype dir:. --only-fixed -o table > /tmp/grype-source.txt || true
+
+        SCAN_OUTPUT=$(grype dir:. --only-fixed -o json)
+        CRITICAL=$(echo "$SCAN_OUTPUT" | jq '[.matches[] | select(.vulnerability.severity == "Critical")] | length')
+        HIGH=$(echo "$SCAN_OUTPUT" | jq '[.matches[] | select(.vulnerability.severity == "High")] | length')
+        MEDIUM=$(echo "$SCAN_OUTPUT" | jq '[.matches[] | select(.vulnerability.severity == "Medium")] | length')
+
+        # Create Job Summary with table
+        echo "## 🔒 Security Scan - Source Code & Dependencies" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Severity | Count | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|----------|-------|--------|" >> $GITHUB_STEP_SUMMARY
+        echo "| 🔴 Critical | $CRITICAL | $([ $CRITICAL -eq 0 ] && echo '✅' || echo '⚠️') |" >> $GITHUB_STEP_SUMMARY
+        echo "| 🟠 High | $HIGH | $([ $HIGH -eq 0 ] && echo '✅' || echo '⚠️') |" >> $GITHUB_STEP_SUMMARY
+        echo "| 🟡 Medium | $MEDIUM | $([ $MEDIUM -eq 0 ] && echo '✅' || echo '⚠️') |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        if [ "$CRITICAL" -gt 0 ] || [ "$HIGH" -gt 0 ]; then
+          echo "⚠️ **Found $CRITICAL Critical and $HIGH High vulnerabilities with available fixes**" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "✅ **No Critical or High vulnerabilities found**" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        # Add collapsible full scan results
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "<details>" >> $GITHUB_STEP_SUMMARY
+        echo "<summary>📋 Full Scan Results</summary>" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        cat /tmp/grype-source.txt >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        echo "</details>" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+  build:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        include:
+          - platform: amd64
+            runner: ubuntu-latest
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+    - name: Check out code
+      uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+    - name: Test Build the Docker images
+      if: github.event_name == 'pull_request'
+      run: |
+        ./containers/compile_dockerfile.sh
+        docker buildx build --no-cache \
+          --platform linux/${{ matrix.platform }} \
+          -t quay.io/krkn-chaos/krkn:pr-${{ github.event.pull_request.number }}-${{ matrix.platform }} \
+          -t quay.io/redhat-chaos/krkn:pr-${{ github.event.pull_request.number }}-${{ matrix.platform }} \
+          containers/ \
+          --build-arg PR_NUMBER=${{ github.event.pull_request.number }} \
+          --load
+
+    - name: Install Grype
+      if: github.event_name == 'pull_request'
+      run: |
+        curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+
+    - name: Scan Docker image for vulnerabilities
+      if: github.event_name == 'pull_request'
+      run: |
+        IMAGE_NAME="quay.io/krkn-chaos/krkn:pr-${{ github.event.pull_request.number }}-${{ matrix.platform }}"
+        echo "🔍 Scanning Docker image: $IMAGE_NAME"
+        grype "$IMAGE_NAME" --only-fixed -o table > /tmp/grype-image-${{ matrix.platform }}.txt || true
+
+        SCAN_OUTPUT=$(grype "$IMAGE_NAME" --only-fixed -o json)
+        CRITICAL=$(echo "$SCAN_OUTPUT" | jq '[.matches[] | select(.vulnerability.severity == "Critical")] | length')
+        HIGH=$(echo "$SCAN_OUTPUT" | jq '[.matches[] | select(.vulnerability.severity == "High")] | length')
+        MEDIUM=$(echo "$SCAN_OUTPUT" | jq '[.matches[] | select(.vulnerability.severity == "Medium")] | length')
+
+        # Create Job Summary with table
+        echo "## 🐳 Docker Image Security Scan - ${{ matrix.platform }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Severity | Count | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|----------|-------|--------|" >> $GITHUB_STEP_SUMMARY
+        echo "| 🔴 Critical | $CRITICAL | $([ $CRITICAL -eq 0 ] && echo '✅' || echo '⚠️') |" >> $GITHUB_STEP_SUMMARY
+        echo "| 🟠 High | $HIGH | $([ $HIGH -eq 0 ] && echo '✅' || echo '⚠️') |" >> $GITHUB_STEP_SUMMARY
+        echo "| 🟡 Medium | $MEDIUM | $([ $MEDIUM -eq 0 ] && echo '✅' || echo '⚠️') |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        if [ "$CRITICAL" -gt 0 ] || [ "$HIGH" -gt 0 ]; then
+          echo "⚠️ **Found $CRITICAL Critical and $HIGH High vulnerabilities with available fixes**" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "✅ **No Critical or High vulnerabilities found**" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        # Add collapsible full scan results
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "<details>" >> $GITHUB_STEP_SUMMARY
+        echo "<summary>📋 Full Scan Results</summary>" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        cat /tmp/grype-image-${{ matrix.platform }}.txt >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        echo "</details>" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+    - name: Login to krkn-chaos quay
+      if: startsWith(github.ref, 'refs/tags')
+      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+      with:
+        registry: quay.io
+        username: ${{ secrets.QUAY_USERNAME }}
+        password: ${{ secrets.QUAY_PASSWORD }}
+
+    - name: Build and push krkn-chaos images
+      if: startsWith(github.ref, 'refs/tags')
+      run: |
+        ./containers/compile_dockerfile.sh
+        TAG=${GITHUB_REF#refs/tags/}
+        docker buildx build --no-cache \
+          --platform linux/${{ matrix.platform }} \
+          --provenance=false \
+          -t quay.io/krkn-chaos/krkn:latest-${{ matrix.platform }} \
+          -t quay.io/krkn-chaos/krkn:${TAG}-${{ matrix.platform }} \
+          containers/ \
+          --build-arg TAG=${TAG} \
+          --push --load
+
+    - name: Login to redhat-chaos quay
+      if: startsWith(github.ref, 'refs/tags')
+      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+      with:
+        registry: quay.io
+        username: ${{ secrets.QUAY_USER_1 }}
+        password: ${{ secrets.QUAY_TOKEN_1 }}
+
+    - name: Push redhat-chaos images
+      if: startsWith(github.ref, 'refs/tags')
+      run: |
+        TAG=${GITHUB_REF#refs/tags/}
+        docker tag quay.io/krkn-chaos/krkn:${TAG}-${{ matrix.platform }} quay.io/redhat-chaos/krkn:${TAG}-${{ matrix.platform }}
+        docker tag quay.io/krkn-chaos/krkn:${TAG}-${{ matrix.platform }} quay.io/redhat-chaos/krkn:latest-${{ matrix.platform }}
+        docker push quay.io/redhat-chaos/krkn:${TAG}-${{ matrix.platform }}
+        docker push quay.io/redhat-chaos/krkn:latest-${{ matrix.platform }}
+
+  manifest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: build
+    if: startsWith(github.ref, 'refs/tags')
+    steps:
+    # Check out the repo so the vendored cosign signing-config is on the runner.
+    # This job otherwise only manipulates already-pushed tags.
+    - name: Check out code
+      uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3
+
+    - name: Install cosign
+      uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+    # cosign 2.6+ deprecated --tlog-upload and made --tlog-upload=false
+    # incompatible with its signing-config flow. To keep key-based, offline
+    # signing (no Fulcio/Rekor) we sign with a signing-config whose
+    # transparency-log (and timestamp) services are stripped out. The config is
+    # vendored in-repo (.github/cosign/signing-config.json) rather than fetched
+    # at release time, so we don't depend on an upstream file that could move or
+    # disappear. The signature format is unchanged, so offline key-based
+    # verification in pkg/verify (krknctl / krkn-operator) is unaffected.
+    # $SIGNING_CONFIG is reused by both signing steps below.
+    - name: Locate offline signing config
+      run: echo "SIGNING_CONFIG=${GITHUB_WORKSPACE}/.github/cosign/signing-config.json" >> "$GITHUB_ENV"
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+    - name: Login to krkn-chaos quay
+      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+      with:
+        registry: quay.io
+        username: ${{ secrets.QUAY_USERNAME }}
+        password: ${{ secrets.QUAY_PASSWORD }}
+
+    # Publish the multi-arch manifests atomically with respect to signing, while
+    # the krkn-chaos credentials are still active. Both accounts use quay.io, so
+    # the later redhat-chaos login overwrites these creds in the docker config;
+    # doing everything here keeps push access to the krkn-chaos repo where the
+    # signature artifact (sha256-<digest>.sig) must live.
+    #
+    # Ordering matters (fail-closed): the manifest list is first pushed to a
+    # STAGING tag only, then signed and verified by DIGEST (anti-TOCTOU), and
+    # only after verification is the exact signed digest promoted to the public
+    # ${TAG} and latest tags. If any step fails, the consumer-facing tags are
+    # never created pointing at an unsigned/unverifiable digest — consumers
+    # (krknctl / krkn-operator via pkg/verify) enforce signatures, so a partial
+    # release would otherwise be unusable. ${TAG} and latest share the same
+    # per-platform digests, hence the same manifest-list digest, so one
+    # signature covers both. Key-based, signed with a no-transparency-log
+    # signing-config, to match the offline verification policy (no Fulcio/Rekor).
+    - name: Push, sign and promote KrknChaos manifests
+      env:
+        COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+        COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+      run: |
+        set -euo pipefail
+        TAG=${GITHUB_REF#refs/tags/}
+        REPO=quay.io/krkn-chaos/krkn
+
+        # Assemble the manifest list and push it to a staging tag ONLY. The
+        # public tags are not created yet.
+        docker manifest create ${REPO}:${TAG}-signing \
+          ${REPO}:${TAG}-amd64 \
+          ${REPO}:${TAG}-arm64
+        DIGEST=$(docker manifest push ${REPO}:${TAG}-signing | tail -n1)
+
+        REF="${REPO}@${DIGEST}"
+        echo "Signing ${REF}"
+        cosign sign --yes --signing-config "${SIGNING_CONFIG}" --key env://COSIGN_PRIVATE_KEY "${REF}"
+        # Self-check: fail the pipeline if the signature does not verify against
+        # the public half of the signing key (derived on the fly, no extra secret).
+        cosign public-key --key env://COSIGN_PRIVATE_KEY > /tmp/cosign.pub
+        cosign verify --insecure-ignore-tlog=true --key /tmp/cosign.pub "${REF}"
+
+        # Verified: promote the exact signed digest to the public tags. imagetools
+        # retags by digest without rebuilding, so ${TAG} and latest resolve to the
+        # already-signed digest the instant they become visible. The staging tag
+        # is left behind but is harmless: it points to the same signed digest.
+        docker buildx imagetools create --tag ${REPO}:${TAG} "${REF}"
+        docker buildx imagetools create --tag ${REPO}:latest "${REF}"
+
+    - name: Login to redhat-chaos quay
+      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+      with:
+        registry: quay.io
+        username: ${{ secrets.QUAY_USER_1 }}
+        password: ${{ secrets.QUAY_TOKEN_1 }}
+
+    # Same fail-closed flow as the krkn-chaos step: push the mirror manifest to a
+    # staging tag, sign and verify by digest, then promote the verified digest to
+    # the public ${TAG} and latest tags, so images pulled from
+    # quay.io/redhat-chaos/krkn are always verifiable with the same embedded key.
+    - name: Push, sign and promote RedHat Chaos manifests
+      env:
+        COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+        COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+      run: |
+        set -euo pipefail
+        TAG=${GITHUB_REF#refs/tags/}
+        REPO=quay.io/redhat-chaos/krkn
+
+        docker manifest create ${REPO}:${TAG}-signing \
+          ${REPO}:${TAG}-amd64 \
+          ${REPO}:${TAG}-arm64
+        DIGEST=$(docker manifest push ${REPO}:${TAG}-signing | tail -n1)
+
+        REF="${REPO}@${DIGEST}"
+        echo "Signing ${REF}"
+        cosign sign --yes --signing-config "${SIGNING_CONFIG}" --key env://COSIGN_PRIVATE_KEY "${REF}"
+        cosign public-key --key env://COSIGN_PRIVATE_KEY > /tmp/cosign.pub
+        cosign verify --insecure-ignore-tlog=true --key /tmp/cosign.pub "${REF}"
+
+        docker buildx imagetools create --tag ${REPO}:${TAG} "${REF}"
+        docker buildx imagetools create --tag ${REPO}:latest "${REF}"
+
+    # This release-time rebuild signs the krkn-hub scenario images it pushes;
+    # the COSIGN_* inputs are consumed by the action (redhat-chaos/actions#34).
+    - name: Rebuild krkn-hub
+      uses: redhat-chaos/actions/krkn-hub@b3118123a105aa4d208b282639d24f71d02fb25c # main
+      with:
+        QUAY_USER: ${{ secrets.QUAY_USERNAME }}
+        QUAY_TOKEN: ${{ secrets.QUAY_PASSWORD }}
+        AUTOPUSH: ${{ secrets.AUTOPUSH }}
+        COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+        COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+
+  security-badge:
+    permissions:
+      contents: write
+    name: Generate Security Badge
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs:
+      - build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - name: Check out code
+        uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3
+
+      - name: Check out doc repo
+        uses: actions/checkout@61b9e3751b92087fd0b06925ba6dd6314e06f089 # master
+        with:
+          repository: krkn-chaos/krkn-lib-docs
+          path: krkn-lib-docs
+          ssh-key: ${{ secrets.KRKN_LIB_DOCS_PRIV_KEY }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build image for security scan
+        run: |
+          ./containers/compile_dockerfile.sh
+          docker buildx build --no-cache \
+            --platform linux/amd64 \
+            -t krkn-chaos/krkn:security-scan \
+            containers/ \
+            --load
+
+      - name: Install Grype
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Scan and generate security badge
+        run: |
+          # Scan with grype (no --only-fixed to get all CVEs for baseline)
+          SCAN_OUTPUT=$(grype krkn-chaos/krkn:security-scan -o json)
+
+          # Count vulnerabilities by severity
+          CRITICAL=$(echo "$SCAN_OUTPUT" | jq '[.matches[] | select(.vulnerability.severity == "Critical")] | length')
+          HIGH=$(echo "$SCAN_OUTPUT" | jq '[.matches[] | select(.vulnerability.severity == "High")] | length')
+          MEDIUM=$(echo "$SCAN_OUTPUT" | jq '[.matches[] | select(.vulnerability.severity == "Medium")] | length')
+          TOTAL=$(echo "$SCAN_OUTPUT" | jq '[.matches[]] | length')
+
+          # Determine badge color based on severity
+          if [ $CRITICAL -gt 0 ]; then
+            COLOR="critical"
+          elif [ $HIGH -gt 10 ]; then
+            COLOR="important"
+          elif [ $HIGH -gt 5 ]; then
+            COLOR="orange"
+          elif [ $HIGH -gt 0 ]; then
+            COLOR="yellow"
+          else
+            COLOR="brightgreen"
+          fi
+
+          echo "Security Scan Results:"
+          echo "  Critical: $CRITICAL"
+          echo "  High: $HIGH"
+          echo "  Medium: $MEDIUM"
+          echo "  Total: $TOTAL"
+          echo "  Badge Color: $COLOR"
+
+          # Generate detailed badge: "C:0 H:7 M:3"
+          curl "https://img.shields.io/badge/security-C:$CRITICAL%20H:$HIGH%20M:$MEDIUM-$COLOR" > ./krkn-lib-docs/security_badge_krkn.svg
+
+      - name: Push updated Security Badge
+        run: |
+          cd krkn-lib-docs
+          git add .
+          git config user.name "krkn-chaos"
+          git config user.email "krkn-actions@users.noreply.github.com"
+          git commit -m "[KRKN] Security Badge ${GITHUB_REF##*/}" || echo "no changes to commit"
+          git push

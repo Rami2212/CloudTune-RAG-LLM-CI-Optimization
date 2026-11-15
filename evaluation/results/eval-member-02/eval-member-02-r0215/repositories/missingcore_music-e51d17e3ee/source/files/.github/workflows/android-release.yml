@@ -1,0 +1,193 @@
+name: Music Automatic Release
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+"
+  workflow_dispatch:
+
+jobs:
+  buildAPKs:
+    name: build APKs from Release Tag for GitHub Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: mobile
+    outputs:
+      commit_tag: ${{ steps.set_tag.outputs.commit_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Environment
+        uses: ./.github/actions/setup
+
+      - name: Save commit tag as environment variable & display it
+        id: set_tag
+        run: |
+          COMMIT_TAG=$(git describe --tags --abbrev=0)
+          echo "COMMIT_TAG=${COMMIT_TAG}" >> $GITHUB_ENV
+          echo "commit_tag=${COMMIT_TAG}" >> $GITHUB_OUTPUT
+          echo "Commit Tag: $COMMIT_TAG"
+
+      - name: Add configs to enable Sentry
+        run: |
+          echo -e "\nmusic.WITH_SENTRY=true" >> android/gradle.properties
+          echo "${{ secrets.SENTRY_PROPERTIES }}" > android/sentry.properties
+          echo "EXPO_PUBLIC_WITH_SENTRY=true" > .env
+
+      - name: Add any additional environment variables
+        run: |
+          echo "EXPO_PUBLIC_CHECK_FOR_UPDATES=true" >> .env
+
+      - name: Add upload key secrets for signing APKs
+        run: |
+          git submodule update --init --recursive
+          echo "${{ secrets.RELEASE_CRED }}" >> android/gradle.properties
+
+      - name: Build upload keystore `.jks` file
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > android/app/keystore.jks
+
+      - name: Clean generated builds
+        run: rm -rf android/app/build/generated/
+
+      - name: Build and sign APKs with Gradle
+        run: cd android && chmod +x gradlew && ./gradlew assembleRelease
+
+      - name: Create GitHub Release draft with APKs
+        uses: softprops/action-gh-release@v3
+        with:
+          name: ${{ env.COMMIT_TAG }}
+          tag_name: ${{ env.COMMIT_TAG }}
+          token: ${{ secrets.MISSINGCORE_BOT_GITHUB_TOKEN }}
+          files: mobile/android/app/build/outputs/apk/release/*.apk
+          draft: true
+          # Mark release as prerelease if the tag contains `-rc.`
+          prerelease: ${{ contains(env.COMMIT_TAG, '-rc.') }}
+          generate_release_notes: true
+
+  buildPrivacyAPKs:
+    name: build privacy APKs for the release
+    needs: buildAPKs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Environment
+        uses: ./.github/actions/setup
+
+      - name: Remove Sentry dependency from the privacy build
+        run: |
+          pnpm uninstall @sentry/react-native
+          pnpm sync:licenses
+
+      - name: Save commit tag as environment variable & display it
+        env:
+          COMMIT_TAG: ${{ needs.buildAPKs.outputs.commit_tag }}
+        run: |
+          echo "COMMIT_TAG=${COMMIT_TAG}" >> $GITHUB_ENV
+          echo "Commit Tag: $COMMIT_TAG"
+
+      - name: Have the "Check for Updates" setting enabled by default
+        run: |
+          echo "EXPO_PUBLIC_CHECK_FOR_UPDATES=true" > .env
+
+      - name: Add upload key secrets for signing APKs
+        run: |
+          git submodule update --init --recursive
+          echo "${{ secrets.RELEASE_CRED }}" >> android/gradle.properties
+
+      - name: Build upload keystore `.jks` file
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > android/app/keystore.jks
+
+      - name: Clean generated builds
+        run: rm -rf android/app/build/generated/
+
+      - name: Build and sign privacy APKs with Gradle
+        run: cd android && chmod +x gradlew && ./gradlew assembleRelease
+
+      - name: Prefix privacy APKs for upload
+        run: |
+          for file in android/app/build/outputs/apk/release/*.apk; do
+            base_name=$(basename "$file")
+            cp "$file" "android/app/build/outputs/apk/release/privacy-${base_name}"
+          done
+
+      - name: Attach privacy APKs to the GitHub Release draft
+        uses: softprops/action-gh-release@v3
+        with:
+          name: ${{ env.COMMIT_TAG }}
+          tag_name: ${{ env.COMMIT_TAG }}
+          token: ${{ secrets.MISSINGCORE_BOT_GITHUB_TOKEN }}
+          files: mobile/android/app/build/outputs/apk/release/privacy-*.apk
+          draft: true
+          # Mark release as prerelease if the tag contains `-rc.`
+          prerelease: ${{ contains(env.COMMIT_TAG, '-rc.') }}
+
+  buildAAB:
+    name: build AAB from Release Tag for Play Console
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Environment
+        uses: ./.github/actions/setup
+
+      - name: Add configs to enable Sentry
+        run: |
+          echo -e "\nmusic.WITH_SENTRY=true" >> android/gradle.properties
+          echo "${{ secrets.SENTRY_PROPERTIES }}" > android/sentry.properties
+          echo "EXPO_PUBLIC_WITH_SENTRY=true" > .env
+
+      - name: Add any additional environment variables
+        run: |
+          echo "EXPO_PUBLIC_CHECK_FOR_UPDATES=true" >> .env
+          echo "EXPO_PUBLIC_DISTRIBUTION=google-play" >> .env
+
+      - name: Add upload key secrets for signing APKs
+        run: |
+          git submodule update --init --recursive
+          echo "${{ secrets.RELEASE_CRED }}" >> android/gradle.properties
+
+      - name: Build upload keystore `.jks` file
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > android/app/keystore.jks
+
+      - name: Clean generated builds
+        run: rm -rf android/app/build/generated/
+
+      - name: Build and sign app bundle with Gradle
+        run: cd android && chmod +x gradlew && ./gradlew bundleRelease
+
+      # Save `.aab` as artifact before upload to Play Console incase upload fails.
+      - name: Upload AAB as artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: outputAAB
+          path: mobile/android/app/build/outputs/bundle/release/*.aab
+
+      - name: Upload AAB to Google Play Console "Internal Testing" track
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: com.cyanchill.missingcore.music
+          releaseFiles: mobile/android/app/build/outputs/bundle/release/app-release.aab
+          # No need for `changesNotSentForReview: true` as internal track shouldn't
+          # get reviewed.
+          tracks: internal

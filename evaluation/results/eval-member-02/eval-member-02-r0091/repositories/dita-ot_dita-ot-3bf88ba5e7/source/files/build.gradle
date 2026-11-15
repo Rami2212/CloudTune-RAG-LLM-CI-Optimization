@@ -1,0 +1,556 @@
+/*
+ * This file is part of the DITA Open Toolkit project.
+ *
+ * Copyright 2015 Jarno Elovirta
+ *
+ * See the accompanying LICENSE file for applicable license.
+ */
+
+plugins {
+    id "java"
+    id "base"
+    id "maven-publish"
+    id "signing"
+    id "com.github.node-gradle.node" version "7.1.0"
+    id "com.diffplug.spotless" version "7.0.4"
+}
+
+import org.apache.tools.ant.filters.ReplaceTokens
+import org.apache.tools.ant.taskdefs.condition.Os
+
+base {
+    group = 'org.dita-ot'
+    archivesName = 'dost'
+    /** Semver version number */
+    version = '4.5.0-SNAPSHOT'
+
+    description = """DITA Open Toolkit"""
+}
+
+java {
+    sourceCompatibility = 17
+    targetCompatibility = 17
+    withJavadocJar()
+    withSourcesJar()
+}
+
+repositories {
+    mavenCentral()
+    maven {
+        url = "https://repository.jboss.org/nexus/content/repositories/thirdparty-releases/"
+    }
+}
+
+dependencies {
+    implementation "commons-io:commons-io:2.19.0"
+    implementation "xerces:xercesImpl:2.12.2"
+    implementation "xml-apis:xml-apis:1.4.01"
+    implementation "xml-resolver:xml-resolver:1.2"
+    implementation "net.sf.saxon:Saxon-HE:12.9"
+    implementation "org.xmlresolver:xmlresolver:5.3.3"
+    implementation "com.ibm.icu:icu4j:77.1"
+    implementation "org.apache.ant:ant:1.10.15"
+    implementation "org.apache.ant:ant-launcher:1.10.15"
+    implementation("com.google.guava:guava:33.4.8-jre") {
+        exclude group: 'org.checkerframework', module: 'checker-qual'
+        exclude group: 'com.google.code.findbugs', module: 'jsr305'
+        exclude group: 'com.google.guava', module: 'failureaccess'
+        exclude group: 'com.google.guava', module: 'listenablefuture'
+        exclude group: 'com.google.errorprone', module: 'error_prone_annotations'
+        exclude group: 'com.google.j2objc', module: 'j2objc-annotations'
+        exclude group: 'org.jspecify', module: 'jspecify'
+    }
+    implementation "org.slf4j:slf4j-api:2.0.18"
+    implementation "ch.qos.logback:logback-classic:1.5.37"
+    implementation "com.fasterxml.jackson.core:jackson-core:2.21.4"
+    implementation "com.fasterxml.jackson.core:jackson-databind:2.21.4"
+    implementation "com.fasterxml.jackson.dataformat:jackson-dataformat-yaml:2.21.4"
+    implementation "org.relaxng:jing:20241231"
+    implementation "org.apache.ant:ant-apache-resolver:1.10.15"
+    testImplementation "com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.21.4"
+    testImplementation  "nu.validator:htmlparser:1.4.16"
+    testImplementation "org.junit.jupiter:junit-jupiter-engine:6.0.2"
+    testImplementation "org.junit.jupiter:junit-jupiter-params:6.0.2"
+    testImplementation  "org.xmlunit:xmlunit-core:2.10.2"
+    testImplementation "io.xspec:xspec:3.2.2"
+    testImplementation "org.assertj:assertj-core:3.27.3"
+    testRuntimeOnly "org.junit.platform:junit-platform-launcher:6.0.2"
+}
+
+node {
+    download = true
+    version = file('.nvmrc').readLines().first().trim()
+}
+
+def nodeExec = System.getProperty('os.name').toLowerCase().contains('windows') ? '/node.exe' : '/bin/node'
+
+spotless {
+    java {
+        prettier(['prettier': '2.8.4', 'prettier-plugin-java': '2.1.0']).configFile('.prettierrc')
+                .nodeExecutable("${tasks.named('nodeSetup').get().nodeDir.get()}${nodeExec}")
+    }
+}
+
+tasks.named("spotlessApply"){
+    dependsOn nodeSetup
+}
+
+tasks.named("spotlessCheck"){
+    dependsOn nodeSetup
+}
+
+jar {
+    archiveFileName = "${project.name}.jar"
+    exclude "catalog.xml"
+}
+
+tasks.named("processResources") {
+    filter ReplaceTokens, tokens: [
+            'version': project.version,
+            'release': "${project.version.toString().split('\\.').toList().subList(0, 2).join('.').toString()}".toString()
+    ]
+}
+
+tasks.named('assemble') {
+    dependsOn jar, javadocJar, sourcesJar
+}
+
+tasks.named("test") {
+    useJUnitPlatform {
+        filter {
+            includeTestsMatching "*Test"
+            excludeTestsMatching "IT*"
+            excludeTestsMatching "EndToEndTest*"
+        }
+    }
+    maxParallelForks = 4
+    inputs.files 'src/test/xsl/**/*.xspec'
+}
+// Integration test
+
+def integrationTestSystemProperties = [
+        temp_dir : "${buildDir}/tmp/integrationTest",
+        dita_dir : "${projectDir}/src/main",
+        basedir : "${projectDir}/src/test"
+]
+if (System.getProperty("test") != null)
+    integrationTestSystemProperties["test"] = "${System.getProperty("test")}"
+if (System.getProperty("log_level") != null)
+    integrationTestSystemProperties["log_level"] = "${System.getProperty("log_level")}"
+
+tasks.register('integrationTest', Test) {
+    group = "verification"
+    description = "Run integration tests."
+    dependsOn buildLocal
+    minHeapSize = "128m"
+    maxHeapSize = "1024m"
+    systemProperties = integrationTestSystemProperties
+    useJUnitPlatform {
+        filter {
+            includeTestsMatching 'IT*'
+        }
+    }
+}
+
+tasks.named('check') {
+    dependsOn integrationTest
+}
+
+
+// End to end test
+
+dependencies {
+    testImplementation  project(':htmlhelp')
+    testImplementation  project(':fo')
+    testImplementation  project(':fop')
+}
+
+def e2eTestSystemProperties = [
+        temp_dir : "${buildDir}/tmp/e2eTest",
+        dita_dir : "${projectDir}/src/main",
+        basedir : "${projectDir}/src/test"
+]
+if (System.getProperty("log_level") != null)
+    e2eTestSystemProperties["log_level"] = "${System.getProperty("log_level")}"
+
+tasks.register('e2eTest', Test) {
+    group = "verification"
+    description = "Run end-to-end tests."
+    dependsOn buildLocal
+    minHeapSize = "128m"
+    maxHeapSize = "1024m"
+    maxParallelForks = 4
+    systemProperties = e2eTestSystemProperties
+    useJUnitPlatform {
+        filter {
+            includeTestsMatching 'EndToEndTest*'
+        }
+    }
+}
+tasks.named('check') {
+    dependsOn e2eTest
+}
+
+// Install
+
+defaultTasks 'buildLocal'
+
+tasks.named("clean") {
+    delete "src/main/lib/"
+    delete "src/main/plugins/org.dita.htmlhelp/lib/"
+    delete "src/main/plugins/org.dita.pdf2/lib/"
+    delete "src/main/plugins/org.dita.pdf2.fop/lib/"
+}
+
+tasks.register('copyInstall', Copy) {
+    description = "Copy jars to local development environment"
+    from(jar)
+    from(configurations.runtimeClasspath.allArtifacts.files)
+    from(configurations.runtimeClasspath) {
+        rename "ant-launcher(-\\d+(\\.\\d+(\\.\\d+)?)?)\\.jar", "ant-launcher.jar"
+        rename "ant(-\\d+(\\.\\d+(\\.\\d+)?)?)\\.jar", "ant.jar"
+    }
+    destinationDir = file("src/main/lib")
+}
+tasks.register('buildLocal', JavaExec) {
+  dependsOn copyInstall, ":fo:copyInstall", ":fop:copyInstall", ":htmlhelp:copyInstall", ":html5:compileSass"
+    group = "build"
+    description = "Build local development environment to run application locally"
+    mainClass = "org.apache.tools.ant.launch.Launcher"
+    classpath = sourceSets.main.runtimeClasspath + files("${projectDir}/src/main", "${projectDir}/src/main/config")
+    workingDir file("${projectDir}/src/main")
+    args "-f"
+    args file("${projectDir}/src/main/integrator.xml")
+}
+
+// Distribution
+
+ext.distTempDir = file("${buildDir}/tmp/dist")
+/** When patch is "0", only use major and minor versions, e.g. 1.2 instead of 1.2.0 */
+def cleanVersion = project.version.toString().split('\\.').toList()[2] == "0" ?
+        project.version.toString().split('\\.').toList().subList(0, 2).join('.').toString() :
+        project.version
+def distVersion = project.hasProperty("commit") && (!project.hasProperty("tag") || tag.empty) ?
+                  "${project.version}@${commit.substring(0, 7)}" :
+                  "${cleanVersion}"
+def distFileName = (project.hasProperty("tag") && tag.empty) ?
+                   "develop" :
+                   "${cleanVersion}"
+def bundledPlugins = [
+        "eclipsehelp": "https://github.com/dita-ot/org.dita.eclipsehelp/releases/download/3.4/org.dita.eclipsehelp-3.4.0.zip",
+        "markdown": "https://github.com/jelovirt/org.lwdita/releases/download/5.9.1/org.lwdita-5.9.1.zip",
+        "normalize": "https://github.com/dita-ot/org.dita.normalize/archive/refs/tags/2.0.zip",
+        "dita11": "https://github.com/dita-ot/org.dita.specialization.dita11/archive/1.1.1.zip",
+        "dita12": "https://github.com/dita-ot/org.oasis-open.dita.v1_2/archive/1.2.1.zip",
+        "dita20": "https://github.com/dita-ot/dita/releases/download/2.0.0-20260630/org.oasis-open.dita.v2_0.zip",
+        "dita20-techcomm": "https://github.com/dita-ot/dita-techcomm/releases/download/2.0.0-20260630/org.oasis-open.dita.techcomm.v2_0.zip",
+        "xdita": "https://github.com/oasis-tcs/dita-lwdita/releases/download/v0.3.0.2/org.oasis-open.xdita.v0_3_2.zip",
+        "index": "https://github.com/dita-ot/org.dita.index/releases/download/2.0.0/org.dita.index-2.0.0.zip",
+        "axf": "https://github.com/dita-ot/org.dita.pdf2.axf/releases/download/3.6.1/org.dita.pdf2.axf-3.6.1.zip",
+        "xep": "https://github.com/dita-ot/org.dita.pdf2.xep/releases/download/3.6.3/org.dita.pdf2.xep-3.6.3.zip",
+        "theme": "https://github.com/jelovirt/pdf-generator/releases/download/0.8.0/com.elovirta.pdf-0.8.0.zip",
+        "init": "https://github.com/dita-ot/org.dita.init/archive/refs/tags/1.0.0.zip"
+]
+
+apply from: 'gradle/dist.gradle'
+
+tasks.register('cleanDistTemp', Delete) {
+    description = "Delete distribution temp dir"
+    delete distTempDir
+}
+
+tasks.register('initDist') {
+    description = "Create distribution temp dir"
+    dependsOn jar, cleanDistTemp
+    doLast {
+        distTempDir.mkdirs()
+        println "distVersion: ${distVersion}"
+        println "distFileName: ${distFileName}"
+    }
+}
+
+tasks.register('copyDistTemp', Copy) {
+    description = "Copy source files to distribution temp dir"
+    dependsOn initDist
+    from(jar) {
+        into "lib"
+    }
+    from(configurations.runtimeClasspath.allArtifacts.files) {
+        into "lib"
+    }
+    from(configurations.runtimeClasspath) {
+        into "lib"
+        rename "ant-launcher(-\\d+(\\.\\d+(\\.\\d+)?)?)\\.jar", "ant-launcher.jar"
+        rename "ant(-\\d+(\\.\\d+(\\.\\d+)?)?)\\.jar", "ant.jar"
+    }
+    from(".") {
+        include "LICENSE"
+    }
+    from("src/main") {
+        include "plugins/*/plugin.xml"
+        expand(
+                version: project.version
+        )
+    }
+    from("src/main") {
+        exclude ".gradle"
+        exclude "plugins/**/build.gradle"
+        exclude "plugins/**/settings.gradle"
+        exclude "plugins/**/.gradle"
+        exclude ".*"
+        exclude "local.properties"
+        include "*.*"
+        include "bin/dita"
+        include "bin/dita.bat"
+        exclude "docsrc/.*"
+        exclude "docsrc/*.md"
+        exclude "docsrc/*.xpr"
+        exclude "docsrc/package*.json"
+        include "docsrc/**"
+        exclude "plugins/*/plugin.xml"
+        include "plugins/org.dita.base/**"
+        include "plugins/org.dita.html5/**"
+        exclude "plugins/org.dita.html5/build"
+        exclude "plugins/org.dita.html5/.sass-cache"
+        include "plugins/org.dita.htmlhelp/**"
+        include "plugins/org.dita.pdf2.axf/**"
+        include "plugins/org.dita.pdf2.fop/**"
+        exclude "plugins/org.dita.pdf2.fop/build"
+        include "plugins/org.dita.pdf2/**"
+        exclude "plugins/org.dita.pdf2/src/**"
+        exclude "plugins/org.dita.pdf2/build"
+        exclude "plugins/org.dita.pdf2/bin/**"
+        include "plugins/org.dita.specialization.dita11/**"
+        include "plugins/org.dita.validate/**"
+        include "plugins/org.dita.xhtml/**"
+        include "plugins/org.oasis-open.dita.v1_2/**"
+        include "plugins/org.oasis-open.dita.v1_3/**"
+        exclude "temp"
+        include "config/**"
+        include "resources/catalog.xml"
+        include "resources/plugin.rnc"
+        include "resources/project.rnc"
+        // legacy build scripts
+        include "startcmd.*"
+        include "bin/ant"
+        include "bin/ant.*"
+    }
+    destinationDir = distTempDir
+    outputs.dir distTempDir
+}
+
+tasks.register('integrateDistTemp', JavaExec) {
+    dependsOn copyDistTemp, ":fo:copyDistTemp", ":fop:copyDistTemp", ":htmlhelp:copyDistTemp"
+    mainClass = "org.apache.tools.ant.launch.Launcher"
+    classpath = sourceSets.main.runtimeClasspath + files("${distTempDir}", "${projectDir}/src/main/config")
+    workingDir distTempDir
+    args "-f"
+    args file("${distTempDir}/integrator.xml")
+}
+
+tasks.register('integrateDistPlugins') {
+    description = "Run integrator in distribution temp to install external plug-ins"
+    mustRunAfter integrateDistTemp
+}
+bundledPlugins.forEach{ name, url ->
+    def integrateDistTask = tasks.register("integrateDist${name}", JavaExec) {
+        dependsOn integrateDistTemp
+        mainClass = "org.apache.tools.ant.launch.Launcher"
+        classpath = sourceSets.main.runtimeClasspath + files("${distTempDir}", "${projectDir}/src/main/config")
+        workingDir distTempDir
+        args "-f"
+        args file("${distTempDir}/integrator.xml")
+        args "install"
+        args "-Dplugin.file=${url}"
+    }
+    tasks.named('integrateDistPlugins') {
+        dependsOn integrateDistTask
+    }
+}
+
+tasks.register('generateDocs', Exec) {
+    dependsOn integrateDistTemp
+    mustRunAfter integrateDistPlugins
+    workingDir = file("${distTempDir}/docsrc")
+    commandLine = Os.isFamily(Os.FAMILY_WINDOWS) ? file("${distTempDir}/docsrc/gradlew.bat") : file("${distTempDir}/docsrc/gradlew")
+    args = ["--no-daemon", "dist"]
+    onlyIf { shouldGenerateDocs() }
+}
+
+tasks.register('cleanGenerateDocs', Delete) {
+    description = "Clean docs source in distribution temp dir"
+    delete "${distTempDir}/temp"
+    delete "${distTempDir}/docsrc/.gradle"
+    delete "${distTempDir}/docsrc/build"
+    delete "${distTempDir}/docsrc/node_modules"
+    delete "${distTempDir}/docsrc/out"
+    delete "${distTempDir}/docsrc/platform.ditaval"
+    delete "${distTempDir}/docsrc/temp"
+
+    mustRunAfter generateDocs
+    onlyIf { shouldGenerateDocs() }
+}
+
+def shouldGenerateDocs() {
+    !(project.hasProperty('skipGenerateDocs') && Boolean.parseBoolean(project.property('skipGenerateDocs').toString()))
+}
+
+tasks.register('generateJavadocs', Javadoc) {
+    include "**/org/dita/dost/*.*"
+    include "**/org/dita/dost/exception/DITAOTException.*"
+    include "**/org/dita/dost/util/Configuration.*"
+    options.addStringOption("public")
+    title = "${project.description} ${project.version}"
+    destinationDir = file("${distTempDir}/doc/api")
+    onlyIf { shouldGenerateDocs() }
+}
+bundledPlugins.forEach { name, url ->
+    tasks.named('generateJavadocs') {
+        dependsOn "integrateDist${name}"
+    }
+}
+
+def plugins = [
+        "org.dita.html5",
+        "org.dita.htmlhelp",
+        "org.dita.pdf2",
+        "org.dita.pdf2.fop",
+        "org.dita.xhtml",
+]
+
+tasks.register('distPlugins') {
+    description = "Build distribution packages for plug-ins"
+    mustRunAfter integrateDistPlugins
+}
+plugins.forEach{ name ->
+    def taskName = tasks.register("distPlugin${name.split("\\.").collect{ token -> return token.capitalize()}.join("")}", Zip) {
+        dependsOn integrateDistTemp
+        from ("${distTempDir}/plugins/${name}") {
+            exclude "build"
+            exclude "src"
+            exclude "out"
+        }
+        archiveFileName = "${name}-${project.version}.zip"
+    }.name
+    tasks.named('distPlugins') {
+        dependsOn taskName
+    }
+}
+
+tasks.register('distPluginChecksums') {
+    description = "Create SHA-256 checksum files for plug-in distribution packages"
+    doLast {
+        ant.checksum(algorithm: "SHA-256", fileext: ".sha256") {
+            fileset(dir: "${buildDir}/distributions") {
+                include(name: '*.zip')
+            }
+        }
+    }
+    mustRunAfter distPlugins
+}
+
+tasks.named("generateNotices") { mustRunAfter distPlugins }
+
+tasks.register('dist', Zip) {
+    description = "Build distribution package"
+    dependsOn jar, integrateDistTemp, integrateDistPlugins, distPlugins, distPluginChecksums, generateNotices, generateDocs, cleanGenerateDocs, generateJavadocs
+    into("dita-ot-${distVersion}") {
+        from(distTempDir) {
+            exclude "bin/dita"
+            exclude "bin/dita.bat"
+            // legacy build scripts
+            exclude "startcmd.*"
+            exclude "bin/ant"
+            exclude "bin/ant.*"
+        }
+        from(distTempDir) {
+            filePermissions {
+                unix(0755)
+            }
+            include "bin/dita"
+            include "bin/dita.bat"
+            // legacy build scripts
+            include "startcmd.*"
+            include "bin/ant"
+            include "bin/ant.*"
+        }
+    }
+    archiveFileName = "dita-ot-${distFileName}.zip"
+}
+
+// Repository deployment
+
+def getRepositoryUsername() {
+    return project.hasProperty('ossrhUsername') ?
+            project.property('ossrhUsername') :
+            System.getenv().containsKey('OSSRH_USERNAME') ?
+                    System.getenv()['OSSRH_USERNAME'] :
+                    ""
+}
+
+def getRepositoryPassword() {
+    return project.hasProperty('ossrhPassword') ?
+            project.property('ossrhPassword') :
+            System.getenv().containsKey('OSSRH_PASSWORD') ?
+                    System.getenv()['OSSRH_PASSWORD'] :
+                    ""
+}
+
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            from components.java
+            afterEvaluate {
+                pom {
+                    name = 'DITA Open Toolkit'
+                    description = 'DITA-OT base library'
+                    url = 'https://www.dita-ot.org/'
+                    scm {
+                        connection = 'scm:git:https://github.com/dita-ot/dita-ot.git'
+                        developerConnection = 'scm:git:git@github.com:dita-ot/dita-ot.git'
+                        url = 'https://github.com/dita-ot/dita-ot/'
+                    }
+                    licenses {
+                        license {
+                            name = 'The Apache License, Version 2.0'
+                            url = 'http://www.apache.org/licenses/LICENSE-2.0.txt'
+                        }
+                    }
+                    developers {
+                        developer {
+                            id = 'robander'
+                            name = 'Robert D Anderson'
+                            email = 'gorodki@gmail.com'
+                        }
+                        developer {
+                            id = 'jelovirt'
+                            name = 'Jarno Elovirta'
+                            email = 'jarno@elovirta.com'
+                        }
+                    }
+                }
+            }
+        }
+    }
+    repositories {
+        maven {
+            def releasesRepoUrl = "https://ossrh-staging-api.central.sonatype.com/service/local/"
+            def snapshotsRepoUrl = "https://central.sonatype.com/repository/maven-snapshots/"
+            url = version.endsWith('SNAPSHOT') ? snapshotsRepoUrl : releasesRepoUrl
+            credentials {
+                username = getRepositoryUsername()
+                password = getRepositoryPassword()
+            }
+        }
+    }
+}
+
+signing {
+    sign publishing.publications.mavenJava
+}
+
+javadoc {
+    if(JavaVersion.current().isJava9Compatible()) {
+        options.addBooleanOption('html5', true)
+    }
+}

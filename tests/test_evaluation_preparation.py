@@ -3,13 +3,16 @@ from __future__ import annotations
 
 import csv
 import hashlib
+from http.client import IncompleteRead
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from evaluation.optimizers.original import original_candidate
 from evaluation.repository_preparation import (
+    GitHubReader,
     PreparationError,
     git_blob_sha1,
     prepare_repository,
@@ -32,6 +35,38 @@ jobs:
         run: pytest -q
 """
 MISSING_DISPATCH = BASIC_WORKFLOW.replace(b"  workflow_dispatch:\n", b"")
+
+
+class GitHubReaderRetryTests(unittest.TestCase):
+    def test_incomplete_response_is_retried_from_scratch(self):
+        broken = MagicMock()
+        broken.__enter__.return_value = broken
+        broken.read.side_effect = IncompleteRead(b'{"partial":', 20)
+        complete = MagicMock()
+        complete.__enter__.return_value = complete
+        complete.read.return_value = b'{"content": "complete"}'
+        with patch('evaluation.repository_preparation.urllib.request.urlopen',
+                   side_effect=[broken, complete]) as open_request, \
+                patch('evaluation.repository_preparation.time.sleep') as sleep:
+            result = GitHubReader().get_json('/repos/owner/repo/git/blobs/abc')
+        self.assertEqual(result, {"content": "complete"})
+        self.assertEqual(open_request.call_count, 2)
+        sleep.assert_called_once_with(0.5)
+        broken.__exit__.assert_called_once()
+
+    def test_repeated_incomplete_responses_stop_after_three_attempts(self):
+        response = MagicMock()
+        response.__enter__.return_value = response
+        error = IncompleteRead(b'partial', 20)
+        response.read.side_effect = error
+        with patch('evaluation.repository_preparation.urllib.request.urlopen',
+                   return_value=response) as open_request, \
+                patch('evaluation.repository_preparation.time.sleep') as sleep:
+            with self.assertRaises(PreparationError) as caught:
+                GitHubReader().get_json('/repos/owner/repo/git/blobs/abc')
+        self.assertIs(caught.exception.__cause__, error)
+        self.assertEqual(open_request.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.5, 1.0])
 
 
 class FakeReader:

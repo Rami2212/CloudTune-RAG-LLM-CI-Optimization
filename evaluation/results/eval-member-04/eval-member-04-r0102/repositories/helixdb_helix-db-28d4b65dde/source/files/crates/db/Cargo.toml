@@ -1,0 +1,185 @@
+[package]
+name = "db"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+slatedb = { git = "https://github.com/HelixDB/slatedb.git", rev = "747f75d851c0105a204ef1b113597e62b752f82b", features = ["zstd"] }
+slatedb-common = { git = "https://github.com/HelixDB/slatedb.git", rev = "747f75d851c0105a204ef1b113597e62b752f82b", optional = true }
+http-body = { version = "1", optional = true }
+helix-ast = { path = "../ast" }
+helix-planner = { path = "../planner" }
+helix-cypher = { path = "../cypher" }
+helix-value-semantics = { path = "../value-semantics" }
+helix-metrics = { path = "../metrics" }
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "fs", "time"] }
+futures = "0.3"
+async-trait = "0.1"
+pin-project-lite = "0.2"
+arc-swap = "1"
+foyer = { version = "0.22.0", features = ["serde"] }
+
+# Data structures
+bytes = { version = "1", features = ["serde"] }
+foldhash = "0.2"
+range-cache = { version = "0.1.1", features = ["async"] }
+roaring = { version = "0.11", features = ["serde"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+simd-json = { version = "0.18.1", default-features = false, features = [
+    "runtime-detection",
+    "serde_impl",
+    "swar-number-parsing",
+] }
+rkyv = "0.8"
+
+# Error handling
+thiserror = "2"
+
+# Object storage
+object_store = { version = "0.12", features = ["aws"] }
+tantivy = { version = "0.26", features = ["quickwit"] }
+sha2 = "0.11"
+stable_deref_trait = "1"
+tempfile = "3"
+chrono = "0.4"
+
+# Utilities
+bincode = "^1.3.3"
+uuid = { version = "1", features = ["v4"] }
+parking_lot = "0.12"
+tracing = { version = "0.1", features = ["log"] }
+rand = "0.10"
+rayon = "1.10"
+insta = "1.46.1"
+bytemuck = { version = "1.24.0", features = ["derive", "extern_crate_alloc"] }
+byteorder = "1.5.0"
+divan = "0.1.21"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+siphasher = "1.0.3"
+dashmap = "6"
+libc = "0.2"
+arrayvec = "0.7.7"
+memmap2 = { version = "0.9", optional = true }
+
+[dev-dependencies]
+# `wal_disable` only adds the opt-in `Settings::wal_enabled` field (default
+# `true`); one legacy-text migration fixture writes without a WAL.
+slatedb = { git = "https://github.com/HelixDB/slatedb.git", rev = "747f75d851c0105a204ef1b113597e62b752f82b", features = ["wal_disable"] }
+tokio-test = "0.4"
+proptest = "1"
+bincode = "^1.3.3"
+parquet = "59"
+arrow-array = "59"
+helix-db-testkit = { path = "../db-testkit" }
+reqwest = "0.13.3"
+
+[features]
+default = []
+index-lifecycle-testing = []
+test-util = ["tokio/test-util"]
+future-vector-codecs = []
+# Benchmarks only: exposes `db::bench_internals`, the internal fixtures the
+# `db` benches drive. No production build enables it.
+bench-internals = []
+# Release-scale soaks only: exposes `db::production_scale`.
+production-scale = ["dep:memmap2"]
+fuzzing = []
+# Benchmark images only: object-store connector counters and SlateDB metrics.
+async-index-benchmark = ["dep:http-body", "dep:slatedb-common"]
+force-vector-scalar-kernel = []
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "projection_materialization"
+harness = false
+
+[[bench]]
+name = "response_encoding"
+harness = false
+
+[[bench]]
+name = "property_row_reads"
+harness = false
+
+[[bench]]
+name = "write_path_mutations"
+harness = false
+
+[[bench]]
+name = "embedded_write_latency"
+harness = false
+
+[[bench]]
+name = "concurrent_request_throughput"
+harness = false
+
+[[bench]]
+name = "secondary_equality_hot_path"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
+name = "secondary_equality_read_scale"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
+name = "vector_batch_insert"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
+name = "vector_memory_store"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
+name = "text_transaction_batching"
+harness = false
+required-features = [
+    "bench-internals",
+    "index-lifecycle-testing",
+]
+
+[[bench]]
+name = "fts_prefilter"
+harness = false
+required-features = ["bench-internals"]
+
+[[test]]
+name = "bench_internals_contracts"
+required-features = ["bench-internals"]
+
+[[test]]
+name = "production_index_operation_queue"
+required-features = ["index-lifecycle-testing"]
+
+[[test]]
+name = "production_text_correctness_regressions"
+required-features = ["index-lifecycle-testing"]
+
+[[test]]
+name = "production_text_queue_contracts"
+required-features = ["index-lifecycle-testing"]
+
+[[test]]
+name = "production_index_lifecycle_scale"
+required-features = ["production-scale"]
+
+[[test]]
+name = "production_vector_migration_scale"
+required-features = ["production-scale"]
+
+[[test]]
+name = "scoped_search_gate"
+required-features = ["production-scale"]
+
+[[test]]
+name = "index_lifecycle_contracts"
+required-features = ["index-lifecycle-testing"]

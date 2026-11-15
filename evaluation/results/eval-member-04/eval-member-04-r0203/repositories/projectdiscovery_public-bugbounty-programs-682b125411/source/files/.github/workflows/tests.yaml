@@ -1,0 +1,119 @@
+name: 🛠️ Tests
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "src/data.yaml"
+      - "src/data.schema.json"
+      - "dist/data.json"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: projectdiscovery/actions/setup/ajv@v1
+      - run: make compile
+      - run: make test
+
+  duplicate-domains:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run duplicate domains check
+        id: duplicate_check
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          make duplicate-domains | tee duplicate-domains.log
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+          if [ -s duplicate-domains.log ]; then
+            echo "has_output=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "body<<EOF"
+              echo "## Duplicate Domain Check"
+              echo
+              echo "Duplicate domains were found during the check:"
+              echo
+              echo '```text'
+              head -c 60000 duplicate-domains.log
+              echo
+              echo '```'
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "has_output=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Comment on PR for duplicate domains
+        if: github.event_name == 'pull_request' && steps.duplicate_check.outputs.has_output == 'true'
+        uses: actions/github-script@v7
+        env:
+          COMMENT_BODY: ${{ steps.duplicate_check.outputs.body }}
+        with:
+          script: |
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: process.env.COMMENT_BODY
+            })
+      - name: Fail when duplicate check fails
+        if: steps.duplicate_check.outputs.exit_code != '0'
+        run: exit 1
+
+  validate-domains:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: projectdiscovery/actions/setup/go@v1
+      - name: Run validate domains check
+        id: validate_check
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          make validate-domains | tee validate-domains.log
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+          if [ -s validate-domains.log ]; then
+            echo "has_output=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "body<<EOF"
+              echo "## Validate Domains Check"
+              echo
+              echo "Invalid domains were found during the check:"
+              echo
+              echo '```text'
+              head -c 60000 validate-domains.log
+              echo
+              echo '```'
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "has_output=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Comment on PR for invalid domains
+        if: github.event_name == 'pull_request' && steps.validate_check.outputs.has_output == 'true'
+        uses: actions/github-script@v7
+        env:
+          COMMENT_BODY: ${{ steps.validate_check.outputs.body }}
+        with:
+          script: |
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: process.env.COMMENT_BODY
+            })
+      - name: Fail when validate check fails
+        if: steps.validate_check.outputs.exit_code != '0'
+        run: exit 1

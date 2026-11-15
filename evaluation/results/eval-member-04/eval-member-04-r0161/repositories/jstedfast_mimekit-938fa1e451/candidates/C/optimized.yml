@@ -1,0 +1,155 @@
+name: Build
+
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  ci:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-15 runs natively on ARM64, exercising the AdvSIMD implementations.
+        os: [ windows-latest, ubuntu-latest, macos-15 ]
+        build-configuration: [ Debug, Release ]
+    outputs:
+      latest-version: ${{ steps.semantic_version.outputs.version_num }}
+    environment: ci
+    env:
+      SOLUTION_PATH: MimeKit.sln
+      BUILD_PLATFORM: Any CPU
+      BUILD_CONFIGURATION: ${{ matrix.build-configuration }}
+      GENERATE_CODE_COVERAGE: ${{ matrix.os == 'windows-latest' && matrix.build-configuration == 'Debug' }}
+      MONO_RUNTIME: ${{ matrix.os != 'windows-latest' }}
+      MIMEKIT_REQUIRE_ARM64_SIMD: ${{ matrix.os == 'macos-15' && '1' || '0' }}
+      PUBLISH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' && matrix.os == 'windows-latest' && matrix.build-configuration == 'Release' }}
+
+    steps:
+      - name: Setup/Install the .NET SDKs
+        id: install-netsdk
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - if: runner.os == 'Windows'
+        name: Setup MSBuild
+        id: setup_msbuild
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Checkout repository
+        id: checkout_repo
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj', '**/packages.lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Get semantic version from csproj
+        id: semantic_version
+        shell: pwsh
+        run: |
+          $xml = [xml](gc MimeKit/MimeKit.csproj)
+          $SEMANTIC_VERSION_NUMBER = $xml.Project.PropertyGroup.VersionPrefix
+          $VERSION_NUM = $SEMANTIC_VERSION_NUMBER[0].Trim()
+          Write-Host "version_num=${VERSION_NUM}"
+          [IO.File]::AppendAllText($env:GITHUB_OUTPUT, "version_num=${VERSION_NUM}$([Environment]::NewLine)")
+
+      - name: Run .NET restore
+        shell: pwsh
+        run: |
+          dotnet restore $env:SOLUTION_PATH
+
+      - name: Run .NET tool restore
+        shell: pwsh
+        run: |
+          dotnet tool restore
+
+      - name: Build solution
+        id: build_solution
+        shell: pwsh
+        run: |
+          dotnet msbuild $env:SOLUTION_PATH -property:Platform=$env:BUILD_PLATFORM -property:Configuration=$env:BUILD_CONFIGURATION -property:MonoRuntime=$env:MONO_RUNTIME
+
+      - name: Run unit tests
+        id: run_unit_tests
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & ./scripts/test.ps1 -Configuration "$env:BUILD_CONFIGURATION" -GenerateCodeCoverage "$env:GENERATE_CODE_COVERAGE"
+
+      - name: Upload unit test results
+        id: upload_test_results
+        uses: actions/upload-artifact@v7
+        with:
+          name: MimeKit.${{ steps.semantic_version.outputs.version_num }}.${{ github.run_number }}-${{ matrix.os }}-${{ matrix.build-configuration }}-TestResults.xml
+          path: TestResult.xml
+
+      - if: ${{ env.GENERATE_CODE_COVERAGE == 'true' }}
+        name: Upload code coverage data to coveralls.io
+        id: upload_to_coveralls
+        run: |
+          & ./scripts/coveralls.ps1
+        env:
+          COVERALLS_REPO_TOKEN: ${{ secrets.COVERALLS_REPO_TOKEN }}
+          GIT_COMMIT_SHA: ${{ github.sha }}
+          GIT_REF: ${{ github.ref }}
+          GIT_ACTOR: ${{ github.event.head_commit.author.username }}
+          GIT_ACTOR_EMAIL: ${{ github.event.head_commit.author.email }}
+          GIT_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          COVERALLS_JOB_ID: ${{ steps.semantic_version.outputs.version_num }}.${{ github.run_number }}
+
+      # The unit test step uses continue-on-error so that the test results and code coverage data
+      # still get uploaded, but the job should still fail if any of the unit tests failed.
+      - if: ${{ steps.run_unit_tests.outcome == 'failure' }}
+        name: Fail if unit tests failed
+        id: check_unit_tests
+        shell: pwsh
+        run: |
+          Write-Output "::error::One or more unit tests failed. See the 'Run unit tests' step for details."
+          exit 1
+
+      - if: ${{ env.PUBLISH == 'true' }}
+        name: Create NuGet packages
+        id: create_nuget_package
+        shell: pwsh
+        run: |
+          nuget pack nuget/MimeKit.nuspec -Version "$env:LATEST_VERSION.$env:BUILD_NUMBER"
+          nuget pack nuget/MimeKit.Core.nuspec -Version "$env:LATEST_VERSION.$env:BUILD_NUMBER"
+          nuget pack nuget/MimeKit.Cryptography.nuspec -Version "$env:LATEST_VERSION.$env:BUILD_NUMBER"
+        env:
+          LATEST_VERSION: ${{ steps.semantic_version.outputs.version_num }}
+          BUILD_NUMBER: ${{ github.run_number }}
+
+      - if: ${{ env.PUBLISH == 'true' }}
+        name: Push NuGet packages to MyGet
+        id: push_nuget_package
+        shell: pwsh
+        run: |
+          nuget push $env:MIMEKIT_CORE_PKG_PATH -ApiKey $env:MYGET_API_KEY -Source https://www.myget.org/F/mimekit/api/v3/index.json
+          nuget push $env:MIMEKIT_CRYPTOGRAPHY_PKG_PATH -ApiKey $env:MYGET_API_KEY -Source https://www.myget.org/F/mimekit/api/v3/index.json
+          nuget push $env:MIMEKIT_PKG_PATH -ApiKey $env:MYGET_API_KEY -Source https://www.myget.org/F/mimekit/api/v3/index.json
+        env:
+          MIMEKIT_PKG_PATH: MimeKit.${{ steps.semantic_version.outputs.version_num }}.${{ github.run_number }}.nupkg
+          MIMEKIT_CORE_PKG_PATH: MimeKit.Core.${{ steps.semantic_version.outputs.version_num }}.${{ github.run_number }}.nupkg
+          MIMEKIT_CRYPTOGRAPHY_PKG_PATH: MimeKit.Cryptography.${{ steps.semantic_version.outputs.version_num }}.${{ github.run_number }}.nupkg
+          MYGET_API_KEY: ${{ secrets.MYGET_API_KEY }}
+
+      - if: ${{ env.PUBLISH == 'true' }}
+        name: Upload NuGet packages as artifacts
+        id: upload_nuget_package
+        uses: actions/upload-artifact@v7
+        with:
+          name: nuget-packages
+          path: |
+            MimeKit.${{ steps.semantic_version.outputs.version_num }}.${{ github.run_number }}.nupkg
+            MimeKit.Core.${{ steps.semantic_version.outputs.version_num }}.${{ github.run_number }}.nupkg
+            MimeKit.Cryptography.${{ steps.semantic_version.outputs.version_num }}.${{ github.run_number }}.nupkg

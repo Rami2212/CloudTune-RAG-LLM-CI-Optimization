@@ -1,0 +1,181 @@
+name: Test
+
+on:
+  push:
+
+jobs:
+  test-cljs:
+    name: Test ClojureScript
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Cache deps.edn dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.cpcache
+            ~/.gitlibs
+          key: cljs-${{ runner.os }}-${{ hashFiles('**/deps.edn') }}
+          restore-keys: cljs-${{ runner.os }}-
+
+      # Java 17 generates class file version 61.0, which is what processing has
+      # been compiled with.
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Clojure
+        uses: DeLaGuardo/setup-clojure@13.6.0
+        with:
+          cli: latest
+          bb: latest
+
+      - name: Setup ImageMagick
+        uses: mfinelli/setup-imagemagick@v7
+
+      - name: Install Ubuntu Fonts
+        if: runner.os == 'Linux'
+        run: sudo apt install fonts-dejavu fonts-inconsolata fonts-roboto fonts-croscore
+
+      - name: System Info
+        run: bb system-info
+
+      # AOT compile applet-listener and applet so CLJS compile can run
+      - name: AOT Compile
+        run: clojure -T:build aot
+
+      # Only needs to run in one matrix step
+      - name: Linting & Formatting
+        run: bin/lint
+
+      - name: Test
+        timeout-minutes: 3
+        run: clojure -Mfig:cljs-test
+
+      # xvfb-run needed so that pixel density be queried and specify reference
+      # snapshots to compare against.
+      - name: Test CLJS Snippet Snapshots
+        run: ${{ matrix.os == 'ubuntu-latest' && 'xvfb-run' || '' }} clojure -M:dev:fig:kaocha --no-capture-output --reporter documentation cljs-snippets
+
+      - name: Upload Test Artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: snippet-differences-cljs-${{ runner.os }}-${{ github.sha }}.${{ github.run_attempt }}
+          path: |
+            dev-resources/snippet-snapshots/*/*/*-actual.png
+            dev-resources/snippet-snapshots/*/*/*-difference.png
+
+      - name: Check Advanced Compilation with Release
+        run: clojure -T:build build.cljs-advanced-test/advanced-compile
+
+  test-clj:
+    name: Test Clojure
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          # SEGV on CGLDescribeRenderer after WARNING: GL pipe is running in software mode (Renderer ID=0x1020400)
+          - macOS-latest
+          # Failing because setup-xvfb powershell can't find clojure commands
+          # - windows-latest
+        java-version: [21]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Cache deps.edn dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.cpcache
+            ~/.gitlibs
+          key: clj-${{ runner.os }}-jdk${{ matrix.java-version }}-${{ hashFiles('**/deps.edn') }}
+          restore-keys: clj-${{ runner.os }}-jdk${{ matrix.java-version }}-
+
+      # Java 17 generates class file version 61.0, which is what processing has
+      # been compiled with.
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '${{ matrix.java-version }}'
+
+      - name: Setup Clojure
+        uses: DeLaGuardo/setup-clojure@13.6.0
+        with:
+          cli: latest
+          bb: latest
+
+      - uses: mfinelli/setup-imagemagick@v7
+
+      - name: Install Ubuntu Fonts
+        if: runner.os == 'Linux'
+        run: sudo apt install fonts-dejavu fonts-inconsolata fonts-roboto fonts-croscore
+
+      - name: Install macOS Fonts
+        if: runner.os == 'macOS'
+        run: brew install --cask font-dejavu font-inconsolata font-roboto font-tinos
+
+      - name: System Info
+        run: bb system-info
+
+      # - name: GLXInfo
+      #   if: matrix.os == 'ubuntu-latest'
+      #   run: |
+      #     sudo apt install mesa-utils
+      #     xvfb-run glxinfo -B
+
+      # AOT compile applet-listener and applet
+      - name: AOT Compile
+        run: clojure -T:build aot
+
+      # Ie all the tests including snippet tests, many of which are also
+      # verified from a CLJS context.
+      - name: Test
+        timeout-minutes: 5
+        env:
+          GLWINDOW_SEGV_HACK: 1
+        run: |
+          ${{ matrix.os == 'ubuntu-latest' && 'xvfb-run' || '' }} clojure -M:dev:kaocha --no-capture-output --reporter documentation unit clj-snippets
+
+      - name: Upload Test Artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: snippet-differences-clj-${{ runner.os }}-${{ github.sha }}.${{ github.run_attempt }}
+          path: |
+            dev-resources/snippet-snapshots/*/*/*-actual.png
+            dev-resources/snippet-snapshots/*/*/*-difference.png
+          if-no-files-found: ignore
+
+      - name: Upload core dump
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: java-core-dump-${{ runner.os }}-${{ github.sha }}.${{ github.run_attempt }}
+          path: |
+            /home/runner/work/quil/quil/core.*
+            /home/runner/work/quil/quil/hs_err_pid*.log
+          if-no-files-found: ignore

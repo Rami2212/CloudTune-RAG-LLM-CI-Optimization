@@ -1,0 +1,109 @@
+name: Release
+
+# Publishes Release binaries for Linux, Windows and macOS to a rolling
+# "latest" GitHub Release, rebuilt from master every time the Build
+# workflow succeeds there (so a broken master never gets published).
+
+on:
+  workflow_run:
+    workflows: ["Build"]
+    branches: [master]
+    types: [completed]
+
+permissions:
+  contents: write
+
+jobs:
+
+  build:
+    # 'workflow_run' only filters on the branch name: also require a push to
+    # this repository, so that a pull request from a fork's 'master' branch
+    # never replaces the published binaries.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset_name: packingsolver-linux-x64
+            archive_ext: tar.gz
+          - os: windows-latest
+            asset_name: packingsolver-windows-x64
+            archive_ext: zip
+          - os: macos-latest
+            asset_name: packingsolver-macos-x64
+            archive_ext: tar.gz
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.workflow_run.head_sha }}
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get -y install liblapack-dev libbz2-dev
+      if: matrix.os == 'ubuntu-latest'
+    - name: Build
+      run: |
+        cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DPACKINGSOLVER_BUILD_TEST=OFF
+        # Bound the number of jobs: without a value, '--parallel' runs an unlimited
+        # 'make -j', which makes the macOS runners (3 CPUs, 7 GB) swap.
+        cmake --build build --config Release --parallel ${{ runner.os == 'macOS' && 3 || 4 }}
+        cmake --install build --config Release --prefix install
+    - name: Package (tar.gz)
+      if: matrix.archive_ext == 'tar.gz'
+      shell: bash
+      run: |
+        mkdir -p dist "${{ matrix.asset_name }}"
+        cp install/bin/packingsolver_* "${{ matrix.asset_name }}/"
+        tar -czf dist/${{ matrix.asset_name }}.tar.gz ${{ matrix.asset_name }}
+    - name: Package (zip)
+      if: matrix.archive_ext == 'zip'
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force -Path dist
+        New-Item -ItemType Directory -Force -Path ${{ matrix.asset_name }}
+        Copy-Item -Path install/bin/packingsolver_*.exe -Destination ${{ matrix.asset_name }}
+        Compress-Archive -Path ${{ matrix.asset_name }} -DestinationPath dist/${{ matrix.asset_name }}.zip
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.asset_name }}
+        path: dist/${{ matrix.asset_name }}.${{ matrix.archive_ext }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.workflow_run.head_sha }}
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: dist
+    - name: Move the "latest" tag to this commit
+      run: |
+        git tag -f latest ${{ github.event.workflow_run.head_sha }}
+        git push origin latest --force
+    - name: Publish rolling release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: latest
+        name: "Latest (master)"
+        body: |
+          Automatically built from master @ ${{ github.event.workflow_run.head_sha }}.
+
+          These binaries are rebuilt on every successful commit to master and are not versioned releases.
+        prerelease: false
+        make_latest: true
+        target_commitish: ${{ github.event.workflow_run.head_sha }}
+        files: dist/**/*

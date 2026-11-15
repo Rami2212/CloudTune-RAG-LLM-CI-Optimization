@@ -1,0 +1,45 @@
+---
+name: PHP Compatibility
+on:
+  push:
+    paths:
+      - "src/**"
+  pull_request:
+    paths:
+      - "src/**"
+
+env:
+  MIN_PHP_VERSION: "8.2"
+
+jobs:
+  php-compatibility:
+      name: PHP Compatibility
+      runs-on: ubuntu-latest
+      steps:
+        - name: Checkout PR
+          uses: actions/checkout@v7
+          if: github.event_name == 'pull_request'
+          with:
+            ref: ${{ github.event.pull_request.head.sha }}
+        - name: Checkout HEAD
+          uses: actions/checkout@v7
+          if: github.event_name == 'push'
+        - name: Setup PHP
+          uses: shivammathur/setup-php@v2
+          with:
+            tools: composer:2.2.17, cs2pr
+            php-version: 8.2
+            extensions: mcrypt, mbstring, intl
+            coverage: none
+        - name: Test src directory
+          uses: pantheon-systems/phpcompatibility-action@dev
+          with:
+            skip-php-setup: true
+            test-versions: ${{ env.MIN_PHP_VERSION }}-
+            paths: ${{ github.workspace }}/src
+        - name: Test tests directory
+          uses: pantheon-systems/phpcompatibility-action@dev
+          with:
+            skip-php-setup: true
+            test-versions: ${{ env.MIN_PHP_VERSION }}-
+            paths: ${{ github.workspace }}/tests

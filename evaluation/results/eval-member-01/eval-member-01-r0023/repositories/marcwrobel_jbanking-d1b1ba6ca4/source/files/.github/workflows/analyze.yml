@@ -1,0 +1,62 @@
+# See https://help.github.com/en/actions/automating-your-workflow-with-github-actions/workflow-syntax-for-github-actions
+name: analyze
+
+on:
+  push:
+    branches: ['main', 'maintenance/*']
+    paths: ['.github/**', '.mvn/**', 'src/**', 'eclipse-formatter-config.xml', 'pom.xml']
+  pull_request:
+    branches: ['main', 'maintenance/*']
+    paths: ['.github/**', '.mvn/**', 'src/**', 'eclipse-formatter-config.xml', 'pom.xml']
+  schedule:
+    - cron: '0 0 * * 6'
+
+permissions:
+  contents: 'read'
+  pull-requests: 'write' # Required by SonarCloud to comment PRs
+  security-events: 'write' # Required by all codeql-action workflows
+
+jobs:
+  sonar:
+    # This workflow is only of value to the marcwrobel/jbanking repository and would always fail in forks
+    if: github.repository == 'marcwrobel/jbanking'
+    runs-on: 'ubuntu-latest'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of sonar analysis
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          java-version-file: '.java-version'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Analyze
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: 'mvn --settings .mvn/settings.xml -B -P analyze verify sonar:sonar'
+
+  codeql:
+    runs-on: 'ubuntu-latest'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          # We must fetch at least the immediate parents so that if this is a pull request then we can check out the head.
+          fetch-depth: 2
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: 'java'
+          queries: 'security-and-quality'
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v4
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4

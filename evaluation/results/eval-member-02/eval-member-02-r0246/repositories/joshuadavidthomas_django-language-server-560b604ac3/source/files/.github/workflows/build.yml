@@ -1,0 +1,411 @@
+name: build
+
+on:
+  push:
+    branches:
+      - main
+      - release/*
+    paths:
+      - .github/actions/setup/action.yml
+      - .github/workflows/build.yml
+      - crates/**
+      - Cargo.lock
+      - Cargo.toml
+      - mise.toml
+      - rust-toolchain.toml
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to build
+        required: false
+        type: string
+      version:
+        description: Version tag for release packaging
+        required: false
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version tag for release packaging
+        required: false
+        type: string
+
+concurrency:
+  group: build-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  should-run:
+    if: "${{ github.event_name != 'push' || startsWith(github.ref, 'refs/tags/') || !contains(github.event.head_commit.message, ':bookmark: bump version') }}"
+    runs-on: ubuntu-latest
+    steps:
+      - run: true
+
+  binary:
+    needs: [should-run]
+    runs-on: ${{ matrix.platform.runner }}
+    env:
+      ZIG_VERSION: 0.13.0
+    strategy:
+      matrix:
+        platform:
+          - runner: ubuntu-22.04
+            target: x86_64
+          - runner: ubuntu-22.04
+            target: aarch64
+          - runner: macos-15-intel
+            target: x86_64
+          - runner: macos-14
+            target: aarch64
+          - runner: windows-latest
+            target: x86_64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Prepare target and platform identifiers
+        shell: bash
+        env:
+          PLATFORM_TARGET: ${{ matrix.platform.target }}
+          RUNNER_OS: ${{ runner.os }}
+        run: |
+          target="$PLATFORM_TARGET"
+
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            target+="-unknown-linux-gnu"
+            os="linux"
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
+            target+="-apple-darwin"
+            os="darwin"
+          elif [[ "$RUNNER_OS" == "Windows" ]]; then
+            target+="-pc-windows-msvc"
+            os="windows"
+          fi
+
+          if [[ "$PLATFORM_TARGET" == "x86_64" ]]; then
+            arch="x64"
+          elif [[ "$PLATFORM_TARGET" == "aarch64" ]]; then
+            arch="arm64"
+          fi
+
+          echo "TARGET=${target}" >> $GITHUB_ENV
+          echo "OS=${os:-'unknown'}" >> $GITHUB_ENV
+          echo "ARCH=${arch:-'unknown'}" >> $GITHUB_ENV
+
+      # No Rust cache: these release-profile builds only run on main and release branches,
+      # and five platform caches would not fit the repository's cache budget.
+      - uses: $/.github/actions/setup
+        with:
+          tools: rust just
+          cache: ${{ inputs.version == '' && !startsWith(github.ref, 'refs/tags/') }}
+
+      - name: Install Rust target
+        shell: bash
+        run: rustup target add "$TARGET"
+
+      - name: Cache Zig toolchain
+        if: ${{ inputs.version == '' && !startsWith(github.ref, 'refs/tags/') && runner.os == 'Linux' && matrix.platform.target == 'aarch64' }}
+        id: cache-zig
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            zig-linux-x86_64-${{ env.ZIG_VERSION }}
+            ~/.cargo/bin/cargo-zigbuild
+          key: ${{ runner.os }}-zig-toolchain-${{ env.ZIG_VERSION }}
+
+      - name: Install Zig and cargo-zigbuild
+        if: ${{ runner.os == 'Linux' && matrix.platform.target == 'aarch64' && steps.cache-zig.outputs.cache-hit != 'true' }}
+        shell: bash
+        run: |
+          wget -q "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz"
+          tar xf "zig-linux-x86_64-${ZIG_VERSION}.tar.xz"
+          cargo install cargo-zigbuild
+
+      - name: Add Zig to PATH
+        if: ${{ runner.os == 'Linux' && matrix.platform.target == 'aarch64' }}
+        shell: bash
+        run: echo "${PWD}/zig-linux-x86_64-${ZIG_VERSION}" >> $GITHUB_PATH
+
+      - name: Build release binary
+        shell: bash
+        env:
+          RUNNER_OS: ${{ runner.os }}
+        run: |
+          just build-release "$TARGET"
+
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            bin="./target/${TARGET}/release/djls.exe"
+          else
+            bin="./target/${TARGET}/release/djls"
+          fi
+
+          echo "BIN=${bin}" >> $GITHUB_ENV
+          echo "ARTIFACT_PATH=${bin}" >> $GITHUB_ENV
+
+      - name: Strip release binary (Unix)
+        if: ${{ runner.os != 'Windows' }}
+        shell: bash
+        env:
+          RUNNER_OS: ${{ runner.os }}
+        run: |
+          if [[ "$RUNNER_OS" == "Linux" && "$TARGET" == aarch64* ]]; then
+            sudo apt-get update
+            sudo apt-get install -y binutils-aarch64-linux-gnu
+            aarch64-linux-gnu-strip "$BIN"
+          else
+            strip "$BIN"
+          fi
+
+      - name: Create release archive
+        if: ${{ inputs.version != '' }}
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          archive="django-language-server-${VERSION}-${OS}-${ARCH}"
+
+          mkdir -p "$archive"
+          cp "$BIN" "$archive/"
+          cp README.md "$archive/"
+          cp LICENSE "$archive/"
+          cp CHANGELOG.md "$archive/"
+
+          echo "ARCHIVE=${archive}" >> $GITHUB_ENV
+
+      - name: Package for release (Windows)
+        if: ${{ inputs.version != '' && runner.os == 'Windows' }}
+        shell: bash
+        run: |
+          7z a "${ARCHIVE}.zip" "$ARCHIVE"
+          sha256sum "${ARCHIVE}.zip" > "${ARCHIVE}.zip.sha256"
+          echo "ARTIFACT_PATH=${ARCHIVE}.zip*" >> $GITHUB_ENV
+
+      - name: Package for release (Unix)
+        if: ${{ inputs.version != '' && runner.os != 'Windows' }}
+        shell: bash
+        run: |
+          tar czf "${ARCHIVE}.tar.gz" "$ARCHIVE"
+          shasum -a 256 "${ARCHIVE}.tar.gz" > "${ARCHIVE}.tar.gz.sha256"
+          echo "ARTIFACT_PATH=${ARCHIVE}.tar.gz*" >> $GITHUB_ENV
+
+      - name: Upload binary
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: binary-${{ env.OS }}-${{ env.ARCH }}
+          path: ${{ env.ARTIFACT_PATH }}
+
+  linux:
+    needs: [should-run]
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      matrix:
+        platform:
+          - runner: ubuntu-22.04
+            target: x86_64
+          - runner: ubuntu-22.04
+            target: aarch64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: 3.x
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist --find-interpreter
+          sccache: ${{ inputs.version == '' && !startsWith(github.ref, 'refs/tags/') }}
+          manylinux: auto
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wheels-linux-${{ matrix.platform.target }}
+          path: dist
+
+  musllinux:
+    needs: [should-run]
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      matrix:
+        platform:
+          - runner: ubuntu-22.04
+            target: x86_64
+          - runner: ubuntu-22.04
+            target: aarch64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: 3.x
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist --find-interpreter
+          sccache: ${{ inputs.version == '' && !startsWith(github.ref, 'refs/tags/') }}
+          manylinux: musllinux_1_2
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wheels-musllinux-${{ matrix.platform.target }}
+          path: dist
+
+  windows:
+    needs: [should-run]
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      matrix:
+        platform:
+          - runner: windows-latest
+            target: x64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          architecture: ${{ matrix.platform.target }}
+          python-version: 3.x
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist --find-interpreter
+          sccache: ${{ inputs.version == '' && !startsWith(github.ref, 'refs/tags/') }}
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wheels-windows-${{ matrix.platform.target }}
+          path: dist
+
+  macos:
+    needs: [should-run]
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      matrix:
+        platform:
+          - runner: macos-15-intel
+            target: x86_64
+          - runner: macos-14
+            target: aarch64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: 3.x
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist --find-interpreter
+          sccache: ${{ inputs.version == '' && !startsWith(github.ref, 'refs/tags/') }}
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wheels-macos-${{ matrix.platform.target }}
+          path: dist
+
+  sdist:
+    needs: [should-run]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          command: sdist
+          args: --out dist
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wheels-sdist
+          path: dist
+
+  attest:
+    runs-on: ubuntu-latest
+    if: ${{ inputs.version != '' }}
+    needs: [binary, wasm, linux, musllinux, windows, macos, sdist]
+    permissions:
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            binary-*/*
+            wheels-*/*
+
+  # The browser build for djls-vscode on vscode.dev and github.dev. Released as a `binary-*`
+  # archive so tools/release.py checksums, uploads, and attests it with the native binaries.
+  wasm:
+    needs: [should-run]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: $/.github/actions/setup
+        with:
+          tools: rust just github:wasm-bindgen/wasm-bindgen
+          cache: ${{ inputs.version == '' && !startsWith(github.ref, 'refs/tags/') }}
+
+      - name: Install Rust target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Build browser package
+        run: just wasm target/wasm/pkg
+
+      - name: Package for release
+        if: ${{ inputs.version != '' }}
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          archive="django-language-server-${VERSION}-wasm"
+          mv target/wasm/pkg "$archive"
+          cp README.md LICENSE CHANGELOG.md "$archive/"
+          tar czf "${archive}.tar.gz" "$archive"
+          shasum -a 256 "${archive}.tar.gz" > "${archive}.tar.gz.sha256"
+
+      - name: Upload browser package
+        if: ${{ inputs.version != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: binary-wasm
+          path: django-language-server-*-wasm.tar.gz*

@@ -1,0 +1,60 @@
+name: Build and Push System Test Docker Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      cargo_build_flags:
+        description: 'Extra build flags for cargo. Default features are kept: enforce-minimum-cpu is runtime-gated to validators on the ika testnet/mainnet networks, so it is inert in test deployments.'
+        required: false
+        default: ''
+      imageTag:
+        description: 'Tag for the Docker image'
+        required: false
+        default: 'latest'
+      use_mocks:
+        description: 'Build the ika-node image with the INSECURE dwallet-mpc-unsafe-mock crypto (deterministic mocks; NOT real crypto). NOTE: any SDK tests run against this image must also use a wasm client built with IKA_WASM_UNSAFE_MOCK=1. Off by default.'
+        type: boolean
+        required: false
+        default: false
+
+env:
+  GH_DEPLOY_KEY: ${{ secrets.GH_DEPLOY_KEY }}
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+  CLOUDSDK_CORE_PROJECT: common-449616
+  DOCKER_TAG: 'us-docker.pkg.dev/common-449616/ika-common-containers/ika-node:${{ github.event.inputs.imageTag }}'
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Docker auth for GAR
+        run: |
+          cat > key.json <<EOF
+          ${{ secrets.GAR_KEY }}
+          EOF
+          gcloud auth activate-service-account --key-file=key.json
+          gcloud auth configure-docker us-docker.pkg.dev --quiet
+
+      - name: Setup SSH
+        uses: ./.github/actions/setup-ssh
+        with:
+          deploy-key: ${{ secrets.GH_DEPLOY_KEY }}
+
+      - name: Build and push Docker image
+        working-directory: sdk/typescript/test/system-tests
+        env:
+          USE_MOCKS: ${{ github.event.inputs.use_mocks }}
+        run: |
+          touch .env
+          FLAGS="${{ github.event.inputs.cargo_build_flags }}"
+          if [ "$USE_MOCKS" = "true" ]; then FLAGS="$FLAGS --features dwallet-mpc-unsafe-mock"; fi
+          ./build.sh $FLAGS
+          docker push "$DOCKER_TAG"

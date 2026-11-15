@@ -1,0 +1,210 @@
+name: Rebuild OID Maps
+on:
+  workflow_dispatch:
+    inputs:
+      maps_enabled:
+        type: boolean
+        description: 'Update maps (slow)'
+        required: false
+        default:  true
+      debug_enabled:
+        type: boolean
+        description: 'With build debug'
+        required: false
+        default:  false
+#  push:
+#    branches:
+#      - master
+jobs:
+  update_maps:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.maps_enabled }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          lfs: true
+
+      - name: Cache Perl dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/perl5
+            ~/.cpanm
+          key: ${{ runner.os }}-perl-deps-${{ hashFiles('.github/workflows/update_maps.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-perl-deps-
+
+      - name: Install dependencies
+        run: |
+          sudo apt install cpanminus
+          cpanm File::Slurper
+
+      - name: genxlate
+        run: |
+          cpanm --local-lib=~/perl5 local::lib && eval $(perl -I ~/perl5/lib/perl5/ -Mlocal::lib)
+          export MIBHOME=`pwd`
+          mkdir -p $MIBHOME/EXTRAS/indexes/cert_indexes
+          EXTRAS/scripts/genxlate
+
+      - name: mkoidmap
+        run: |
+          cpanm --local-lib=~/perl5 local::lib && eval $(perl -I ~/perl5/lib/perl5/ -Mlocal::lib)
+          export MIBHOME=`pwd`
+          mkdir -p $MIBHOME/EXTRAS/indexes/cert_indexes
+          EXTRAS/scripts/mkoidmap
+
+      - name: mkproductlookup
+        run: |
+          export MIBHOME=`pwd`
+          grep -E '^\.1\.3\.6\.1\.4\.1\.[0-9]+\.' $MIBHOME/EXTRAS/reports/*_oids | \
+            cut -s -d, -f1,2 | \
+            sed -e 's/::/,/' | \
+            cut -d : -f 2 | \
+            cut -d , -f 1,3 | \
+            grep -v '.0,' | \
+            sed -e 's/^\.1\.3\.6\.1\.4\.1\.//' > $MIBHOME/EXTRAS/reports/all_leafs_only
+
+      - name: Commit files
+        run: |
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add --all
+          git diff --staged --quiet || git commit -m "Update the OID maps via Github Actions"
+
+      - name: Push changes
+        uses: ad-m/github-push-action@master
+        if: ${{ github.event_name == 'workflow_dispatch' && ! inputs.debug_enabled }}
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ github.ref }}
+
+#    - name: Setup tmate session
+#      uses: mxschmitt/action-tmate@v3
+##      if: always() && github.event.inputs.debug_enabled
+#      if: always() && ${{ github.event_name == 'workflow_dispatch' && inputs.debug_enabled }}
+##      with:
+##        sudo: true
+
+  build_object_sql:
+    runs-on: ubuntu-latest
+    if: ${{ always() }}
+    needs: update_maps
+    container:
+      image: 'netdisco/netdisco:latest-backend'
+      options: '--user root --entrypoint /bin/ash'
+      #volumes:
+      #  - '/home/runner/work:/github/workspace'
+      #  # this allows us to load in the new netdisco-mibs
+      #  # /home/runner/work/netdisco-mibs/netdisco-mibs contains the files
+
+    # PostgreSQL service container for temporary table
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_DB: netdisco
+          POSTGRES_USER: netdisco
+          POSTGRES_PASSWORD: netdisco
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Install packages
+        run: |
+          apk update
+          apk add --no-cache git git-lfs openssh-client nodejs curl gzip sudo
+
+      - uses: actions/checkout@v7
+        with:
+          lfs: true
+          # Include the commit pushed by update_maps.
+          ref: ${{ github.ref }}
+
+      - name: Deploy database schema
+        env:
+          NETDISCO_HOME: /__w/netdisco-mibs
+          NETDISCO_DB_USER: netdisco
+          NETDISCO_DB_PASS: netdisco
+          NETDISCO_DB_HOST: postgres
+          NETDISCO_DB_PORT: 5432
+          NETDISCO_DB_NAME: netdisco
+        run: |
+          /home/netdisco/bin/localenv /home/netdisco/bin/netdisco-db-deploy
+
+      - name: Parse current OID reports into SNMP objects
+        env:
+          NETDISCO_HOME: /__w/netdisco-mibs
+          NETDISCO_DB_USER: netdisco
+          NETDISCO_DB_PASS: netdisco
+          NETDISCO_DB_HOST: postgres
+          NETDISCO_DB_PORT: 5432
+          NETDISCO_DB_NAME: netdisco
+        run: |
+          mkdir -p /__w/netdisco-mibs/environments
+          echo 'loadmibs_timeout: 6000' >> /__w/netdisco-mibs/environments/deployment.yml
+          /home/netdisco/bin/localenv /home/netdisco/bin/netdisco-do loadmibsfromoids --debug
+
+      - name: Dump the data
+        run: |
+          mkdir -p /__w/netdisco-mibs/netdisco-mibs/EXTRAS/sql
+          echo 'DELETE FROM "snmp_object";' >> /__w/netdisco-mibs/netdisco-mibs/EXTRAS/sql/netdisco-mibs-snmp-object.sql
+          echo 'COPY snmp_object (oid, oid_parts, mib, leaf, "type", "access", "index", num_children, status, enum, descr) FROM stdin;' >> /__w/netdisco-mibs/netdisco-mibs/EXTRAS/sql/netdisco-mibs-snmp-object.sql
+          sudo PGPASSWORD=netdisco psql -h postgres -U netdisco -d netdisco  -c "\copy snmp_object TO '/__w/netdisco-mibs/netdisco-mibs/EXTRAS/sql/netdisco-mibs-snmp-object.sql.new'"
+          # Netdisco runs this file's DELETE unconditionally, so an empty or
+          # truncated dump would wipe snmp_object on every install.
+          SQLDIR=/__w/netdisco-mibs/netdisco-mibs/EXTRAS/sql
+          NEW_ROWS=$(wc -l < $SQLDIR/netdisco-mibs-snmp-object.sql.new)
+          OLD_ROWS=0
+          if gzip -t $SQLDIR/netdisco-mibs-snmp-object.sql.gz 2>/dev/null; then
+            OLD_ROWS=$(( $(gzip -dc $SQLDIR/netdisco-mibs-snmp-object.sql.gz | wc -l) - 3 ))
+          fi
+          echo "snmp_object rows: $NEW_ROWS, previously committed: $OLD_ROWS"
+          if [ "$NEW_ROWS" -eq 0 ]; then
+            echo "::error::loadmibsfromoids produced no snmp_object rows; check that EXTRAS/reports/*_oids are real files and not git-lfs pointers. Refusing to commit SQL that would empty snmp_object."
+            exit 1
+          fi
+          if [ $(( NEW_ROWS * 10 )) -lt $(( OLD_ROWS * 9 )) ]; then
+            echo "::error::snmp_object shrank by more than 10% ($OLD_ROWS -> $NEW_ROWS rows); check the loadmibsfromoids output above. If the drop is intended, lower this threshold in the same commit as the change that causes it."
+            exit 1
+          fi
+          cat /__w/netdisco-mibs/netdisco-mibs/EXTRAS/sql/netdisco-mibs-snmp-object.sql.new >> /__w/netdisco-mibs/netdisco-mibs/EXTRAS/sql/netdisco-mibs-snmp-object.sql
+          rm /__w/netdisco-mibs/netdisco-mibs/EXTRAS/sql/netdisco-mibs-snmp-object.sql.new
+          echo '\.' >> /__w/netdisco-mibs/netdisco-mibs/EXTRAS/sql/netdisco-mibs-snmp-object.sql
+          rm -f /__w/netdisco-mibs/netdisco-mibs/EXTRAS/sql/netdisco-mibs-snmp-object.sql.gz
+          gzip -9 /__w/netdisco-mibs/netdisco-mibs/EXTRAS/sql/netdisco-mibs-snmp-object.sql
+
+      - name: Commit files
+        run: |
+          git config --global --add safe.directory /__w/netdisco-mibs/netdisco-mibs
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add /__w/netdisco-mibs/netdisco-mibs/EXTRAS/sql/netdisco-mibs-snmp-object.sql.gz
+          git diff --staged --quiet || git commit -m "Update SNMP Objects SQL"
+
+      - name: Push changes
+        uses: ad-m/github-push-action@master
+        if: ${{ github.event_name == 'workflow_dispatch' && ! inputs.debug_enabled }}
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ github.ref }}
+
+      - name: Setup tmate session
+        uses: mxschmitt/action-tmate@v3.24
+        if: always() && inputs.debug_enabled
+        env:
+          NETDISCO_HOME: /__w/netdisco-mibs
+          NETDISCO_DB_USER: netdisco
+          NETDISCO_DB_PASS: netdisco
+          NETDISCO_DB_HOST: postgres
+          NETDISCO_DB_PORT: 5432
+          NETDISCO_DB_NAME: netdisco
+          PGUSER:     netdisco
+          PGPASSWORD: netdisco
+          PGHOST:     postgres
+          PGPORT:     5432
+          PGDATABASE: netdisco
+        with:
+          sudo: true

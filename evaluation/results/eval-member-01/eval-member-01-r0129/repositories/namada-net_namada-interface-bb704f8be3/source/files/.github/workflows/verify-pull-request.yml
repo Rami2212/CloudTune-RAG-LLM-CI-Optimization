@@ -1,0 +1,145 @@
+name: PR checks
+on:
+  pull_request:
+
+env:
+  CI: false
+  YARN_ENABLE_HARDENED_MODE: 0
+
+jobs:
+  # Running yarn install in hardened mode here makes it safe to run the other
+  # jobs without hardened mode, which is good because hardened mode is slow.
+  # https://yarnpkg.com/features/security#hardened-mode
+  check-yarn-lock-poisoning:
+    name: Check for yarn.lock poisoning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check if yarn.lock changed
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            lockfile:
+              - "yarn.lock"
+
+      - name: Check yarn.lock for lockfile poisoning
+        if: steps.filter.outputs.lockfile == 'true'
+        uses: ./.github/actions/yarn-cache
+        env:
+          YARN_ENABLE_HARDENED_MODE: 1
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    needs: [check-yarn-lock-poisoning]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install yarn dependencies
+        uses: ./.github/actions/yarn-cache
+
+      - name: Run ESLint
+        run: yarn lint:ci
+
+  unit-tests-js:
+    name: JS unit tests
+    needs: [check-yarn-lock-poisoning]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install yarn dependencies
+        uses: ./.github/actions/yarn-cache
+
+      - name: Apt update
+        run: sudo apt update
+        shell: bash
+
+      - name: Run unit tests
+        id: run-unit-tests
+        run: yarn test:ci
+
+  build-interface:
+    name: Build Namadillo
+    needs: [check-yarn-lock-poisoning]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install yarn dependencies
+        uses: ./.github/actions/yarn-cache
+
+      - name: Apt update
+        run: sudo apt update
+        shell: bash
+
+      - name: Install protoc
+        run: sudo apt-get install -y protobuf-compiler
+
+      - name: build the site
+        working-directory: ./apps/namadillo
+        run: yarn build
+        env:
+          NAMADA_INTERFACE_NAMADA_ALIAS: "Namada Devnet"
+          NAMADA_INTERFACE_NAMADA_CHAIN_ID: "internal-devnet-6be.86067e06a5"
+          NAMADA_INTERFACE_NAMADA_URL: "https://proxy.heliax.click/internal-devnet-6be.86067e06a5"
+
+  build-extension:
+    name: Build Extension
+    needs: [check-yarn-lock-poisoning]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install yarn dependencies
+        uses: ./.github/actions/yarn-cache
+
+      - name: Apt update
+        run: sudo apt update
+        shell: bash
+
+      - name: Build the extension
+        working-directory: ./apps/extension
+        run: yarn build:chrome
+
+  E2E-tests:
+    if: false
+    name: E2E tests
+    needs: [build-interface]
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./apps/namadillo
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install yarn dependencies
+        uses: ./.github/actions/yarn-cache
+
+      - uses: actions/setup-node@v2
+        with:
+          node-version: "18.x"
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.3.0
+        with:
+          version: "v0.10.3"
+      - name: Install Playwright Browsers
+        run: npx playwright install --with-deps
+      - name: Run Playwright tests
+        id: run-playwright-tests
+        run: PLAYWRIGHT_BASE_URL=https://pull-request-${{ github.event.number }}--wallet-development-heliax-dev.netlify.app NETLIFY_SITE_PROTECTION_PASSWORD=${{ secrets.NETLIFY_SITE_PROTECTION_PASSWORD }} yarn playwright test
+      - uses: actions/upload-artifact@v2
+        if: always()
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 30

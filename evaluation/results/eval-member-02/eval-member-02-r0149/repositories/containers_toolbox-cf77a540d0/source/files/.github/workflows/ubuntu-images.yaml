@@ -1,0 +1,97 @@
+name: "Ubuntu: Build and push ubuntu-toolbox images"
+
+permissions: read-all
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - images/ubuntu/**
+      - .github/workflows/ubuntu-images.yaml
+  push:
+    branches:
+      - main
+    paths:
+      - images/ubuntu/**
+      - .github/workflows/ubuntu-images.yaml
+  schedule:
+    - cron: '0 0 * * MON'
+
+env:
+  distro: 'ubuntu'
+  latest_release: '24.04'
+  platforms: 'linux/amd64, linux/arm64'
+  registry: 'quay.io/toolbx'
+  username: 'toolbx+github'
+
+# Prevent multiple workflow runs from racing to ensure that pushes are made
+# sequentially for the main branch. Also cancel in progress workflow runs for
+# pull requests only.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build-push-images:
+    strategy:
+      matrix:
+        release: ['18.04', '20.04', '22.04', '24.04', '25.04', '25.10', '26.04']
+      fail-fast: false
+
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU for multi-arch builds
+        shell: bash
+        run: |
+          sudo apt update
+          sudo apt install qemu-user-static
+
+      - name: Build container image
+        uses: redhat-actions/buildah-build@v2
+        if: env.latest_release != matrix.release
+        with:
+          platforms: ${{ env.platforms }}
+          context: images/${{ env.distro }}/${{ matrix.release }}
+          image: ${{ env.distro }}-toolbox
+          tags: ${{ matrix.release }}
+          containerfiles: images/${{ env.distro }}/${{ matrix.release }}/Containerfile
+          layers: false
+          oci: true
+
+      - name: Build container image (latest tag)
+        uses: redhat-actions/buildah-build@v2
+        if: env.latest_release == matrix.release
+        with:
+          platforms: ${{ env.platforms }}
+          context: images/${{ env.distro }}/${{ matrix.release }}
+          image: ${{ env.distro }}-toolbox
+          tags: ${{ matrix.release }} latest
+          containerfiles: images/${{ env.distro }}/${{ matrix.release }}/Containerfile
+          layers: false
+          oci: true
+
+      - name: Push to Container Registry
+        uses: redhat-actions/push-to-registry@v2
+        id: push
+        if: (github.event_name == 'push' || github.event_name == 'schedule') && github.ref == 'refs/heads/main' && env.latest_release != matrix.release
+        with:
+          username: ${{ env.username }}
+          password: ${{ secrets.QUAY_ROBOT_TOKEN }}
+          image: ${{ env.distro }}-toolbox
+          registry: ${{ env.registry }}
+          tags: ${{ matrix.release }}
+
+      - name: Push to Container Registry (latest tag)
+        uses: redhat-actions/push-to-registry@v2
+        id: push-latest
+        if: (github.event_name == 'push' || github.event_name == 'schedule') && github.ref == 'refs/heads/main' && env.latest_release == matrix.release
+        with:
+          username: ${{ env.username }}
+          password: ${{ secrets.QUAY_ROBOT_TOKEN }}
+          image: ${{ env.distro }}-toolbox
+          registry: ${{ env.registry }}
+          tags: ${{ matrix.release }} latest

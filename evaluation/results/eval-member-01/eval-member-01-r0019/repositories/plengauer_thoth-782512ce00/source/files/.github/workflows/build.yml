@@ -1,0 +1,724 @@
+name: 'Build'
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: true
+
+env:
+  OTEL_KILL_SWITCH: ${{ vars.OTEL_KILL_SWITCH }}
+
+jobs:
+
+  verify-scripts:
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: plengauer/opentelemetry-github/actions/instrument/job@5d34a21816f798c24f19857225b018a7f2af731f # v5.66.0
+        env:
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.OTEL_EXPORTER_OTLP_ENDPOINT }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+        with:
+          secrets_to_redact: '["${{ github.token }}"]'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - run: find . -iname '*.sh' -exec bash -n '{}' ';'
+
+  build-http:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        architecture: ['amd64', 'arm64/v8', 'mips64le', 'ppc64le', 'riscv64', 's390x'] # 'i386', 'arm32/v7'
+      fail-fast: false
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: plengauer/opentelemetry-github/actions/instrument/job@5d34a21816f798c24f19857225b018a7f2af731f # v5.66.0
+        env:
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.OTEL_EXPORTER_OTLP_ENDPOINT }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+        with:
+          secrets_to_redact: '["${{ github.token }}"]'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - if: ${{ matrix.architecture != 'amd64' }}
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - id: build
+        run: |
+          debian_architecture="$(echo ${{ matrix.architecture }} | cut -d / -f 1 | sed 's/le$/el/g')"
+          if curl -s -L https://deb.debian.org/debian/dists/oldstable/main | grep -q binary-"$debian_architecture" && sudo docker pull --platform linux/${{ matrix.architecture }} docker.io/"$(echo ${{ matrix.architecture }} | tr -d /)"/debian:oldstable; then
+            image=debian:oldstable
+          elif curl -s -L https://deb.debian.org/debian/dists/stable/main | grep -q binary-"$debian_architecture" && sudo docker pull --platform linux/${{ matrix.architecture }} docker.io/"$(echo ${{ matrix.architecture }} | tr -d /)"/debian:stable; then
+            image=debian:stable
+          elif curl -s -L https://deb.debian.org/debian/dists/testing/main | grep -q binary-"$debian_architecture" && sudo docker pull --platform linux/${{ matrix.architecture }} docker.io/"$(echo ${{ matrix.architecture }} | tr -d /)"/debian:testing; then
+            image=debian:testing
+          elif curl -s -L https://deb.debian.org/debian/dists/unstable/main | grep -q binary-"$debian_architecture" && sudo docker pull --platform linux/${{ matrix.architecture }} docker.io/"$(echo ${{ matrix.architecture }} | tr -d /)"/debian:unstable; then
+            image=debian:unstable
+          else
+            echo "no debian found supporting the architecture ${{ matrix.architecture }}"
+            exit 1
+          fi
+          echo 'cd src/usr/share/opentelemetry_shell/agent.instrumentation.http/ && apt-get update 1>&2 && yes | apt-get install build-essential 1>&2 && gcc -shared -fPIC -o libinjecthttpheader.so agent.injection.http_header.c -ldl 1>&2 && arch' \
+           | sudo docker run -i --rm --network host -v "$(pwd)"/src:/home/root/src -w /home/root --platform linux/${{ matrix.architecture }} docker.io/"$(echo ${{ matrix.architecture }} | tr -d /)"/"$image" | xargs -0 -I {} echo 'architecture={}' >> "$GITHUB_OUTPUT"
+      - run: |
+          [ -r src/usr/share/opentelemetry_shell/agent.instrumentation.http/libinjecthttpheader.so ]
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: http_${{ steps.build.outputs.architecture }}_${{ inputs.ref }}
+          path: src/usr/share/opentelemetry_shell/agent.instrumentation.http/libinjecthttpheader.so
+          if-no-files-found: error
+  merge-http:
+    needs: build-http
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: plengauer/opentelemetry-github/actions/instrument/job@5d34a21816f798c24f19857225b018a7f2af731f # v5.66.0
+        env:
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.OTEL_EXPORTER_OTLP_ENDPOINT }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+        with:
+          secrets_to_redact: '["${{ github.token }}"]'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: http_*_${{ inputs.ref }}
+      - run: |
+          mkdir bin
+          find . -maxdepth 1 -name 'http_*' -type d -printf '%f\n' | while read -r directory; do
+            architecture="${directory#http_}"
+            architecture="${architecture%_*}"
+            mv "$directory" bin/"$architecture"
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: http_${{ inputs.ref }}
+          path: bin/
+
+  list-node-versions:
+    runs-on: ubuntu-slim
+    outputs:
+      versions: ${{ steps.dynamic.outputs.versions }}
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: plengauer/opentelemetry-github/actions/instrument/job@5d34a21816f798c24f19857225b018a7f2af731f # v5.66.0
+        env:
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.OTEL_EXPORTER_OTLP_ENDPOINT }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+        with:
+          secrets_to_redact: '["${{ github.token }}"]'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - run: cd src/usr/share/opentelemetry_shell/agent.instrumentation.node && npm install
+      - id: dynamic
+        run: |
+          seq "$(cat src/usr/share/opentelemetry_shell/agent.instrumentation.node/node_modules/@opentelemetry/*/package.json | jq -r .engines.node | grep -v null | cut -d ' ' -f 1 | tr -d ^ | cut -d = -f 2 | cut -d . -f 1 | sort -n -u | tail -n 1)" "$(cat src/usr/share/opentelemetry_shell/agent.instrumentation.node/Dockerfile | grep '^FROM ' | cut -d ' ' -f 2 | cut -d : -f 2)" \
+            | jq -s -c | xargs -0 -I {} echo 'versions={}' >> "$GITHUB_OUTPUT"
+  build-node-modules:
+    needs: list-node-versions
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        version: ${{ fromJSON(needs.list-node-versions.outputs.versions) }}
+      fail-fast: false
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: plengauer/opentelemetry-github/actions/instrument/job@5d34a21816f798c24f19857225b018a7f2af731f # v5.66.0
+        env:
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.OTEL_EXPORTER_OTLP_ENDPOINT }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+          OTEL_KILL_SWITCH: 1
+        with:
+          secrets_to_redact: '["${{ github.token }}"]'
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.version }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - run: |
+          cd src/usr/share/opentelemetry_shell/agent.instrumentation.node
+          npm install
+          npm prune
+      - run: |
+          ! find src/usr/share/opentelemetry_shell/agent.instrumentation.node/node_modules -iname '*.so' | grep '.so$'
+      - run: |
+          ! find -L src/usr/share/opentelemetry_shell/agent.instrumentation.node/node_modules -type l -exec readlink -f '{}' ';' | while read -r file; do realpath "$file"; done | grep '^'"$(pwd)"/src/usr/share/opentelemetry_shell/agent.instrumentation.node/node_modules
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: node_modules_${{ matrix.version }}_${{ inputs.ref }}
+          path: src/usr/share/opentelemetry_shell/agent.instrumentation.node/node_modules
+  merge-node-modules:
+    needs: build-node-modules
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: plengauer/opentelemetry-github/actions/instrument/job@5d34a21816f798c24f19857225b018a7f2af731f # v5.66.0
+        env:
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.OTEL_EXPORTER_OTLP_ENDPOINT }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+          OTEL_SHELL_CONFIG_MUTE_INTERNALS: 'TRUE'
+        with:
+          secrets_to_redact: '["${{ github.token }}"]'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: node_modules_*_${{ inputs.ref }}
+      - run: |
+          find . -maxdepth 1 -name 'node_modules_*' -type d -printf '%f\n' | while read -r directory; do
+            version="${directory#node_modules_}"
+            version="${version%_*}"
+            mkdir "$version"
+            mv "$directory" "$version"/node_modules
+          done
+      - env:
+          OTEL_SHELL_CONFIG_MUTE_INTERNALS: TRUE
+        run: |
+          prev_hash=""
+          prev_version=""
+          for version in $(find . -maxdepth 1 -regextype posix-extended -regex './[0-9]+' -printf '%f\n' | sort -n); do
+            hash="$(find "$version" -type f | sort | while IFS= read -r f; do printf '%s\n' "${f#*/}"; \cat "$f"; done | sha256sum | cut -d ' ' -f 1)"
+            if [ "$hash" = "$prev_hash" ]; then
+              echo "node $version is redundant (identical to node $prev_version), deduplicating"
+              rm -rf "$version"
+            else
+              if [ -n "$prev_version" ]; then
+                echo "node $version is not redundant (differs from node $prev_version):"
+                diff \
+                  <(find "$prev_version" -type f | sort | while IFS= read -r f; do printf '%s %s\n' "$(\sha256sum "$f" | \cut -d ' ' -f 1)" "${f#*/}"; done) \
+                  <(find "$version" -type f | sort | while IFS= read -r f; do printf '%s %s\n' "$(\sha256sum "$f" | \cut -d ' ' -f 1)" "${f#*/}"; done) \
+                  | \grep '^[<>]' | \cut -d ' ' -f 2- | \sort -u || true
+              fi
+              prev_hash="$hash"
+              prev_version="$version"
+            fi
+          done
+      - run: find . -type f -print0 | xargs -0 sha256sum | sort | cut -d ' ' -f 3- | tar -cf node_modules.tar -T - && zstd --rm -19 --long=27 -T0 node_modules.tar
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: node_modules_${{ inputs.ref }}
+          path: node_modules.tar.zst
+
+  list-python-versions:
+    runs-on: ubuntu-slim
+    outputs:
+      versions: ${{ steps.dynamic.outputs.versions }}
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: plengauer/opentelemetry-github/actions/instrument/job@5d34a21816f798c24f19857225b018a7f2af731f # v5.66.0
+        env:
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.OTEL_EXPORTER_OTLP_ENDPOINT }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+        with:
+          secrets_to_redact: ${{ github.token }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - run: |
+          python3 -m venv venv
+          . venv/bin/activate
+          pip3 install -r src/usr/share/opentelemetry_shell/agent.instrumentation.python/requirements.txt
+          deactivate
+      - id: dynamic
+        run: |
+          seq "$(cat venv/lib/python*/site-packages/opentelemetry_*.dist-info/METADATA | grep '^Requires-Python: >=' | cut -d . -f 2 | sort -n -u | tail -n 1)" "$(cat src/usr/share/opentelemetry_shell/agent.instrumentation.python/Dockerfile | grep '^FROM ' | cut -d ' ' -f 2 | cut -d : -f 2 | cut -d . -f 2)" \
+            | while read -r version; do echo '"'3."$version"'"'; done | jq -s -c | xargs -0 -I {} echo 'versions={}' >> "$GITHUB_OUTPUT"
+  build-python-site-packages:
+    needs: list-python-versions
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        version: ${{ fromJSON(needs.list-python-versions.outputs.versions) }}
+        architecture: ['x86_64', 'aarch64'] # 'ppc64le', 'riscv64', 's390x'
+      fail-fast: false
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: plengauer/opentelemetry-github/actions/instrument/job@5d34a21816f798c24f19857225b018a7f2af731f # v5.66.0
+        env:
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.OTEL_EXPORTER_OTLP_ENDPOINT }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+          OTEL_KILL_SWITCH: 1
+        with:
+          secrets_to_redact: ${{ github.token }}
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.version }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - env:
+          ARCHITECTURE: ${{ matrix.architecture }}
+          PYTHON_VERSION: ${{ matrix.version }}
+        run: |
+          cd src/usr/share/opentelemetry_shell/agent.instrumentation.python
+          target="$RUNNER_TEMP"/out/"$ARCHITECTURE"/"$PYTHON_VERSION"/site-packages
+          pip3 install --target "$target" --implementation cp --python-version "$PYTHON_VERSION" --platform manylinux2014_"$ARCHITECTURE" --platform manylinux_2_28_"$ARCHITECTURE" --only-binary=:all: -r requirements.txt
+          rm -rf "${target:?}"/bin
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: python_site_packages_${{ matrix.architecture }}_${{ matrix.version }}_${{ inputs.ref }}
+          path: ${{ runner.temp }}/out
+          if-no-files-found: error
+  merge-python-site-packages:
+    needs: build-python-site-packages
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: plengauer/opentelemetry-github/actions/instrument/job@5d34a21816f798c24f19857225b018a7f2af731f # v5.66.0
+        env:
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.OTEL_EXPORTER_OTLP_ENDPOINT }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+          OTEL_SHELL_CONFIG_MUTE_INTERNALS: 'TRUE'
+        with:
+          secrets_to_redact: '["${{ github.token }}"]'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: python_site_packages_*_*_${{ inputs.ref }}
+          path: site-packages
+          merge-multiple: true
+      - env:
+          OTEL_SHELL_CONFIG_MUTE_INTERNALS: TRUE
+        run: | # layout is <arch>/<version>/site-packages, deduplicate versions per architecture (identical trees cannot contain version specific native extensions, so the version fallback during install is exact for them)
+          mkdir -p site-packages
+          find site-packages -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | while read -r arch; do
+            prev_hash=""
+            prev_version=""
+            for version in $(find site-packages/"$arch" -maxdepth 1 -regextype posix-extended -regex '.*/3\.[0-9]+' -printf '%f\n' | sort -t. -k2 -n); do
+              hash="$(cd site-packages/"$arch" && find "$version" -type f | sort | while IFS= read -r f; do printf '%s\n' "${f#*/}"; \cat "$f"; done | sha256sum | cut -d ' ' -f 1)"
+              if [ "$hash" = "$prev_hash" ]; then
+                echo "python $version on $arch is redundant (identical to python $prev_version), deduplicating"
+                rm -rf site-packages/"$arch"/"$version"
+              else
+                if [ -n "$prev_version" ]; then
+                  echo "python $version on $arch is not redundant (differs from python $prev_version):"
+                  diff \
+                    <(cd site-packages/"$arch" && find "$prev_version" -type f | sort | while IFS= read -r f; do printf '%s %s\n' "$(\sha256sum "$f" | \cut -d ' ' -f 1)" "${f#*/}"; done) \
+                    <(cd site-packages/"$arch" && find "$version" -type f | sort | while IFS= read -r f; do printf '%s %s\n' "$(\sha256sum "$f" | \cut -d ' ' -f 1)" "${f#*/}"; done) \
+                    | \grep '^[<>]' | \cut -d ' ' -f 2- | \sort -u || true
+                fi
+                prev_hash="$hash"
+                prev_version="$version"
+              fi
+            done
+          done
+      - run: |
+          mkdir out
+          find site-packages -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | while read -r arch; do
+            mkdir out/"$arch"
+            (cd site-packages/"$arch" && find . -type f -print0 | xargs -0 sha256sum | sort | cut -d ' ' -f 3- | tar -cf ../../out/"$arch"/python_site_packages.tar -T - && zstd --rm -19 --long=27 -T0 ../../out/"$arch"/python_site_packages.tar)
+            echo "$arch" >> out/architectures.txt
+          done
+          touch out/architectures.txt
+          cat out/architectures.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: python_site_packages_${{ inputs.ref }}
+          path: out/
+
+  build-java-agents:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: plengauer/opentelemetry-github/actions/instrument/job@5d34a21816f798c24f19857225b018a7f2af731f # v5.66.0
+        env:
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.OTEL_EXPORTER_OTLP_ENDPOINT }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+        with:
+          secrets_to_redact: '["${{ github.token }}"]'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          java-version: 25.0.5+8.0.LTS
+          distribution: temurin
+      - run: |
+          cd src/usr/share/opentelemetry_shell/agent.instrumentation.java
+          javac -source 8 -target 8 SystemPropertiesPrinter.java
+      - run: |
+          cd src/usr/share/opentelemetry_shell/agent.instrumentation.java
+          mvn dependency:resolve
+          find ~/.m2 -iname 'opentelemetry-javaagent-*.jar' -exec cp '{}' opentelemetry-javaagent.jar \;
+          find ~/.m2 -iname 'byte-buddy-*.jar' -exec cp '{}' byte-buddy.jar \;
+      - id: determine-minimum-version
+        run: |
+          directory="$(mktemp -d)"
+          unzip -d "$directory" src/usr/share/opentelemetry_shell/agent.instrumentation.java/opentelemetry-javaagent.jar 2> /dev/null
+          cd "$directory"
+          # class_file_version="$(cat META-INF/MANIFEST.MF | grep '^Premain-Class' | cut -d : -f 2 | tr -d ' ' | tr -d '\r' | xargs -t -r javap -v -cp . | grep 'major version' | cut -d : -f 2 | tr -d ' ')"
+          class_file_version="$(find . -iname '*.class' | while read -r path; do echo "${path#\./}"; done | cut -d . -f 1 | tr / . | xargs -r -P 0 javap -v -cp . | grep 'major version' | cut -d : -f 2 | tr -d ' ' | sort -n | tail -n 1)"
+          class_file_version_base=44
+          java_version=$((class_file_version - class_file_version_base))
+          echo version="$java_version" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          java-version: ${{ steps.determine-minimum-version.outputs.version }}
+          distribution: temurin
+      - run: |
+          cd src/usr/share/opentelemetry_shell/agent.instrumentation.java
+          javac -classpath ./opentelemetry-javaagent.jar RootContextAgent.java
+          printf '%s\n\n' "Premain-Class: RootContextAgent" > manifest.txt
+          jar cmf manifest.txt rootcontextagent.jar RootContextAgent*.class
+      - run: |
+          cd src/usr/share/opentelemetry_shell/agent.instrumentation.java
+          javac -classpath  ./opentelemetry-javaagent.jar:./byte-buddy.jar SubprocessInjectionAgent.java
+          printf '%s\n\n' 'Premain-Class: SubprocessInjectionAgent
+          Boot-Class-Path: /usr/share/opentelemetry_shell/agent.instrumentation.java/subprocessinjectionagent.jar ./byte-buddy.jar
+          Can-Retransform-Classes: true
+          Can-Redefine-Classes: true
+          ' > manifest.txt
+          set +f
+          jar cmf manifest.txt subprocessinjectionagent.jar SubprocessInjectionAgent*.class
+      - run: |
+          cd src/usr/share/opentelemetry_shell/agent.instrumentation.java
+          javac -classpath ./opentelemetry-javaagent.jar:./byte-buddy.jar GradleHttpPropagationAgent.java
+          printf '%s\n\n' 'Premain-Class: GradleHttpPropagationAgent
+          Boot-Class-Path: /usr/share/opentelemetry_shell/agent.instrumentation.java/gradlehttppropagationagent.jar ./byte-buddy.jar
+          Can-Retransform-Classes: true
+          Can-Redefine-Classes: true
+          ' > manifest.txt
+          jar cmf manifest.txt gradlehttppropagationagent.jar GradleHttpPropagationAgent*.class
+      - run: |
+          cd src/usr/share/opentelemetry_shell/agent.instrumentation.java
+          echo "${{ steps.determine-minimum-version.outputs.version }}" > version
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: java_${{ inputs.ref }}
+          path: |
+            src/usr/share/opentelemetry_shell/agent.instrumentation.java/SystemPropertiesPrinter.class
+            src/usr/share/opentelemetry_shell/agent.instrumentation.java/*.jar
+            src/usr/share/opentelemetry_shell/agent.instrumentation.java/version
+    permissions:
+      actions: read
+
+  verify-deb-python-dependency:
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: plengauer/opentelemetry-github/actions/instrument/job@5d34a21816f798c24f19857225b018a7f2af731f # v5.66.0
+        with:
+          secrets_to_redact: '["${{ github.token }}"]'
+        env:
+          OTEL_EXPORTER_OTLP_ENDPOINT: '${{ secrets.OTEL_EXPORTER_OTLP_ENDPOINT }}'
+          OTEL_EXPORTER_OTLP_HEADERS: '${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - run: |
+          python3 -m venv venv
+          . venv/bin/activate
+          pip3 install -r src/opt/opentelemetry_shell/requirements.txt
+          deactivate
+          min_version_otel="$(cat venv/lib/python*/site-packages/opentelemetry_api-*.dist-info/METADATA | grep '^Requires-Python: ' | cut -d ' ' -f 2 | cut -d . -f 2-)"
+          min_version_otel="${min_version_otel:-9}"
+          min_version_shell="$(cat meta/debian/control | grep '^Pre-Depends:' | tr ',' '\n' | grep -F -- 'python3 (>=' | cut -d '(' -f 2- | cut -d ')' -f 1 | cut -d ' ' -f 2 | cut -d . -f 2)"
+          [ "$min_version_shell" -ge "$min_version_otel" ] || (echo "::error::Minimum version is $min_version_shell but otel requires at least $min_version_otel!" && exit 1)
+  verify-deb-dependencies:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: plengauer/opentelemetry-github/actions/instrument/job@5d34a21816f798c24f19857225b018a7f2af731f # v5.66.0
+        env:
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.OTEL_EXPORTER_OTLP_ENDPOINT }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+        with:
+          secrets_to_redact: '["${{ github.token }}"]'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - run: sudo apt-get update && sudo apt-get -y install apt-file
+      - run: sudo apt-file update
+      - run: |
+          process_packages() { sed 's/^awk$/gawk/g' | sed 's/^python3$/python3-minimal/g' | sed 's/^coreutils$/coreutils\ncoreutils-from-gnu\ncoreutils-from-uutils/'; }
+          process_commands() { sed 's/^awk$/gawk/g' | grep -vE '^which$' | grep -vE '^print$' | grep -vE '^rpm$';  }
+          patternify() { grep -v '^$' | grep -P '^[a-zA-Z0-9/_.-]+$' | while read -r pattern; do echo '^'"$pattern"'$'; done }
+          check_command() {
+            local dependencies="$1"
+            local command="$2"
+            apt-file search /"$command" | grep -E "/$command\$" | grep -E ': /bin/|: /sbin/|: /usr/bin/|: /usr/sbin/|: /usr/local/bin/|: /usr/local/sbin/' | cut -d : -f 1 | grep -q "$dependencies" && echo "$command OK" || echo "$command UNAVAILABLE"
+          }
+          export -f check_command
+          verify() {
+            local dependencies
+            dependencies="$(cat meta/debian/control | grep -E "$1" | cut -d : -f 2- | tr '|' ',' | tr ',' '\n' | cut -d '(' -f 1 | tr -d ' ' | process_packages | patternify)"
+            cat | while read -r file; do echo "Verifying $file" >&2; echo "$file"; done | xargs cat \
+              | grep -v 'SKIP_DEPENDENCY_CHECK' | while read -r line; do line="${line%%#*}"; printf '%s\n' "$line"; done \
+              | grep -oP '(^[[:space:]]*|\$\()\\?[a-zA-Z/][a-zA-Z0-9/_.-]*($|[[:space:]])' \
+              | while read -r command; do command="${command% }"; command="${command# }"; command="${command#\$\(}"; command="${command#\\}"; [ "${#command}" -gt 1 ] && printf '%s\n' "$command" || true; done \
+              | grep -vE '^_otel|^otel_|^OTEL_' | grep -vE "$(compgen -b | patternify)" | grep -vE "$(compgen -k | patternify)" | process_commands \
+              | sort -u | xargs -d '\n' -r parallel -q check_command "$dependencies" ::: | tee /dev/stderr | grep -q 'UNAVAILABLE' && return 1 || return 0
+          }
+          find meta/debian | grep -vE '^meta/debian$|^meta/debian/control$|^meta/debian/triggers$' | verify '^Pre-Depends:' && find src -iname '*.sh' | verify '^Pre-Depends:|^Depends:|^Recommends:|^Suggests:'
+  build-deb:
+    needs: [verify-scripts, verify-deb-dependencies, verify-deb-python-dependency, merge-http, merge-node-modules, merge-python-site-packages, build-java-agents, list-python-versions]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: plengauer/opentelemetry-github/actions/instrument/job@5d34a21816f798c24f19857225b018a7f2af731f # v5.66.0
+        env:
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.OTEL_EXPORTER_OTLP_ENDPOINT }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+        with:
+          secrets_to_redact: '["${{ github.token }}"]'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - run: |
+          {
+            find src -iname '*.c' -type f
+            find src -iname '*.java' -type f
+            find src -iname 'manifest.txt' -type f
+            find src -iname 'pom.xml' -type f
+          } | xargs -r rm
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: http_${{ inputs.ref }}
+          path: src/usr/share/opentelemetry_shell/agent.instrumentation.http
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: node_modules_${{ inputs.ref }}
+          path: src/usr/share/opentelemetry_shell/agent.instrumentation.node
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: python_site_packages_${{ inputs.ref }}
+          path: ${{ runner.temp }}/python_site_packages
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: java_${{ inputs.ref }}
+          path: src/usr/share/opentelemetry_shell/agent.instrumentation.java
+      - run: cp -r meta/debian src/DEBIAN
+      - run: sed -i "s/__VERSION__/$(cat VERSION)/g" src/DEBIAN/control
+      - run: |
+          printf '%s' "${{ needs.list-python-versions.outputs.versions }}" | jq -r '.[]' | while read -r version; do
+            grep 'python3$' src/DEBIAN/triggers | sed "s~/python3~/python$version~g" | tee -a src/DEBIAN/triggers > /dev/null
+          done
+      - run: |
+          cd src
+          replaced_binaries="$(mktemp -d)"
+          mv usr/share/opentelemetry_shell/agent.instrumentation.http/* "$replaced_binaries"
+          dpkg-deb --root-owner-group -Zgzip --build . ../opentelemetry-shell_"$(cat ../VERSION)"_all.deb
+          find "$replaced_binaries" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' | while read -r arch; do
+            debian_arch="$(echo "$arch" | sed s/x86_64/amd64/g | sed s/aarch64/arm64/g | sed 's/le$/el/g')"
+            cp "$replaced_binaries"/"$arch"/*.so usr/share/opentelemetry_shell/agent.instrumentation.http
+            [ ! -r "$RUNNER_TEMP"/python_site_packages/"$arch"/python_site_packages.tar.zst ] || cp "$RUNNER_TEMP"/python_site_packages/"$arch"/python_site_packages.tar.zst usr/share/opentelemetry_shell/agent.instrumentation.python/
+            sed -i "s/Architecture: .*/Architecture: $debian_arch/g" DEBIAN/control
+            dpkg-deb --root-owner-group -Zgzip --build . ../opentelemetry-shell_"$(cat ../VERSION)"_"$debian_arch".deb
+            rm usr/share/opentelemetry_shell/agent.instrumentation.http/*.so
+            rm -f usr/share/opentelemetry_shell/agent.instrumentation.python/python_site_packages.tar.zst
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: packages.deb.${{ inputs.ref }}
+          path: opentelemetry-shell_*_*.deb
+          if-no-files-found: error
+
+  verify-rpm-python-dependency:
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: plengauer/opentelemetry-github/actions/instrument/job@5d34a21816f798c24f19857225b018a7f2af731f # v5.66.0
+        with:
+          secrets_to_redact: '["${{ github.token }}"]'
+        env:
+          OTEL_EXPORTER_OTLP_ENDPOINT: '${{ secrets.OTEL_EXPORTER_OTLP_ENDPOINT }}'
+          OTEL_EXPORTER_OTLP_HEADERS: '${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - run: |
+          python3 -m venv venv
+          . venv/bin/activate
+          pip3 install -r src/opt/opentelemetry_shell/requirements.txt
+          deactivate
+          min_version_otel="$(cat venv/lib/python*/site-packages/opentelemetry_api-*.dist-info/METADATA | grep '^Requires-Python: ' | cut -d ' ' -f 2 | cut -d . -f 2-)"
+          min_version_otel="${min_version_otel:-9}"
+          min_version_shell="$(cat meta/rpm/*.spec | grep '^Requires:' | tr ',' '\n' | grep -F -- 'python3 >=' | cut -d '=' -f 2- | cut -d . -f 2)"
+          [ "$min_version_shell" -ge "$min_version_otel" ] || (echo "::error::Minimum version is $min_version_shell but otel requires at least $min_version_otel!" && exit 1)
+  build-rpm:
+    needs: [verify-scripts, verify-rpm-python-dependency, merge-http, merge-node-modules, merge-python-site-packages, build-java-agents]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: plengauer/opentelemetry-github/actions/instrument/job@5d34a21816f798c24f19857225b018a7f2af731f # v5.66.0
+        env:
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.OTEL_EXPORTER_OTLP_ENDPOINT }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+        with:
+          secrets_to_redact: '["${{ github.token }}"]'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: http_${{ inputs.ref }}
+          path: src/usr/share/opentelemetry_shell/agent.instrumentation.http
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: node_modules_${{ inputs.ref }}
+          path: src/usr/share/opentelemetry_shell/agent.instrumentation.node
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: python_site_packages_${{ inputs.ref }}
+          path: ${{ runner.temp }}/python_site_packages
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: java_${{ inputs.ref }}
+          path: src/usr/share/opentelemetry_shell/agent.instrumentation.java
+      - run: |
+          replaced_binaries="$(mktemp -d)"
+          mv src/usr/share/opentelemetry_shell/agent.instrumentation.http/*/ "$replaced_binaries"
+          source_snapshot="$(mktemp -d)"
+          cp -a src "$source_snapshot"
+          { echo noarch; ls "$replaced_binaries"; } | while read -r arch; do
+            rm -rf src /home/runner/rpmbuild
+            cp -a "$source_snapshot"/src .
+            {
+              find src -iname '*.c' -type f
+              find src -iname '*.java' -type f
+              find src -iname 'manifest.txt' -type f
+              find src -iname 'pom.xml' -type f
+            } | xargs -r rm
+            cp meta/rpm/opentelemetry-shell.spec .
+            sed -i "s/__VERSION__/$(cat VERSION)/g" opentelemetry-shell.spec
+            # sed -i "s/BuildArch: .*/BuildArch: $arch/g" opentelemetry-shell.spec
+            [ "$arch" = noarch ] || cp "$replaced_binaries"/"$arch"/*.so src/usr/share/opentelemetry_shell/agent.instrumentation.http
+            [ "$arch" = noarch ] || [ ! -r "$RUNNER_TEMP"/python_site_packages/"$arch"/python_site_packages.tar.zst ] || cp "$RUNNER_TEMP"/python_site_packages/"$arch"/python_site_packages.tar.zst src/usr/share/opentelemetry_shell/agent.instrumentation.python/
+            {
+              cat meta/debian/triggers | grep -v '^$' | cut -d ' ' -f 2 | rev | cut -d / -f 1 | rev | sort -u | grep -v python3 | while read -r package; do
+                echo "%triggerin -- $package"
+                echo '#/bin/sh -e'
+                echo "if [ \"\$1\" = 0 ] || [ \"\$1\" = 1 ] || [ \"\$1\" = 2 ]; then set -- configure; fi"
+                cat meta/debian/postinst
+                echo "%triggerun -- $package"
+                echo '#/bin/sh -e'
+                echo "if [ \"\$1\" = 0 ] || [ \"\$1\" = 1 ] || [ \"\$1\" = 2 ]; then set -- configure; fi"
+                cat meta/debian/postinst
+              done
+              echo "%post"
+              echo '#/bin/sh -e'
+              echo "if [ \"\$1\" = 0 ] || [ \"\$1\" = 1 ] || [ \"\$1\" = 2 ]; then set -- configure; fi"
+              cat meta/debian/postinst
+              echo "%preun"
+              echo '#!/bin/sh -e'
+              echo "if [ \"\$1\" = 0 ]; then set -- remove; fi"
+              echo "if [ \"\$1\" = 1 ]; then set -- upgrade; fi"
+              cat meta/debian/prerm
+              echo '%files'
+              ( cd src && find . | grep -v '.spec$' | while read -r file; do echo "${file#.}"; done | grep -v '^$' | while read -r file; do if [ -d "$file" ]; then if ! echo "$file" | grep opentelemetry-shell; then continue; fi; echo -n '%dir '; fi; echo \""$file"\"; done )
+            } >> opentelemetry-shell.spec
+            rpmbuild -bb --buildroot="$(pwd)/src" opentelemetry-shell.spec
+            mv /home/runner/rpmbuild/RPMS/noarch/opentelemetry-shell-"$(cat VERSION)"-1.noarch.rpm opentelemetry-shell-"$(cat VERSION)"-1."$arch".rpm
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: packages.rpm.${{ inputs.ref }}
+          path: opentelemetry-shell-*.*.rpm
+          if-no-files-found: error
+
+  build-apk:
+    needs: [verify-scripts, merge-node-modules, build-java-agents]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: plengauer/opentelemetry-github/actions/instrument/job@5d34a21816f798c24f19857225b018a7f2af731f # v5.66.0
+        env:
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.OTEL_EXPORTER_OTLP_ENDPOINT }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+        with:
+          secrets_to_redact: '["${{ github.token }}"]'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - run: |
+          {
+            find src -iname '*.c' -type f
+            find src -iname '*.java' -type f
+            find src -iname 'manifest.txt' -type f
+            find src -iname 'pom.xml' -type f
+          } | xargs -r rm
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: node_modules_${{ inputs.ref }}
+          path: src/usr/share/opentelemetry_shell/agent.instrumentation.node
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: java_${{ inputs.ref }}
+          path: src/usr/share/opentelemetry_shell/agent.instrumentation.java
+      - run: |
+          workspace="$(mktemp -d)"
+          cp meta/apk/* "$workspace"/
+          sed -i "s/__VERSION__/$(cat VERSION)/g" "$workspace"/APKBUILD
+          cat meta/debian/postinst >> "$workspace"/opentelemetry-shell.post-install
+          cat meta/debian/postinst >> "$workspace"/opentelemetry-shell.post-upgrade
+          cat meta/debian/prerm >> "$workspace"/opentelemetry-shell.pre-deinstall
+          cat meta/debian/prerm >> "$workspace"/opentelemetry-shell.pre-upgrade
+          cp -r src "$workspace"/my_src
+          echo 'cd ~/workspace && apk add abuild && SUDO=env abuild-keygen -a -i -n && abuild -F -r && find ~/packages -iname '\''*.apk'\'' | xargs -I "{}" mv "{}" .' | \sudo docker run --rm --network host -v "$workspace":/root/workspace -i alpine:latest
+          mv "$workspace"/*.apk .
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: packages.apk.${{ inputs.ref }}
+          path: opentelemetry-shell-*.apk
+          if-no-files-found: error
+
+  build-workflow-image:
+    needs: build-apk
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: plengauer/opentelemetry-github/actions/instrument/job@5d34a21816f798c24f19857225b018a7f2af731f # v5.66.0
+        env:
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.OTEL_EXPORTER_OTLP_ENDPOINT }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+        with:
+          secrets_to_redact: '["${{ github.token }}"]'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: packages.apk.${{ inputs.ref }}
+      - run: |
+          cp ./*.apk actions/instrument/workflow
+          pushd actions/instrument/workflow
+          sudo docker build --build-arg=repository="$GITHUB_REPOSITORY" --network host --tag opentelemetry-github-workflow-instrumentation-runner .
+          popd
+          sudo docker save -o opentelemetry-github-workflow-instrumentation-runner.image opentelemetry-github-workflow-instrumentation-runner
+          sudo chmod +r opentelemetry-github-workflow-instrumentation-runner.image
+          rm actions/instrument/workflow/*.apk
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: images.${{ inputs.ref }}
+          path: '*.image'

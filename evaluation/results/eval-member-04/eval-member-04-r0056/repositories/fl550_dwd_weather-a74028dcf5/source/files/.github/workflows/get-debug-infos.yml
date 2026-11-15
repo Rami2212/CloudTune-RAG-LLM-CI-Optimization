@@ -1,0 +1,99 @@
+name: Get debug infos
+# Usage: Comment /debug STATION_ID MODE
+# Mode is optional an can be "hourly". Default is "daily"
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  debug-info:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    # correct author, correct command prefix
+    if: |
+      github.event.comment.user.login == 'FL550' &&
+      startsWith(github.event.comment.body, '/debug ')
+
+    steps:
+      - name: checkout repo
+        uses: actions/checkout@v4
+        with:
+            sparse-checkout: |
+                .github
+            sparse-checkout-cone-mode: false
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('.github/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+      - name: Install dependencies
+        run: |
+            sudo apt-get update
+            sudo apt-get install -y python3-tk
+            pip install --cache-dir ~/.cache/pip -r .github/requirements.txt
+      #  extract the argument (everything after "/debug ")
+      - id: parse
+        run: |
+          STATION=$(echo "${{ github.event.comment.body }}" | awk '{print $2}')
+          MODE=$(echo "${{ github.event.comment.body }}" | awk '{print $3}')
+          echo "station=$STATION" >> "$GITHUB_OUTPUT"
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+      # use the extracted value
+      - name: fetch weather
+        id: run
+        env:
+          STATION: ${{ steps.parse.outputs.station }}
+          MODE: ${{ steps.parse.outputs.mode }}
+        run: |
+            python .github/scripts/get_station_data.py > result.txt
+            echo "stdout=result.txt" >> "$GITHUB_OUTPUT"
+
+      - name: parse_result
+        id: parse_result
+        run: |
+            # --- build the folded markdown ---
+            RAW="$(cat ${{ steps.run.outputs.stdout }})"
+
+            # Extract station info (first two lines)
+            STATION_LINE=$(echo "$RAW" | grep '^## Station:' | head -n1 | sed 's/^## //')
+            INFO_LINE=$(echo "$RAW" | grep "{" | head -n1)
+
+            # Extract forecast header and table (everything after the station info)
+            FORECAST_HEADER=$(echo "$RAW" | grep '^## Forecast' | head -n1 | sed 's/^## //')
+            FORECAST_TABLE=$(echo "$RAW" | awk '/^\|/{print}' | sed ':a;N;$!ba;s/\n/\\n/g')
+
+            BODY=$(cat <<EOF
+            Debug information
+
+            <details>
+            <summary>$STATION_LINE</summary>
+
+            \`\`\`python
+            $INFO_LINE
+            \`\`\`
+            </details>
+
+            <details>
+            <summary>Raw $FORECAST_HEADER</summary>
+
+            $(echo -e "$FORECAST_TABLE")
+
+            </details>
+            EOF
+            )
+
+            # expose BODY as a step output for downstream steps
+            echo "body<<EOF" >> "$GITHUB_OUTPUT"
+            echo "$BODY" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Update comment
+        uses: peter-evans/create-or-update-comment@v5
+        with:
+          comment-id: ${{ github.event.comment.id }}
+          edit-mode: replace
+          body: "${{ steps.parse_result.outputs.body }}"

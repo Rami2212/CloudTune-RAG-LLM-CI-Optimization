@@ -1,0 +1,135 @@
+name: Sync Panther Analysis from Upstream
+
+on:
+  schedule:
+    # 15:00Z, every Wednesday
+    - cron: "00 15 * * 3"
+  workflow_dispatch: # or on button click
+
+env:
+  YOUR_REPO_PRIMARY_BRANCH_NAME: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  check_upstream:
+    if: |
+      github.repository != 'panther-labs/panther-analysis'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Set token
+        id: set_token
+        env:
+          PANTHER_SYNC_UPSTREAM: ${{ secrets.PANTHER_SYNC_UPSTREAM }}
+          DEFAULT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "$PANTHER_SYNC_UPSTREAM" ]; then
+            echo "Using PANTHER_SYNC_UPSTREAM for authentication"
+            echo "token=$PANTHER_SYNC_UPSTREAM" >> "$GITHUB_OUTPUT"
+          else
+            echo "PANTHER_SYNC_UPSTREAM not found, using default GITHUB_TOKEN"
+            echo "token=$DEFAULT_TOKEN" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 #v9.0.0
+        id: set_upstream
+        name: Check Upstream
+        with:
+          github-token: ${{ steps.set_token.outputs.token }}
+          script: |
+            const fs = require('fs');
+            const upstreamLatest = await github.rest.repos.getLatestRelease({
+              owner: 'panther-labs',
+              repo: 'panther-analysis'
+            })
+            fs.appendFileSync(
+              process.env['GITHUB_OUTPUT'],
+              'latest-release=' +  upstreamLatest.data.tag_name + '\n');
+      ## CREATE A BRANCH
+      - uses: peterjgrainger/action-create-branch@4b81ce657e255acd677cc6c55c9c763654be3aef #v4.0.0
+        id: create_a_branch
+        env:
+          GITHUB_TOKEN: ${{ steps.set_token.outputs.token }}
+        with:
+          branch: "sync_upstream_${{steps.set_upstream.outputs.latest-release}}"
+      # Checkout this repo into the branch
+      - name: Checkout your local repo in PR branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          # Credentials must persist: the Fork-Sync action below fetches from origin
+          # before it rewrites the remote URL with target_repo_token, which private
+          # forks need in order to authenticate.
+          ref: "sync_upstream_${{steps.set_upstream.outputs.latest-release}}"
+          token: ${{ steps.set_token.outputs.token }}
+      # Sync this branch with upstream
+      - name: Sync upstream changes into PR branch
+        id: sync
+        uses: aormsby/Fork-Sync-With-Upstream-action@83d78e8c4bf524e79b091cf257deba4dee9e60df #v3.4.3
+        with:
+          # target_sync_branch == the branch in your fork that you want to sync to upstream
+          target_sync_branch: "sync_upstream_${{steps.set_upstream.outputs.latest-release}}"
+          # REQUIRED 'target_repo_token' exactly like this!
+          target_repo_token: ${{ steps.set_token.outputs.token }}
+          # Sync from upstream's main branch
+          upstream_sync_branch: main
+          upstream_sync_repo: panther-labs/panther-analysis
+          #test_mode: true
+          upstream_pull_args: "--allow-unrelated-histories"
+      # Create a PR from this branch back to this fork's primary branch
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 #v9.0.0
+        id: create_pr
+        name: Create a PR to bring upstream changes into the local repo primary branch
+        if: steps.sync.outputs.has_new_commits == 'true'
+        env:
+          LATEST_RELEASE: ${{ steps.set_upstream.outputs.latest-release }}
+          PRIMARY_BRANCH: ${{ env.YOUR_REPO_PRIMARY_BRANCH_NAME }}
+        with:
+          github-token: ${{ steps.set_token.outputs.token }}
+          result-encoding: string
+          script: |
+            const fs = require('fs');
+            const latestRelease = process.env.LATEST_RELEASE;
+            try {
+              const response = await github.rest.pulls.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `sync this fork to panther-labs/panther-analysis ${latestRelease}`,
+                head: `sync_upstream_${latestRelease}`,
+                base: process.env.PRIMARY_BRANCH,
+              });
+            } catch(e) {
+              if (e.response && e.response.data && e.response.data.errors && e.response.data.errors.length > 0 && e.response.data.errors[0].message && e.response.data.errors[0].message.includes('No commits between')) {
+                fs.appendFileSync(
+                  process.env['GITHUB_OUTPUT'],
+                  'pr_state=no-updates\n');
+              } else if (e.response && e.response.data && e.response.data.errors && e.response.data.errors.length > 0 && e.response.data.errors[0].message && e.response.data.errors[0].message.includes('A pull request already exists for')) {
+                fs.appendFileSync(
+                  process.env['GITHUB_OUTPUT'],
+                  'pr_state=update-pr-already-exists\n');
+              } else {
+                fs.appendFileSync(
+                  process.env['GITHUB_OUTPUT'],
+                  'pr_state=error\n');
+                console.log(e);
+              }
+            }
+      - id: pr_not_needed_already_exists
+        name: PR for latest release already exists
+        if: ${{ steps.create_pr.outputs.pr_state == 'update-pr-already-exists' }}
+        run: |
+          echo "PR for latest release was previously created and is not closed"
+      - id: pr_not_needed_in_sync
+        name: Local repo already synced to latest release
+        if: ${{ steps.create_pr.outputs.pr_state == 'no-updates' }}
+        run: |
+          echo "Local repo in sync with latest upstream release"
+      - id: pr_create_error
+        name: Create PR step had an error
+        if: ${{ steps.create_pr.outputs.pr_state == 'error' }}
+        run: |
+          echo "unhandled exception in PR create step. Check output of that step."
+          exit 128
