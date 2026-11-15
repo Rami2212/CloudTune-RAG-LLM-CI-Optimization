@@ -1,0 +1,43 @@
+name: Tests
+on: [push, pull_request]
+jobs:
+  test:
+    name: Test suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:13
+        ports: ['5432:5432']
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: secret
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: 3.4.12
+          bundler-cache: true
+      - name: Install Elasticsearch
+        uses: ankane/setup-elasticsearch@v1
+        with:
+          elasticsearch-version: 9
+      - name: Verify Elasticsearch connection and create index
+        env:
+          ELASTICSEARCH_URL: http://localhost:9200
+        run: |
+          echo $ELASTICSEARCH_URL
+          curl -fsSL "$ELASTICSEARCH_URL/_cat/health?h=status"
+          curl -X PUT $ELASTICSEARCH_URL/joss-production
+      - name: Run tests
+        env:
+          ELASTICSEARCH_URL: http://localhost:9200
+          PGUSER: postgres
+          PGPASSWORD: secret
+          RAILS_ENV: test
+          GH_SECRET: 12345
+        run: |
+          bin/rails db:create
+          bin/rails db:schema:load
+          bin/rails spec

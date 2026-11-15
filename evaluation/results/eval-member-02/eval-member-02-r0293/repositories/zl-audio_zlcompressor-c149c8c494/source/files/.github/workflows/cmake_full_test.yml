@@ -1,0 +1,100 @@
+name: macOS/Windows/Linux Test
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel older runs of this workflow on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  DISPLAY: :0 # linux pluginval needs this
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+
+jobs:
+  build_and_test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+            pluginval-binary: ./pluginval
+            formats: VST3
+            simd: AVX2
+          - name: macOS
+            os: macos-latest
+            pluginval-binary: pluginval.app/Contents/MacOS/pluginval
+            formats: AU
+            simd: NEON
+          - name: Windows
+            os: windows-latest
+            vcvars_script: vcvars64.bat
+            pluginval-binary: ./pluginval.exe
+            formats: VST3
+            simd: AVX2
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Configure and Build
+        uses: ./.github/actions/build
+        with:
+          formats: ${{ matrix.formats }}
+          simd: ${{ matrix.simd }}
+          vcvars-script: ${{ matrix.vcvars_script }}
+          cmake-extra-args: -DZL_EQ_BAND_NUM=8
+
+      - name: Pluginval setup
+        shell: bash
+        run: |
+          curl -LO "https://github.com/ZL-Audio/pluginval/releases/download/v1.0.4-temp/pluginval_${{ runner.os }}.zip"
+          7z x pluginval_${{ runner.os }}.zip
+          echo "PLUGINVAL_DISABLED=Plugin state restoration" >> $GITHUB_ENV
+
+      - name: Setup Pluginval random seed
+        id: setup_seed
+        shell: bash
+        run: |
+          CURRENT_DATE_SEED=$(date +%y%m%d%H%M)
+          echo "Generated Seed: $CURRENT_DATE_SEED"
+          echo "RANDOM_SEED=$CURRENT_DATE_SEED" >> "$GITHUB_OUTPUT"
+
+      - name: Pluginval VST3 validations
+        if: ${{ runner.os != 'macOS' }}
+        shell: bash
+        run: |
+          ${{ matrix.pluginval-binary }} --verbose --validate "${{ env.VST3_PATH }}" --disabled-tests "${{ env.PLUGINVAL_DISABLED }}"
+        env:
+          STRICTNESS_LEVEL: 10
+          TIMEOUT_MS: 1440000
+          REPEAT: 2
+          RANDOM_SEED: "${{ steps.setup_seed.outputs.RANDOM_SEED }}"
+
+      - name: Pluginval AU validations (macOS)
+        if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        run: |
+          sudo cp -r "${{ env.AU_PATH }}" "/Library/Audio/Plug-ins/components"
+          sudo killall -9 AudioComponentRegistrar
+          ${{ matrix.pluginval-binary }} --verbose --validate "/Library/Audio/Plug-ins/components/${{ env.PRODUCT_NAME }}.component" --disabled-tests "${{ env.PLUGINVAL_DISABLED }}"
+        env:
+          STRICTNESS_LEVEL: 10
+          TIMEOUT_MS: 1440000
+          REPEAT: 2
+          RANDOM_SEED: "${{ steps.setup_seed.outputs.RANDOM_SEED }}"
