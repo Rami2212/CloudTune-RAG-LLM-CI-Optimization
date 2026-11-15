@@ -1,0 +1,53 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [MEDIUM] Add concurrency group to "build-and-test.yml"
+# Estimated savings: ~2 min/run
+#
+name: Build/Test
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build-and-test:
+    name: Build/Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Initialize Cachix
+        uses: cachix/cachix-action@v14
+        with:
+          name: watersucks
+          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+          skipPush: true
+
+      - name: Check for compile errors
+        run: |
+          nix develop .# -c make
+          nix develop .# -c make FLAKE=false
+
+      - name: Run checks
+        run: nix develop .# -c make check
+
+      - name: Run tests
+        run: nix develop .# -c make test
+
+      - name: Build Nix packages
+        run: nix build .#{nixos,nixosLegacy}
+
+      - name: Build docs
+        run: nix develop .# -c make gen-docs

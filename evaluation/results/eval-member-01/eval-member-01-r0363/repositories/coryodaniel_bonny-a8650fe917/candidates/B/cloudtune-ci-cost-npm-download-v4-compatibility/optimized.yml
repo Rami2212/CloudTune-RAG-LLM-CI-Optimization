@@ -1,0 +1,96 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [MEDIUM] Add concurrency group to "ci.yaml"
+# Estimated savings: ~2 min/run
+#
+name: CI
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        k8s_version: [v1.35.1]
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Setup Mise JDX
+        id: mise
+        run: |
+          curl https://mise.run | sh
+          echo "$HOME/.local/share/mise/bin" >> $GITHUB_PATH
+          echo "$HOME/.local/share/mise/shims" >> $GITHUB_PATH
+          echo "eval \"\$(mise activate bash)\"" >> ~/.bash_profile
+          mise install erlang elixir
+          echo "otp-version=$(mise current erlang | tr -d '\n')" >> "$GITHUB_OUTPUT"
+          echo "elixir-version=$(mise current elixir | tr -d '\n')" >> "$GITHUB_OUTPUT"
+
+      - name: Install Hex
+        run: mise x elixir erlang -- mix local.hex --force
+
+      - name: Setup Kind
+        run: mise run setup-kind --image kindest/node:${{ matrix.k8s_version }}
+
+      - name: Retrieve Build Cache
+        uses: actions/cache@v6
+        id: build-folder-cache
+        with:
+          path: _build
+          key: ${{ runner.os }}-${{ steps.mise.outputs.otp-version }}-${{ steps.mise.outputs.elixir-version }}-build-${{ hashFiles(format('{0}{1}', github.workspace, '/mix.lock')) }}
+
+      - name: Retrieve Mix Dependencies Cache
+        uses: actions/cache@v6
+        id: mix-cache
+        with:
+          path: deps
+          key: ${{ runner.os }}-${{ steps.mise.outputs.otp-version }}-${{ steps.mise.outputs.elixir-version }}-mix-${{ hashFiles(format('{0}{1}', github.workspace, '/mix.lock')) }}
+
+      - name: Retrieve PLT Cache
+        uses: actions/cache@v6
+        id: plt-cache
+        with:
+          key: |
+            ${{ runner.os }}-${{ steps.mise.outputs.otp-version }}-${{ steps.mise.outputs.elixir-version }}-plt
+          restore-keys: |
+            ${{ runner.os }}-${{ steps.mise.outputs.otp-version }}-${{ steps.mise.outputs.elixir-version }}-plt
+          path: |
+            priv/plts
+
+      - name: Install Mix Dependencies
+        run: mise run deps
+
+      - name: Check Formatting
+        run: mise run format --check-formatted
+
+      - name: Run Credo
+        run: mise run credo
+
+      - name: Run Coverage
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 10
+          max_attempts: 5
+          command: |
+            mise run integration-tests-ci
+
+      # Create PLTs if no cache was found
+      - name: Create PLTs
+        if: steps.plt-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p priv/plts
+          mise run dialyzer --plt
+
+      - name: Run dialyzer
+        run: mise run dialyzer --format github

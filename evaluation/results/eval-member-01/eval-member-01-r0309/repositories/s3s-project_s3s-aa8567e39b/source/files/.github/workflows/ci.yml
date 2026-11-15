@@ -1,0 +1,322 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+      - 'feat/**'
+  merge_group:
+    types: [ checks_requested ]
+  schedule:
+    - cron: '0 0 * * 0' # at midnight of each sunday
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  skip-check:
+    permissions:
+      actions: write
+      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      should_skip: ${{ steps.skip_check.outputs.should_skip }}
+    steps:
+      - id: skip_check
+        uses: fkirc/skip-duplicate-actions@v5
+        with:
+          cancel_others: true
+          paths_ignore: '["*.md"]'
+
+  python:
+    needs: skip-check
+    if: needs.skip-check.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@just
+      - uses: astral-sh/setup-uv@v7
+      - run: just ci-python
+
+  rust-msrv:
+    needs: skip-check
+    if: needs.skip-check.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@just
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.0 # MSRV
+      - uses: Swatinem/rust-cache@v2
+      - run: just test
+
+  rust:
+    needs: skip-check
+    if: needs.skip-check.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ contains(matrix.toolchain, 'nightly') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain:
+          - stable
+          - nightly
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@just
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: just spdx-check
+      - run: just link-license-check
+      - run: just ci-rust
+      # The workspace commands above build everything with --all-features, so a
+      # default build is never checked for the optional HTTP/3 dependencies, and
+      # the feature is never checked without the binary feature.
+      - name: Check s3s-fs feature subsets
+        run: |
+          # `grep -c` exits 1 when it matches nothing, so capture the counts before
+          # asserting on them instead of relying on its exit code.
+          default_count=$(cargo tree -p s3s-fs | grep -cE 'quinn|h3 v' || true)
+          http3_count=$(cargo tree -p s3s-fs --features http3 | grep -cE 'quinn|h3 v' || true)
+          test "$default_count" = 0
+          test "$http3_count" -gt 0
+          cargo check -p s3s-fs --all-targets
+          cargo build -p s3s-fs --no-default-features --features http3
+
+  cross-test:
+    needs: skip-check
+    if: needs.skip-check.outputs.should_skip != 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@just
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: just test
+
+  wasm-test:
+    needs: skip-check
+    if: needs.skip-check.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@just
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@wasm-pack
+      - uses: taiki-e/install-action@wasm-bindgen-cli
+      - name: wasm-pack test
+        run: |
+          cd crates/s3s-wasm
+          wasm-pack test --node
+
+  coverage:
+    needs: skip-check
+    if: needs.skip-check.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@just
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: |
+          cargo llvm-cov -p s3s -p s3s-chunked -p s3s-rfc2047 -p s3s-multipart -p s3s-sigv2 -p s3s-sigv4 -p s3s-test -p s3s-time --all-features --codecov --output-path target/codecov.json
+      - uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: target/codecov.json
+
+  mint-proxy-minio:
+    name: e2e (mint, s3s-proxy, silo)
+    needs: skip-check
+    if: github.event_name != 'pull_request' && needs.skip-check.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - name: Pull pinned mint image
+        run: |
+          . scripts/mint.env
+          docker pull "$MINT_IMAGE_REF"
+      - name: Pull the pinned backend image
+        run: |
+          . scripts/minio.env
+          docker pull "$MINIO_IMAGE_REF"
+      - run: just install-proxy
+      - run: ./scripts/e2e-mint.sh
+      - run: cargo run -q -p xtask -- report mint /tmp/mint/log.json
+      # The mint console output only shows one failure per suite and the raw
+      # /tmp/mint/log.json is what `xtask report mint` reads, so both are
+      # collected even when the gate fails.
+      - name: Collect mint logs
+        if: always()
+        run: |
+          mkdir -p target
+          cp /tmp/mint/log.json target/mint.log.json 2>/dev/null || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: mint-proxy-minio.logs
+          path: |
+            ./target/s3s-proxy.log
+            ./target/mint.log
+            ./target/mint.log.json
+
+  e2e-fs:
+    name: e2e (s3s-e2e, s3s-fs)
+    needs: skip-check
+    if: github.event_name != 'pull_request' && needs.skip-check.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - run: just install-e2e
+      - run: just install-fs
+      - run: ./scripts/e2e-fs.sh --filter '^Basic'
+      - uses: actions/upload-artifact@v7
+        with:
+          name: e2e-fs.logs
+          path: ./target/s3s-fs.log
+
+  e2e-boto3-fs:
+    name: e2e (boto3, s3s-fs)
+    needs: skip-check
+    if: github.event_name != 'pull_request' && needs.skip-check.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - run: uv sync
+      - run: just install-fs
+      - run: ./scripts/e2e-boto3-fs.sh
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: e2e-boto3-fs.logs
+          path: ./target/s3s-fs-boto3.log
+
+  e2e-boto3-minio:
+    name: e2e (boto3, silo)
+    needs: skip-check
+    if: github.event_name != 'pull_request' && needs.skip-check.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - run: uv sync
+      - name: Pull the pinned backend image
+        run: |
+          . scripts/minio.env
+          docker pull "$MINIO_IMAGE_REF"
+      - run: ./scripts/e2e-boto3-minio.sh
+
+  e2e-rclone-fs:
+    name: e2e (rclone, s3s-fs)
+    needs: skip-check
+    if: github.event_name != 'pull_request' && needs.skip-check.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - name: Pull pinned rclone image
+        run: |
+          . scripts/rclone.env
+          docker pull "$RCLONE_IMAGE_REF"
+      - run: just install-fs
+      - run: ./scripts/e2e-rclone-fs.sh
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: e2e-rclone-fs.logs
+          path: |
+            ./target/rclone.log
+            ./target/s3s-fs-rclone.log
+
+  e2e-minio:
+    name: e2e (s3s-e2e, silo)
+    needs: skip-check
+    if: github.event_name != 'pull_request' && needs.skip-check.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - name: Pull the pinned backend image
+        run: |
+          . scripts/minio.env
+          docker pull "$MINIO_IMAGE_REF"
+      - run: just install-e2e
+      - run: ./scripts/e2e-minio.sh
+
+  s3tests-proxy-minio:
+    name: e2e (s3-tests, s3s-proxy, silo)
+    needs: skip-check
+    if: github.event_name != 'pull_request' && needs.skip-check.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      # The suite comes from the pinned image (scripts/s3tests.env), so nothing is
+      # cloned and no venv cache is needed: one tag identifies one exact suite.
+      - name: Pull the pinned backend image
+        run: |
+          . scripts/minio.env
+          docker pull "$MINIO_IMAGE_REF"
+      - run: just install-proxy
+      - run: ./scripts/e2e-s3tests.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: e2e-s3tests.logs
+          path: |
+            ./target/s3-tests.log
+            ./target/s3-tests.junit.xml
+            ./target/s3s-proxy.log
+
+  status-check:
+    if: always()
+    needs:
+      - python
+      - rust-msrv
+      - rust
+      - cross-test
+      - wasm-test
+      - coverage
+      - e2e-fs
+      - e2e-boto3-fs
+      - e2e-boto3-minio
+      - e2e-rclone-fs
+      - e2e-minio
+      - mint-proxy-minio
+      - s3tests-proxy-minio
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all jobs
+        run: |
+          # Check if any required job failed
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "At least one required job failed"
+            exit 1
+          fi
+          
+          # Check if any required job was cancelled
+          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "At least one required job was cancelled"
+            exit 1
+          fi
+          
+          echo "All jobs passed or were skipped"
+          exit 0

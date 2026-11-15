@@ -1,0 +1,225 @@
+name: Docker
+
+on:
+  push:
+    tags:
+      - "v*"
+  schedule:
+    # Run weekly on Sundays at 00:00 UTC
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+
+# Serialize runs that publish the same tags: published tags are mutable, so two
+# runs racing on the edge tag would leave whichever finishes last on the tag.
+# Non-push runs (schedule, manual) always build main, so they share one group;
+# tag pushes group by tag.
+concurrency:
+  group: docker-${{ github.event_name != 'push' && 'refs/heads/main' || github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY_IMAGE: ghcr.io/${{ github.repository_owner }}/s3s
+
+jobs:
+  skip-check:
+    permissions:
+      actions: write
+      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      should_skip: ${{ steps.skip_check.outputs.should_skip }}
+    steps:
+      - id: skip_check
+        uses: fkirc/skip-duplicate-actions@v5
+        with:
+          cancel_others: true
+          paths_ignore: '["*.md"]'
+          # Don't skip scheduled or tag-based builds
+          skip_after_successful_duplicate: ${{ github.event_name == 'workflow_dispatch' }}
+
+  build:
+    needs: skip-check
+    if: needs.skip-check.outputs.should_skip != 'true'
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runs-on: ubuntu-24.04
+            arch: amd64
+          - platform: linux/arm64
+            runs-on: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Scheduled and manual runs build main; tag pushes build the tag.
+          # Manual runs therefore cannot move edge to a maintenance branch.
+          ref: ${{ github.event_name != 'push' && 'main' || github.ref }}
+      - name: Prepare
+        run: |
+          platform=${{ matrix.platform }}
+          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Native runners build one platform each (no QEMU emulation), so the only
+      # reliable cross-run cache on ephemeral runners is the GitHub Actions layer
+      # cache, scoped per platform to avoid amd64/arm64 clashes. mode=max exports
+      # intermediate layers (toolchain + cargo-chef dependency plan) so source-only
+      # changes reuse the compiled dependencies.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ env.REGISTRY_IMAGE }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=docker-${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=docker-${{ env.PLATFORM_PAIR }}
+
+      - name: Export digest
+        run: |
+          mkdir -p ${{ runner.temp }}/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: [build, skip-check]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # latest and the major tag (0) must only move forward: pre-releases never
+      # move them, and a stable tag only moves them when it is the highest stable
+      # tag in the repository, so a patch release cut from a maintenance branch
+      # cannot pull latest backwards.
+      - name: Decide whether this tag may move latest
+        id: promote
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "$TAG is a pre-release or not a stable semver tag; latest stays put"
+            echo "latest=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # An infrastructure error must not block the release image: keep latest
+          # where it is (never a wrong promotion) and let the version tags publish.
+          if ! tags=$(git ls-remote --tags --refs "https://github.com/${GITHUB_REPOSITORY}.git" 'v*' \
+            | awk '{print $2}' | sed 's#^refs/tags/##'); then
+            echo "::warning::could not list the repository tags; latest stays put"
+            echo "latest=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          highest=$(printf '%s\n' "$tags" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)
+          if [[ -n "$highest" && "$TAG" == "$highest" ]]; then
+            echo "$TAG is the highest stable tag; latest moves"
+            echo "latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "$TAG is not the highest stable tag (${highest:-none}); latest stays put"
+            echo "latest=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # A tag pushed on the default branch carries the same commit as main, so its
+      # image is the freshest main build. Tags from maintenance branches are not on
+      # main and must not move edge.
+      - name: Check whether this tag is on the default branch
+        id: on_main
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Edge is best effort: if the comparison cannot be made, keep edge where
+          # it is instead of failing the release.
+          if ! status=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${GITHUB_REF_NAME}...main" --jq .status 2>/dev/null); then
+            echo "::warning::could not compare $GITHUB_REF_NAME with main; edge stays put"
+            echo "on_main=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          case "$status" in
+            ahead | identical)
+              echo "$GITHUB_REF_NAME is on main; edge will move"
+              echo "on_main=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "$GITHUB_REF_NAME is not on main ($status); edge stays put"
+              echo "on_main=false" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+          # flavor latest=auto (the default) adds an implicit latest to every
+          # stable semver tag, bypassing the promotion gate above.
+          flavor: |
+            latest=false
+          tags: |
+            type=semver,pattern={{version}},enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern={{major}},enable=${{ steps.promote.outputs.latest == 'true' }}
+            type=raw,value=latest,enable=${{ steps.promote.outputs.latest == 'true' }}
+            type=raw,value=edge,enable=${{ github.event_name != 'push' || steps.on_main.outputs.on_main == 'true' }}
+
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY_IMAGE }}@sha256:%s ' *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ env.REGISTRY_IMAGE }}:${{ steps.meta.outputs.version }}

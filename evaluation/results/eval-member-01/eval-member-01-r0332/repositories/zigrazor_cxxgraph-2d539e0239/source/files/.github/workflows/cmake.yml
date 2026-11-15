@@ -1,0 +1,510 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CXXGraph – Comprehensive Build & Test Matrix
+#
+# Axes:
+#   OS           Ubuntu 22.04 / 24.04 · macOS 13 (x86) / latest (arm64) · Windows
+#   Compiler     GCC 12/13/14 · Clang 15/17/18 · Apple Clang · MSVC 2022 · Clang-CL
+#   C++ Std      17 · 20
+#   Build Type   Release · Debug · RelWithDebInfo
+#   Par. Backend none (sequential) · TBB (std::execution) · OpenMP
+# ─────────────────────────────────────────────────────────────────────────────
+name: CMake Build & Test
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Use ${{ github.workspace }} — evaluated by Actions before CMake ever runs,
+  # producing a real absolute path.  Do NOT use ~ here: CMake's file(DOWNLOAD)
+  # never expands tilde and will fail with "cannot open file for write".
+  CPM_SOURCE_CACHE: ${{ github.workspace }}/.cache/cpm
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ╔══════════════════════════════════════════════════════════════╗
+          # ║   UBUNTU · GCC · Sequential (no extra parallel library)     ║
+          # ╚══════════════════════════════════════════════════════════════╝
+
+          - name: "Ubuntu 22.04 · GCC 12 · C++17 · Release · Sequential"
+            os: ubuntu-22.04
+            cc: gcc-12
+            cxx: g++-12
+            build_type: Release
+            cxx_std: 17
+            extra_cmake: ""
+            extra_apt: ""
+
+          - name: "Ubuntu 22.04 · GCC 12 · C++17 · Debug · Sequential"
+            os: ubuntu-22.04
+            cc: gcc-12
+            cxx: g++-12
+            build_type: Debug
+            cxx_std: 17
+            extra_cmake: ""
+            extra_apt: ""
+
+          # ╔══════════════════════════════════════════════════════════════╗
+          # ║   UBUNTU · GCC · TBB  (std::execution → oneTBB backend)    ║
+          # ╚══════════════════════════════════════════════════════════════╝
+
+          - name: "Ubuntu 22.04 · GCC 13 · C++17 · Release · TBB"
+            os: ubuntu-22.04
+            cc: gcc-13
+            cxx: g++-13
+            build_type: Release
+            cxx_std: 17
+            extra_cmake: "-DCMAKE_EXE_LINKER_FLAGS=-ltbb"
+            extra_apt: "gcc-13 g++-13 libtbb-dev"
+
+          - name: "Ubuntu 22.04 · GCC 13 · C++20 · Release · TBB"
+            os: ubuntu-22.04
+            cc: gcc-13
+            cxx: g++-13
+            build_type: Release
+            cxx_std: 20
+            extra_cmake: "-DCMAKE_EXE_LINKER_FLAGS=-ltbb"
+            extra_apt: "gcc-13 g++-13 libtbb-dev"
+
+          - name: "Ubuntu 24.04 · GCC 14 · C++17 · Release · TBB"
+            os: ubuntu-24.04
+            cc: gcc-14
+            cxx: g++-14
+            build_type: Release
+            cxx_std: 17
+            extra_cmake: "-DCMAKE_EXE_LINKER_FLAGS=-ltbb"
+            extra_apt: "gcc-14 g++-14 libtbb-dev"
+
+          - name: "Ubuntu 24.04 · GCC 14 · C++17 · RelWithDebInfo · TBB"
+            os: ubuntu-24.04
+            cc: gcc-14
+            cxx: g++-14
+            build_type: RelWithDebInfo
+            cxx_std: 17
+            extra_cmake: "-DCMAKE_EXE_LINKER_FLAGS=-ltbb"
+            extra_apt: "gcc-14 g++-14 libtbb-dev"
+
+          - name: "Ubuntu 24.04 · GCC 14 · C++20 · Release · TBB"
+            os: ubuntu-24.04
+            cc: gcc-14
+            cxx: g++-14
+            build_type: Release
+            cxx_std: 20
+            extra_cmake: "-DCMAKE_EXE_LINKER_FLAGS=-ltbb"
+            extra_apt: "gcc-14 g++-14 libtbb-dev"
+
+          # ╔══════════════════════════════════════════════════════════════╗
+          # ║   UBUNTU · GCC · OpenMP  (-DCXXGRAPH_WITH_OPENMP + -fopenmp)║
+          # ║   libgomp is bundled with GCC — no extra apt package needed ║
+          # ╚══════════════════════════════════════════════════════════════╝
+
+          - name: "Ubuntu 22.04 · GCC 13 · C++17 · Release · OpenMP"
+            os: ubuntu-22.04
+            cc: gcc-13
+            cxx: g++-13
+            build_type: Release
+            cxx_std: 17
+            extra_cmake: "-DCMAKE_CXX_FLAGS='-DCXXGRAPH_WITH_OPENMP -fopenmp' -DCMAKE_EXE_LINKER_FLAGS=-fopenmp"
+            extra_apt: "gcc-13 g++-13"
+
+          - name: "Ubuntu 24.04 · GCC 14 · C++17 · Release · OpenMP"
+            os: ubuntu-24.04
+            cc: gcc-14
+            cxx: g++-14
+            build_type: Release
+            cxx_std: 17
+            extra_cmake: "-DCMAKE_CXX_FLAGS='-DCXXGRAPH_WITH_OPENMP -fopenmp' -DCMAKE_EXE_LINKER_FLAGS=-fopenmp"
+            extra_apt: "gcc-14 g++-14"
+
+          - name: "Ubuntu 24.04 · GCC 14 · C++20 · Release · OpenMP"
+            os: ubuntu-24.04
+            cc: gcc-14
+            cxx: g++-14
+            build_type: Release
+            cxx_std: 20
+            extra_cmake: "-DCMAKE_CXX_FLAGS='-DCXXGRAPH_WITH_OPENMP -fopenmp' -DCMAKE_EXE_LINKER_FLAGS=-fopenmp"
+            extra_apt: "gcc-14 g++-14"
+
+          # ╔══════════════════════════════════════════════════════════════╗
+          # ║   UBUNTU · CLANG · Sequential                               ║
+          # ╚══════════════════════════════════════════════════════════════╝
+
+          - name: "Ubuntu 22.04 · Clang 15 · C++17 · Release · Sequential"
+            os: ubuntu-22.04
+            cc: clang-15
+            cxx: clang++-15
+            build_type: Release
+            cxx_std: 17
+            extra_cmake: ""
+            extra_apt: ""
+            clang_ver: "15"
+
+          - name: "Ubuntu 22.04 · Clang 15 · C++17 · Debug · Sequential"
+            os: ubuntu-22.04
+            cc: clang-15
+            cxx: clang++-15
+            build_type: Debug
+            cxx_std: 17
+            extra_cmake: ""
+            extra_apt: ""
+            clang_ver: "15"
+
+          # ╔══════════════════════════════════════════════════════════════╗
+          # ║   UBUNTU · CLANG · TBB                                      ║
+          # ╚══════════════════════════════════════════════════════════════╝
+
+          - name: "Ubuntu 24.04 · Clang 17 · C++17 · Release · TBB"
+            os: ubuntu-24.04
+            cc: clang-17
+            cxx: clang++-17
+            build_type: Release
+            cxx_std: 17
+            extra_cmake: "-DCMAKE_EXE_LINKER_FLAGS=-ltbb"
+            extra_apt: "libtbb-dev"
+            clang_ver: "17"
+
+          - name: "Ubuntu 24.04 · Clang 18 · C++17 · Release · TBB"
+            os: ubuntu-24.04
+            cc: clang-18
+            cxx: clang++-18
+            build_type: Release
+            cxx_std: 17
+            extra_cmake: "-DCMAKE_EXE_LINKER_FLAGS=-ltbb"
+            extra_apt: "libtbb-dev"
+            clang_ver: "18"
+
+          - name: "Ubuntu 24.04 · Clang 18 · C++20 · Release · TBB"
+            os: ubuntu-24.04
+            cc: clang-18
+            cxx: clang++-18
+            build_type: Release
+            cxx_std: 20
+            extra_cmake: "-DCMAKE_EXE_LINKER_FLAGS=-ltbb"
+            extra_apt: "libtbb-dev"
+            clang_ver: "18"
+
+          - name: "Ubuntu 24.04 · Clang 18 · C++20 · Debug · TBB"
+            os: ubuntu-24.04
+            cc: clang-18
+            cxx: clang++-18
+            build_type: Debug
+            cxx_std: 20
+            extra_cmake: "-DCMAKE_EXE_LINKER_FLAGS=-ltbb"
+            extra_apt: "libtbb-dev"
+            clang_ver: "18"
+
+          # ╔══════════════════════════════════════════════════════════════╗
+          # ║   UBUNTU · CLANG · OpenMP                                   ║
+          # ║   Clang needs libomp (not bundled unlike GCC's libgomp)    ║
+          # ╚══════════════════════════════════════════════════════════════╝
+
+          - name: "Ubuntu 24.04 · Clang 18 · C++17 · Release · OpenMP"
+            os: ubuntu-24.04
+            cc: clang-18
+            cxx: clang++-18
+            build_type: Release
+            cxx_std: 17
+            extra_cmake: "-DCMAKE_CXX_FLAGS='-DCXXGRAPH_WITH_OPENMP -fopenmp=libomp' -DCMAKE_EXE_LINKER_FLAGS=-fopenmp=libomp"
+            extra_apt: "libomp-18-dev"
+            clang_ver: "18"
+
+          - name: "Ubuntu 24.04 · Clang 18 · C++20 · Release · OpenMP"
+            os: ubuntu-24.04
+            cc: clang-18
+            cxx: clang++-18
+            build_type: Release
+            cxx_std: 20
+            extra_cmake: "-DCMAKE_CXX_FLAGS='-DCXXGRAPH_WITH_OPENMP -fopenmp=libomp' -DCMAKE_EXE_LINKER_FLAGS=-fopenmp=libomp"
+            extra_apt: "libomp-18-dev"
+            clang_ver: "18"
+
+          # ╔══════════════════════════════════════════════════════════════╗
+          # ║   macOS · Apple Clang · Sequential                          ║
+          # ╚══════════════════════════════════════════════════════════════╝
+
+          - name: "macOS 13 (x86) · Apple Clang · C++17 · Release · Sequential"
+            os: macos-13
+            cc: clang
+            cxx: clang++
+            build_type: Release
+            cxx_std: 17
+            extra_cmake: ""
+            extra_brew: ""
+
+          - name: "macOS latest (arm64) · Apple Clang · C++17 · Release · Sequential"
+            os: macos-latest
+            cc: clang
+            cxx: clang++
+            build_type: Release
+            cxx_std: 17
+            extra_cmake: ""
+            extra_brew: ""
+
+          - name: "macOS latest (arm64) · Apple Clang · C++20 · Release · Sequential"
+            os: macos-latest
+            cc: clang
+            cxx: clang++
+            build_type: Release
+            cxx_std: 20
+            extra_cmake: ""
+            extra_brew: ""
+
+          # ╔══════════════════════════════════════════════════════════════╗
+          # ║   macOS · Apple Clang · TBB (Homebrew oneTBB)               ║
+          # ╚══════════════════════════════════════════════════════════════╝
+
+          - name: "macOS latest (arm64) · Apple Clang · C++17 · Release · TBB"
+            os: macos-latest
+            cc: clang
+            cxx: clang++
+            build_type: Release
+            cxx_std: 17
+            extra_cmake: "-DCMAKE_EXE_LINKER_FLAGS=-ltbb -DCMAKE_PREFIX_PATH=/opt/homebrew"
+            extra_brew: "tbb"
+
+          - name: "macOS latest (arm64) · Apple Clang · C++20 · Release · TBB"
+            os: macos-latest
+            cc: clang
+            cxx: clang++
+            build_type: Release
+            cxx_std: 20
+            extra_cmake: "-DCMAKE_EXE_LINKER_FLAGS=-ltbb -DCMAKE_PREFIX_PATH=/opt/homebrew"
+            extra_brew: "tbb"
+
+          - name: "macOS 13 (x86) · Apple Clang · C++17 · Release · TBB"
+            os: macos-13
+            cc: clang
+            cxx: clang++
+            build_type: Release
+            cxx_std: 17
+            extra_cmake: "-DCMAKE_EXE_LINKER_FLAGS=-ltbb -DCMAKE_PREFIX_PATH=/usr/homebrew"
+            extra_brew: "tbb"
+
+          # ╔══════════════════════════════════════════════════════════════╗
+          # ║   macOS · Apple Clang · OpenMP                              ║
+          # ║   Apple Clang ships WITHOUT OpenMP — brew libomp required  ║
+          # ║   arm64 prefix: /opt/homebrew   x86 prefix: /usr/local     ║
+          # ╚══════════════════════════════════════════════════════════════╝
+
+          - name: "macOS latest (arm64) · Apple Clang · C++17 · Release · OpenMP"
+            os: macos-latest
+            cc: clang
+            cxx: clang++
+            build_type: Release
+            cxx_std: 17
+            extra_cmake: >-
+              -DCMAKE_CXX_FLAGS="-DCXXGRAPH_WITH_OPENMP -Xpreprocessor -fopenmp -I/opt/homebrew/opt/libomp/include"
+              -DCMAKE_EXE_LINKER_FLAGS="-L/opt/homebrew/opt/libomp/lib -lomp"
+            extra_brew: "libomp"
+
+          - name: "macOS 13 (x86) · Apple Clang · C++17 · Release · OpenMP"
+            os: macos-13
+            cc: clang
+            cxx: clang++
+            build_type: Release
+            cxx_std: 17
+            extra_cmake: >-
+              -DCMAKE_CXX_FLAGS="-DCXXGRAPH_WITH_OPENMP -Xpreprocessor -fopenmp -I/usr/local/opt/libomp/include"
+              -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/opt/libomp/lib -lomp"
+            extra_brew: "libomp"
+
+          # ╔══════════════════════════════════════════════════════════════╗
+          # ║   WINDOWS · MSVC 2022 · Sequential                          ║
+          # ╚══════════════════════════════════════════════════════════════╝
+
+          - name: "Windows · MSVC 2022 · C++17 · Release · Sequential"
+            os: windows-latest
+            build_type: Release
+            cxx_std: 17
+            extra_cmake: ""
+            msvc: true
+
+          - name: "Windows · MSVC 2022 · C++17 · Debug · Sequential"
+            os: windows-latest
+            build_type: Debug
+            cxx_std: 17
+            extra_cmake: ""
+            msvc: true
+
+          - name: "Windows · MSVC 2022 · C++20 · Release · Sequential"
+            os: windows-latest
+            build_type: Release
+            cxx_std: 20
+            extra_cmake: ""
+            msvc: true
+
+          # ╔══════════════════════════════════════════════════════════════╗
+          # ║   WINDOWS · MSVC 2022 · OpenMP  (/openmp)                   ║
+          # ║   MSVC ships OpenMP runtime vcomp — no extra install needed ║
+          # ╚══════════════════════════════════════════════════════════════╝
+
+          - name: "Windows · MSVC 2022 · C++17 · Release · OpenMP"
+            os: windows-latest
+            build_type: Release
+            cxx_std: 17
+            extra_cmake: "-DCMAKE_CXX_FLAGS='/DCXXGRAPH_WITH_OPENMP /openmp'"
+            msvc: true
+
+          - name: "Windows · MSVC 2022 · C++20 · Release · OpenMP"
+            os: windows-latest
+            build_type: Release
+            cxx_std: 20
+            extra_cmake: "-DCMAKE_CXX_FLAGS='/DCXXGRAPH_WITH_OPENMP /openmp'"
+            msvc: true
+
+          # ╔══════════════════════════════════════════════════════════════╗
+          # ║   WINDOWS · Clang-CL · Sequential                           ║
+          # ╚══════════════════════════════════════════════════════════════╝
+
+          - name: "Windows · Clang-CL · C++17 · Release · Sequential"
+            os: windows-latest
+            build_type: Release
+            cxx_std: 17
+            extra_cmake: ""
+            clang_cl: true
+
+    # ─────────────────────────────────────────────────────────────────────
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      # ── Install GCC (Ubuntu) ──────────────────────────────────────────
+      - name: Install GCC (Ubuntu)
+        if: runner.os == 'Linux' && startsWith(matrix.cc, 'gcc')
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends ${{ matrix.cc }} ${{ matrix.cxx }}
+
+      # ── Install Clang via LLVM script (Ubuntu) ────────────────────────
+      - name: Install Clang (Ubuntu)
+        if: runner.os == 'Linux' && startsWith(matrix.cc, 'clang') && matrix.clang_ver
+        run: |
+          sudo apt-get update -q
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- ${{ matrix.clang_ver }} all
+          sudo apt-get install -y --no-install-recommends ${{ matrix.cc }} ${{ matrix.cxx }}
+
+      # ── Extra apt packages (TBB, libomp, …) ──────────────────────────
+      - name: Install extra apt packages
+        if: runner.os == 'Linux' && matrix.extra_apt != ''
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends ${{ matrix.extra_apt }}
+
+      # ── Extra Homebrew packages (TBB, libomp) ─────────────────────────
+      - name: Install extra brew packages
+        if: runner.os == 'macOS' && matrix.extra_brew != ''
+        run: brew install ${{ matrix.extra_brew }}
+
+      # ── Ninja (all platforms) ─────────────────────────────────────────
+      - name: Install Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v6
+
+      # ── ccache ────────────────────────────────────────────────────────
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ matrix.name }}-${{ github.sha }}
+          restore-keys: ${{ matrix.name }}-
+          max-size: 500M
+
+      # ── CPM dependency cache ───────────────────────────────────────────
+      # IMPORTANT: path must match CPM_SOURCE_CACHE exactly.
+      # Tilde (~) is NOT safe here — use github.workspace for an absolute path.
+      - name: Cache CPM packages
+        uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}/.cache/cpm
+          key: cpm-${{ runner.os }}-${{ hashFiles('**/CMakeLists.txt') }}
+          restore-keys: cpm-${{ runner.os }}-
+
+      # ── Configure: Unix / macOS ───────────────────────────────────────
+      - name: Configure CMake (Unix)
+        if: runner.os != 'Windows'
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: |
+          cmake -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_CXX_STANDARD=${{ matrix.cxx_std }} \
+            -DCMAKE_CXX_STANDARD_REQUIRED=ON \
+            -DCMAKE_CXX_EXTENSIONS=OFF \
+            -DTEST=ON \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            ${{ matrix.extra_cmake }}
+
+      # ── Configure: Windows MSVC ───────────────────────────────────────
+      - name: Configure CMake (Windows MSVC)
+        if: matrix.msvc == true
+        run: |
+          cmake -B build `
+            -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} `
+            -DCMAKE_CXX_STANDARD=${{ matrix.cxx_std }} `
+            -DCMAKE_CXX_STANDARD_REQUIRED=ON `
+            -DCMAKE_CXX_EXTENSIONS=OFF `
+            -DTEST=ON `
+            -Dgtest_disable_pthreads=ON `
+            ${{ matrix.extra_cmake }}
+
+      # ── Configure: Windows Clang-CL ───────────────────────────────────
+      - name: Configure CMake (Windows Clang-CL)
+        if: matrix.clang_cl == true
+        run: |
+          cmake -B build `
+            -G "Visual Studio 17 2022" -A x64 -T ClangCL `
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} `
+            -DCMAKE_CXX_STANDARD=${{ matrix.cxx_std }} `
+            -DCMAKE_CXX_STANDARD_REQUIRED=ON `
+            -DCMAKE_CXX_EXTENSIONS=OFF `
+            -DTEST=ON `
+            -Dgtest_disable_pthreads=ON `
+            ${{ matrix.extra_cmake }}
+
+      # ── Build ─────────────────────────────────────────────────────────
+      - name: Build
+        run: cmake --build build --config ${{ matrix.build_type }} --parallel
+
+      # ── Test ──────────────────────────────────────────────────────────
+      - name: Test
+        working-directory: build
+        shell: bash
+        run: |
+          ctest \
+            --build-config ${{ matrix.build_type }} \
+            --output-on-failure \
+            --parallel 4 \
+            --timeout 120 \
+            -T Test
+
+      # ── Upload test result XMLs as artifacts ──────────────────────────
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-${{ matrix.name }}
+          path: build/Testing/**/*.xml
+          if-no-files-found: ignore
+          retention-days: 14

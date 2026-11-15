@@ -1,0 +1,50 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 3 optimizations:
+# - [MEDIUM] Add concurrency group to "ci.yml"
+# - [MEDIUM] Switch "test" from Windows to ubuntu runner
+# - [LOW] Use shallow clone in "test" job
+# Estimated savings: ~2 min/run
+#
+name: Run Tests
+
+on:
+  push:
+    branches:
+      - '*'
+  pull_request:
+    branches:
+      - '*'
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: 
+          fetch-depth: 1
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 8.12.1
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          cache: "pnpm"
+          node-version: "20.x"
+
+      - name: Install Dependencies
+        run: pnpm install
+
+      - name: Run Tests
+        shell: pwsh
+        run: |
+          & pnpm test 2>&1 | Tee-Object -FilePath test-output.log
+          $exitCode = $LASTEXITCODE
+          if ($exitCode -ne 0) {
+            exit $exitCode
+          }

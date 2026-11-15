@@ -1,0 +1,132 @@
+name: Prime IntelliJ Platform Test Cache
+
+on:
+  workflow_call:
+    inputs:
+      gradleVersion:
+        type: string
+        required: true
+        description: 'Gradle version used to warm up the shared test cache'
+      os:
+        type: string
+        required: true
+        description: 'Operating system'
+      testName:
+        type: string
+        required: false
+        default: org.jetbrains.intellij.platform.gradle.tasks.PrintBundledPluginsTaskTest
+        description: 'Test filter used to populate the shared IntelliJ Platform test cache'
+
+jobs:
+  primeCache:
+    name: Prime cache @ ${{ inputs.os }}
+    runs-on: ${{ inputs.os }}
+    permissions:
+      checks: write
+    steps:
+
+      # Free GitHub Actions Environment Disk Space
+      - name: Maximize Build Space
+        if: runner.os == 'Linux'
+        uses: jlumbroso/free-disk-space@v2.0.0
+        with:
+          preinstalled-runtimes: false
+          large-packages: false
+
+      - name: Fetch Sources
+        uses: actions/checkout@v7
+
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: zulu
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6.4.1
+        with:
+          cache-read-only: true
+
+      - name: Restore IntelliJ Platform test cache
+        id: intellij-platform-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: .gradle/testGradleHome/.intellijPlatform
+          key: test-gradle-home-v5-intellij-platform-${{ runner.os }}-${{ hashFiles('gradle.properties', 'build.gradle.kts', 'gradle/libs.versions.toml', 'src/test/**/*.kt', 'src/test/resources/**', 'src/testFixtures/**/*.kt', 'src/integrationTest/**/*.kt', 'src/integrationTest/resources/**') }}
+          restore-keys: |
+            test-gradle-home-v5-intellij-platform-${{ runner.os }}-
+
+      - name: Restore Gradle TestKit cache
+        id: gradle-testkit-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: .gradle/testGradleHome/.testKit
+          key: test-gradle-home-v2-testkit-${{ runner.os }}-${{ inputs.gradleVersion }}-${{ hashFiles('gradle.properties', 'build.gradle.kts', 'gradle/libs.versions.toml') }}
+          restore-keys: |
+            test-gradle-home-v2-testkit-${{ runner.os }}-
+
+      - name: Prime IntelliJ Platform test cache
+        if: ${{ steps.intellij-platform-cache.outputs.cache-hit != 'true' }}
+        env:
+          DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+          TEST_NAME: ${{ inputs.testName }}
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            TEST_GRADLE_USER_HOME="$(pwd -W)\\.gradle\\testGradleHome"
+          else
+            TEST_GRADLE_USER_HOME="$PWD/.gradle/testGradleHome"
+          fi
+
+          ./gradlew test \
+            -PtestGradleVersion="${{ inputs.gradleVersion }}" \
+            -PtestGradleUserHome="$TEST_GRADLE_USER_HOME" \
+            --tests "$TEST_NAME" \
+            --console=plain \
+            --no-build-cache
+
+      - name: Check IntelliJ Platform test cache
+        if: ${{ always() && !cancelled() && steps.intellij-platform-cache.outputs.cache-hit != 'true' }}
+        id: intellij-platform-cache-path
+        shell: bash
+        run: |
+          if [ -d .gradle/testGradleHome/.intellijPlatform ] && [ -n "$(find .gradle/testGradleHome/.intellijPlatform -mindepth 1 -print -quit)" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save IntelliJ Platform test cache
+        if: ${{ always() && !cancelled() && steps.intellij-platform-cache.outputs.cache-hit != 'true' && steps.intellij-platform-cache-path.outputs.present == 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: .gradle/testGradleHome/.intellijPlatform
+          key: ${{ steps.intellij-platform-cache.outputs.cache-primary-key }}
+
+      - name: Check Gradle TestKit cache
+        if: ${{ always() && !cancelled() && steps.gradle-testkit-cache.outputs.cache-hit != 'true' }}
+        id: gradle-testkit-cache-path
+        shell: bash
+        run: |
+          if [ -d .gradle/testGradleHome/.testKit ] && [ -n "$(find .gradle/testGradleHome/.testKit -mindepth 1 -print -quit)" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save Gradle TestKit cache
+        if: ${{ always() && !cancelled() && steps.gradle-testkit-cache.outputs.cache-hit != 'true' && steps.gradle-testkit-cache-path.outputs.present == 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: .gradle/testGradleHome/.testKit
+          key: ${{ steps.gradle-testkit-cache.outputs.cache-primary-key }}
+
+      - name: Upload Failure Reports
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: unit-test-cache-prime-reports-${{ inputs.os }}-${{ inputs.gradleVersion }}
+          path: |
+            build/diagnostics/
+            build/test-results/test/
+            build/reports/tests/test/

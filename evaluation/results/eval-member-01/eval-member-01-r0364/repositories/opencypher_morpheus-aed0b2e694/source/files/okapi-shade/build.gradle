@@ -1,0 +1,71 @@
+apply plugin: 'com.gradleup.shadow'
+
+description = 'Okapi Shade contains the full Okapi stack and its relocated dependencies'
+
+dependencies {
+    api project(':okapi-relational')
+}
+
+ext.excludedDependencyGroups = [
+    'org.scala-lang',
+    'org.scala-lang.modules',
+]
+
+pub.each { k, v ->
+    v.artifacts = []
+}
+
+publishing {
+    publications {
+        full(MavenPublication) { pub ->
+            artifact shadowJar
+            artifact sourceJar
+            artifact docJar
+            pom pomConfig
+        }
+    }
+}
+
+shadowJar {
+    archiveClassifier = ''
+    from generatePomFileForFullPublication {
+        rename('pom-default.xml',"META-INF/maven/${project.group}/${project.name}/pom.xml")
+    }
+    def relocatePackage = 'org.opencypher.relocated'
+    [
+            'cats',
+            'fastparse',
+            'machinist',
+            'org.apache',
+            'org.atnos',
+            'org.parboiled',
+            'sourcecode',
+            'ujson',
+            'upack',
+            'upickle',
+    ].each { pkg ->
+        relocate(pkg, "${relocatePackage}.$pkg")
+    }
+
+    dependencies {
+        excludedDependencyGroups.each {
+            exclude(dependency("$it:"))
+        }
+    }
+    exclude "META-INF/maven/org.apache*/**"
+    exclude "META-INF/versions/**/*"
+    exclude "META-INF/services/**/*"
+    exclude "META-INF/NOTICE*"
+    exclude "META-INF/LICENSE*"
+    exclude "META-INF/DEPENDENCIES*"
+    exclude "utf8.json"
+
+    metaInf { from tasks.licenseFile } 
+}
+
+assemble.dependsOn shadowJar
+
+// TODO: this is a way but not the right way to achieve this
+tasks.named('publishFullPublicationToMavenLocal').configure {
+    enabled = false
+}

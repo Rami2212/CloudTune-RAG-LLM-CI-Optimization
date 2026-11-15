@@ -1,0 +1,159 @@
+name: Create Release PR
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump-version:
+    runs-on: ubuntu-latest
+
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+
+      - name: Get current SDK version
+        id: current_version
+        run: |
+          CURRENT_VERSION=$(node -p "require('./package.json').config.sdkVersion")
+          echo "current=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Get last release commit
+        id: last_commit
+        env:
+          CURRENT_VERSION: ${{ steps.current_version.outputs.current }}
+        run: |
+          LAST_RELEASE_DATE=$(git show -s --format=%cI "$CURRENT_VERSION")
+          echo "date=$LAST_RELEASE_DATE" >> $GITHUB_OUTPUT
+
+      - name: Get merged PRs since last release
+        id: get_prs
+        uses: actions/github-script@v8
+        env:
+          LAST_RELEASE_DATE: ${{ steps.last_commit.outputs.date }}
+        with:
+          script: |
+            const lastReleaseDate = process.env.LAST_RELEASE_DATE;
+
+            // Get merged PRs
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'closed',
+              base: 'main',
+              per_page: 100
+            });
+
+            // Filter and process PRs
+            const mergedPrs = prs
+              .filter(pr => pr.merged_at && new Date(pr.merged_at) > new Date(lastReleaseDate))
+              .map(pr => ({
+                number: pr.number,
+                title: pr.title,
+              }));
+            core.setOutput('prs', JSON.stringify(mergedPrs));
+
+            const hasFeatures = mergedPrs.some(pr => /^feat/i.test(pr.title));
+            core.setOutput('isFeature', hasFeatures);
+
+      - name: Calculate new version
+        id: new_version
+        env:
+          CURRENT: ${{ steps.current_version.outputs.current }}
+          IS_FEATURE: ${{ steps.get_prs.outputs.isFeature }}
+        run: |
+          MAJOR=${CURRENT:0:2}
+          MINOR=${CURRENT:2:2}
+          PATCH=${CURRENT:4:2}
+
+          if [[ "$IS_FEATURE" == "true" ]]; then
+            MINOR=$(printf "%02d" $((10#$MINOR + 1)))
+            PATCH="00"
+          else
+            PATCH=$(printf "%02d" $((10#$PATCH + 1)))
+          fi
+
+          NEW_VERSION="${MAJOR}${MINOR}${PATCH}"
+          echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create release branch on main
+        env:
+          NEW_VERSION: ${{ steps.new_version.outputs.version }}
+        run: |
+          git checkout -b "rel/$NEW_VERSION"
+          git push -u origin "rel/$NEW_VERSION"
+
+      - name: Update package.json sdk version
+        env:
+          NEW_VERSION: ${{ steps.new_version.outputs.version }}
+        run: |
+          vp pm pkg set config.sdkVersion="$NEW_VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json
+          git commit -m "Release $NEW_VERSION"
+          git push
+
+      - name: Generate release notes
+        id: release_notes
+        uses: actions/github-script@v8
+        env:
+          PRS_JSON: ${{ steps.get_prs.outputs.prs }}
+        with:
+          script: |
+            // Trim whitespace from PR titles
+            const prs = JSON.parse(process.env.PRS_JSON).map(pr => ({
+              ...pr,
+              title: pr.title.trim()
+            }));
+
+            // Categorize PRs
+            const features = prs.filter(pr => /^feat/i.test(pr.title));
+            const fixes = prs.filter(pr => /^fix/i.test(pr.title));
+            const improvements = prs.filter(pr => /^(perf|refactor|chore)/i.test(pr.title));
+
+            // Helper function to build section
+            const buildSection = (title, prs) => {
+              if (prs.length === 0) return '';
+              let section = `### ${title}\n\n`;
+              prs.forEach(pr => {
+                section += `- ${pr.title} (#${pr.number})\n`;
+              });
+              return section + '\n';
+            };
+
+            let releaseNotes = '';
+            releaseNotes += buildSection('🚀 New Features', features);
+            releaseNotes += buildSection('🐛 Bug Fixes', fixes);
+            releaseNotes += buildSection('🔧 Improvements', improvements);
+
+            core.setOutput('notes', releaseNotes);
+
+      - name: Create release PR
+        env:
+          NEW_VERSION: ${{ steps.new_version.outputs.version }}
+        run: |
+          # Keep 'EOF' quoted to disable shell expansion on the interpolated notes.
+          cat > release_notes.md << 'EOF'
+          Channels: Current, Stable
+
+          ${{ steps.release_notes.outputs.notes }}
+          EOF
+
+          gh pr create \
+            --title "Release $NEW_VERSION" \
+            --body-file release_notes.md \
+            --base main \
+            --reviewer fadi-george,sherwinski,jkasten2

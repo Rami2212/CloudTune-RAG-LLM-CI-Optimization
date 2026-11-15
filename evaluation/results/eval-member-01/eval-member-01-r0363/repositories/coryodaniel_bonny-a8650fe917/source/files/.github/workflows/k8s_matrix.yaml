@@ -1,0 +1,58 @@
+name: Kubernetes Compatibility Matrix
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        k8s_version: [v1.31.14, v1.32.11, v1.33.7, v1.34.3, v1.35.1]
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Setup Mise JDX
+        id: mise
+        run: |
+          curl https://mise.run | sh
+          echo "$HOME/.local/share/mise/bin" >> $GITHUB_PATH
+          echo "$HOME/.local/share/mise/shims" >> $GITHUB_PATH
+          echo "eval \"\$(mise activate bash)\"" >> ~/.bash_profile
+          mise install erlang elixir
+          echo "otp-version=$(mise current erlang | tr -d '\n')" >> "$GITHUB_OUTPUT"
+          echo "elixir-version=$(mise current elixir | tr -d '\n')" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Kind
+        run: mise run setup-kind --image kindest/node:${{ matrix.k8s_version }}
+
+      - name: Install Hex
+        run: MIX_ENV=test mise x elixir erlang -- mix local.hex --force
+
+      - name: Retrieve Build Cache
+        uses: actions/cache@v6
+        id: build-folder-cache
+        with:
+          path: _build
+          key: ${{ runner.os }}-${{ steps.mise.outputs.otp-version }}-${{ steps.mise.outputs.elixir-version }}-build-${{ hashFiles(format('{0}{1}', github.workspace, '/mix.lock')) }}
+
+      - name: Retrieve Mix Dependencies Cache
+        uses: actions/cache@v6
+        id: mix-cache
+        with:
+          path: deps
+          key: ${{ runner.os }}-${{ steps.mise.outputs.otp-version }}-${{ steps.mise.outputs.elixir-version }}-mix-${{ hashFiles(format('{0}{1}', github.workspace, '/mix.lock')) }}
+
+      - name: Run Integration Tests
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 10
+          max_attempts: 5
+          command: |
+            mise run integration-tests-ci

@@ -1,0 +1,65 @@
+name: Canary integration tests
+on:
+  push:
+    tags:
+      - v*
+    branches:
+      - master
+      - release-*
+
+defaults:
+  run:
+    # reference: https://docs.github.com/en/actions/reference/workflow-syntax-for-github-actions#using-a-specific-shell
+    shell: bash --noprofile --norc -eo pipefail -x {0}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-rook-image-amd64:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
+        with:
+          tool-cache: true # removes old golang version but saves ~6GB
+          large-packages: false # takes a long time to run b/c package mgr
+          android: false # takes a long time to run b/c package mgr
+          dotnet: false # takes a long time to run b/c package mgr
+          haskell: false # takes a long time to run b/c package mgr
+
+      - name: setup golang
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26"
+
+      - name: build rook image
+        run: tests/scripts/github-action-helper.sh build_rook_image_artifact
+
+      - name: upload rook image
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rook-image-amd64
+          path: _output/ci-image
+          retention-days: 7
+          # the payload is already zstd-compressed
+          compression-level: 0
+          overwrite: true
+
+  canary-tests:
+    needs: build-rook-image-amd64
+    uses: ./.github/workflows/canary-integration-test.yml
+    with:
+      ceph_images: '["quay.io/ceph/ceph:v20"]'
+      rook_image_artifact: rook-image-amd64
+    secrets: inherit

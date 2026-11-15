@@ -1,0 +1,242 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 9 optimizations:
+# - [HIGH] Add pip dependency cache to "sdist" job
+# - [HIGH] Add pip dependency cache to "lint" job
+# - [HIGH] Add pip dependency cache to "build" job
+# - [HIGH] Add pip dependency cache to "build_cblosc" job
+# - [MEDIUM] 4 jobs clone the repo — consider artifact sharing
+# - [LOW] Explicitly set fail-fast for large matrix job "build" (12 combinations)
+# - [LOW] Use shallow clone in "sdist" job
+# - [LOW] Use shallow clone in "build" job
+# - [LOW] Use shallow clone in "build_cblosc" job
+# Estimated savings: ~15 min/run
+#
+name: CI
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.number }}-${{ github.event.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    # branches: [ "master" ] # Run after merging into the "master" target
+    paths: # Run only if files relevant to CI have changed (i.e. not bench, contrib, doc, examples, utils or submodule folders)
+      - '.flake8'
+      - '.github/workflows/**'
+      - 'MANIFEST.in'
+      - 'Makefile'
+      - 'ci/**'
+      - 'pyproject.toml'
+      - 'requirements*.txt'
+      - 'setup.py'
+      - 'src/**'
+      - 'tables/**'
+
+  pull_request:
+    branches: [ "master" ] # Run in PRs targeting the "master" branch
+    types: # Avoid low-impact events like "edited" or "labeled"
+      - opened
+      - synchronize
+      - reopened
+    paths:
+      - '.flake8'
+      - '.github/workflows/**'
+      - 'MANIFEST.in'
+      - 'Makefile'
+      - 'ci/**'
+      - 'pyproject.toml'
+      - 'requirements*.txt'
+      - 'setup.py'
+      - 'src/**'
+      - 'tables/**'
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PACKAGE: tables
+
+jobs:
+
+  sdist:
+    name: Create sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          submodules: true
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        name: Install Python
+        with:
+          python-version: 3.x
+      - name: Ubuntu library headers
+        run:  |
+          sudo apt update
+          # Keep in sync with "Prerequisites" in User's Guide.
+          DEBIAN_FRONTEND=noninteractive sudo apt install -y --no-install-recommends libblosc-dev libbz2-dev libhdf5-dev liblz4-dev liblzo2-dev libsnappy-dev libzstd-dev zlib1g-dev
+      - name: Source distribution
+        run: |
+          pip install build
+          python -m build --sdist
+      - name: Save source distribution
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tables-sdist
+          path: dist/*.tar.gz
+
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.x"
+
+      - name: Install lint dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install flake8 isort black packaging
+          if [ -f requirements-lint.txt ]; then pip install -r requirements-lint.txt; fi
+
+      - name: Check dependency constraints are in sync
+        run: python ci/check_requirements_sync.py
+
+      - name: Lint (flake8)
+        run: |
+          python -m flake8 --version
+          python -m flake8 --count --show-source --statistics ${PACKAGE}
+
+      - name: Lint (isort)
+        run: |
+          python -m isort --version
+          python -m isort --check ${PACKAGE}
+
+      - name: Lint (black)
+        run: |
+          python -m black --version
+          python -m black --check ${PACKAGE}
+
+
+  build:
+    name: ${{ matrix.os }} ${{ matrix.python }} ${{ matrix.numpy }} ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    needs: sdist
+    defaults:
+      run:
+        shell: bash -l {0}
+    strategy:
+      fail-fast: false
+      matrix:
+        # os: [ubuntu-latest, macos-15-intel, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Keep in sync with ``project.classifiers`` in ``pyproject.toml``.
+        python: ['3.11', '3.12', '3.13', '3.14']
+        numpy: ['stable']
+        include:
+          - os: ubuntu-latest
+            python: '3.14'
+            numpy: 'dev' # Extra build: NumPy dev with latest Python
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 0
+        submodules: true
+    - name: Set up Python ${{ matrix.python }}
+      uses: conda-incubator/setup-miniconda@be893c923ea9cf1cf7cd510fbdde27c7e18cbdcb # v4.1.0
+      with:
+        python-version: ${{ matrix.python }}
+        auto-update-conda: true
+        channels: conda-forge
+        channel-priority: strict
+    - name: Install compilers
+      if: runner.os != 'Linux'
+      run: |
+        conda install c-compiler cxx-compiler
+    - name: Install dependencies
+      run: |
+        # Keep in sync with
+        # "Prerequisites" in User's Guide,
+        # ``build-system.requires`` in ``pyproject.toml``.
+        conda install -q bzip2 hdf5 lzo zlib pip
+        python -m pip install --require-hashes -r requirements.txt
+    - name: Reinstall NumPy dev
+      if: ${{ matrix.numpy == 'dev' }}
+      run: |
+        python -m pip install --force-reinstall --index-url https://pypi.anaconda.org/scientific-python-nightly-wheels/simple numpy
+    - name: Python and NumPy version
+      run: |
+        echo "$(python --version) ($(python -c 'import os, sys; print(os.path.abspath(sys.executable))'))"
+        echo "NumPy $(numpy-config --version)"
+    - name: Get source distribution
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        name: tables-sdist
+    - name: Installation
+      run: |
+        python -m pip install -v tables-*.tar.gz
+    - name: 'Run test'
+      continue-on-error: ${{ matrix.numpy == 'dev' }} # Do not abort job if NumPy dev fails
+      run: |
+        mv tables _tables
+        python -Werror -m tests.test_all -v
+        pt2to3 -h
+        ptrepack -h
+        ptdump -h
+        pttree -h
+
+
+  build_cblosc:
+    name: Sdist with cblosc2
+    runs-on: ubuntu-latest
+    needs: sdist
+    defaults:
+      run:
+        shell: bash -l {0}
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 0
+        submodules: true
+    - name: Set up Python
+      uses: conda-incubator/setup-miniconda@be893c923ea9cf1cf7cd510fbdde27c7e18cbdcb # v4.1.0
+      with:
+        auto-update-conda: true
+        channels: conda-forge
+        channel-priority: strict
+    - name: Install compilers
+      if: runner.os != 'Linux'
+      run: |
+        conda install c-compiler cxx-compiler
+    - name: Install dependencies
+      run: |
+        # Keep in sync with "Prerequisites" in User's Guide,
+        # ``build-system.requires`` in ``pyproject.toml``.
+        conda install bzip2 hdf5 lzo zlib blosc c-blosc2 pip setuptools packaging py-cpuinfo "numpy>=2" cython numexpr
+    - name: Get source distribution
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        name: tables-sdist
+    - name: Installation
+      run: |
+        python -m pip install -v tables-*.tar.gz --no-deps
+    - name: Python blosc2 wheel or conda pkg is not installed
+      run: |
+        ! conda list | grep -E '^(python-)?blosc2'
+    - name: 'Run test'
+      run: |
+        mv tables _tables
+        python -Werror -m tests.test_all -v
+        pt2to3 -h
+        ptrepack -h
+        ptdump -h
+        pttree -h

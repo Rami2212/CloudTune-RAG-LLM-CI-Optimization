@@ -1,0 +1,120 @@
+# Inspired from:
+# - https://github.com/cockroachdb/sqlalchemy-cockroachdb/blob/master/.github/workflows/ci.yml
+# - https://github.com/rgeo/activerecord-postgis-adapter/blob/master/.github/workflows/tests.yml
+name: Test
+
+on:
+  push:
+    branches: [master]
+  # Triggers the workflow on pull request events.
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+# This allows a subsequently queued workflow run to interrupt previous runs.
+concurrency:
+  group: "${{ github.workflow }} @ ${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  # Since the name of the matrix job depends on the version, we define another job with a more stable name.
+  test_results:
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    name: Test Results
+    needs: [test]
+    steps:
+      - name: Check Success
+        run: |
+          result="${{ needs.test.result }}"
+
+          if [[ $result == "success" || $result == "skipped" ]]; then
+            echo "All tests passed :taco:" >>$GITHUB_STEP_SUMMARY
+            exit 0
+          else
+            exit 1
+          fi
+      - name: Download Reports
+        if: failure()
+        uses: actions/download-artifact@v4
+        with:
+          path: reports
+      - name: Aggregate Reports
+        if: failure()
+        run: |
+          cat <<EOF >>$GITHUB_STEP_SUMMARY
+          # Failing Tests
+
+          <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Test</th>
+              <th>Failure</th>
+            </tr>
+          </thead>
+          <tbody>
+          EOF
+
+          jq --slurp --raw-output '
+            map(.failed_tests) | flatten | map({
+              klass,
+              NAME,
+              failure: .failures[0],
+              source_url: (
+                .source_location | if (.[0] | contains("/gems/")) then
+                  (.[0] | capture("rails-(?<sha>.*?)/(?<path>.*)")) *
+                  {line: .[1], server: "https://github.com", repo: "rails/rails"}
+                else
+                  (.[0] | capture("activerecord-cockroachdb-adapter/(?<path>test/.*)") *
+                  {line: .[1], sha: $ENV.GITHUB_SHA, repo: $ENV.GITHUB_REPOSITORY, server: $ENV.GITHUB_SERVER_URL}
+                end | "\(.server)/\(.repo)/blob/\(.sha)/\(.path)#L\(.line)"
+              )
+            }) | group_by(.) | map(.[0] * { count: length }) | sort[0:100][]
+            | "<tr>"
+            +   "<td><strong>\(.count)</strong></td>"
+            +   "<td><a href=\"\(.source_url)\">\(.klass)#\(.NAME)</a></td>"
+            +   "<td><pre>\(.failure)</pre></td>"
+            + "</tr>"
+          ' reports/*/report.json >>$GITHUB_STEP_SUMMARY
+
+          cat <<EOF >>$GITHUB_STEP_SUMMARY
+          </tbody>
+          </table>
+          EOF
+
+          # Do not print json if too large.
+          [[ "$(du -s reports | cut -f1)" -gt 124 ]] && exit 0
+
+          echo >>$GITHUB_STEP_SUMMARY
+          echo '```json' >>$GITHUB_STEP_SUMMARY
+          jq --slurp --compact-output '.' reports/*/report.json >>$GITHUB_STEP_SUMMARY
+          echo '```' >>$GITHUB_STEP_SUMMARY
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # https://www.cockroachlabs.com/docs/releases/release-support-policy
+        crdb: [v24.3, v25.2, v25.4, v26.2]
+        ruby: ["3.4"]
+    name: Test (crdb=${{ matrix.crdb }} ruby=${{ matrix.ruby }})
+    steps:
+      - name: Set Up Actions
+        uses: actions/checkout@v4
+      - uses: ./.github/actions/test-runner
+        id: test
+        with:
+          crdb: ${{ matrix.crdb }}
+          ruby: ${{ matrix.ruby }}
+        env:
+          JSON_REPORTER: "report.json"
+      - name: Upload Report
+        if: ${{ failure() && steps.test.conclusion == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-${{ matrix.crdb }}-${{ matrix.ruby }}
+          path: report.json

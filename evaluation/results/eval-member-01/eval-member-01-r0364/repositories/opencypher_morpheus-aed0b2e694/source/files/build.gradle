@@ -1,0 +1,229 @@
+plugins {
+    id 'java-library'
+
+    alias(libs.plugins.champeau.jmh).apply(false)
+    alias(libs.plugins.license).apply(false)
+    alias(libs.plugins.shadowjar).apply(false)
+    alias(libs.plugins.spotless).apply(false)
+
+    alias(libs.plugins.versionCatalogUpdate)
+}
+
+apply from: 'build.params.gradle'
+apply plugin: 'base'
+
+allprojects {
+    group = 'org.opencypher.morpheus'
+    version = ver.self
+
+    // Gradle version-catalog-update has to be able to resolve the dependencies.
+    repositories {
+        mavenCentral()
+        mavenLocal()
+    }
+
+    java {
+        toolchain {
+            languageVersion = JavaLanguageVersion.of(21)
+            vendor = JvmVendorSpec.ADOPTIUM // Gradle constant for Temurin
+        }
+    }
+}
+
+apply from: 'build.licenses.gradle'
+
+subprojects {
+    apply plugin: 'scala'
+    apply plugin: 'java-library'
+
+    configurations {
+        mockitoAgent
+    }
+
+    dependencies {
+        api libs.scala.library
+
+        // Seems we need to lock these down, otherwise we get runtime errors on reflection
+        api libs.scala.lang.compiler
+        api libs.scala.lang.reflect
+
+        api libs.log4j.api
+        api libs.scala.log4j.api
+
+        testImplementation libs.log4j.core
+        testImplementation libs.testing.scala.scalatest
+        testImplementation libs.testing.scala.scalacheck
+        testImplementation libs.testing.mockito.core
+        mockitoAgent(libs.testing.mockito.core) {
+            transitive = false
+        }
+        testImplementation libs.testing.scalatest.scalacheck
+        testImplementation libs.testing.scalatest.mockito
+        testImplementation libs.testing.junit.platform.launcher
+
+        testRuntimeOnly libs.testing.junit.platform.engine
+        testRuntimeOnly libs.testing.scalatest.junit
+    }
+
+    test {
+        maxHeapSize = "2g"
+        maxParallelForks = Runtime.runtime.availableProcessors().intdiv(2) ?: 1
+
+        useJUnitPlatform {
+            includeEngines 'scalatest'
+            testLogging {
+                events("failed", "standard_error")
+            }
+        }
+
+        // JVM args required by spark (see org.apache.spark.launcher.JavaModuleOptions)
+        jvmArgs(
+                '-XX:+IgnoreUnrecognizedVMOptions',
+                '--add-exports=java.base/sun.nio.ch=ALL-UNNAMED',
+                '--add-opens=java.base/java.lang.invoke=ALL-UNNAMED',
+                '--add-opens=java.base/java.lang=ALL-UNNAMED',
+                '--add-opens=java.base/java.lang.invoke=ALL-UNNAMED',
+                '--add-opens=java.base/java.lang.reflect=ALL-UNNAMED',
+                '--add-opens=java.base/java.io=ALL-UNNAMED',
+                '--add-opens=java.base/java.net=ALL-UNNAMED',
+                '--add-opens=java.base/java.nio=ALL-UNNAMED',
+                '--add-opens=java.base/java.util=ALL-UNNAMED',
+                '--add-opens=java.base/java.util.concurrent=ALL-UNNAMED',
+                '--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED',
+                '--add-opens=java.base/jdk.internal.ref=ALL-UNNAMED',
+                '--add-opens=java.base/sun.nio.ch=ALL-UNNAMED',
+                '--add-opens=java.base/sun.nio.cs=ALL-UNNAMED',
+                '--add-opens=java.base/sun.security.action=ALL-UNNAMED',
+                '--add-opens=java.base/sun.util.calendar=ALL-UNNAMED',
+                '--add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED',
+                '-Djdk.reflect.useDirectMethodHandle=false'
+        )
+        jvmArgs += "-javaagent:${configurations.mockitoAgent.asPath}"
+
+        def testTempDir = layout.buildDirectory.get().dir("tmp/test").asFile
+        testTempDir.mkdirs()
+        systemProperty 'java.io.tmpdir', testTempDir.absolutePath
+    }
+
+    ext.scalacParameters = [
+            '-unchecked',
+            '-deprecation',
+            '-feature',
+            '-Xfatal-warnings',
+            '-Xfuture',
+            '-Ypartial-unification',
+            '-Ywarn-adapted-args'
+    ]
+
+    tasks.withType(ScalaCompile).configureEach {
+        options.encoding = 'UTF-8'
+        scalaCompileOptions.additionalParameters = scalacParameters
+    }
+
+    tasks.withType(ScalaDoc).configureEach {
+        scalaDocOptions.additionalParameters = scalacParameters
+    }
+
+    tasks.register('sourceJar', Jar) {
+        archiveClassifier = 'sources'
+        from(sourceSets.main.allSource)
+    }
+
+    tasks.register('docJar', Jar) {
+        dependsOn tasks.scaladoc
+        archiveClassifier = 'javadoc'
+        from(tasks.scaladoc.destinationDir)
+    }
+
+    tasks.register('testJar', Jar) {
+        archiveClassifier = 'tests'
+        from(sourceSets.test.output)
+    }
+
+    tasks.withType(Jar).configureEach {
+        from(tasks.generateLicensesFiles) {
+            into("META-INF/")
+        }
+    }
+
+    tasks.register('licenseFile') {
+        outputs.file(project.parent.file('LICENSE.txt'))
+    }
+
+    tasks.register('dependencySearch', DependencyInsightReportTask) {
+        description = 'Searches all projects for a dependency'
+        group = 'help'
+    }
+
+    // TODO: it looks like this is only used for `:morpheus-examples` - we don't need it for all sub-projects 🤔
+    // see: README.md:163
+    tasks.register('runApp', JavaExec) {
+        dependsOn tasks.classes
+        group = 'run'
+        description = 'Run a custom Scala app (use -PmainClass=com.my.package.App)'
+
+        classpath = sourceSets.main.runtimeClasspath
+        mainClass = project.provider { project.findProperty('mainClass') }
+    }
+
+    tasks.named('runApp').configure {
+        jvmArgs = [
+                '-Xmx2g',
+                '-Dconfig.file=app.conf',
+                '-XX:+IgnoreUnrecognizedVMOptions',
+                '--add-exports=java.base/sun.nio.ch=ALL-UNNAMED',
+                '--add-opens=java.base/java.lang.invoke=ALL-UNNAMED',
+                '--add-opens=java.base/java.lang=ALL-UNNAMED',
+                '--add-opens=java.base/java.lang.invoke=ALL-UNNAMED',
+                '--add-opens=java.base/java.lang.reflect=ALL-UNNAMED',
+                '--add-opens=java.base/java.io=ALL-UNNAMED',
+                '--add-opens=java.base/java.net=ALL-UNNAMED',
+                '--add-opens=java.base/java.nio=ALL-UNNAMED',
+                '--add-opens=java.base/java.util=ALL-UNNAMED',
+                '--add-opens=java.base/java.util.concurrent=ALL-UNNAMED',
+                '--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED',
+                '--add-opens=java.base/jdk.internal.ref=ALL-UNNAMED',
+                '--add-opens=java.base/sun.nio.ch=ALL-UNNAMED',
+                '--add-opens=java.base/sun.nio.cs=ALL-UNNAMED',
+                '--add-opens=java.base/sun.security.action=ALL-UNNAMED',
+                '--add-opens=java.base/sun.util.calendar=ALL-UNNAMED',
+                '--add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED',
+                '-Djdk.reflect.useDirectMethodHandle=false'
+        ]
+    }
+
+    // copied from https://stackoverflow.com/a/38058671/568723
+    tasks.register('depSize') {
+        description = 'Lists all dependencies sorted by their size'
+
+        doFirst {
+            configurations {
+                resolvableDefault {
+                    extendsFrom configurations.default
+                    canBeResolved = true
+                    canBeConsumed = false
+                    description = 'Resolvable default configuration.'
+                }
+            }
+        }
+
+        doLast {
+            final formatStr = "%,10.2f"
+            final conf = configurations.resolvableDefault
+            final size = conf.collect { it.length() / (1024 * 1024) }.sum()
+            final out = new StringBuffer()
+            out << 'Total dependencies size:'.padRight(65)
+            out << "${String.format(formatStr, size)} Mb\n\n"
+            conf.sort { -it.length() }
+                    .each {
+                        out << "${it.name}".padRight(65)
+                        out << "${String.format(formatStr, (it.length() / 1024))} kb\n"
+                    }
+            println(out)
+        }
+    }
+}
+
+apply from: 'build.publishing.gradle'
+apply from: 'build.style.gradle'
+apply from: 'build.version.catalog.update.gradle'

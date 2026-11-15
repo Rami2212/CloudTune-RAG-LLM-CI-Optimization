@@ -1,0 +1,41 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [MEDIUM] Add concurrency group to "build.yml"
+# Estimated savings: ~2 min/run
+#
+name: build
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [18.x]
+
+    steps:
+      - uses: actions/checkout@v2
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v2
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: npm install, build
+        run: |
+          yarn --frozen-lockfile
+          yarn bootstrap
+          yarn lint
+          yarn build
+        env:
+          CI: true
+          PUPPETEER_SKIP_DOWNLOAD: true

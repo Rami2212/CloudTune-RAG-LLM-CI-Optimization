@@ -1,0 +1,99 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright Contributors to the rawtoaces project.
+
+# This starter workflow is for a CMake project running on multiple platforms. There is a different starter workflow if you just want a single platform.
+# See: https://github.com/actions/starter-workflows/blob/main/ci/cmake-single-platform.yml
+name: CI
+permissions:
+  contents: read
+
+on:
+  push:
+    #branches: [ "master" ]
+  pull_request:
+    #branches: [ "master" ]
+
+jobs:
+  aswf:
+    name: "VFX${{ matrix.vfxyear }}"
+    permissions: read-all
+    uses: ./.github/workflows/build-steps.yml
+    with:
+      container: ${{ matrix.container }}
+      container_volumes: ${{ matrix.container_volumes || '[]' }}
+      cc_compiler: ${{ matrix.compiler[0] }}
+      cxx_compiler: ${{ matrix.cxx_compiler[1] }}
+      cxx_standard: ${{ matrix.cxx_standard || 17 }}
+      vfxyear: ${{ matrix.vfxyear || 0 }}
+      toolchain_file: "/__w/rawtoaces/rawtoaces/build_deps/conan_toolchain.cmake"
+      workflow_name: ${{ matrix.compiler[0] }}
+      python_version: ${{ matrix.python_version }}
+      
+    strategy:
+      # Set fail-fast to false to ensure that feedback is delivered for all matrix combinations. Consider changing this to true when your workflow is stable.
+      fail-fast: false
+      
+      matrix:
+        vfxyear: [ 2023, 2024, 2025, 2026, 2027 ]
+        compiler: [ [gcc, g++], [clang, clang++] ]
+        include:
+          - vfxyear: 2023
+            container: aswf/ci-rawtoaces:2023.4
+            python_version: '3.10.20'
+          - vfxyear: 2024
+            container: aswf/ci-rawtoaces:2024.8
+            python_version: '3.11.15'
+          - vfxyear: 2025
+            container: aswf/ci-rawtoaces:2025.7
+            python_version: '3.11.15'
+          - vfxyear: 2026
+            container: aswf/ci-rawtoaces:2026.5
+            python_version: '3.13.14'
+            cxx_standard: 20
+          - vfxyear: 2027
+            container: aswf/ci-rawtoaces:2027.0
+            python_version: '3.13.14'
+            cxx_standard: 20
+
+  build:
+    name: "${{matrix.os}} ${{matrix.c_compiler}}"
+    permissions: read-all
+    uses: ./.github/workflows/build-steps.yml
+    with:
+      runner: ${{ matrix.os }}-latest
+      container: ${{ matrix.container }}
+      cc_compiler: ${{ matrix.cc_compiler }}
+      cxx_compiler: ${{ matrix.cxx_compiler }}
+      install_deps: install_deps_${{ matrix.os }}
+      toolchain_file: ${{ matrix.toolchain_file }}
+      build_shared_libs: ${{ matrix.build_shared_libs || 'ON' }}
+      workflow_name:  ${{ matrix.options[0] }}
+      enable_eigen:   ${{ matrix.options[1] }}
+      enable_ceres:   ${{ matrix.options[2] }}
+      enable_lensfun: ${{ matrix.options[3] }}
+      cxx_standard: 17
+    strategy:
+      # Set fail-fast to false to ensure that feedback is delivered for all matrix combinations. Consider changing this to true when your workflow is stable.
+      fail-fast: false
+
+      matrix:
+        os: [ macos, ubuntu, windows ]
+        options: [
+          # [ name, enable_eigen, enable_ceres, enable_lensfun]
+          ["minimal", 'OFF', 'OFF', 'OFF'],
+          ["eigen",   'ON',  'OFF', 'OFF'],
+          ["ceres",   'OFF', 'ON',  'OFF'],
+          ["full",    'ON',  'ON',  'ON' ]
+        ]
+        include:
+          - os: windows
+            c_compiler: cl
+            cpp_compiler: cl
+            toolchain_file: "C:/vcpkg/scripts/buildsystems/vcpkg.cmake"
+            build_shared_libs: OFF
+          - os: ubuntu
+            c_compiler: gcc
+            cpp_compiler: g++
+          - os: macos
+            c_compiler: clang
+            cpp_compiler: clang++

@@ -1,0 +1,161 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright Contributors to the rawtoaces project.
+
+name: CI Steps
+
+on:
+  workflow_call:
+    # This inputs receive values via the "with:" section in ci_workflow.yml
+    inputs:
+      runner:
+        type: string
+        default: 'ubuntu-latest'
+      container:
+        type: string
+      container_volumes:
+        type: string
+        default: '[]'
+      cc_compiler:
+        type: string
+      cxx_compiler:
+        type: string
+      cxx_standard:
+        type: number
+        default: 17
+      build_type:
+        type: string
+        default: 'Release'
+      install_deps:
+        type: string
+        default: 'install_deps_aswf'
+      toolchain_file:
+        type: string
+      build_shared_libs:
+        type: string
+        default: 'ON'
+      enable_lensfun:
+        type: string
+        default: 'ON'
+      enable_eigen:
+        type: string
+        default: 'ON'
+      enable_ceres:
+        type: string
+        default: 'ON'
+      vfxyear:
+        type: number
+        default: 0
+      sanitiser_mode:
+        type: string
+        default: 'none'
+      workflow_name:
+        type: string
+        default: 'CI Steps'
+      python_version:
+        type: string
+        default: ''
+      
+
+permissions: read-all
+
+jobs:
+  build_steps:
+    name: ${{ inputs.workflow_name }}
+    runs-on: ${{ inputs.runner }}
+    container:
+      image: ${{ inputs.container }}
+      volumes: ${{ fromJson( inputs.container_volumes ) }}
+
+    env:
+      CXX: ${{inputs.cxx_compiler}}
+      CC: ${{inputs.cc_compiler}}
+
+    steps:
+          
+      - name: "Checkout"
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: '0'
+
+      - name: Cache vcpkg binary cache
+        if: inputs.runner == 'windows-latest'
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
+        with:
+          path: C:/vcpkg/binary-cache
+          key: |
+            vcpkg-binary-cache-${{ runner.os }}-${{ hashFiles('build_scripts/vcpkg.json') }}
+          restore-keys: |
+            vcpkg-binary-cache-${{ runner.os }}-
+
+      - name: Dependencies
+        env:
+          RTA_ENABLE_LENSFUN: '${{inputs.enable_lensfun}}'
+          RTA_ENABLE_EIGEN: '${{inputs.enable_eigen}}'
+          RTA_ENABLE_CERES: '${{inputs.enable_ceres}}'
+        shell: bash
+        run: |
+          bash build_scripts/${{ inputs.install_deps }}.bash
+    
+      - name: Configure CMake
+        run: >
+          cmake 
+          -B build 
+          -S .
+          -D CMAKE_INSTALL_PREFIX=${{ github.workspace }}/install
+          -D CMAKE_CXX_STANDARD=${{ inputs.cxx_standard }}
+          -D CMAKE_TOOLCHAIN_FILE="${{ inputs.toolchain_file }}"
+          -D CMAKE_BUILD_TYPE="${{ inputs.build_type }}"
+          -D ENABLE_SHARED="${{ inputs.build_shared_libs }}"
+          -D RTA_ENABLE_LENSFUN="${{ inputs.enable_lensfun }}"
+          -D RTA_ENABLE_EIGEN="${{ inputs.enable_eigen }}"
+          -D RTA_ENABLE_CERES="${{ inputs.enable_ceres }}"
+          -D RTA_SANITISER_MODE="${{ inputs.sanitiser_mode }}"
+          -D RTA_PYTHON_VERSION="${{ inputs.python_version }}"
+
+      - name: Build
+        # Build your program with the given configuration. Note that --config is needed because the default Windows generator is a multi-config generator (Visual Studio generator).
+        run: |
+          cmake --build build --config ${{ inputs.build_type }}
+          
+      - name: Test
+        # Execute tests defined by the CMake configuration. Note that --build-config is needed because the default Windows generator is a multi-config generator (Visual Studio generator).
+        # See https://cmake.org/cmake/help/latest/manual/ctest.1.html for more detail
+        if: inputs.sanitiser_mode == 'none'
+        working-directory: build
+        run: >
+          ctest
+          --build-config ${{ inputs.build_type }}
+          --rerun-failed
+          --output-on-failure
+
+      - name: Install
+        run: >
+          cmake --install build
+      
+      - name: Configure config_tests
+        run: >
+          cmake
+          -B build_config_test
+          -S ./tests/config_tests
+          -D RAWTOACES_DIR=${{ github.workspace }}/install/lib/cmake/RAWTOACES
+          -D CMAKE_TOOLCHAIN_FILE="${{ inputs.toolchain_file }}"
+          -D CMAKE_CXX_STANDARD=${{ inputs.cxx_standard }}
+          -D CMAKE_BUILD_TYPE=${{ inputs.build_type }}
+
+      - name: Build config_tests
+        run: >
+          cmake --build build_config_test --config ${{ inputs.build_type }}
+          
+      - name: Test config_tests
+        run: >
+          ctest
+          --build-config ${{ inputs.build_type }}
+          --rerun-failed 
+          --output-on-failure 
+          --test-dir build_config_test
+
+      - name: Run sanitiser checks
+        if: inputs.sanitiser_mode != 'none'
+        working-directory: build/src/cpp/rawtoaces
+        run: |
+          bash ../../../../tests/run_valid.sh

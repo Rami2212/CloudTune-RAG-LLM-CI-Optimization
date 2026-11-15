@@ -1,0 +1,195 @@
+name: Run Unit and Ganesha Tests
+
+on:
+    merge_group:
+    pull_request:
+    push:
+        branches:
+            - dev
+
+jobs:
+    Run-Unit-Tests-and-Ganesha:
+        runs-on: ubuntu-24.04
+
+        env:
+            SAUNAFS_TEST_TIMEOUT_MULTIPLIER: 2
+
+
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+              with:
+                  submodules: true
+                  fetch-depth: 0
+
+            - name: ccache
+              uses: hendrikmuhs/ccache-action@v1.2
+              with:
+                  create-symlink: true
+
+            # Reference for previous vcpkg setup: maybe we can fix it in the future
+            #- name: Setup a new (or from cache) vcpkg
+            #  uses: lukka/run-vcpkg@v11
+
+            - name: Free Disk Space (Ubuntu)
+              uses: jlumbroso/free-disk-space@main
+              with:
+                  # removes all the pre-cached tools (Node, Go, Python, Ruby, ...) that are
+                  # installed in the path specified by the $AGENT_TOOLSDIRECTORY environment variable
+                  tool-cache: false          # ~6GB
+                  android: true              # ~12GB
+                  dotnet: true               # ~4GB
+                  haskell: true              # ~6GB
+                  # large-packages is the most time consuming step, enable only if really needed
+                  large-packages: false      # ~5GB (Chrome, Firefox, etc)
+                  docker-images: false       # 0B
+                  swap-storage: false        # Keep swap enabled for safety
+
+            - name: Build and install NFS-Ganesha
+              run: |
+                set -eux
+                cd "${GITHUB_WORKSPACE}"
+                sudo apt-get update
+                # All Ganesha build + runtime deps come from the single shared list;
+                # the version and build procedure live alongside it.
+                grep -vE '^[[:space:]]*(#|$)' tests/ci_build/ganesha/ganesha-deps.txt \
+                    | xargs sudo apt-get install -y --no-install-recommends
+                tests/ci_build/ganesha/build-ganesha.sh /usr
+
+            - name: Set up Python
+              uses: actions/setup-python@v4
+              with:
+                  python-version: "3.x"
+
+            - name: Install SaunaFS dependencies, setup environment and build
+              run: |
+                  sudo mkdir /mnt/hd{b,c,d}
+                  cd $GITHUB_WORKSPACE/tests
+                  sudo ./setup_machine.sh setup /mnt/hdb /mnt/hdc /mnt/hdd
+
+            - name: Cache vcpkg
+              uses: actions/cache@v4
+              with:
+                path: |
+                  ~/vcpkg
+                  ~/.cache/vcpkg
+                key: ${{ runner.os }}-vcpkg-${{ hashFiles('vcpkg.json', 'utils/vcpkg_setup.sh') }}
+                restore-keys: |
+                  ${{ runner.os }}-vcpkg-
+
+            - name: Setup vcpkg and install dependencies
+              run: |
+                $GITHUB_WORKSPACE/utils/vcpkg_setup.sh
+                vcpkg install --triplet x64-linux
+
+            - name: Build SaunaFS
+              run: |
+                  export PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH"
+                  source /var/lib/saunafs_setup_machine_venv/bin/activate
+                  mkdir -p build
+                  cd build
+                  nice cmake \
+                  -DCMAKE_TOOLCHAIN_FILE="${HOME}/vcpkg/scripts/buildsystems/vcpkg.cmake" \
+                  -DENABLE_CLIENT_LIB=ON \
+                  -DENABLE_DOCS=ON \
+                  -DENABLE_NFS_GANESHA=ON \
+                  -DENABLE_URAFT=ON \
+                  -DGSH_CAN_HOST_LOCAL_FS=ON \
+                  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                  -DCMAKE_INSTALL_PREFIX="${GITHUB_WORKSPACE}/install/leilfs/" \
+                  -DENABLE_TESTS=ON \
+                  -DCODE_COVERAGE=OFF \
+                  -DSAUNAFS_TEST_POINTER_OBFUSCATION=ON \
+                  -DENABLE_WERROR=ON \
+                  -DENABLE_FOUNDATIONDB=ON \
+                  "${GITHUB_WORKSPACE}"
+                  make -j"$(nproc)" install
+
+            - name: Enable systemd core dumps
+              run: |
+                sudo mkdir -p /etc/systemd/coredump.conf.d
+                echo -e "[Coredump]\nStorage=external\nProcessSizeMax=2G" | sudo tee /etc/systemd/coredump.conf.d/coredump.conf
+                sudo systemctl daemon-reexec
+
+            - name: Run Unit Tests suite
+              run: |
+                  "${GITHUB_WORKSPACE}/build/src/unittests/unittests" --gtest_color=yes
+
+            - name: Enable soft-RDMA kernel modules
+              run: |
+                  # Needed by RDMA tests. SoftiWARP (siw) / SoftRoCE (rdma_rxe) usually ship
+                  # in linux-modules-extra.
+                  sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
+                  sudo modprobe siw 2>/dev/null || sudo modprobe rdma_rxe 2>/dev/null || true
+                  if modinfo siw >/dev/null 2>&1 || modinfo rdma_rxe >/dev/null 2>&1; then
+                      echo "soft-RDMA module available; RDMA test will run"
+                  else
+                      echo "soft-RDMA module NOT available on this kernel; RDMA test will skip"
+                  fi
+
+            - name: Run Ganesha suite
+              run: |
+                  sudo chmod o+xr /home/runner/
+                  sudo chown saunafstest:saunafstest /mnt/saunafstest_loop_*
+                  sudo chown saunafstest:saunafstest /mnt/hd{b,c,d}
+                  SCRIPT="${GITHUB_WORKSPACE}/tests/ci_build/run-ganesha-tests.sh"
+                  chmod +x "${SCRIPT}"
+                  # -E: sudoers resets the environment by default, so without this the job's
+                  # SAUNAFS_TEST_TIMEOUT_MULTIPLIER is gone before run-ganesha-tests.sh gets to
+                  # preserve it for leil-tests, and every test silently runs on a multiplier of 1.
+                  sudo -E bash -c "ulimit -c unlimited && exec '${SCRIPT}'"
+
+            - name: Analyze core dump with coredumpctl
+              if: failure()
+              run: |
+                echo "===== Searching for recent core dumps for ganesha.nfsd ====="
+                echo "Recent coredumps:"
+                coredumpctl --no-pager list | tail -n 5 || true
+
+                COREDUMP_INFO=$(coredumpctl --no-pager list ganesha.nfsd | tail -n 1 || true)
+
+                if [ -z "$COREDUMP_INFO" ]; then
+                  echo "No core dump found for ganesha.nfsd"
+                  exit 0
+                fi
+
+                PID=$(echo "$COREDUMP_INFO" | awk '{print $5}')
+                echo "Found core dump for ganesha.nfsd with PID: $PID"
+
+                # Dump the core
+                CORE_PATH="/tmp/core.ganesha-nfsd.${PID}"
+                echo "Dumping core to: $CORE_PATH"
+                if ! sudo coredumpctl dump "$PID" --output="$CORE_PATH"; then
+                  echo "Error: coredumpctl failed to dump core for PID $PID"
+                  exit 1
+                fi
+
+                # Find the binary
+                BIN_PATH=$(coredumpctl info "$PID" | grep 'Executable:' | awk '{print $2}')
+                echo "Executable path: $BIN_PATH"
+
+                if [ ! -f "$BIN_PATH" ]; then
+                  echo "Binary not found at $BIN_PATH"
+                  exit 1
+                fi
+
+                # Generate backtrace
+                BACKTRACE_FILE="${CORE_PATH}.backtrace.txt"
+                echo "Generating backtrace to $BACKTRACE_FILE"
+                if ! gdb -batch -ex "thread apply all bt full" -ex "info registers" -ex "quit" \
+                  "$BIN_PATH" "$CORE_PATH" > "$BACKTRACE_FILE" 2> "${BACKTRACE_FILE}.stderr"; then
+                    echo "Error: gdb failed to generate backtrace. See ${BACKTRACE_FILE}.stderr for details."
+                    exit 1
+                fi
+
+                echo "===== Core Dump Backtrace (first 200 lines) ====="
+                head -n 200 "$BACKTRACE_FILE"
+
+            - name: Upload core dump and backtrace
+              if: failure()
+              uses: actions/upload-artifact@v4
+              with:
+                name: core-dump-ganesha
+                path: |
+                  /tmp/core.ganesha-nfsd.*
+                if-no-files-found: warn

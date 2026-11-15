@@ -1,0 +1,46 @@
+group = "${group}.documentation"
+
+tasks.register('asciidocJar', Jar) {
+    group = 'documentation'
+    description = 'Package asciidoc source files.'
+    archiveClassifier = 'asciidoc'
+    from("asciidoc")
+}
+
+tasks.register('aggregatedScalaDoc', ScalaDoc) {
+    ext.fromProjects = [
+            project(':okapi-api'),
+            project(':morpheus-spark-cypher'),
+            project(':morpheus-examples'),
+    ]
+
+    classpath = project.sourceSets.main.compileClasspath
+    source = fromProjects.collect { it.sourceSets.main.allSource }
+
+    include '**/api/**/*.scala'
+    include '**/api/**/*.java'
+    include '**/examples/**/*.scala'
+    include '**/examples/**/*.java'
+
+    scalaDocOptions.additionalParameters = scalacParameters
+}
+
+tasks.register('aggregatedScalaDocJar', Jar) {
+    archiveClassifier = 'javadoc'
+    from tasks.aggregatedScalaDoc
+}
+
+pub.full.artifacts = [
+        'aggregatedScalaDocJar',
+        'asciidocJar',
+]
+pub.dev.artifacts = [
+        'aggregatedScalaDocJar',
+        'asciidocJar',
+]
+
+dependencies {
+    tasks.aggregatedScalaDoc.fromProjects.each {
+        compileOnly it
+    }
+}
