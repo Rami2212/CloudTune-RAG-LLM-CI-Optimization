@@ -1,0 +1,109 @@
+name: CI Diff
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    # Ignore files that do not affect build output to skip unnecessary builds
+    paths-ignore:
+      - '**/*.md'
+      - '.agents/**'
+      - 'website/**'
+
+  push:
+    branches:
+      - main
+      - release/2.3.0
+      - v1.x
+    # Ignore files that do not affect build output to skip unnecessary builds
+    paths-ignore:
+      - '**/*.md'
+      - '.agents/**'
+      - 'website/**'
+
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: 'Target branch to compare against'
+        required: false
+        default: 'main'
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.ref_name != 'main' && github.ref_name != 'release/2.3.0' && github.ref_name != 'v1.x' }}
+
+permissions:
+  # Allow commenting on issues for `reusable-build.yml`
+  issues: write
+  # Allow commenting on pull requests
+  pull-requests: write
+
+jobs:
+  build:
+    name: Build Bindings
+    uses: ./.github/workflows/reusable-build.yml
+    with:
+      target: x86_64-unknown-linux-gnu
+      runner: ${{ vars.LINUX_SELF_HOSTED_RUNNER_LABELS || '"ubuntu-22.04"' }}
+      test: false
+      ref: ${{ github.event.pull_request.head.sha }}
+
+  diff-projects:
+    name: Diff Benchmark Projects
+    needs: build
+    runs-on: ${{ fromJSON(vars.LINUX_SELF_HOSTED_RUNNER_LABELS || '"ubuntu-22.04"') }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          clean: ${{ runner.environment == 'github-hosted' }}
+
+      - name: Download bindings
+        uses: ./.github/actions/artifact/download
+        with:
+          name: bindings-x86_64-unknown-linux-gnu
+          path: crates/node_binding/
+
+      - name: Setup Pnpm
+        timeout-minutes: 5
+        uses: ./.github/actions/pnpm/setup
+        with:
+          node-version: 24
+
+      - name: Pnpm Install
+        run: pnpm i
+
+      - name: Build JS
+        run: pnpm run build:js
+
+      - name: Clone build-tools-performance
+        run: |
+          cd ..
+          git clone https://github.com/rstackjs/build-tools-performance.git
+
+      - name: Link packages and install dependencies
+        working-directory: ../build-tools-performance
+        run: |
+          npm pkg set "devDependencies.@rspack/binding=link:../rspack/crates/node_binding"
+          npm pkg set "devDependencies.@rspack/core=link:../rspack/packages/rspack"
+          npm pkg set "devDependencies.@rspack/cli=link:../rspack/packages/rspack-cli"
+          # Use --no-frozen-lockfile to allow updating lockfile after modifying package.json
+          pnpm i --no-frozen-lockfile
+
+      - name: Build cases
+        working-directory: ../build-tools-performance
+        run: RSDOCTOR=true CI=true pnpm run build:cases
+
+      - name: Report Compressed Size
+        uses: web-infra-dev/rsdoctor-action@21f1a9449eedfb4a7ce0f39a0004b950e616d489 # v1.2.0
+        env:
+          AI_TOKEN: ${{ secrets.AI_TOKEN }}
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          file_path: '../build-tools-performance/**/dist/rsdoctor-data.json'
+          target_branch: ${{ github.event_name == 'push' && github.ref_name || github.event_name == 'pull_request' && github.base_ref || inputs.target_branch || 'main' }}
+          ai_model: qwen3.5-plus

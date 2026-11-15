@@ -1,0 +1,281 @@
+name: Package All
+
+on: workflow_dispatch
+
+env:
+  JAVA_VERSION: 21
+  JAVA_DISTRIBUTION: zulu
+
+jobs:
+  package-android:
+    name: Package Android
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        continue-on-error: true
+        timeout-minutes: 5
+        with:
+          cache-overwrite-existing: true
+
+      - name: Setup Android
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+
+      - name: Run package
+        run: internal/package_android.sh
+
+      - name: Upload Android artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-artifacts
+          path: samples/androidApp/build/outputs/apk/release/*.apk
+
+  package-ios:
+    name: Package iOS
+    runs-on: macos-26
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        continue-on-error: true
+        timeout-minutes: 5
+        with:
+          cache-overwrite-existing: true
+
+      - name: Run package
+        run: internal/package_ios.sh
+
+      - name: Read version name
+        id: version_name_step
+        run: |
+          versionName=$(grep '^versionName=' gradle.properties | awk -F'=' '{print $2}')
+          echo "version_name=$versionName" >> $GITHUB_OUTPUT
+
+      - name: Zip
+        run: |
+          cd samples/shared/build/ios/outputs/Build/Products/Debug-iphonesimulator
+          zip -r "sketch-sample-ios-${{ steps.version_name_step.outputs.version_name }}.app.zip" "Sketch Sample.app"
+          cd -
+
+      - name: Upload iOS artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ios-artifacts
+          path: samples/shared/build/ios/outputs/Build/Products/Debug-iphonesimulator/*.app.zip
+
+  package-jvm-linux:
+    name: Package JVM Linux
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        continue-on-error: true
+        timeout-minutes: 5
+        with:
+          cache-overwrite-existing: true
+
+      - name: Run package
+        run: internal/package_jvm.sh
+
+      - name: Upload JVM Linux artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: jvm-linux-artifacts
+          path: samples/jvmApp/build/compose/binaries/main-release/deb/*.deb
+
+  package-jvm-macos:
+    name: Package JVM macOS
+    runs-on: macos-26
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        continue-on-error: true
+        timeout-minutes: 5
+        with:
+          cache-overwrite-existing: true
+
+      - name: Run package
+        run: internal/package_jvm.sh
+
+      - name: Upload JVM macOS artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: jvm-macos-artifacts
+          path: samples/jvmApp/build/compose/binaries/main-release/dmg/*.dmg
+
+  package-jvm-windows:
+    name: Package JVM Windows
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        continue-on-error: true
+        timeout-minutes: 5
+        with:
+          cache-overwrite-existing: true
+
+      - name: Run package
+        run: ./gradlew samples:jvmApp:packageReleaseDistributionForCurrentOS
+
+      - name: Upload JVM Windows artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: jvm-windows-artifacts
+          path: samples/jvmApp/build/compose/binaries/main-release/msi/*.msi
+
+  package-macos-native:
+    name: Package macOS Native
+    runs-on: macos-26
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        continue-on-error: true
+        timeout-minutes: 5
+        with:
+          cache-overwrite-existing: true
+
+      - name: Run package
+        run: internal/package_macos_native.sh
+
+      - name: Upload macOS native artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-native-artifacts
+          path: samples/macosApp/build/compose/binaries/main/native-macosArm64-release-dmg/*.dmg
+
+  package-js-browser:
+    name: Package js Browser
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        continue-on-error: true
+        timeout-minutes: 5
+        with:
+          cache-overwrite-existing: true
+
+      - name: Run package
+        run: internal/package_js.sh
+
+      - name: Read version name
+        id: version_name_step
+        run: |
+          versionName=$(grep '^versionName=' gradle.properties | awk -F'=' '{print $2}')
+          echo "version_name=$versionName" >> $GITHUB_OUTPUT
+
+      - name: Zip
+        run: |
+          cd samples/jsApp/build/dist/js/productionExecutable
+          zip -r "sketch-sample-js-browser-${{ steps.version_name_step.outputs.version_name }}.zip" *
+          cd -
+
+      - name: Upload js browser artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: js-browser-artifacts
+          path: samples/jsApp/build/dist/js/productionExecutable/*.zip
+
+  package-wasmJs-browser:
+    name: Package wasmJs Browser
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        continue-on-error: true
+        timeout-minutes: 5
+        with:
+          cache-overwrite-existing: true
+
+      - name: Run package
+        run: internal/package_wasmJs.sh
+
+      - name: Read version name
+        id: version_name_step
+        run: |
+          versionName=$(grep '^versionName=' gradle.properties | awk -F'=' '{print $2}')
+          echo "version_name=$versionName" >> $GITHUB_OUTPUT
+
+      - name: Zip
+        run: |
+          cd samples/wasmJsApp/build/dist/wasmJs/productionExecutable
+          zip -r "sketch-sample-wasmJs-browser-${{ steps.version_name_step.outputs.version_name }}.zip" *
+          cd -
+
+      - name: Upload wasmJs browser artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: wasmJs-browser-artifacts
+          path: samples/wasmJsApp/build/dist/wasmJs/productionExecutable/*.zip
