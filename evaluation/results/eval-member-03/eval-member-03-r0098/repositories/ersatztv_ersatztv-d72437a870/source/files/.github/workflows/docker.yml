@@ -1,0 +1,156 @@
+name: Build & Publish to Docker Hub
+on:
+  workflow_call:
+    inputs:
+      base_version:
+        description: 'Base version (latest or develop)'
+        required: true
+        type: string
+      tag:
+        description: 'Release tag, also the per-build docker tag (e.g. v26.10.0 or v26.11.0-f8410286-develop)'
+        required: true
+        type: string
+      publish:
+        description: 'Push the images and tag them; false only builds them'
+        required: true
+        type: boolean
+    secrets:
+      docker_hub_username:
+        required: true
+      docker_hub_access_token:
+        required: true
+jobs:
+  build_images:
+    name: Build ${{ matrix.name }} image
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - name: amd64
+            os: ubuntu-latest
+            path: ''
+            suffix: '-amd64'
+            platform: 'linux/amd64'
+          - name: arm64
+            os: ubuntu-24.04-arm
+            path: 'arm64/'
+            suffix: '-arm64'
+            platform: 'linux/arm64'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Download next artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case "${{ matrix.name }}" in
+            amd64) TARGET="linux-x64" ;;
+            arm64) TARGET="linux-arm64" ;;
+          esac
+          .github/scripts/download-next.sh "$TARGET" next-extracted
+          mv next-extracted/ersatztv-channel .
+          rm -rf next-extracted
+
+      - name: Calculate informational version
+        id: version
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+        run: echo "info_version=${TAG%-develop}-docker${{ matrix.suffix }}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to DockerHub
+        if: inputs.publish
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.docker_hub_username }}
+          password: ${{ secrets.docker_hub_access_token }}
+
+      - name: Log in to the Container registry
+        if: inputs.publish
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./docker/${{ matrix.path }}Dockerfile
+          push: ${{ inputs.publish }}
+          provenance: false
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            INFO_VERSION=${{ steps.version.outputs.info_version }}
+          outputs: |
+            type=image,name=ersatztv/legacy,name-canonical=true,push-by-digest=true
+            type=image,name=ghcr.io/ersatztv/legacy,name-canonical=true,push-by-digest=true
+
+      - name: Save digest to artifact
+        if: inputs.publish
+        run: echo ${{ steps.build.outputs.digest }} > digest.txt
+
+      - name: Upload digest artifact
+        if: inputs.publish
+        uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.name }}
+          path: digest.txt
+
+  merge_manifests:
+    name: Merge Manifests
+    runs-on: ubuntu-latest
+    needs: build_images
+    if: inputs.publish
+    steps:
+      - name: Login to DockerHub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.docker_hub_username }}
+          password: ${{ secrets.docker_hub_access_token }}
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download all digest artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: digest-*
+          path: digests/
+
+      - name: Read digests from artifacts
+        id: digests
+        run: |
+          AMD64_HASH=$(cat digests/digest-amd64/digest.txt)
+          ARM64_HASH=$(cat digests/digest-arm64/digest.txt)
+
+          DOCKER_HUB_DIGESTS="ersatztv/legacy@${AMD64_HASH} ersatztv/legacy@${ARM64_HASH}"
+          GHCR_DIGESTS="ghcr.io/ersatztv/legacy@${AMD64_HASH} ghcr.io/ersatztv/legacy@${ARM64_HASH}"
+
+          echo "docker_hub_digests=${DOCKER_HUB_DIGESTS}" >> "$GITHUB_OUTPUT"
+          echo "ghcr_digests=${GHCR_DIGESTS}" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push manifests
+        run: |
+          docker manifest create ersatztv/legacy:${{ inputs.base_version }} ${{ steps.digests.outputs.docker_hub_digests }}
+          docker manifest push ersatztv/legacy:${{ inputs.base_version }}
+          docker manifest create ersatztv/legacy:${{ inputs.tag }} ${{ steps.digests.outputs.docker_hub_digests }}
+          docker manifest push ersatztv/legacy:${{ inputs.tag }}
+
+          docker manifest create ghcr.io/ersatztv/legacy:${{ inputs.base_version }} ${{ steps.digests.outputs.ghcr_digests }}
+          docker manifest push ghcr.io/ersatztv/legacy:${{ inputs.base_version }}
+          docker manifest create ghcr.io/ersatztv/legacy:${{ inputs.tag }} ${{ steps.digests.outputs.ghcr_digests }}
+          docker manifest push ghcr.io/ersatztv/legacy:${{ inputs.tag }}

@@ -1,0 +1,488 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 5 optimizations:
+# - [MEDIUM] Switch "sign_dotnet_windows" from Windows to ubuntu runner
+# - [MEDIUM] 5 jobs clone the repo — consider artifact sharing
+# - [LOW] Use shallow clone in "build_dotnet_mac" job
+# - [LOW] Use shallow clone in "build_and_upload_linux" job
+# - [LOW] Use shallow clone in "build_dotnet_windows" job
+# Estimated savings: ~1 min/run
+#
+﻿name: Build Artifacts
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Release tag to upload assets to (may be a draft), e.g. v26.10.0 or v26.11.0-f8410286-develop'
+        required: true
+        type: string
+      publish:
+        description: 'Sign the builds and upload them to the release; false only builds and packages them, unsigned'
+        required: true
+        type: boolean
+      release_repo:
+        description: 'Repository under this owner that holds the release (e.g. legacy-develop-builds); defaults to this repository'
+        required: false
+        type: string
+        default: ''
+      release_app_client_id:
+        description: 'Client ID of the GitHub App that can write releases to release_repo; required with release_repo'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      apple_developer_certificate_p12_base64:
+        required: false
+      apple_developer_certificate_password:
+        required: false
+      ac_username:
+        required: false
+      ac_password:
+        required: false
+      gh_token:
+        required: true
+      azure_client_id:
+        required: false
+      azure_tenant_id:
+        required: false
+      azure_subscription_id:
+        required: false
+      release_app_private_key:
+        required: false
+permissions:
+  id-token: write
+  contents: write
+env:
+  TAG: ${{ inputs.tag }}
+jobs:
+  build_dotnet_mac:
+    name: Build dotnet for ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [osx-x64, osx-arm64]
+    steps:
+      - name: Get the sources
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup dotnet
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      # Cache packages only; restore must still generate each job's build metadata.
+      - name: Cache NuGet packages
+        uses: actions/cache@v6
+        with:
+          path: ~/.nuget/packages
+          key: nuget-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('**/*.csproj', '**/*.props', '**/*.targets', '**/packages.lock.json', '**/[Nn]u[Gg]et.[Cc]onfig', 'global.json') }}
+          restore-keys: |
+            nuget-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-
+
+      - name: Clean
+        run: dotnet clean --configuration Release
+
+      - name: Install dependencies
+        run: dotnet restore -r "${{ matrix.target }}"
+
+      - name: Build
+        shell: bash
+        run: |
+          sed -i '/Scanner/d' ErsatzTV/ErsatzTV.csproj
+          dotnet publish ErsatzTV.Scanner/ErsatzTV.Scanner.csproj --framework net10.0 --runtime "${{ matrix.target }}" -c Release -o publish -p:RestoreEnablePackagePruning=true -p:InformationalVersion="${TAG%-develop}-${{ matrix.target }}" -p:EnableCompressionInSingleFile=false -p:DebugType=Embedded -p:PublishSingleFile=true --self-contained true
+          dotnet publish ErsatzTV/ErsatzTV.csproj --framework net10.0 --runtime "${{ matrix.target }}" -c Release -o publish -p:RestoreEnablePackagePruning=true -p:InformationalVersion="${TAG%-develop}-${{ matrix.target }}" -p:EnableCompressionInSingleFile=false -p:DebugType=Embedded -p:PublishSingleFile=true --self-contained true
+
+      # tar keeps the executable bits that artifact zips drop
+      - name: Archive
+        run: tar cf "dotnet-${{ matrix.target }}.tar" publish
+
+      - name: Upload .NET Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: dotnet-${{ matrix.target }}
+          path: dotnet-${{ matrix.target }}.tar
+          retention-days: 1
+
+  build_and_upload_mac:
+    name: Mac Build & Upload
+    runs-on: ${{ matrix.os }}
+    needs: build_dotnet_mac
+    strategy:
+      matrix:
+        include:
+          - os: macos-15
+            kind: macOS
+            target: osx-x64
+            ffmpeg_target: macos64
+          - os: macos-15
+            kind: macOS
+            target: osx-arm64
+            ffmpeg_target: macosarm64
+    steps:
+      - name: Get the sources
+        uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - name: Download .NET Artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: dotnet-${{ matrix.target }}
+
+      - name: Extract .NET Artifact
+        run: tar xf "dotnet-${{ matrix.target }}.tar" && rm "dotnet-${{ matrix.target }}.tar"
+
+      - name: Import Code-Signing Certificates
+        if: inputs.publish
+        uses: Apple-Actions/import-codesign-certs@v7
+        with:
+          p12-file-base64: ${{ secrets.apple_developer_certificate_p12_base64 }}
+          p12-password: ${{ secrets.apple_developer_certificate_password }}
+
+      - name: Calculate Release Name
+        shell: bash
+        run: |
+          release_name="ErsatzTV-Legacy-${TAG}-${{ matrix.target }}"
+          echo "RELEASE_NAME=${release_name}" >> "$GITHUB_ENV"
+
+      - name: Bundle
+        shell: bash
+        run: |
+          brew install coreutils
+          # bundle versions must be numeric
+          bundle_version="${TAG#v}"
+          bundle_version="${bundle_version%%-*}"
+          plutil -replace CFBundleShortVersionString -string "$bundle_version" ErsatzTV-macOS/ErsatzTV-macOS/Info.plist
+          plutil -replace CFBundleVersion -string "$bundle_version" ErsatzTV-macOS/ErsatzTV-macOS/Info.plist
+          # the Xcode project signs with the Developer ID cert, which unsigned builds lack
+          scripts/macOS/bundle.sh ${{ !inputs.publish && 'CODE_SIGNING_ALLOWED=NO' || '' }}
+
+      - name: Bundle ersatztv-channel from next
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          next_target="${{ matrix.target }}"
+          .github/scripts/download-next.sh "${next_target/osx/macos}" next-extracted
+          mv next-extracted/ersatztv-channel ErsatzTV-Legacy.app/Contents/MacOS/
+          chmod +x ErsatzTV-Legacy.app/Contents/MacOS/ersatztv-channel
+          rm -rf next-extracted
+
+      - name: Download ffmpeg
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/download-ffmpeg.sh "${{ matrix.ffmpeg_target }}" ffmpeg
+
+      - name: Sign
+        if: inputs.publish
+        shell: bash
+        run: scripts/macOS/sign.sh ffmpeg/bin
+
+      # sign.sh normally copies ffmpeg in
+      - name: Add ffmpeg
+        if: ${{ !inputs.publish }}
+        shell: bash
+        run: cp -p ffmpeg/bin/ffmpeg ffmpeg/bin/ffprobe ErsatzTV-Legacy.app/Contents/MacOS/
+
+      - name: Create DMG
+        shell: bash
+        run: |
+          brew install create-dmg
+          create-dmg \
+            --volname "ErsatzTV-Legacy" \
+            --volicon "artwork/ErsatzTV.icns" \
+            --window-pos 200 120 \
+            --window-size 800 400 \
+            --icon-size 100 \
+            --icon "ErsatzTV.app" 200 190 \
+            --hide-extension "ErsatzTV.app" \
+            --app-drop-link 600 185 \
+            --skip-jenkins \
+            --no-internet-enable \
+            "ErsatzTV-Legacy.dmg" \
+            "ErsatzTV-Legacy.app/"
+
+      # stapler uses HTTP/3, which drops on hosted runners; blocking UDP 443 forces TCP
+      - name: Work around stapling issue (actions/runner-images#14924)
+        if: inputs.publish
+        shell: bash
+        run: |
+          echo "block return out quick proto udp from any to any port 443" | sudo pfctl -f -
+          sudo pfctl -E
+
+      - name: Notarize
+        if: inputs.publish
+        shell: bash
+        run: |
+          xcrun notarytool submit ErsatzTV-Legacy.dmg --apple-id "${{ secrets.ac_username }}" --password "${{ secrets.ac_password }}" --team-id 32MB98Q32R --wait
+          xcrun stapler staple ErsatzTV-Legacy.dmg
+
+      - name: Cleanup
+        shell: bash
+        run: |
+          mv ErsatzTV-Legacy.dmg "${{ env.RELEASE_NAME }}.dmg"
+          rm -r publish
+          rm -r ErsatzTV-Legacy.app
+          rm -r ffmpeg
+
+      # github.token can't write to other repos
+      - name: Get release repository token
+        id: release-token
+        if: inputs.publish && inputs.release_repo != ''
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ inputs.release_app_client_id }}
+          private-key: ${{ secrets.release_app_private_key }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ inputs.release_repo }}
+
+      - name: Publish
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ steps.release-token.outputs.token || github.token }}
+          RELEASE_REPO: ${{ inputs.release_repo && format('{0}/{1}', github.repository_owner, inputs.release_repo) || github.repository }}
+        run: gh release upload "$TAG" "${{ env.RELEASE_NAME }}.dmg" --clobber --repo "$RELEASE_REPO"
+
+  build_and_upload_linux:
+    name: Build & Upload Linux
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            kind: linux
+            target: linux-x64
+          - os: ubuntu-latest
+            kind: linux
+            target: linux-musl-x64
+          - os: ubuntu-24.04-arm
+            kind: linux
+            target: linux-arm64
+    steps:
+      - name: Get the sources
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup dotnet
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      # Cache packages only; restore must still generate each job's build metadata.
+      - name: Cache NuGet packages
+        uses: actions/cache@v6
+        with:
+          path: ~/.nuget/packages
+          key: nuget-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('**/*.csproj', '**/*.props', '**/*.targets', '**/packages.lock.json', '**/[Nn]u[Gg]et.[Cc]onfig', 'global.json') }}
+          restore-keys: |
+            nuget-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-
+
+      - name: Clean
+        run: dotnet clean --configuration Release
+
+      - name: Install dependencies
+        run: dotnet restore -r "${{ matrix.target }}"
+
+      - name: Build
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release_name="ErsatzTV-Legacy-${TAG}-${{ matrix.target }}"
+          echo "RELEASE_NAME=${release_name}" >> "$GITHUB_ENV"
+
+          sed -i '/Scanner/d' ErsatzTV/ErsatzTV.csproj
+          dotnet publish ErsatzTV.Scanner/ErsatzTV.Scanner.csproj --framework net10.0 --runtime "${{ matrix.target }}" -c Release -o "scanner" -p:RestoreEnablePackagePruning=true -p:InformationalVersion="${TAG%-develop}-${{ matrix.target }}" -p:EnableCompressionInSingleFile=true -p:DebugType=Embedded -p:PublishSingleFile=true --self-contained true
+          dotnet publish ErsatzTV/ErsatzTV.csproj --framework net10.0 --runtime "${{ matrix.target }}" -c Release -o "main" -p:RestoreEnablePackagePruning=true -p:InformationalVersion="${TAG%-develop}-${{ matrix.target }}" -p:EnableCompressionInSingleFile=true -p:DebugType=Embedded -p:PublishSingleFile=true --self-contained true
+          mkdir "$release_name"
+          mv scanner/* "$release_name/"
+          mv main/* "$release_name/"
+
+          .github/scripts/download-next.sh "${{ matrix.target }}" next-extracted
+          mv next-extracted/ersatztv-channel "$release_name/"
+          rm -rf next-extracted
+
+          tar czvf "${release_name}.tar.gz" "$release_name"
+
+          rm -r "$release_name"
+
+      - name: Get release repository token
+        id: release-token
+        if: inputs.publish && inputs.release_repo != ''
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ inputs.release_app_client_id }}
+          private-key: ${{ secrets.release_app_private_key }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ inputs.release_repo }}
+
+      - name: Publish
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ steps.release-token.outputs.token || github.token }}
+          RELEASE_REPO: ${{ inputs.release_repo && format('{0}/{1}', github.repository_owner, inputs.release_repo) || github.repository }}
+        run: gh release upload "$TAG" "${{ env.RELEASE_NAME }}.tar.gz" --clobber --repo "$RELEASE_REPO"
+
+  build_dotnet_windows:
+    name: Build dotnet for Windows
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the sources
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup dotnet
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      # Cache packages only; restore must still generate each job's build metadata.
+      - name: Cache NuGet packages
+        uses: actions/cache@v6
+        with:
+          path: ~/.nuget/packages
+          key: nuget-v1-${{ runner.os }}-${{ runner.arch }}-win-x64-${{ hashFiles('**/*.csproj', '**/*.props', '**/*.targets', '**/packages.lock.json', '**/[Nn]u[Gg]et.[Cc]onfig', 'global.json') }}
+          restore-keys: |
+            nuget-v1-${{ runner.os }}-${{ runner.arch }}-win-x64-
+
+      - name: Clean
+        run: dotnet clean --configuration Release
+
+      - name: Install dependencies
+        run: dotnet restore -r "win-x64"
+
+      - name: Build dotnet projects
+        shell: bash
+        run: |
+          sed -i '/Scanner/d' ErsatzTV/ErsatzTV.csproj
+          dotnet publish ErsatzTV.Scanner/ErsatzTV.Scanner.csproj --framework net10.0 --runtime "win-x64" -c Release -o "scanner" -p:RestoreEnablePackagePruning=true -p:InformationalVersion="${TAG%-develop}-win-x64" -p:EnableCompressionInSingleFile=true -p:DebugType=Embedded -p:PublishSingleFile=true --self-contained true
+          dotnet publish ErsatzTV/ErsatzTV.csproj --framework net10.0 --runtime "win-x64" -c Release -o "main" -p:RestoreEnablePackagePruning=true -p:InformationalVersion="${TAG%-develop}-win-x64" -p:EnableCompressionInSingleFile=true -p:DebugType=Embedded -p:PublishSingleFile=true --self-contained true
+
+      - name: Upload .NET Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: dotnet-windows-build
+          path: |
+            scanner/
+            main/
+          retention-days: 1
+
+  # own job: the signing environment only admits main and v* tags
+  sign_dotnet_windows:
+    name: Sign dotnet for Windows
+    runs-on: windows-latest
+    needs: build_dotnet_windows
+    if: inputs.publish
+    environment: signing
+    steps:
+      - name: Download dotnet artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: dotnet-windows-build
+          path: dotnet-build
+
+      - name: Azure login
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.azure_client_id }}
+          tenant-id: ${{ secrets.azure_tenant_id }}
+          subscription-id: ${{ secrets.azure_subscription_id }}
+          enable-AzPSSession: true
+
+      - name: Sign dotnet artifacts
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: https://eus.codesigning.azure.net/
+          signing-account-name: ArtifactSigning
+          certificate-profile-name: ErsatzTV
+          files-folder: ${{ github.workspace }}/dotnet-build
+          files-folder-recurse: true
+          files-folder-filter: ErsatzTV.exe,ErsatzTV.Scanner.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Replace dotnet artifact with signed build
+        uses: actions/upload-artifact@v7
+        with:
+          name: dotnet-windows-build
+          path: dotnet-build/
+          retention-days: 1
+          overwrite: true
+
+  package_and_upload_windows:
+    name: Package & Upload Windows
+    runs-on: windows-latest
+    needs: [build_dotnet_windows, sign_dotnet_windows]
+    # sign_dotnet_windows is skipped when unsigned
+    if: ${{ !failure() && !cancelled() }}
+    steps:
+      - name: Get the sources
+        uses: actions/checkout@v7
+
+      - name: Download dotnet artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: dotnet-windows-build
+          path: dotnet-build
+
+      - name: Download rust launcher
+        uses: suisei-cn/actions-download-file@v1.6.1
+        with:
+          url: "https://github.com/ErsatzTV/ErsatzTV-Windows/releases/download/v1.0.0/ErsatzTV-Windows.exe"
+          target: rust-build/
+
+      - name: Download ffmpeg
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/download-ffmpeg.sh win64 ffmpeg
+
+      - name: Package artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release_name="ErsatzTV-Legacy-${TAG}-win-x64"
+          echo "RELEASE_NAME=${release_name}" >> "$GITHUB_ENV"
+          mkdir "$release_name"
+
+          mv dotnet-build/scanner/* "$release_name/"
+          mv dotnet-build/main/* "$release_name/"
+
+          # dotnet copies Resources here anyway
+          rm -rf "$release_name/Resources"
+
+          mv rust-build/ErsatzTV-Windows.exe "$release_name/ErsatzTV-Windows.exe"
+
+          .github/scripts/download-next.sh windows-x64 next-extracted
+          mv next-extracted/ersatztv-channel.exe "$release_name/"
+          mv next-extracted/libvpl.dll "$release_name/"
+          mv next-extracted/libvpl-LICENSE.txt "$release_name/"
+          rm -rf next-extracted
+
+          cp ffmpeg/bin/*.exe "$release_name/"
+
+          (cd "${release_name}" && 7z a "../${release_name}.zip" .)
+
+      - name: Get release repository token
+        id: release-token
+        if: inputs.publish && inputs.release_repo != ''
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ inputs.release_app_client_id }}
+          private-key: ${{ secrets.release_app_private_key }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ inputs.release_repo }}
+
+      - name: Publish
+        if: inputs.publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.release-token.outputs.token || github.token }}
+          RELEASE_REPO: ${{ inputs.release_repo && format('{0}/{1}', github.repository_owner, inputs.release_repo) || github.repository }}
+        run: gh release upload "$TAG" "${{ env.RELEASE_NAME }}.zip" --clobber --repo "$RELEASE_REPO"

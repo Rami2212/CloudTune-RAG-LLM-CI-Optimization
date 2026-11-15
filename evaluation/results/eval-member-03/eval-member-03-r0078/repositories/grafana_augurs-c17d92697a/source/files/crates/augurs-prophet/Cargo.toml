@@ -1,0 +1,109 @@
+[package]
+name = "augurs-prophet"
+license.workspace = true
+authors.workspace = true
+documentation.workspace = true
+repository.workspace = true
+version.workspace = true
+edition.workspace = true
+keywords.workspace = true
+description = "Prophet: time-series forecasting at scale, in Rust."
+include = [
+    ".gitignore",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+    "CHANGELOG.md",
+    "build.rs",
+    "data",
+    "src/**/*",
+    "examples",
+    "tests",
+    "benches",
+    "prophet-wasmstan.wit",
+    "prophet-wasmstan.wasm",
+    "prophet.stan",
+]
+
+[dependencies]
+anyhow.workspace = true
+augurs-core.workspace = true
+bytemuck = { workspace = true, features = ["derive"], optional = true }
+itertools.workspace = true
+rand.workspace = true
+statrs.workspace = true
+serde = { workspace = true, optional = true, features = ["derive"] }
+serde_json = { workspace = true, optional = true }
+tempfile = { version = "3.13.0", optional = true }
+thiserror.workspace = true
+tracing.workspace = true
+ureq = { version = "3.0.0", optional = true }
+wasmtime = { version = "48", features = [
+    "runtime",
+    "component-model",
+], optional = true }
+wasmtime-wasi = { version = "48", optional = true }
+wasmtime-wasi-io = { version = "48", optional = true }
+zip = { version = "9", optional = true }
+
+[dev-dependencies]
+augurs.workspace = true
+augurs-testing.workspace = true
+chrono.workspace = true
+criterion.workspace = true
+pretty_assertions.workspace = true
+tracing-subscriber = { workspace = true, default-features = true }
+
+[build-dependencies]
+tempfile = { version = "3.13.0", optional = true }
+
+[features]
+bytemuck = ["dep:bytemuck"]
+cmdstan = ["dep:tempfile", "dep:serde_json", "serde"]
+compile-cmdstan = ["cmdstan", "dep:tempfile"]
+download = ["dep:ureq", "dep:zip"]
+serde = ["dep:serde"]
+wasmstan = ["wasmstan-min"]
+wasmstan-min = ["dep:serde_json", "dep:wasmtime", "dep:wasmtime-wasi", "dep:wasmtime-wasi-io", "serde"]
+
+# Ignore cmdstan compilation or wasmstan copying in the build script.
+# This should only be used for developing the library, not by
+# end users, or you may end up with a broken build where the
+# Prophet model isn't available to be compiled into the binary.
+internal-ignore-build-failures = []
+
+[lib]
+bench = false
+
+[[bench]]
+name = "prophet-cmdstan-linear"
+harness = false
+required-features = ["cmdstan", "compile-cmdstan"]
+
+[[bench]]
+name = "prophet-cmdstan-logistic"
+harness = false
+required-features = ["cmdstan", "compile-cmdstan"]
+
+[[bench]]
+name = "prophet-wasmstan-linear"
+harness = false
+required-features = ["wasmstan"]
+
+[[bench]]
+name = "prophet-wasmstan-logistic"
+harness = false
+required-features = ["wasmstan"]
+
+[[bin]]
+name = "download-stan-model"
+path = "src/bin/main.rs"
+required-features = ["download"]
+
+[[test]]
+name = "wasmstan"
+required-features = ["wasmstan"]
+
+[lints]
+workspace = true

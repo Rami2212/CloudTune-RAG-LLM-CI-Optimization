@@ -1,0 +1,52 @@
+# Pinned GitHub Actions
+# - actions/checkout v6.0.2 @ de0fac2e4500dabe0009e67214ff5f5447ce83dd
+#   - Repo: https://github.com/actions/checkout
+#   - Version: https://github.com/actions/checkout/tree/v6.0.2
+#   - Pinned: https://github.com/actions/checkout/commit/de0fac2e4500dabe0009e67214ff5f5447ce83dd
+# - actions/setup-python v5 @ a26af69be951a213d495a4c3e4e4022e16d87065
+#   - Repo: https://github.com/actions/setup-python
+#   - Version: https://github.com/actions/setup-python/tree/v5
+#   - Pinned: https://github.com/actions/setup-python/commit/a26af69be951a213d495a4c3e4e4022e16d87065
+name: Pre-release PR
+
+on:
+  pull_request:
+    branches:
+      - "master"
+    paths-ignore: # not always respected. See https://github.com/actions/runner/issues/2324#issuecomment-1703345084
+      - ".github/**"
+      - "**.md"
+
+# creating a separate concurrency group for each PR
+# so that our "PR checks" are always running for the latest commit in the PR
+# and as PRs are updated we want to make sure "in progress" jobs are killed so we don't waste resources
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
+
+jobs:
+  preprod_test:
+    name: Pre-prod code testing
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          submodules: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+      - name: Find spawn.sh script version
+        run: egrep '^# Spawn Version:[0-9ab]+$' ./exegol/utils/imgsync/spawn.sh | cut -d ':' -f2
+      - name: Check for prod readiness of spawn.sh script version
+        run: egrep '^# Spawn Version:[0-9]+$' ./exegol/utils/imgsync/spawn.sh
+      - name: Check package version (alpha and beta version cannot be released)
+        run: python3 -c 'from exegol.config.ConstantConfig import ConstantConfig; print(ConstantConfig.version); exit(any(c in ConstantConfig.version for c in ["a", "b"]))'
+
+  code_test:
+    name: Python tests and checks
+    needs: preprod_test
+    if: github.event.pull_request.head.ref != 'dev'
+    uses: ./.github/workflows/sub_testing.yml

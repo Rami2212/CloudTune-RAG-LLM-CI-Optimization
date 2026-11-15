@@ -1,0 +1,37 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [MEDIUM] Add concurrency group to "build.yml"
+# - [LOW] Use shallow clone in "build" job
+# Estimated savings: ~2 min/run
+#
+name: build
+
+on:
+  push:
+    branches:
+      - "main"
+    tags:
+      - "v*"
+  pull_request:
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "stable"
+          cache: true
+      - run: go mod tidy
+      - run: go test -v -failfast -race -coverpkg=./... -covermode=atomic -coverprofile=coverage.txt ./... -timeout=2m
+      - uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          file: ./coverage.txt

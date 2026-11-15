@@ -1,0 +1,46 @@
+name: augurs-js
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions: {}
+
+jobs:
+  test:
+    name: JS tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: just,wasm-pack
+
+      - name: Build augurs-js
+        run: just build-augurs-js
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: js/.node-version
+      - name: Install dependencies
+        run: npm ci
+        working-directory: js/testpkg
+      - name: Run typecheck
+        run: npm run typecheck
+        working-directory: js/testpkg
+      - name: Run tests
+        run: npm run test:ci
+        working-directory: js/testpkg

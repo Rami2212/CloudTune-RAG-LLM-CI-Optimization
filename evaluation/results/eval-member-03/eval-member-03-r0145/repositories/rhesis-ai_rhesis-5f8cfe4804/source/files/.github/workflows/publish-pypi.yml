@@ -1,0 +1,87 @@
+name: Publish to PyPI
+
+# Publishes both rhesis and rhesis-sdk packages to PyPI
+# rhesis must be published first since rhesis-sdk depends on rhesis[telemetry]
+
+on:
+  push:
+    tags:
+      - 'sdk-v*'  # Trigger on SDK version tags (e.g., sdk-v0.6.4)
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  # Blocks both publish jobs, and the publish jobs upload exactly the files
+  # tested here. #2834 shipped a wheel with no code in it and #2835 borrowed
+  # the OTLP exporter's session, both of which a build alone cannot catch.
+  smoke-test-wheels:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read   # Required for actions/checkout
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v6
+      with:
+        persist-credentials: false
+
+    - name: Smoke test the built wheels
+      uses: ./.github/actions/sdk-wheel-smoke-test
+
+    - name: Upload rhesis dists
+      uses: actions/upload-artifact@v7
+      with:
+        name: pypi-dist-rhesis
+        path: packages/rhesis/dist/
+        if-no-files-found: error
+
+    - name: Upload rhesis-sdk dists
+      uses: actions/upload-artifact@v7
+      with:
+        name: pypi-dist-rhesis-sdk
+        path: sdk/dist/
+        if-no-files-found: error
+
+  publish-rhesis:
+    needs: smoke-test-wheels
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/rhesis
+    permissions:
+      id-token: write  # Required for trusted publishing
+
+    steps:
+    - name: Download rhesis dists
+      uses: actions/download-artifact@v8
+      with:
+        name: pypi-dist-rhesis
+        path: dist/
+
+    - name: Publish rhesis to PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        packages-dir: dist/
+        skip-existing: true
+
+  publish-sdk:
+    needs: [smoke-test-wheels, publish-rhesis]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/rhesis-sdk
+    permissions:
+      id-token: write  # Required for trusted publishing
+
+    steps:
+    - name: Download rhesis-sdk dists
+      uses: actions/download-artifact@v8
+      with:
+        name: pypi-dist-rhesis-sdk
+        path: dist/
+
+    - name: Publish rhesis-sdk to PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        packages-dir: dist/
+        skip-existing: true

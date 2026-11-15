@@ -1,0 +1,117 @@
+BUILD_DIR := $(CURDIR)/_build
+
+REBAR := rebar3
+
+CT_READABLE ?= false
+
+compile:
+	$(REBAR) do compile, dialyzer, xref
+
+.PHONY: all
+all: compile test
+
+.PHONY: clean
+clean: distclean
+
+.PHONY: distclean
+distclean:
+	@rm -rf _build erl_crash.dump rebar3.crashdump rebar.lock
+
+.PHONY: xref
+xref:
+	$(REBAR) xref
+
+.PHONY: eunit
+eunit: compile
+	$(REBAR) eunit verbose=true
+
+.PHONY: test
+test: smoke-test ct-consistency ct-fault-tolerance
+	rebar3 cover
+
+.PHONY: smoke-test
+smoke-test:
+	$(REBAR) do eunit --cover, ct -v --cover --readable=$(CT_READABLE)
+
+.PHONY: ct-consistency
+ct-consistency:
+	#$(REBAR) ct --cover -v --readable=$(CT_READABLE) --suite mria_proper_suite_,mria_proper_mixed_cluster_suite_
+	echo "FIXME"
+
+.PHONY: ct-fault-tolerance
+ct-fault-tolerance:
+	$(REBAR) ct --cover -v --readable=$(CT_READABLE) --suite mria_fault_tolerance_suite_
+
+.PHONY: ct-suite
+ct-suite: compile
+ifneq ($(TESTCASE),)
+	$(REBAR) ct -v --readable=$(CT_READABLE) --suite $(SUITE)  --case $(TESTCASE)
+else
+	$(REBAR) ct -v --readable=$(CT_READABLE) --suite $(SUITE)
+endif
+
+cover: | smoke-test ct-consistency ct-fault-tolerance
+	$(REBAR) cover
+
+.PHONY: coveralls
+coveralls:
+	@rebar3 as test coveralls send
+
+.PHONY: dialyzer
+dialyzer:
+	$(REBAR) dialyzer
+
+CUTTLEFISH_SCRIPT = _build/default/lib/cuttlefish/cuttlefish
+
+$(CUTTLEFISH_SCRIPT):
+	@${REBAR} get-deps
+	@if [ ! -f cuttlefish ]; then make -C _build/default/lib/cuttlefish; fi
+
+app.config: $(CUTTLEFISH_SCRIPT)
+	$(verbose) $(CUTTLEFISH_SCRIPT) -l info -e etc/ -c etc/mria.conf.example -i priv/mria.schema -d data/
+
+##########################################################################################
+# Concuerror
+##########################################################################################
+
+CONCUERROR := $(BUILD_DIR)/Concuerror/bin/concuerror
+CONCUERROR_RUN := $(CONCUERROR) \
+	--treat_as_normal shutdown --treat_as_normal normal --treat_as_normal intentional \
+	--treat_as_normal optvar_set --treat_as_normal optvar_stopped --treat_as_normal optvar_retry \
+	-x code -x code_server -x error_handler \
+	-pa $(BUILD_DIR)/concuerror+test/lib/snabbkaffe/ebin \
+	-pa $(BUILD_DIR)/concuerror+test/lib/optvar/ebin \
+	-pa $(BUILD_DIR)/concuerror+test/lib/mria/ebin
+
+concuerror = $(CONCUERROR_RUN) -f $(BUILD_DIR)/concuerror+test/lib/mria/test/concuerror_tests.beam -t $(1) || \
+	{ cat concuerror_report.txt; exit 1; }
+
+.PHONY: concuerror_test
+concuerror_test: $(CONCUERROR)
+	rebar3 as concuerror eunit -m concuerror_tests
+	# $(call concuerror,wait_for_shards_crash_test)
+	$(call concuerror,notify_different_tags_test)
+	$(call concuerror,get_core_node_test)
+	$(call concuerror,dirty_bootstrap_test)
+	$(call concuerror,wait_for_shards_timeout_test)
+
+
+$(CONCUERROR):
+	mkdir -p _build/
+	cd _build && git clone https://github.com/parapluu/Concuerror.git
+	$(MAKE) -C _build/Concuerror/
+
+##########################################################################################
+# Docs
+##########################################################################################
+DOC_DIR=doc
+DOC_SRC_DIR=$(DOC_DIR)/src
+
+UMLS=$(wildcard $(DOC_SRC_DIR)/*.uml)
+PICS=$(UMLS:$(DOC_SRC_DIR)/%.uml=$(DOC_DIR)/%.png)
+
+.PHONY: doc
+doc: $(PICS)
+
+$(DOC_DIR)/%.png: $(DOC_SRC_DIR)/%.uml
+	cat $< | plantuml -pipe > $@

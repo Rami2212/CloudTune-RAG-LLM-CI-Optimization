@@ -1,0 +1,108 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
+# SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
+
+name: "MiNiFi-CPP Verify Package"
+
+on:
+  workflow_dispatch:
+    inputs:
+      enable_fips:
+        type: boolean
+        description: Enable FIPS mode (some tests override this)
+        default: false
+      artifacts_workflow_id:
+        type: string
+        description: The id of the create-release-artifacts workflow to download artifacts from
+        required: true
+  workflow_run:
+    workflows: ["Create Release Artifacts"]
+    types:
+      - completed
+    branches: [main]
+
+env:
+  DOCKER_CMAKE_FLAGS: -DDOCKER_VERIFY_THREADS=3 -DUSE_SHARED_LIBS= -DSTRICT_GSL_CHECKS=AUDIT -DCI_BUILD=ON -DENABLE_AWS=ON -DENABLE_KAFKA=ON -DENABLE_MQTT=ON -DENABLE_AZURE=ON -DENABLE_SQL=ON \
+    -DENABLE_SPLUNK=ON -DENABLE_GCP=ON -DENABLE_OPC=ON -DENABLE_PYTHON_SCRIPTING=ON -DENABLE_LUA_SCRIPTING=ON -DENABLE_KUBERNETES=ON -DENABLE_TEST_PROCESSORS=ON -DENABLE_PROMETHEUS=ON \
+    -DENABLE_ELASTICSEARCH=OFF -DENABLE_GRAFANA_LOKI=ON -DENABLE_COUCHBASE=ON -DMINIFI_RUST=ON -DDOCKER_BUILD_ONLY=ON
+
+jobs:
+  check-artifacts-workflow:
+    name: "Check Create Release Artifacts status"
+    if: github.event_name == 'workflow_run'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check workflow conclusion
+        if: github.event.workflow_run.conclusion != 'success'
+        run: |
+          echo "Create Release Artifacts workflow failed with conclusion: ${{ github.event.workflow_run.conclusion }}"
+          exit 1
+  docker-test-modular:
+    name: "${{ matrix.platform.name }} (${{ matrix.arch }})${{ (github.event_name != 'workflow_dispatch' || inputs.enable_fips) && ' (FIPS Mode)' || '' }}"
+    needs: [check-artifacts-workflow]
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ${{ matrix.arch == 'x86_64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        platform: [
+          { name: "Rocky Linux 9 modular", id: "rocky9", build_cmd: "make rocky9_from_rocky_package", verify_cmd: "make docker-verify-rocky9-modular" },
+          { name: "Rocky Linux 10 modular", id: "rocky10", build_cmd: "make rocky10_from_rocky_package", verify_cmd: "make docker-verify-rocky10-modular" },
+          { name: "Rocky Linux 9 from RPM modular", id: "rocky9-rpm", build_cmd: "make rocky9_from_rpm_package", verify_cmd: "make docker-verify-rocky9-rpm-modular" },
+          { name: "Rocky Linux 10 from RPM modular", id: "rocky10-rpm", build_cmd: "make rocky10_from_rpm_package", verify_cmd: "make docker-verify-rocky10-rpm-modular" },
+          { name: "Ubuntu 22.04 modular", id: "ubuntu_jammy", build_cmd: "make jammy_from_rocky_package", verify_cmd: "make docker-verify-jammy-modular" },
+          { name: "Ubuntu 24.04 modular", id: "ubuntu_noble", build_cmd: "make noble_from_rocky_package", verify_cmd: "make docker-verify-noble-modular" },
+          { name: "Debian 12 modular", id: "debian_bookworm", build_cmd: "make bookworm_from_rocky_package", verify_cmd: "make docker-verify-bookworm-modular" },
+          { name: "Debian 13 modular", id: "debian_trixie", build_cmd: "make trixie_from_rocky_package", verify_cmd: "make docker-verify-trixie-modular" },
+        ]
+    permissions:
+      contents: read
+    steps:
+      - id: checkout
+        uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          run-id: ${{ inputs.artifacts_workflow_id || github.event.workflow_run.id }}
+          name: minifi-${{ matrix.arch }}-tar
+          path: build
+          github-token: ${{ github.token }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          run-id: ${{ inputs.artifacts_workflow_id || github.event.workflow_run.id }}
+          name: minifi-${{ matrix.arch }}-rpm
+          path: build
+          github-token: ${{ github.token }}
+
+      - id: install_deps
+        run: |
+          sudo apt update
+          sudo apt install -y python3-virtualenv
+
+      - run: |
+          cd build && cmake ${DOCKER_CMAKE_FLAGS} ..
+          VERIFY_CMD="${{ matrix.platform.verify_cmd }}"
+          if [[ "${{ inputs.enable_fips }}" == "true" ]]; then
+            VERIFY_CMD="${VERIFY_CMD}-fips"
+          fi
+          ${{ matrix.platform.build_cmd }} && $VERIFY_CMD
+
+      - name: Test Reporter
+        if: always()
+        uses: dorny/test-reporter@a43b3a5f7366b97d083190328d2c652e1a8b6aa2 # v3
+        with:
+          name: "${{ matrix.platform.name }} (${{ matrix.arch }})${{ (github.event_name != 'workflow_dispatch' || inputs.enable_fips) && ' (FIPS Mode)' || '' }}"
+          path: build/behavex_output_modular/behave/*.xml
+          reporter: java-junit
+          list-tests: 'failed'
+          list-suites: 'failed'
+
+      - name: Upload artifact
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.platform.id }}_${{ matrix.arch }}_behavex_output_modular${{ (github.event_name != 'workflow_dispatch' || inputs.enable_fips) && '_fips' || '' }}
+          path: build/behavex_output_modular

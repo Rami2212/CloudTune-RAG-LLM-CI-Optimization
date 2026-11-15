@@ -1,0 +1,332 @@
+name: "hubble-ci"
+
+on:
+  workflow_call:
+    inputs:
+      server-baselines:
+        type: string
+        default: '["candidate"]'
+      current-artifact-name:
+        type: string
+        required: true
+      current-java-version:
+        description: Resolved JDK version used to build the shared SDK
+        type: string
+        default: ''
+      reuse-candidate-sdk:
+        type: boolean
+        default: false
+      current-repository:
+        type: string
+        required: true
+      current-ref:
+        type: string
+        required: true
+      current-commit:
+        type: string
+        required: true
+      server-repository:
+        type: string
+        default: apache/hugegraph
+      artifact-name:
+        type: string
+        required: true
+      server-commit:
+        type: string
+        required: true
+      server-ref:
+        type: string
+        required: true
+
+env:
+  TRAVIS_DIR: hugegraph-hubble/hubble-dist/assembly/travis
+
+jobs:
+  hubble-ci:
+    name: Hubble build and single-graph smoke (${{ matrix.SERVER_BASELINE }})
+    runs-on: ubuntu-latest
+    env:
+      STATIC_DIR: hugegraph-hubble/hubble-dist/assembly/static
+      MAVEN_OPTS: -Xmx3g -XX:MaxMetaspaceSize=768m
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        JAVA_VERSION: ['17']
+        SERVER_BASELINE: ${{ fromJSON(inputs.server-baselines) }}
+        python-version: ["3.11"]
+
+    steps:
+      - name: Fetch Code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+
+      - name: Install released Server JDK
+        if: matrix.SERVER_BASELINE == 'release-1.7'
+        id: released-java
+        uses: actions/setup-java@v5
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+          overwrite-settings: false
+
+      - name: Record released Server JDK
+        if: matrix.SERVER_BASELINE == 'release-1.7'
+        run: echo "SERVER_JAVA_HOME=$JAVA_HOME" >> "$GITHUB_ENV"
+
+      - name: Setup Java environment
+        uses: ./.github/actions/setup-java-env
+        with:
+          # Different runner images may resolve floating Java 17 to different patches.
+          java-version: ${{ inputs.reuse-candidate-sdk && inputs.current-java-version || matrix.JAVA_VERSION }}
+          distribution: 'temurin'
+
+      - name: Record candidate Server JDK
+        if: matrix.SERVER_BASELINE == 'candidate'
+        run: echo "SERVER_JAVA_HOME=$JAVA_HOME" >> "$GITHUB_ENV"
+
+      - name: Validate requested SDK reuse
+        if: inputs.reuse-candidate-sdk
+        env:
+          SDK_FIXTURE_ARTIFACT: ${{ inputs.current-artifact-name }}
+          SDK_JAVA_VERSION: ${{ inputs.current-java-version }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$SDK_FIXTURE_ARTIFACT" ]]; then
+            echo 'SDK reuse requires current-artifact-name' >&2
+            exit 1
+          fi
+          if [[ ! "${SDK_JAVA_VERSION:-}" =~ ^17\.[0-9]+\.[0-9]+(\.[0-9]+)?\+[0-9]+([.-][[:alnum:]_.-]+)?$ ]]; then
+            echo 'SDK reuse requires a concrete producer JDK version' >&2
+            exit 1
+          fi
+
+      - name: Install locked candidate SDK
+        id: candidate-sdk
+        uses: ./.github/actions/setup-candidate-sdk
+        with:
+          fixture-artifact: ${{ inputs.reuse-candidate-sdk && inputs.current-artifact-name || '' }}
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: Set up pinned Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: hugegraph-hubble/hubble-fe/.node-version
+
+      - name: Activate pinned pnpm
+        id: pnpm
+        working-directory: hugegraph-hubble/hubble-fe
+        run: |
+          corepack enable
+          pnpm --version
+          echo "store=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+          echo "version=$(node -p 'require("./package.json").packageManager')" >> "$GITHUB_OUTPUT"
+          echo "node=$(node --version)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm downloads
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.pnpm.outputs.store }}
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.pnpm.outputs.node }}-${{ steps.pnpm.outputs.version }}-${{ hashFiles('hugegraph-hubble/hubble-fe/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-${{ steps.pnpm.outputs.node }}-${{ steps.pnpm.outputs.version }}-
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-${{ runner.arch }}-playwright-${{ hashFiles('hugegraph-hubble/hubble-fe/pnpm-lock.yaml') }}
+
+      - name: Frontend build and quality checks
+        working-directory: hugegraph-hubble/hubble-fe
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: |
+          # Shared with Maven/Docker: frozen install, i18n, typecheck and Vite.
+          node ../hubble-dist/assembly/travis/build-frontend.mjs
+          pnpm lint
+          pnpm test:ci
+          node --test ../hubble-dist/assembly/travis/ui_auth.test.js \
+            ../hubble-dist/assembly/travis/graph_acceptance_helpers.test.js \
+            ../hubble-dist/assembly/travis/run_ui_graph_acceptance.test.js \
+            ../hubble-dist/assembly/travis/run_ui_http_smoke.test.js \
+            ../hubble-dist/assembly/travis/run_ui_full_acceptance.test.js
+          node --test ../hubble-dist/assembly/travis/build-frontend.test.mjs
+          node --test ../hubble-dist/assembly/travis/run_ui_deployment_regressions.test.js \
+            ../hubble-dist/assembly/travis/verify-ui.test.mjs
+
+      - name: Verify frontend third-party notices
+        run: |
+          python3 hugegraph-dist/release-docs/licenses/fe-licenses/test_generate.py
+          python3 hugegraph-dist/release-docs/licenses/fe-licenses/generate.py
+          git diff --exit-code -- hugegraph-dist/release-docs/licenses/fe-licenses
+
+      - name: Install Playwright Chromium
+        working-directory: hugegraph-hubble/hubble-fe
+        run: |
+          # Browser dependencies use Ubuntu repositories; this job does not use the Microsoft feed.
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/microsoft-prod.sources
+          pnpm exec playwright install --with-deps chromium
+
+      - name: Browser assertion regressions
+        working-directory: hugegraph-hubble/hubble-fe
+        run: |
+          node --test ../hubble-dist/assembly/travis/run_ui_browser_smoke.browser.test.js \
+            ../hubble-dist/assembly/travis/ui_usability.browser.test.js
+
+      - name: Production UI fixture regression gate
+        if: matrix.SERVER_BASELINE == 'candidate'
+        timeout-minutes: 8
+        working-directory: hugegraph-hubble/hubble-fe
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: pnpm verify:ui
+
+      - name: Real public graph PNG contract
+        working-directory: hugegraph-hubble/hubble-fe
+        run: node scripts/run-png-contract.mjs --output-dir ../target/hubble-png-contract
+
+      - name: Install Hubble Java dependencies
+        run: |
+          # Hubble embeds the ordinary Loader JAR; its standalone shaded archive is unnecessary.
+          mvn install -pl hugegraph-client,hugegraph-loader -am -Dloader.distribution.skip=true \
+            -Dmaven.javadoc.skip=true -DskipTests -ntp
+
+      - name: Prepare env and service
+        env:
+          COMMIT_ID: ${{ matrix.SERVER_BASELINE == 'candidate' && inputs.current-commit || inputs.server-commit }}
+          COMMIT_REF: ${{ matrix.SERVER_BASELINE == 'candidate' && inputs.current-commit || inputs.server-ref }}
+          SERVER_REPOSITORY: ${{ matrix.SERVER_BASELINE == 'candidate' && inputs.current-repository || inputs.server-repository }}
+          HG_SERVER_BASELINE: ${{ matrix.SERVER_BASELINE }}
+          SERVER_MAVEN_REPO: ${{ runner.temp }}/hubble-fixture-${{ matrix.SERVER_BASELINE }}-m2
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: |
+          echo "=== Environment Info ==="
+          node -v
+          (cd hugegraph-hubble/hubble-fe && pnpm --version)
+          echo "NODE_OPTIONS: $NODE_OPTIONS"
+          echo "COMMIT_ID: $COMMIT_ID"
+          echo "COMMIT_REF: $COMMIT_REF"
+          free -h || true
+          echo "======================="
+
+          python -m pip install -r "${TRAVIS_DIR}/requirements.txt"
+          cd hugegraph-hubble
+          # prepare-package verifies and reuses the already built UI.
+          MAVEN_OPTS='-Xmx2g -XX:MaxMetaspaceSize=768m' \
+            mvn package -P unit-test -DskipTests -Dmaven.javadoc.skip=true -ntp
+          cd apache-hugegraph-hubble-*
+          cd bin
+          ./start-hubble.sh -d
+          ./stop-hubble.sh
+          cd ../../../
+          pwd
+
+
+      - name: Setup shared HugeGraph server
+        uses: ./.github/actions/setup-hugegraph-server
+        with:
+          mode: start
+          java-version: ${{ matrix.SERVER_BASELINE == 'candidate' && '17' || '11' }}
+          java-home: ${{ env.SERVER_JAVA_HOME }}
+          artifact-name: ${{ matrix.SERVER_BASELINE == 'candidate' && inputs.current-artifact-name || inputs.artifact-name }}
+          local-fixture-dir: ${{ matrix.SERVER_BASELINE == 'candidate' && steps.candidate-sdk.outputs.fixture-directory || '' }}
+          export-candidate-sdk: ${{ matrix.SERVER_BASELINE == 'candidate' && inputs.reuse-candidate-sdk }}
+          commit-id: ${{ matrix.SERVER_BASELINE == 'candidate' && inputs.current-commit || inputs.server-commit }}
+          repository: ${{ matrix.SERVER_BASELINE == 'candidate' && inputs.current-repository || inputs.server-repository }}
+          fetch-ref: ${{ matrix.SERVER_BASELINE == 'candidate' && inputs.current-ref || inputs.server-ref }}
+          travis-dir: ${{ env.TRAVIS_DIR }}
+
+      - name: Test Gremlin fixture configuration
+        run: |
+          python3 "$TRAVIS_DIR/test_configure_gremlin_fixture.py"
+          python3 "$TRAVIS_DIR/test_run_live_hubble_smoke.py"
+
+      - name: Archive and distribution audit tests
+        run: |
+          python3 "$TRAVIS_DIR/test_archive_hubble.py"
+          python3 "$TRAVIS_DIR/test_check_hubble_dist.py"
+          python3 "$TRAVIS_DIR/test_check_java_build_inputs.py"
+          python3 "$TRAVIS_DIR/test_distribution_outputs.py" \
+            --maven-repo "${{ steps.candidate-sdk.outputs.maven-repo }}"
+
+      - name: Release package audit
+        env:
+          GNUPGHOME: ${{ runner.temp }}/hubble-release-gate-gpghome
+        run: |
+          archives=(hugegraph-hubble/target/apache-hugegraph-hubble-*.tar.gz)
+          if [[ ${#archives[@]} -ne 1 || ! -f "${archives[0]}" ]]; then
+            echo "Expected exactly one Hubble tarball" >&2
+            exit 1
+          fi
+
+          HUBBLE_TARBALL="${archives[0]}"
+          mkdir -p "${GNUPGHOME}"
+          chmod 700 "${GNUPGHOME}"
+          shasum -a 512 "${HUBBLE_TARBALL}" > "${HUBBLE_TARBALL}.sha512"
+          printf '%s\n' \
+            '%no-protection' \
+            'Key-Type: RSA' \
+            'Key-Length: 2048' \
+            'Subkey-Type: RSA' \
+            'Subkey-Length: 2048' \
+            'Name-Real: Hubble CI Release Gate' \
+            'Name-Email: hubble-ci-release-gate@example.invalid' \
+            'Expire-Date: 0' \
+            '%commit' \
+            > "${RUNNER_TEMP}/hubble-release-gate-key.conf"
+          gpg --batch --generate-key "${RUNNER_TEMP}/hubble-release-gate-key.conf"
+          gpg --batch --yes --armor --detach-sign "${HUBBLE_TARBALL}"
+          bash "${TRAVIS_DIR}/check-hubble-dist.sh" "${HUBBLE_TARBALL}" \
+               --require-sidecars \
+               --json-output hugegraph-hubble/target/hubble-dist-check.json
+
+      - name: Unit test
+        run: mvn test -P unit-test -pl hugegraph-hubble/hubble-be -ntp
+
+      - name: API and real single-graph UI smoke
+        env:
+          # One graph only: this smoke does not prove the full scope/auth/PD/resource acceptance matrix.
+          HUBBLE_GRAPH_CHECKS: example,authentication,query,schema,cards,algorithm
+          HG_SERVER_BASELINE: ${{ matrix.SERVER_BASELINE }}
+        run: |
+          cd hugegraph-hubble
+          archives=(target/apache-hugegraph-hubble-*.tar.gz)
+          if [[ ${#archives[@]} -ne 1 || ! -f "${archives[0]}" ]]; then
+            echo "Expected exactly one Hubble tarball" >&2
+            exit 1
+          fi
+          HUBBLE_TARBALL="${archives[0]}"
+          HUBBLE_694_EVIDENCE_DIR=target/hubble-live-acceptance \
+            hubble-dist/assembly/travis/verify-hubble-issue-694.sh \
+            "${HUBBLE_TARBALL}" http://127.0.0.1:8080
+
+      - name: Upload Hubble smoke evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: hubble-smoke-java-${{ matrix.JAVA_VERSION }}-${{ matrix.SERVER_BASELINE }}-${{ github.run_attempt }}
+          path: |
+            hugegraph-hubble/target/hubble-dist-check.json
+            hugegraph-hubble/target/hubble-png-contract/**/*.json
+            hugegraph-hubble/target/hubble-png-contract/**/*.png
+            hugegraph-hubble/target/hubble-ui-fixture/**/*.json
+            hugegraph-hubble/target/hubble-ui-fixture/**/*.png
+            hugegraph-hubble/target/hubble-live-acceptance/**/*.json
+            hugegraph-hubble/target/hubble-live-acceptance/**/*.png
+            hugegraph-hubble/target/hubble-live-acceptance/**/*.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload coverage to Codecov
+        continue-on-error: true
+        uses: ./.github/actions/upload-coverage
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          file: hugegraph-hubble/hubble-be/target/jacoco.xml

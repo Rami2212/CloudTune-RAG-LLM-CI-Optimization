@@ -1,0 +1,49 @@
+name: CI
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - CHANGELOG.md
+  # pr.yml doesn't package
+  pull_request:
+    paths:
+      - .github/**
+      - '!.github/next-tag'
+      - scripts/macOS/**
+      - docker/**
+      - ErsatzTV-macOS
+jobs:
+  calculate_version:
+    name: Calculate version information
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the sources
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Calculate version
+        id: version
+        run: .github/scripts/develop-tag.sh "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+
+  build_artifacts:
+    uses: ./.github/workflows/artifacts.yml
+    needs: calculate_version
+    with:
+      tag: ${{ needs.calculate_version.outputs.tag }}
+      publish: false
+    secrets:
+      gh_token: ${{ secrets.GITHUB_TOKEN }}
+
+  build_images:
+    uses: ./.github/workflows/docker.yml
+    needs: calculate_version
+    with:
+      base_version: develop
+      tag: ${{ needs.calculate_version.outputs.tag }}
+      publish: false
+    secrets:
+      docker_hub_username: ${{ secrets.DOCKER_HUB_USERNAME }}
+      docker_hub_access_token: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}

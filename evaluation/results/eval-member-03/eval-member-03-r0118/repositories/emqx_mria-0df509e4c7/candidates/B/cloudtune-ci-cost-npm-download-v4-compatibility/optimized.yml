@@ -1,0 +1,81 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [LOW] Use shallow clone in "run_test_case" job
+# Estimated savings: ~0 min/run
+#
+name: Run test case
+
+on: [push, pull_request]
+
+jobs:
+    run_test_case:
+      runs-on: ubuntu-latest
+      strategy:
+        fail-fast: false
+        matrix:
+          os:
+            - ubuntu24.04
+          arch:
+            - amd64
+          otp:
+            - "28.4.1-2"
+          builder:
+            - '6.1-2'
+          elixir:
+            - '1.19.1'
+
+      container: "ghcr.io/emqx/emqx-builder/${{ matrix.builder }}:${{ matrix.elixir }}-${{ matrix.otp }}-${{ matrix.os }}"
+
+      steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          # Needed for backward-compatibility test:
+          fetch-depth: 0
+
+      - name: Install prerequisites
+        run: |
+          apt update
+          apt install -y cmake
+
+      - name: Configure git
+        run: |
+          git config --global --add safe.directory "*"
+
+      - name: Compile
+        run: |
+          make
+
+      - name: Concuerror tests
+        run : |
+          make concuerror_test
+
+      - name: Smoke test
+        run: |
+          make smoke-test
+
+      - name: Fault-tolerance tests
+        run: |
+          make ct-fault-tolerance
+
+      - name: Consistency tests
+        run: |
+          make ct-consistency
+
+      - name: Coveralls
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+            make coveralls
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        if: always()
+        with:
+          name: logs
+          path: _build/test/logs
+          retention-days: 7
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: cover
+          path: _build/test/cover
+          retention-days: 7

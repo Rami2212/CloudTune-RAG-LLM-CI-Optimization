@@ -1,0 +1,37 @@
+name: SBOM Generation
+
+# Generates CycloneDX SBOMs on every published release and uploads them as
+# release assets (and workflow artifacts).
+
+permissions:
+  contents: write
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  sbom:
+    name: Generate SBOMs
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      # On a release, this action also attaches the SBOM to the release itself
+      # as verifywise-sbom.cyclonedx.json (its upload-release-assets default),
+      # so no separate attach step is needed.
+      - name: Generate repository SBOM (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: ./
+          format: cyclonedx-json
+          output-file: sbom-repository.json
+
+      - name: Upload SBOM as workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: sbom
+          path: sbom-repository.json
+          retention-days: 90

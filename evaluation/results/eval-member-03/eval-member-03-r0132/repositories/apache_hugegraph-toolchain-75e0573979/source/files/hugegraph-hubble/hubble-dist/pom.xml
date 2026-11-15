@@ -1,0 +1,196 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one or more
+  contributor license agreements.  See the NOTICE file distributed with
+  this work for additional information regarding copyright ownership.
+  The ASF licenses this file to You under the Apache License, Version 2.0
+  (the "License"); you may not use this file except in compliance with
+  the License.  You may obtain a copy of the License at
+      http://www.apache.org/licenses/LICENSE-2.0
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+  -->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>org.apache.hugegraph</groupId>
+        <artifactId>hugegraph-hubble</artifactId>
+        <version>${revision}</version>
+    </parent>
+
+    <artifactId>hubble-dist</artifactId>
+
+    <properties>
+        <release.name>${project.parent.artifactId}</release.name>
+        <final.name>apache-${release.name}-${project.version}</final.name>
+        <top.level.dir>${project.basedir}/..</top.level.dir>
+        <repo.root.dir>${top.level.dir}/..</repo.root.dir>
+        <current.basedir>${project.basedir}</current.basedir>
+        <assembly.dir>${current.basedir}/assembly</assembly.dir>
+        <assembly.descriptor.dir>${assembly.dir}/descriptor</assembly.descriptor.dir>
+        <assembly.static.dir>${assembly.dir}/static</assembly.static.dir>
+        <release.docs.dir>${repo.root.dir}/hugegraph-dist/release-docs</release.docs.dir>
+        <hubble-fe.dir>${project.basedir}/../hubble-fe</hubble-fe.dir>
+        <hubble.frontend.mode>production</hubble.frontend.mode>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.apache.hugegraph</groupId>
+            <artifactId>hubble-be</artifactId>
+            <version>${revision}</version>
+            <exclusions>
+                <!-- Exclude log4j-slf4j-impl to prevent conflict with
+                     Spring Boot's logback + log4j-to-slf4j logging stack.
+                     log4j-slf4j-impl and log4j-to-slf4j cannot coexist. -->
+                <exclusion>
+                    <groupId>org.apache.logging.log4j</groupId>
+                    <artifactId>log4j-slf4j-impl</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-starter-log4j2</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-assembly-plugin</artifactId>
+                <version>2.4</version>
+                <executions>
+                    <execution>
+                        <id>assembly-hugegraph-hubble</id>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>single</goal>
+                        </goals>
+                        <configuration>
+                            <attach>false</attach>
+                            <appendAssemblyId>false</appendAssemblyId>
+                            <outputDirectory>${top.level.dir}</outputDirectory>
+                            <descriptor>${assembly.descriptor.dir}/assembly.xml</descriptor>
+                            <finalName>${final.name}</finalName>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <!-- Compile/test of the Java reactor never installs or builds the UI.
+                 Node and pnpm are pinned by hubble-fe; the shared entry point
+                 validates every input and output before reusing a UI build. -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <version>${exec-maven-plugin.version}</version>
+                <executions>
+                    <execution>
+                        <id>build-hubble-frontend</id>
+                        <phase>prepare-package</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <executable>node</executable>
+                            <arguments>
+                                <argument>${assembly.dir}/travis/build-frontend.mjs</argument>
+                                <argument>--mode</argument>
+                                <argument>${hubble.frontend.mode}</argument>
+                            </arguments>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <artifactId>maven-antrun-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>clear-old-distribution-outputs</id>
+                        <phase>prepare-package</phase>
+                        <goals>
+                            <goal>run</goal>
+                        </goals>
+                        <configuration>
+                            <target>
+                                <!-- Rebuild generated product paths so removed files cannot survive
+                                     an incremental package. Keep databases/logs/uploads intact. -->
+                                <delete dir="${top.level.dir}/${final.name}/bin"/>
+                                <delete dir="${top.level.dir}/${final.name}/conf"/>
+                                <delete dir="${top.level.dir}/${final.name}/lib"/>
+                                <delete dir="${top.level.dir}/${final.name}/ui"/>
+                                <delete dir="${top.level.dir}/${final.name}/licenses"/>
+                                <delete file="${top.level.dir}/${final.name}/LICENSE"/>
+                                <delete file="${top.level.dir}/${final.name}/NOTICE"/>
+                                <delete file="${top.level.dir}/${final.name}/README.md"/>
+                                <delete file="${top.level.dir}/${final.name}/candidate-sdk-manifest.json"/>
+                            </target>
+                        </configuration>
+                    </execution>
+                    <execution>
+                        <id>archive-and-audit-hubble</id>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>run</goal>
+                        </goals>
+                        <configuration>
+                            <target>
+                                <delete dir="${top.level.dir}/${final.name}/ui"/>
+                                <copy todir="${top.level.dir}/${final.name}/ui">
+                                    <fileset dir="${hubble-fe.dir}/build">
+                                        <exclude name="**/*.map"/>
+                                    </fileset>
+                                </copy>
+                                <exec executable="python3" failonerror="true">
+                                    <arg value="${repo.root.dir}/hugegraph-client/assembly/travis/verify_candidate_image_sdk.py"/>
+                                    <arg value="${settings.localRepository}"/>
+                                    <arg value="--mode"/>
+                                    <arg value="${sdk.validation.mode}"/>
+                                    <arg value="--version"/>
+                                    <arg value="${hugegraph.version}"/>
+                                    <arg value="--distribution"/>
+                                    <arg value="${top.level.dir}/${final.name}"/>
+                                    <arg value="--module"/>
+                                    <arg value="hubble"/>
+                                </exec>
+                                <exec executable="bash" failonerror="true">
+                                    <arg value="${assembly.dir}/travis/archive-hubble.sh"/>
+                                    <arg value="${top.level.dir}/${final.name}"/>
+                                    <arg value="${top.level.dir}/target/${final.name}.tar.gz"/>
+                                </exec>
+                                <exec executable="bash" failonerror="true">
+                                    <arg value="${assembly.dir}/travis/check-hubble-dist.sh"/>
+                                    <arg value="${top.level.dir}/target/${final.name}.tar.gz"/>
+                                </exec>
+                            </target>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <artifactId>maven-clean-plugin</artifactId>
+                <configuration>
+                    <filesets>
+                        <fileset>
+                            <directory>${top.level.dir}</directory>
+                            <includes>
+                                <include>*.tar.gz</include>
+                                <include>${final.name}/**</include>
+                            </includes>
+                            <followSymlinks>false</followSymlinks>
+                        </fileset>
+                        <fileset>
+                            <directory>${final.name}</directory>
+                        </fileset>
+                    </filesets>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

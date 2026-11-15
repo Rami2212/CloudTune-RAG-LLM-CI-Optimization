@@ -1,0 +1,40 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [HIGH] Add npm dependency cache to "build" job
+# - [MEDIUM] Add concurrency group to "ci.yml"
+# Estimated savings: ~6 min/run
+#
+name: CI
+'on':
+  push:
+    branches:
+      - mainline
+      - feature*
+  pull_request:
+    branches:
+      - mainline
+      - feature*
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: jsii/superchain:1-bookworm-slim-node22
+    strategy:
+      matrix:
+        node-version:
+          - 20.x
+          - 22.x
+          - 24.x
+    steps:
+      - uses: actions/checkout@v7
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - run: npm install --global yarn
+      - run: yarn global add typescript
+      - run: yarn build
+      - run: ./pack.sh

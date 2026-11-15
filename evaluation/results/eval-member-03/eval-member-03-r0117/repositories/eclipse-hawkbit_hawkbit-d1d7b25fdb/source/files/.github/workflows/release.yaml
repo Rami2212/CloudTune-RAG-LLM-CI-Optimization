@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  # enable running the workflow manually
+  workflow_dispatch:
+    inputs:
+      revision:
+        type: string
+        description: 'Release version'
+        default: '0-SNAPSHOT'
+      override_tag:
+        type: boolean
+        description: 'If to move the tag if already exists'
+        default: false
+        required: false
+      dry_run:
+        type: boolean
+        description: 'If to skip publishing the release to central repository'
+        default: false
+        required: false
+
+permissions:
+  contents: write
+  security-events: write
+
+jobs:
+  audit:
+    # only on original eclipse-hawkbit/hawkbit repo
+    if: github.repository == 'eclipse-hawkbit/hawkbit'
+    runs-on: ubuntu-latest
+
+    steps:
+      # inputs are passed via env (not ${{ }} in run:) so they can't inject shell code; the format check stops
+      # a malformed revision before tag / deploy, which depend on this job
+      - name: "Release ${{ inputs.revision }}"
+        env:
+          REVISION: ${{ inputs.revision }}
+        run: |
+          [[ "$REVISION" =~ ^[0-9A-Za-z._-]+$ ]] || { echo "invalid revision: $REVISION"; exit 1; }
+          echo "Releasing $REVISION"
+
+  # tag with release version if not already tagged
+  # if already tagged - it will release from there
+  tag:
+    # only on original eclipse-hawkbit/hawkbit repo and when release fixed version
+    if: github.repository == 'eclipse-hawkbit/hawkbit' && inputs.revision != '0-SNAPSHOT'
+    needs: audit
+    uses: ./.github/workflows/reusable_workflow_tag.yaml
+    permissions:
+      contents: write
+    with:
+      tag_name: ${{ inputs.revision }}
+      tag_message: "Release version ${{ inputs.revision }}"
+      override_tag: ${{ inputs.override_tag }}
+
+  license-scan:
+    # only on original eclipse-hawkbit/hawkbit repo
+    if: github.repository == 'eclipse-hawkbit/hawkbit'
+    needs: tag
+    uses: ./.github/workflows/reusable_workflow_license-scan.yaml
+    permissions:
+      contents: write
+    with:
+      ref: ${{ inputs.revision == '0-SNAPSHOT' && github.ref || inputs.revision }}
+
+  trivy-scan:
+    # only on original eclipse-hawkbit/hawkbit repo or when manually triggered
+    if: github.repository == 'eclipse-hawkbit/hawkbit'
+    needs: tag
+    uses: ./.github/workflows/reusable_workflow_trivy-scan.yaml
+    permissions:
+      contents: read
+      security-events: write
+    with:
+      ref: ${{ inputs.revision == '0-SNAPSHOT' && github.ref || inputs.revision }}
+      upload: true
+
+  deploy:
+    # only on original eclipse-hawkbit/hawkbit repo
+    if: github.repository == 'eclipse-hawkbit/hawkbit'
+    needs:
+      - license-scan
+      - trivy-scan
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    services:
+      rabbitmq:
+        image: rabbitmq:3-management-alpine
+        env:
+          RABBITMQ_DEFAULT_VHOST: /
+          RABBITMQ_DEFAULT_USER: guest
+          RABBITMQ_DEFAULT_PASS: guest
+        ports:
+          - 15672:15672
+          - 5672:5672
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.revision == '0-SNAPSHOT' && github.ref || inputs.revision }}
+          # the build runs tests and doesn't push - don't leave the write GITHUB_TOKEN in .git/config
+          persist-credentials: false
+
+      - name: Set up JDK & Maven Central credentials
+        uses: actions/setup-java@v6.2.0
+        with:
+          distribution: 'temurin'
+          java-version: '25'
+          server-id: central
+          server-username: MAVEN_USERNAME
+          server-password: MAVEN_PASSWORD
+          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+
+      - name: Cache maven repository
+        uses: ./.github/actions/maven-cache
+
+      - name: Run build javadoc, verify (test)
+        env:
+          REVISION: ${{ inputs.revision }}
+        run: mvn verify javadoc:jar -DdetectOfflineLinks=false -PgenerateTestReport "-Drevision=$REVISION" --batch-mode
+
+      - name: "Deploy ${{ inputs.revision }}"
+        env:
+          REVISION: ${{ inputs.revision }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          MAVEN_USERNAME: ${{ secrets.CENTRAL_SONATYPE_TOKEN_USERNAME }}
+          MAVEN_PASSWORD: ${{ secrets.CENTRAL_SONATYPE_TOKEN_PASSWORD }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: mvn deploy -DskipTests -Ppublish "-Drevision=$REVISION" "-DskipPublishing=$DRY_RUN" --batch-mode

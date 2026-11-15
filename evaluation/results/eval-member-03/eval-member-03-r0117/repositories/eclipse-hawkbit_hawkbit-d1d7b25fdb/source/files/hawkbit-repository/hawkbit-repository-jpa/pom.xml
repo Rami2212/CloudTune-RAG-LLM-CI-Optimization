@@ -1,0 +1,164 @@
+<!--
+
+    Copyright (c) 2015 Bosch Software Innovations GmbH and others
+
+    This program and the accompanying materials are made
+    available under the terms of the Eclipse Public License 2.0
+    which is available at https://www.eclipse.org/legal/epl-2.0/
+
+    SPDX-License-Identifier: EPL-2.0
+
+-->
+<project xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="http://maven.apache.org/POM/4.0.0"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>org.eclipse.hawkbit</groupId>
+        <version>${revision}</version>
+        <artifactId>hawkbit-repository</artifactId>
+    </parent>
+
+    <artifactId>hawkbit-repository-jpa</artifactId>
+    <name>hawkBit :: Repository :: JPA Implementation</name>
+
+    <properties>
+        <apt.source.dir>${project.build.directory}/generated-sources/apt/</apt.source.dir>
+        <jpa.vendor>eclipselink</jpa.vendor>
+    </properties>
+
+    <profiles>
+        <profile>
+            <id>eclipselink</id>
+            <activation>
+                <property>
+                    <!-- default, if not set (or not hibernate) - eclipse link -->
+                    <name>jpa.vendor</name>
+                    <value>!hibernate</value>
+                </property>
+            </activation>
+
+            <properties>
+                <!-- base package woven by the EclipseLink static weaver; a module may override it in its properties -->
+                <eclipselink.weave.basePackage>org.eclipse.hawkbit.repository.jpa.model</eclipselink.weave.basePackage>
+            </properties>
+
+            <dependencies>
+                <dependency>
+                    <groupId>org.eclipse.hawkbit</groupId>
+                    <artifactId>hawkbit-repository-jpa-eclipselink</artifactId>
+                    <version>${project.version}</version>
+                </dependency>
+            </dependencies>
+
+            <build>
+                <plugins>
+                    <!-- Static weaver for EclipseLink, needs to be in the module where the entity classes are -->
+                    <plugin>
+                        <groupId>com.ethlo.persistence.tools</groupId>
+                        <artifactId>eclipselink-maven-plugin</artifactId>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <profile>
+            <id>hibernate</id>
+            <activation>
+                <property>
+                    <name>jpa.vendor</name>
+                    <value>hibernate</value>
+                </property>
+            </activation>
+
+            <dependencies>
+                <dependency>
+                    <groupId>org.eclipse.hawkbit</groupId>
+                    <artifactId>hawkbit-repository-jpa-hibernate</artifactId>
+                    <version>${project.version}</version>
+                </dependency>
+            </dependencies>
+
+            <build>
+                <plugins>
+                    <!-- Bytecode enhancement for Hibernate, needs to be in the module where the entity classes are. -->
+                    <plugin>
+                        <groupId>org.hibernate.orm</groupId>
+                        <artifactId>hibernate-maven-plugin</artifactId>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+
+    <dependencies>
+        <!-- Hawkbit -->
+        <dependency>
+            <groupId>org.eclipse.hawkbit</groupId>
+            <artifactId>hawkbit-ql-jpa</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.integration</groupId>
+            <artifactId>spring-integration-jdbc</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-collections4</artifactId>
+        </dependency>
+
+        <dependency> <!-- Static class generation -->
+            <groupId>org.hibernate.orm</groupId>
+            <artifactId>hibernate-processor</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- Test -->
+        <dependency>
+            <groupId>org.eclipse.hawkbit</groupId>
+            <artifactId>hawkbit-repository-test</artifactId>
+            <version>${project.version}</version>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-micrometer-metrics</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.github.classgraph</groupId>
+            <artifactId>classgraph</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <executions>
+                    <!-- main compile only: no entities in test sources, there the option is reported as unrecognized -->
+                    <execution>
+                        <id>default-compile</id>
+                        <configuration>
+                            <compilerArgs combine.children="append">
+                                <!-- hibernate-processor: entities are annotation-only, skip parsing the EclipseLink-generated persistence.xml -->
+                                <arg>-AfullyAnnotationConfigured=true</arg>
+                            </compilerArgs>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

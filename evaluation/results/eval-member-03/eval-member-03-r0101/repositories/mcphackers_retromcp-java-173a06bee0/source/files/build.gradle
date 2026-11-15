@@ -1,0 +1,109 @@
+plugins {
+	id "java"
+}
+
+allprojects {
+	apply plugin: "java"
+	apply plugin: "maven-publish"
+
+	def retromcp_version = '1.2.1'
+
+	repositories {
+		mavenCentral()
+		maven {
+			url = "https://maven.fabricmc.net/"
+			content {
+				includeGroup "net.fabricmc"
+			}
+		}
+		maven { url = "https://mcphackers.org/libraries/" }
+		maven { url = "https://maven.glass-launcher.net/releases" }
+		maven {
+			url = "https://jitpack.io/"
+			content {
+				includeGroupByRegex "io\\.github\\..+"
+				includeGroupByRegex "com\\.github\\..+"
+			}
+		}
+	}
+
+	dependencies {
+		runtimeOnly sourceSets.test.output
+
+		// Required libraries
+		implementation libs.asm
+		implementation libs.asm.analysis
+		implementation libs.asm.commons
+		implementation libs.asm.tree
+		implementation libs.asm.util
+
+		implementation libs.rdi.nio
+		implementation libs.rdi
+
+		implementation libs.fernflower
+
+		implementation libs.json
+		implementation libs.diffpatch
+		implementation libs.commons.lang3
+		implementation libs.mapping.io
+	}
+
+	tasks.withType(JavaCompile).configureEach {
+		it.options.encoding = "UTF-8"
+
+		// Use release flag on Java 9+ instead of source & target flags
+		// This makes the JDK read the boot classpath and use the proper
+		// libraries to be compliant with Java 8 without issues
+		if (JavaVersion.current().isJava9Compatible()) {
+			it.options.release.set(8)
+		}
+	}
+
+	java {
+		sourceCompatibility = JavaVersion.VERSION_1_8
+		targetCompatibility = JavaVersion.VERSION_1_8
+	}
+
+	publishing {
+		publications {
+			maven(MavenPublication) {
+				groupId = 'org.mcphackers'
+				// Jank hack to have CLI and GUI be retromcp-cli and retromcp-gui
+				// while still keeping retromcp-java as the main artifact
+				artifactId = project.name.toLowerCase()
+				if (!artifactId.contains('retromcp-')) {
+					artifactId = 'retromcp-' + artifactId
+				}
+				version = retromcp_version
+
+				pom {
+					description = 'A rewrite of MCP to provide support for many versions of Minecraft which were never supported by original MCP.'
+					url = 'https://mcphackers.org'
+					licenses {
+						license {
+							name = 'The MIT License'
+							url = 'https://spdx.org/licenses/MIT.html'
+						}
+					}
+					scm {
+						connection = 'scm:git:git@github.com:MCPHackers/RetroMCP-Java.git'
+						developerConnection = connection
+						url = 'https://github.com/MCPHackers/RetroMCP-Java'
+					}
+				}
+
+				from components.java
+			}
+		}
+	}
+
+	javadoc {
+		if(JavaVersion.current().isJava9Compatible()) {
+			options.addBooleanOption('html5', true)
+		}
+	}
+}
+
+subprojects {
+	apply plugin: "application"
+}

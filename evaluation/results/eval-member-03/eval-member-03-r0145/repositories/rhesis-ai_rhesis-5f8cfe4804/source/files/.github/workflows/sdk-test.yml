@@ -1,0 +1,100 @@
+name: "[Test] SDK"
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'sdk/**'
+      - 'packages/rhesis/**'
+      - 'penelope/**'
+      - 'skills/rhesis/references/**'
+      - 'tests/sdk/**'
+      - 'tests/docker-compose.test.yml'
+      - '.github/actions/sdk-wheel-smoke-test/**'
+      - '.github/workflows/publish-pypi.yml'
+      - '.github/workflows/sdk-test.yml'
+      - 'scripts/sdk_wheel_smoke_test.py'
+  push:
+    branches: [ main ]
+    paths:
+      - 'sdk/**'
+      - 'packages/rhesis/**'
+      - 'penelope/**'
+      - 'skills/rhesis/references/**'
+      - 'tests/sdk/**'
+      - 'tests/docker-compose.test.yml'
+      - '.github/actions/sdk-wheel-smoke-test/**'
+      - '.github/workflows/publish-pypi.yml'
+      - '.github/workflows/sdk-test.yml'
+      - 'scripts/sdk_wheel_smoke_test.py'
+  schedule:
+    - cron: '0 0 * * *'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  # Cancel only on PR branches. Two merges landing close together share one group
+  # on main, and cancelling there leaves the earlier commit with no test verdict.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test-sdk:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v6
+      with:
+        persist-credentials: false
+        fetch-depth: 0  # Needed for git diff
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      with:
+        version: latest
+        enable-cache: true
+        ignore-nothing-to-cache: true
+
+    # - name: Type check SDK
+    #   run: |
+    #     cd sdk
+    #     uv run pyright
+    #   continue-on-error: false
+
+    - name: Test SDK (fast)
+      run: |
+        cd sdk
+        make test
+      continue-on-error: false
+
+    # Note: what the built wheel actually contains is checked in the
+    # `smoke-test-wheels` job below. These tests run against the source tree, so
+    # they cannot see it.
+    - name: Clean uv cache
+      run: uv cache clean --force
+
+    - name: Test SDK (full)
+      if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+      run: |
+        cd sdk
+        # [all] no longer brings huggingface or the framework integrations.
+        uv sync --extra all --extra huggingface --extra all-integrations
+        make test-integration
+      continue-on-error: false
+
+  # Same action `publish-pypi.yml` gates the release on, so a packaging
+  # regression is caught on the PR rather than on PyPI.
+  smoke-test-wheels:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v6
+      with:
+        persist-credentials: false
+
+    - name: Smoke test the built wheels
+      uses: ./.github/actions/sdk-wheel-smoke-test
