@@ -1,0 +1,223 @@
+name: Release
+
+# NOTE: the npm Trusted Publisher on npmjs.com must reference this filename
+# (release.yml) under "Workflow filename", or publishing will fail.
+on:
+  push:
+    branches: [main]
+
+# Never run two releases at once.
+concurrency: ${{ github.workflow }}-${{ github.ref }}
+
+permissions: {}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # version-bump commits, tags, GitHub Releases
+      pull-requests: write # open/update the "Version Packages" PR
+      id-token: write # npm OIDC trusted publishing + provenance
+    outputs:
+      published: ${{ steps.changesets.outputs.published }}
+      publishedPackages: ${{ steps.changesets.outputs.published-packages }}
+    steps:
+      # Mint a token from the release GitHub App. Unlike the default
+      # GITHUB_TOKEN, pushes made with it DO trigger other workflows - so the
+      # "Version Packages" PR runs the required CI. Note the app's ruleset
+      # bypass does NOT exempt its commits from the signed-commits rule at
+      # merge time (bypass applies to whoever merges, not whoever pushed);
+      # that's what `commitMode: github-api` below solves.
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          # Scope the token to only what the release needs (the app itself may
+          # hold more): push branches/tags and open the Version Packages PR.
+          permission-contents: write
+          permission-pull-requests: write
+
+      # persist-credentials (default) keeps the app token in git config so the
+      # "Push release tags" step below can push tags as the app.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Set node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          registry-url: https://registry.npmjs.org
+          # No `cache:` on the publish runner (cache-poisoning hardening).
+
+      # OIDC trusted publishing needs npm >= 11.5.1. Node 24.x already ships a
+      # newer npm, so only upgrade on the rare runner that lags the floor.
+      - name: Ensure npm >= 11.5.1
+        # The global npm upgrade is an intentional tooling bump (OIDC trusted
+        # publishing floor), not a lockfile-managed dependency.
+        run: | # zizmor: ignore[adhoc-packages]
+          need=11.5.1
+          have=$(npm -v)
+          [ "$(printf '%s\n%s\n' "$need" "$have" | sort -V | head -n1)" = "$need" ] || npm install -g npm@latest
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      # changesets/action with `commitMode: github-api` skips configuring a git
+      # user (commits are created via the API), but `changeset publish` still
+      # creates release tags with the git CLI - and the annotated `git tag -m`
+      # it runs fails without a committer identity. changesets swallows that
+      # failure after logging "New tag:", leaving no tag for the push step
+      # below (this is how 1.5.4 and 1.5.5 ended up with no tag on GitHub).
+      - name: Set git identity for release tags
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # Opens/updates the Version Packages PR; publishes once that PR is merged.
+      - name: Create Release PR or publish
+        id: changesets
+        uses: changesets/action@ae32849d5ba541f9ae29e40e22a623bc13562f51 # v2.1.2
+        with:
+          # v2 no longer reads the GITHUB_TOKEN environment variable.
+          github-token: ${{ steps.app-token.outputs.token }}
+          version-script: pnpm run version-packages
+          publish-script: pnpm run release
+          # Friendlier than the default "Version Packages" commit/title.
+          commit-message: "chore: version packages"
+          pr-title: "chore: version packages"
+          # Leave push-with-git-cli at its false default: the version-bump
+          # commit then goes through the GitHub API, which signs it, so the
+          # Version Packages PR passes the ruleset's required-signatures rule
+          # (a git-CLI commit is unsigned and blocks the merge).
+          #
+          # The GitHub Release is created by the `release-notes` job below,
+          # from the changelog rather than the action's own body.
+          create-github-releases: false
+          # v2 would otherwise start pushing tags on its own. Its pushTag
+          # downgrades failures to a warning under the API push mode, which is
+          # how 1.5.4 and 1.5.5 ended up with no tag on GitHub. The guarded
+          # "Push release tags" step below keeps owning them.
+          push-git-tags: false
+        env:
+          # Generates npm provenance during `changeset publish`.
+          NPM_CONFIG_PROVENANCE: "true"
+
+      # changesets/action only pushes release tags as part of
+      # createGithubReleases, which is disabled above - so the tags created by
+      # `changeset publish` never reach GitHub and the `release-notes` job
+      # can't find them. Push them explicitly, and fail loudly if a published
+      # package is missing its local tag (a bare `git push --tags` reported
+      # "Everything up-to-date" and hid exactly that for 1.5.5).
+      - name: Push release tags
+        if: steps.changesets.outputs.published == 'true'
+        env:
+          PUBLISHED_PACKAGES: ${{ steps.changesets.outputs.published-packages }}
+        run: |
+          echo "$PUBLISHED_PACKAGES" | jq -r '.[] | "\(.name)@\(.version)"' | while read -r tag; do
+            if [ -z "$(git tag -l "$tag")" ]; then
+              echo "::error::tag $tag was not created by changeset publish"
+              exit 1
+            fi
+            git push origin "refs/tags/$tag"
+          done
+
+  # Publishes the GitHub Release for each package that was just released. Runs
+  # only on the publish push - i.e. when a version was actually released - and
+  # stays a separate job so it never runs alongside the `id-token` (OIDC)
+  # permission the publish job needs.
+  release-notes:
+    needs: release
+    if: needs.release.outputs.published == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub Release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # tags, so the notes can link to a compare range
+          persist-credentials: false
+
+      - name: Set node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+
+      # The release body is the package's CHANGELOG.md entry for the published
+      # version, which changesets builds from the changeset files (with PR
+      # links and contributor credit via @changesets/changelog-github). Keeping
+      # the notes and the changelog on the same source avoids the previous
+      # setup, where notes were derived from commit subjects and a PR title
+      # without a conventional-commit prefix produced "No significant changes".
+      - name: Create GitHub Releases from the changelog
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PUBLISHED_PACKAGES: ${{ needs.release.outputs.publishedPackages }}
+        run: node .github/scripts/release-notes.mjs
+
+  # This workflow only runs on push to main and nothing watches it, so a broken
+  # release is invisible: in August 2026 it failed on five consecutive pushes
+  # over six days before anyone noticed, and a merged changeset never reached
+  # npm. Turn that silence into an issue.
+  report-failure:
+    needs: [release, release-notes]
+    if: ${{ always() && (needs.release.result == 'failure' || needs.release-notes.result == 'failure') }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open an issue for the failed release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SHA: ${{ github.sha }}
+          FAILED_JOB: ${{ needs.release.result == 'failure' && 'release' || 'release-notes' }}
+          # Whether npm publish already went through. `release` can fail after
+          # publishing (the tag push runs later), and `release-notes` only runs
+          # once it has, so the job name alone does not say what happened.
+          PUBLISHED: ${{ needs.release.outputs.published }}
+          PUBLISHED_PACKAGES: ${{ needs.release.outputs.publishedPackages }}
+        run: |
+          set -euo pipefail
+
+          if [ "${PUBLISHED:-}" = "true" ]; then
+            packages=$(echo "${PUBLISHED_PACKAGES:-[]}" |
+              jq -r '[.[] | "\(.name)@\(.version)"] | join(", ")')
+            state="Already published to npm: \`$packages\`. The failure is after publishing, so re-running the publish is not the fix."
+          else
+            state="Nothing was versioned or published. Every later push to \`main\` fails the same way until this is fixed, and any merged changeset stays unreleased."
+          fi
+
+          body=$(cat <<EOF
+          The release workflow failed in the \`$FAILED_JOB\` job.
+
+          $state
+
+          - Commit: \`$SHA\`
+          - Run: $RUN_URL
+          EOF
+          )
+
+          gh label create release-failure \
+            --repo "$REPO" \
+            --color B60205 \
+            --description "The release workflow failed" \
+            --force
+
+          existing=$(gh issue list --repo "$REPO" --state open --label release-failure \
+            --limit 1 --json number -q '.[0].number // empty')
+
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body "$body"
+          else
+            gh issue create --repo "$REPO" --title "Release failed on ${SHA:0:7}" \
+              --label release-failure --body "$body"
+          fi

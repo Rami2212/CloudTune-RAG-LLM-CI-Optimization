@@ -1,0 +1,42 @@
+buildscript {
+    ext {
+        buildToolsVersion = "37.0.0"
+        minSdkVersion = 24
+        compileSdkVersion = 37
+        targetSdkVersion = 36
+        ndkVersion = "27.1.12297006"
+        kotlinVersion = "2.2.0"
+        isGHExampleApp = true
+    }
+    repositories {
+        google()
+        mavenCentral()
+    }
+    // RNRepo plugin classpath for CI builds (plugin applied in app/build.gradle).
+    // To disable RNRepo support, set DISABLE_RNREPO environment variable to ANY value.
+    def rnrepoClasspath = {
+        def rnrepoDir = new File(
+            providers.exec {
+                workingDir(rootDir)
+                commandLine("node", "--print", "require.resolve('@rnrepo/build-tools/package.json')")
+            }.standardOutput.asText.get().trim()
+        ).getParentFile().absolutePath
+        return fileTree(dir: "${rnrepoDir}/gradle-plugin/build/libs", include: ["prebuilds-plugin.jar"])
+    }
+    dependencies {
+        classpath("com.android.tools.build:gradle")
+        classpath("com.facebook.react:react-native-gradle-plugin")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin")
+        classpath rnrepoClasspath()
+    }
+    allprojects {
+        project.pluginManager.withPlugin("com.facebook.react") {
+            react {
+                reactNativeDir = rootProject.file("../../../node_modules/react-native/")
+                codegenDir = rootProject.file("../../../node_modules/react-native-codegen/")
+            }
+        }
+    }
+}
+
+apply plugin: "com.facebook.react.rootproject"

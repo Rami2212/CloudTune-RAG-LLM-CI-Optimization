@@ -1,0 +1,54 @@
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "logprobs": null,
+      "message": {
+        "content": "{\n  \"decision\": \"APPLY\",\n  \"workflow_yaml\": \"name: lint\\non: [push, pull_request]\\n\\npermissions: read-all\\n\\njobs:\\n  lint:\\n    runs-on: ubuntu-latest\\n    timeout-minutes: 5\\n\\n    steps:\\n      - name: Checkout repository\\n        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\\n\\n      - name: Use Node.js\\n        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0\\n        with:\\n          cache: npm\\n          node-version-file: .nvmrc\\n\\n      - name: Install dependencies\\n        run: npm ci --prefer-offline\\n\\n      - name: Build package\\n        run: npm run build\\n\\n      - name: Run ESLint\\n        run: npm run lint\\n\\n      - name: Type check\\n        run: npm run lint:tsc\\n\\n      - name: Lint package\\n        run: npm run lint:package\\n\\n      - name: Check package types\\n        run: npm run lint:types\\n\",\n  \"rationale\": \"Add a custom job timeout of 5 minutes (P-LIT-CUSTOM-TIMEOUT). The experiment evidence (batch-interactive-three--fb8b16eb65a11508) shows a measured 26.8% elapsed-time reduction on a nearly identical Node.js lint/typecheck workflow when adding timeout-minutes: 5. The current workflow lacks any timeout (default 6 hours), and historical runs complete in ~1-2 minutes, giving ~8x headroom. The pattern catalog reports 12.9%/8.1% VM-time reduction (free/paid) for custom timeouts. No contraindications apply: valid runs are well under the limit, and the change preserves all build/test coverage.\",\n  \"evidence_ids\": [\"experiment:batch-interactive-three--fb8b16eb65a11508\", \"pattern:P-LIT-CUSTOM-TIMEOUT\"]\n}",
+        "reasoning": "Let me analyze the workflow and evidence to determine if there's a suitable CI optimization.\n\nThe workflow is a lint workflow that runs on push and pull_request. It:\n1. Checks out code\n2. Sets up Node.js with npm cache\n3. Installs dependencies with `npm ci --prefer-offline`\n4. Builds the package\n5. Runs ESLint\n6. Type checks\n7. Lints package\n8. Checks package types\n\nLooking at the evidence, I see several patterns. The most relevant ones for this workflow:\n\n1. **P-LIT-CUSTOM-TIMEOUT** - Adding a custom timeout to bound job runtime. The experiment example shows adding `timeout-minutes: 5` to a similar Node.js workflow, with measured savings of ~27% elapsed time.\n\n2. **P-LIT-GHA-CACHE** - The workflow already uses `cache: npm` in setup-node, so this is already implemented.\n\n3. **P-LIT-CANCEL-STALE** - Could be applicable since this runs on push and PR, but the workflow doesn't have concurrency settings.\n\n4. **P-LIT-DISTRIBUTED-CACHE** - The experiment shows adding pip cache, but this is for Python, not npm.\n\nLooking at the workflow, it doesn't have a timeout set. The default GitHub Actions timeout is 6 hours, which is very long. Adding a reasonable timeout could prevent runaway jobs.\n\nThe experiment evidence (batch-interactive-three--fb8b16eb65a11508) shows a very similar workflow (Node.js, eslint, typecheck) where adding `timeout-minutes: 5` resulted in 26.8% elapsed time savings. The workflow in the experiment runs similar steps: checkout, setup-node, npm ci, eslint, typecheck, etc.\n\nThe current workflow runs:\n- npm ci --prefer-offline\n- npm run build\n- npm run lint\n- npm run lint:tsc\n- npm run lint:package\n- npm run lint:types\n\nThis seems like it should complete well within 5 minutes. The experiment showed median job runtime of 34 seconds baseline, 27 seconds optimized.\n\nLet me check if there are any contraindications for P-LIT-CUSTOM-TIMEOUT: \"Valid slow runs exceed the proposed limit\". We need to ensure 5 minutes is enough. Given the experiment with very similar steps completed in ~34 seconds median, 5 minutes (300 seconds) provides ~8.8x headroom, which seems reasonable.\n\nThe pattern catalog for P-LIT-CUSTOM-TIMEOUT shows:\n- Preconditions: \"Representative successful-duration history exists\"\n- The repository has CI history showing successful runs completing in ~1 minute (from the timestamps: created_at to updated_at is about 1-2 minutes)\n\nThe evidence IDs I can use:\n- experiment:batch-interactive-three--fb8b16eb65a11508 (shows measured improvement with timeout-minutes: 5 on similar workflow)\n- pattern:P-LIT-CUSTOM-TIMEOUT (the pattern catalog entry)\n\nThis seems like a safe, evidence-supported optimization. The workflow doesn't have a timeout, and adding one with reasonable headroom is supported by the experiment.\n\nLet me create the updated workflow with timeout-minutes: 5 added to the job.",
+        "reasoning_details": [
+          {
+            "format": "unknown",
+            "index": 0,
+            "text": "Let me analyze the workflow and evidence to determine if there's a suitable CI optimization.\n\nThe workflow is a lint workflow that runs on push and pull_request. It:\n1. Checks out code\n2. Sets up Node.js with npm cache\n3. Installs dependencies with `npm ci --prefer-offline`\n4. Builds the package\n5. Runs ESLint\n6. Type checks\n7. Lints package\n8. Checks package types\n\nLooking at the evidence, I see several patterns. The most relevant ones for this workflow:\n\n1. **P-LIT-CUSTOM-TIMEOUT** - Adding a custom timeout to bound job runtime. The experiment example shows adding `timeout-minutes: 5` to a similar Node.js workflow, with measured savings of ~27% elapsed time.\n\n2. **P-LIT-GHA-CACHE** - The workflow already uses `cache: npm` in setup-node, so this is already implemented.\n\n3. **P-LIT-CANCEL-STALE** - Could be applicable since this runs on push and PR, but the workflow doesn't have concurrency settings.\n\n4. **P-LIT-DISTRIBUTED-CACHE** - The experiment shows adding pip cache, but this is for Python, not npm.\n\nLooking at the workflow, it doesn't have a timeout set. The default GitHub Actions timeout is 6 hours, which is very long. Adding a reasonable timeout could prevent runaway jobs.\n\nThe experiment evidence (batch-interactive-three--fb8b16eb65a11508) shows a very similar workflow (Node.js, eslint, typecheck) where adding `timeout-minutes: 5` resulted in 26.8% elapsed time savings. The workflow in the experiment runs similar steps: checkout, setup-node, npm ci, eslint, typecheck, etc.\n\nThe current workflow runs:\n- npm ci --prefer-offline\n- npm run build\n- npm run lint\n- npm run lint:tsc\n- npm run lint:package\n- npm run lint:types\n\nThis seems like it should complete well within 5 minutes. The experiment showed median job runtime of 34 seconds baseline, 27 seconds optimized.\n\nLet me check if there are any contraindications for P-LIT-CUSTOM-TIMEOUT: \"Valid slow runs exceed the proposed limit\". We need to ensure 5 minutes is enough. Given the experiment with very similar steps completed in ~34 seconds median, 5 minutes (300 seconds) provides ~8.8x headroom, which seems reasonable.\n\nThe pattern catalog for P-LIT-CUSTOM-TIMEOUT shows:\n- Preconditions: \"Representative successful-duration history exists\"\n- The repository has CI history showing successful runs completing in ~1 minute (from the timestamps: created_at to updated_at is about 1-2 minutes)\n\nThe evidence IDs I can use:\n- experiment:batch-interactive-three--fb8b16eb65a11508 (shows measured improvement with timeout-minutes: 5 on similar workflow)\n- pattern:P-LIT-CUSTOM-TIMEOUT (the pattern catalog entry)\n\nThis seems like a safe, evidence-supported optimization. The workflow doesn't have a timeout, and adding one with reasonable headroom is supported by the experiment.\n\nLet me create the updated workflow with timeout-minutes: 5 added to the job.",
+            "type": "reasoning.text"
+          }
+        ],
+        "refusal": null,
+        "role": "assistant"
+      },
+      "native_finish_reason": "stop"
+    }
+  ],
+  "created": 1794729485,
+  "id": "gen-1794729485-C0zH3J4JIYWm2jAKVVII",
+  "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+  "object": "chat.completion",
+  "provider": "Nvidia",
+  "service_tier": null,
+  "system_fingerprint": null,
+  "usage": {
+    "completion_tokens": 1222,
+    "completion_tokens_details": {
+      "audio_tokens": 0,
+      "image_tokens": 0,
+      "reasoning_tokens": 711
+    },
+    "cost": 0,
+    "cost_details": {
+      "upstream_inference_completions_cost": 0,
+      "upstream_inference_cost": 0,
+      "upstream_inference_prompt_cost": 0
+    },
+    "is_byok": false,
+    "prompt_tokens": 27615,
+    "prompt_tokens_details": {
+      "audio_tokens": 0,
+      "cache_write_tokens": 0,
+      "cached_tokens": 0,
+      "video_tokens": 0
+    },
+    "total_tokens": 28837
+  }
+}

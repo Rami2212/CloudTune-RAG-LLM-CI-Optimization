@@ -1,0 +1,260 @@
+name: Integration Tests CI
+
+# Manually triggered. Runs the Rust dwallet-MPC integration tests (real
+# class-groups crypto, in-process consensus harness) on the `ika-k8s-large`
+# self-hosted runner. `scope: all` widens to the workspace test suite MINUS
+# `ika-test-cluster`, for two reasons that both matter:
+#
+# 1. Ports. Its tests boot a Sui swarm each, and under plain `cargo test`
+#    a binary's tests run concurrently in ONE process. The test ports come
+#    from `deterministic_port_base` (crates/ika-config/src/local_ip_utils.rs),
+#    which derives the block from NEXTEST_TEST_GLOBAL_SLOT and falls back to
+#    slot 0 without it — so every libtest thread draws base 9000 and the
+#    first cluster holds the ports for its whole test. Both `all` runs before
+#    this exclusion died that way in sui-swarm with "Address already in use":
+#    29056939247 (2026-07-09) and 33750543127 (2026-09-03: one test failed —
+#    the five sui-node threads of its swarm died with EADDRINUSE and the
+#    test thread with RecvError; the binary's other two tests passed). The
+#    cluster suite is covered by
+#    `test-cluster.yaml`, which runs it one process per test under nextest
+#    (profile `cluster`) so each test gets its own slot.
+# 2. Crypto. `ika-test-cluster` carries a self dev-dependency that enables
+#    `dwallet-mpc-unsafe-mock` (crates/ika-test-cluster/Cargo.toml). Under
+#    `--workspace`, dev-dependency features unify into the single `ika-core`
+#    build, so with the crate included EVERY test in the run — including the
+#    dwallet-MPC integration tests — used the INSECURE mock even with
+#    `use_mocks=false` (run 33750543127: ika-core lib in 761 s; excluded, run
+#    33768433944: 4180 s, matching the real-crypto `integration` scope).
+#    `scope: all` is real-crypto coverage only while this exclusion stands.
+#    Re-including the crate, e.g. by moving `all` onto nextest, silently
+#    re-mocks the whole workspace unless the self dev-dependency changes.
+#
+# `ika-upgrade-test` is NOT excluded: its scenario binaries return early
+# unless their RUN_* variable is set (they drive an external `sui` localnet
+# on fixed ports only under `upgrade-test.yaml`, one scenario per job), and
+# its 36 lib unit tests run nowhere else in CI.
+#
+# So `all` is "every workspace test that can share a process, with real
+# crypto"; the cluster suite must be dispatched separately.
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "Which Rust tests to run"
+        type: choice
+        required: false
+        default: "integration"
+        options:
+          - integration
+          - all
+      test_threads:
+        description: "Concurrent test count (default 4 — concurrent tests share one rayon pool; too many queue-starves the per-advancement wall-clock budgets)"
+        type: string
+        required: false
+        default: "4"
+      test_filter:
+        description: "Optional test-name filter for the integration scope (e.g. network_dkg::test_network_dkg_full_flow)"
+        type: string
+        required: false
+        default: ""
+      rust_log:
+        description: "RUST_LOG override for the test run"
+        type: string
+        required: false
+        default: "error"
+      use_mocks:
+        description: "Run with the INSECURE dwallet-mpc-unsafe-mock crypto (fast, deterministic; NOT real-crypto coverage). Off = real crypto (default)."
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUST_BACKTRACE: 1
+  # Change to specific Rust release to pin or `stable` for the latest stable version.
+  rust_stable: 1.99.1
+  rust_nightly: nightly
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+  GH_DEPLOY_KEY: ${{ secrets.GH_DEPLOY_KEY }}
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+  RUST_LOG: error
+  # Generous safety-net headroom over the harness's per-advancement
+  # wall-clock budgets, for contention outliers on shared runners.
+  IKA_TEST_MAX_PARTY_ITERATIONS: "6000"
+  IKA_TEST_MAX_COMPUTATION_WAIT_ITERATIONS: "18000"
+
+jobs:
+  run-tests:
+    env:
+      # The one place the `all` exclusion is defined; both cargo steps and the
+      # guard use it.
+      ALL_SCOPE_EXCLUDES: "--exclude ika-test-cluster"
+      # Crates that pull a swarm library but are SAFE in-process, and why.
+      # The guard step derives the excluded crates from ALL_SCOPE_EXCLUDES
+      # and treats only these as additionally allowed:
+      #   ika            — depends on ika-swarm for `ika start`; its tests
+      #                    never boot one (run 33768433944: 10 tests, ≤0.02 s)
+      #   ika-swarm      — its Swarm::launch tests are #[ignore]d
+      #   ika-upgrade-test — scenario binaries are RUN_*-gated no-ops
+      # Un-ignoring or un-gating any of those re-breaks scope=all with the
+      # guard silent: move the crate to ALL_SCOPE_EXCLUDES instead.
+      SAFE_SWARM_DEPENDENTS: "crates/ika/Cargo.toml crates/ika-swarm/Cargo.toml crates/ika-upgrade-test/Cargo.toml"
+    name: Run ${{ inputs.scope }} tests
+    runs-on: ika-k8s-large
+    timeout-minutes: 180
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Runner resources
+        run: |
+          # Surface what this pod ACTUALLY gets — the scale set advertises up
+          # to 80 vCPUs, but a low cgroup quota (requests/limits mismatch) or
+          # node oversubscription silently throttles the crypto workloads.
+          echo "nproc: $(nproc)"
+          echo "cgroup cpu.max: $(cat /sys/fs/cgroup/cpu.max 2>/dev/null || cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us 2>/dev/null || echo n/a)"
+          echo "cgroup memory.max: $(cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo n/a)"
+          free -g 2>/dev/null || true
+          uptime || true
+
+      - name: Setup SSH
+        uses: ./.github/actions/setup-ssh
+        with:
+          deploy-key: ${{ secrets.GH_DEPLOY_KEY }}
+
+      - name: Install Rust ${{ env.rust_stable }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_stable }}
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install build dependencies
+        run: |
+          # Some runner pods lack IPv6 egress while DNS returns AAAA records,
+          # so force IPv4 and retry — apt mirror flakiness otherwise fails the
+          # whole job before any test runs.
+          if command -v sudo >/dev/null; then SUDO=sudo; else SUDO=; fi
+          APT="-o Acquire::ForceIPv4=true"
+          for attempt in 1 2 3; do
+            $SUDO apt-get $APT update && \
+              $SUDO apt-get $APT install -y cmake clang pkg-config libssl-dev curl && break
+            echo "apt attempt $attempt failed; retrying in 15s" && sleep 15
+          done
+          command -v cmake >/dev/null || { echo "build dependencies missing after retries"; exit 1; }
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start CPU sampler
+        run: |
+          # Every 15s: cgroup cpu.stat (usage_usec delta -> effective CPUs
+          # actually consumed; nr_throttled/throttled_usec -> CFS quota
+          # stalls) + loadavg. Answers "does this workload USE the vCPUs"
+          # rather than inferring it from wall-clock.
+          nohup bash -c 'prev=$(grep usage_usec /sys/fs/cgroup/cpu.stat 2>/dev/null | awk "{print \$2}"); while true; do sleep 15; cur=$(grep usage_usec /sys/fs/cgroup/cpu.stat 2>/dev/null | awk "{print \$2}"); echo "$(date -u +%T) effective_cpus=$(( (cur - prev) / 15000000 )).$(( ((cur - prev) / 1500000) % 10 )) $(grep -E "nr_throttled|throttled_usec" /sys/fs/cgroup/cpu.stat 2>/dev/null | tr "\n" " ") load=$(cut -d" " -f1-3 /proc/loadavg)"; prev=$cur; done' > cpu-sampler.log 2>&1 &
+          echo $! > cpu-sampler.pid
+
+      - name: Guard the scope=all exclusion
+        if: inputs.scope == 'all'
+        # Before the build, because the failure this prevents costs a full
+        # release build plus a 20-minute-deep test abort. A crate outside the
+        # excluded set and the safe list that pulls a swarm library — sui's
+        # `test-cluster`/`sui-node` (how ika-test-cluster boots its network)
+        # or `sui-swarm`/`ika-swarm` — would run its swarm tests in-process
+        # and collide on ports.
+        run: |
+          excluded=""
+          set -- $ALL_SCOPE_EXCLUDES
+          while [ $# -gt 0 ]; do
+            if [ "$1" = "--exclude" ]; then excluded="$excluded crates/$2/Cargo.toml"; shift; fi
+            shift
+          done
+          allowed="$excluded $SAFE_SWARM_DEPENDENTS"
+          unexpected=""
+          for f in $(grep -lE '^(sui-swarm|ika-swarm|test-cluster|sui-node)[a-z-]*(\.workspace)? *=' crates/*/Cargo.toml); do
+            case " $allowed " in *" $f "*) ;; *) unexpected="$unexpected $f" ;; esac
+          done
+          echo "excluded:$excluded; safe: $SAFE_SWARM_DEPENDENTS; swarm dependents found: $(grep -lE '^(sui-swarm|ika-swarm|test-cluster|sui-node)[a-z-]*(\.workspace)? *=' crates/*/Cargo.toml | tr '\n' ' ')"
+          if [ -n "$unexpected" ]; then
+            echo "::error::swarm dependents outside ALL_SCOPE_EXCLUDES and SAFE_SWARM_DEPENDENTS:$unexpected — their tests would collide on ports in-process; add them to ALL_SCOPE_EXCLUDES, or to SAFE_SWARM_DEPENDENTS with the reason they cannot boot a swarm under cargo test"
+            exit 1
+          fi
+
+      - name: Build tests
+        env:
+          SCOPE: ${{ inputs.scope }}
+          USE_MOCKS: ${{ inputs.use_mocks }}
+        run: |
+          # Compilation in its own step: the Downloaded/Compiling stream
+          # dominates the log volume, a separate step collapses in the UI
+          # when green, and `time` in the run step covers test execution,
+          # not rustc.
+          # `use_mocks` layers the INSECURE deterministic mock on top of
+          # test-utils; default (off) is real crypto for the `integration`
+          # scope, and for `all` only because `ika-test-cluster` is excluded
+          # (see the header: its self dev-dependency would unify the mock
+          # into ika-core for the whole run).
+          FEATURES="test-utils"
+          if [ "$USE_MOCKS" = "true" ]; then FEATURES="test-utils,dwallet-mpc-unsafe-mock"; fi
+          if [ "$SCOPE" = "all" ]; then
+            # See the header for why `ika-test-cluster` is excluded.
+            cargo test --release --workspace $ALL_SCOPE_EXCLUDES \
+              --features "$FEATURES" --color=always --no-run
+          else
+            cargo test -p ika-core --lib --release --features "$FEATURES" --color=always --no-run
+          fi
+
+      - name: Run tests
+        env:
+          SCOPE: ${{ inputs.scope }}
+          TEST_THREADS: ${{ inputs.test_threads }}
+          TEST_FILTER: ${{ inputs.test_filter }}
+          RUST_LOG: ${{ inputs.rust_log || 'error' }}
+          USE_MOCKS: ${{ inputs.use_mocks }}
+        run: |
+          set -o pipefail
+          THREADS=""
+          if [ -n "$TEST_THREADS" ]; then
+            THREADS="--test-threads=$TEST_THREADS"
+          fi
+          FEATURES="test-utils"
+          if [ "$USE_MOCKS" = "true" ]; then FEATURES="test-utils,dwallet-mpc-unsafe-mock"; fi
+          if [ "$SCOPE" = "all" ]; then
+            # $ALL_SCOPE_EXCLUDES is the job-level list the build step used.
+            time cargo test --release --workspace $ALL_SCOPE_EXCLUDES \
+              --features "$FEATURES" --color=always -- \
+              $THREADS --nocapture 2>&1 | tee rust-tests.log
+          else
+            FILTER="dwallet_mpc::integration_tests"
+            if [ -n "$TEST_FILTER" ]; then
+              FILTER="dwallet_mpc::integration_tests::$TEST_FILTER"
+            fi
+            time cargo test -p ika-core --lib "$FILTER" --release \
+              --features "$FEATURES" --color=always -- $THREADS --nocapture 2>&1 | tee rust-tests.log
+          fi
+
+      - name: Summarize results
+        if: always()
+        run: |
+          grep -E "^test .*(ok|FAILED)|test result" rust-tests.log | tail -60 || true
+
+      - name: Upload CPU sampler log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cpu-sampler-${{ github.job }}-${{ github.run_attempt }}
+          path: cpu-sampler.log
+          retention-days: 7
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rust-tests-log-${{ github.run_attempt }}
+          path: rust-tests.log
+          retention-days: 7

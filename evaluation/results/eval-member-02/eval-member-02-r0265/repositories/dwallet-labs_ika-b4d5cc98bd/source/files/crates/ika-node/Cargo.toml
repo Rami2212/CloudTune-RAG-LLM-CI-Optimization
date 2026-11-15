@@ -1,0 +1,100 @@
+[package]
+name = "ika-node"
+version.workspace = true
+authors = ["Mysten Labs <build@mystenlabs.com>"]
+license = "BSD-3-Clause-Clear"
+publish = false
+edition = "2024"
+
+[lints]
+workspace = true
+
+# Default binary (auto-detects mode from config)
+[[bin]]
+name = "ika-node"
+path = "src/main.rs"
+
+# Validator binary (requires consensus_config)
+[[bin]]
+name = "ika-validator"
+path = "src/bin/ika-validator.rs"
+
+# Fullnode binary (no consensus, no notifier)
+[[bin]]
+name = "ika-fullnode"
+path = "src/bin/ika-fullnode.rs"
+
+# Notifier binary (requires notifier_client_key_pair)
+[[bin]]
+name = "ika-notifier"
+path = "src/bin/ika-notifier.rs"
+
+[dependencies]
+anemo.workspace = true
+dwallet-mpc-types.workspace = true
+anemo-tower.workspace = true
+arc-swap.workspace = true
+axum.workspace = true
+hex.workspace = true
+anyhow.workspace = true
+bin-version.workspace = true
+clap.workspace = true
+prometheus.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tracing.workspace = true
+futures.workspace = true
+tower.workspace = true
+reqwest.workspace = true
+tap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+humantime.workspace = true
+sha2.workspace = true
+sysinfo.workspace = true
+
+sui-macros.workspace = true
+ika-config.workspace = true
+ika-core.workspace = true
+ika-network.workspace = true
+ika-protocol-config.workspace = true
+ika-telemetry.workspace = true
+ika-types.workspace = true
+ika-archival.workspace = true
+mysten-metrics.workspace = true
+mysten-common.workspace = true
+typed-store.workspace = true
+mysten-network.workspace = true
+telemetry-subscribers.workspace = true
+sui-types.workspace = true
+sui-storage.workspace = true
+ika-sui-client.workspace = true
+sui-metrics-push-client.workspace = true
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
+
+[target.'cfg(msim)'.dependencies]
+sui-simulator.workspace = true
+
+
+[features]
+default = ["enforce-minimum-cpu", "jemalloc"]
+
+# Compile in the 16-core minimum for cryptographic computations. Even when
+# compiled in, it is enforced at runtime only for a node running as a
+# validator on the ika testnet or mainnet networks (identified by the deployed
+# ika system object, not the Sui settlement chain — see ika-core's runtime.rs).
+enforce-minimum-cpu = ["ika-core/enforce-minimum-cpu"]
+# INSECURE test-only mock: forwards to the deterministic inkrypto protocol mocks.
+# Never enable in production. See inkrypto `unsafe_mock`.
+dwallet-mpc-unsafe-mock = ["ika-core/dwallet-mpc-unsafe-mock"]
+# Compiled-in jemalloc as the global allocator (mirrors sui-node) — better
+# fragmentation behavior than glibc malloc for long-running RocksDB-heavy
+# validators, and arch-independent (the Dockerfile previously attempted
+# this via an LD_PRELOAD that never actually persisted).
+jemalloc = ["tikv-jemallocator"]
+# TEST-ONLY: enables test-testing fault injection in the node (e.g. builds an
+# `ika-validator` that corrupts its outgoing reconfiguration message, for the
+# cross-binary malicious-detection harness). The harness builds the faulty
+# binary with `--features test-testing`; never enable it in a production build.
+test-testing = ["ika-core/test-testing"]

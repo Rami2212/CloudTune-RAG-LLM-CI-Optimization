@@ -1,0 +1,51 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [HIGH] Add pip dependency cache to "build_wheels" job
+# Estimated savings: ~3 min/run
+#
+name: Wheel Builder
+
+on:
+  push:
+    tags:
+      - '*'
+
+jobs:
+  build_wheels:
+    name: Push new release to PyPI
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mpf
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Checkout MPF
+        uses: actions/checkout@v6
+
+      - name: Setup python
+        uses: actions/setup-python@v6
+        with:
+          python-version: 3.13
+
+      - name: Install MPF
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y '^libxcb.*-dev' libx11-xcb-dev libjpeg-dev
+          sudo apt-get install -y qt6-base-dev
+          pip install --upgrade pip setuptools wheel build
+          pip install -e .
+
+      - name: Run tests
+        run: python -m unittest discover -s mpf/tests
+
+      - name: Build wheel
+        run: python -m build
+
+      - uses: actions/upload-artifact@v7
+        with:
+          path: ./dist/*.*
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

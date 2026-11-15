@@ -1,0 +1,477 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  RUSTDOCFLAGS: -Dwarnings
+  RUST_BACKTRACE: 1
+  # Change to specific Rust release to pin or `stable` for the latest stable version.
+  rust_stable: 1.99.1
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+  GH_DEPLOY_KEY: ${{ secrets.GH_DEPLOY_KEY }}
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+  RUST_LOG: error
+
+jobs:
+  build:
+    if: github.event_name == 'push'
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: 'node-cleanup'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Setup SSH
+        uses: ./.github/actions/setup-ssh
+        with:
+          deploy-key: ${{ secrets.GH_DEPLOY_KEY }}
+
+      - name: Install Rust ${{ env.rust_stable }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_stable }}
+          targets: x86_64-unknown-linux-gnu
+      - name: Install Target
+        run: rustup target add x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: |
+          # Install build dependencies. Some runners lack IPv6 egress while
+          # DNS returns AAAA records, so force IPv4 and retry — apt mirror
+          # flakiness otherwise fails the job before the build starts.
+          APT="-o Acquire::ForceIPv4=true"
+          for attempt in 1 2 3; do
+            sudo apt-get $APT update && \
+              sudo apt-get $APT install -y cmake clang pkg-config libssl-dev && break
+            echo "apt attempt $attempt failed; retrying in 15s" && sleep 15
+          done
+          command -v cmake >/dev/null || { echo "build dependencies missing after retries"; exit 1; }
+          RUSTFLAGS="-D warnings" cargo build --bin ika --target x86_64-unknown-linux-gnu
+
+  fmt:
+    name: Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Setup SSH
+        uses: ./.github/actions/setup-ssh
+        with:
+          deploy-key: ${{ secrets.GH_DEPLOY_KEY }}
+
+      - name: Install Rust ${{ env.rust_stable }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_stable }}
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Fmt Check
+        run: cargo fmt -- --check
+      - name: Fmt Check - Wasm
+        run: cargo fmt -- --check
+        working-directory: sdk/ika-wasm
+      - name: Metric name convention
+        # New prometheus metrics must use the ika_ prefix; the legacy set
+        # is frozen in scripts/metric-name-allowlist.txt.
+        # See dev-docs/conventions/metrics.md.
+        run: ./scripts/check-metric-names.sh
+      - name: Workspace membership
+        # Every crate must be built by the workspace or explicitly excluded;
+        # a crate in neither is never compiled and rots invisibly.
+        run: ./scripts/check-workspace-manifests.sh
+      - name: Epoch-table write discipline
+        # Every AuthorityEpochTables field must declare whether it is
+        # commit-batched or written directly (and why that is safe).
+        # See dev-docs/conventions/epoch-table-write-discipline.md.
+        run: ./scripts/check-epoch-table-write-discipline.sh
+      - name: Invariant violation metric coverage
+        # Every should-never-happen log must increment the fleet-visible
+        # invariant violation counter through the shared macro.
+        run: ./scripts/check-invariant-violation-markers.sh
+      - name: Chain-mirror layout
+        # The Move structs that Rust mirrors with UNTAGGED structs may not
+        # change shape without the Rust mirror and the version dispatch moving
+        # in the same PR: BCS is positional, so their field order is the wire
+        # format of bytes already on chain, and no OCS proof gate verifies shape.
+        # See dev-docs/conventions/chain-mirror-layout.md.
+        run: ./scripts/check-chain-mirror-layout.sh
+      - name: Chain-mirror layout (Rust half)
+        # The golden BCS pins beside each mirror are the Rust half of the
+        # check above: the script reads Move declarations and Rust field
+        # NAMES, so a Rust-side retype (u64 -> u32) passes it and only the
+        # pinned length/digest catches it. Nothing else on PR CI executes
+        # ika-types' tests (Cargo Test Check is compile-only), so the pins
+        # must run here or a retype merges green. ika-types has no MPC
+        # crypto, so the debug profile is fine.
+        run: |
+          set -o pipefail
+          cargo test -p ika-types --lib -- layout_is_pinned variant_indices_are_pinned \
+            | tee "$RUNNER_TEMP/layout-pins.log"
+          # cargo exits 0 when a name filter matches nothing, so renaming a
+          # pinned test would silently disable this gate. Require that tests
+          # actually ran.
+          grep -qE '^test result: ok\. [1-9][0-9]* passed' "$RUNNER_TEMP/layout-pins.log"
+      - name: System checkpoint message widths
+        # Move peels a checkpoint's whole message vector as one flat BCS stream,
+        # with no per-message length prefix to resynchronize on, so a Rust
+        # payload whose width no longer matches its `peel_*` call desynchronizes
+        # every message after it in the same checkpoint. The pins live in
+        # ika-types' tests, which PR CI otherwise never executes (Cargo Test
+        # Check is compile-only), so they must be named here to run at all.
+        run: |
+          set -o pipefail
+          cargo test -p ika-types --lib -- variant_encodings_are_pinned_to_the_move_peel_widths \
+            | tee "$RUNNER_TEMP/width-pins.log"
+          # Same vacuity guard as the layout pins above: a name filter that
+          # matches nothing still exits 0.
+          grep -qE '^test result: ok\. [1-9][0-9]* passed' "$RUNNER_TEMP/width-pins.log"
+      - name: Sui version consistency
+        # The Sui pin lives in several places that don't update together;
+        # see dev-docs/conventions/sui-version-bump.md.
+        run: ./scripts/check-sui-version-consistency.sh
+      - name: Rust toolchain consistency
+        # rust-toolchain.toml and the Docker builders' `FROM rust:` image are
+        # separate pins, and only release tags build the Dockerfiles — the
+        # v1.4.0 release build failed on exactly this drift.
+        run: ./scripts/check-rust-toolchain-consistency.sh
+
+      - name: Workspace version consistency (standalone lockfiles)
+        # Standalone lockfiles (sdk/ika-wasm) pin root-workspace crates and
+        # don't update with the root lock: the v1.2.2 bump missed the wasm
+        # lock, breaking --locked SDK builds. Red PR instead of a
+        # post-release discovery.
+        run: ./scripts/check-workspace-version-consistency.sh
+
+  # Runs on PRs AND pushes: clippy used to be push-to-main-only, which let a
+  # workspace-wide lint backlog accumulate invisibly (PRs merged unlinted and
+  # only the FIRST failing crate ever surfaced on main).
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Setup SSH
+        uses: ./.github/actions/setup-ssh
+        with:
+          deploy-key: ${{ secrets.GH_DEPLOY_KEY }}
+
+      - name: Install Rust ${{ env.rust_stable }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_stable }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # The msim compilation universe (`--cfg msim` + msim-patched tokio and the
+  # `[target.'cfg(msim)']` deps) is invisible to the regular clippy job above;
+  # without this pass, simtest-only code only fails at the next (manual or
+  # nightly) simtest run. `cargo simtest clippy` is the shim's clippy mode.
+  clippy-simtest:
+    name: Clippy (msim / simtest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Setup SSH
+        uses: ./.github/actions/setup-ssh
+        with:
+          deploy-key: ${{ secrets.GH_DEPLOY_KEY }}
+
+      - name: Install Rust ${{ env.rust_stable }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_stable }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # msim artifacts don't overlap with the normal CI cache (same
+          # prefix as the simtest workflow, which shares the dep graph).
+          prefix-key: "simtest"
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2.87.8
+        with:
+          tool: cargo-nextest
+      - name: Install cargo-simtest shim
+        run: ./scripts/simtest/install.sh
+      - name: Run Clippy under msim
+        run: cargo simtest clippy --all-targets --all-features -- -D warnings
+
+  noa-presign-regressions:
+    name: NOA presign regressions
+    runs-on: ika-k8s-large
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Setup SSH
+        uses: ./.github/actions/setup-ssh
+        with:
+          deploy-key: ${{ secrets.GH_DEPLOY_KEY }}
+      - name: Install Rust ${{ env.rust_stable }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_stable }}
+      - name: Install build dependencies
+        run: |
+          if command -v sudo >/dev/null; then SUDO=sudo; else SUDO=; fi
+          APT="-o Acquire::ForceIPv4=true"
+          for attempt in 1 2 3; do
+            $SUDO apt-get $APT update && \
+              $SUDO apt-get $APT install -y cmake clang pkg-config libssl-dev && break
+            echo "apt attempt $attempt failed; retrying in 15s" && sleep 15
+          done
+          command -v cmake >/dev/null || { echo "build dependencies missing after retries"; exit 1; }
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: noa-presign-release
+      - name: Run NOA startup and replay regressions
+        # Package scope keeps real crypto; workspace scope would unify the
+        # cluster crate's mock feature. Check counts so a rename cannot turn
+        # either filter into a successful run of zero tests.
+        run: |
+          set -o pipefail
+          cargo test --locked --release -p ika-core --lib \
+            dwallet_mpc::network_owned_address_signing_key::tests -- --test-threads=1 \
+            | tee "$RUNNER_TEMP/noa-key-preparation.log"
+          grep -qE '^test result: ok\. 10 passed' "$RUNNER_TEMP/noa-key-preparation.log"
+          cargo test --locked --release -p ika-core --lib -- --exact \
+            dwallet_mpc::dwallet_mpc_service::tests::noa_startup_preserves_global_presign_checkpoint \
+            dwallet_mpc::dwallet_mpc_service::tests::noa_restart_preserves_later_noa_assignment \
+            --test-threads=1 | tee "$RUNNER_TEMP/noa-presign-regressions.log"
+          grep -qE '^test result: ok\. 2 passed' "$RUNNER_TEMP/noa-presign-regressions.log"
+          cargo test --locked --release -p ika-node --lib -- --exact \
+            tests::all_cert_network_key_outputs_held_locally_cases --test-threads=1 \
+            | tee "$RUNNER_TEMP/noa-material-readiness.log"
+          grep -qE '^test result: ok\. 1 passed' "$RUNNER_TEMP/noa-material-readiness.log"
+      - name: Run inherited epoch preparation regressions
+        run: |
+          set -o pipefail
+          cargo test --locked --release -p ika-core --lib -- \
+            dwallet_mpc::epoch_start_data::tests \
+            epoch_startup_ \
+            dwallet_mpc::integration_tests::mid_epoch_restart_keys::missing_prior_cert_blob_is_refetched_from_peers_and_ingested \
+            --test-threads=1 | tee "$RUNNER_TEMP/epoch-preparation.log"
+          grep -qE '^test result: ok\. 6 passed' "$RUNNER_TEMP/epoch-preparation.log"
+      - name: Run consensus-owned replay regressions
+        run: |
+          set -o pipefail
+          cargo test --locked --release -p ika-core --lib \
+            consensus_manager::replay_tests -- --test-threads=1 \
+            | tee "$RUNNER_TEMP/consensus-replay.log"
+          grep -qE '^test result: ok\. 6 passed' "$RUNNER_TEMP/consensus-replay.log"
+      - name: Run consensus authority identity regression
+        run: |
+          set -o pipefail
+          cargo test --locked --release -p ika-types --lib -- --exact \
+            sui::epoch_start_system::tests::consensus_committee_uses_raw_consensus_key_names \
+            --test-threads=1 | tee "$RUNNER_TEMP/consensus-authority-names.log"
+          grep -qE '^test result: ok\. 1 passed' "$RUNNER_TEMP/consensus-authority-names.log"
+      - name: Upload regression logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: noa-presign-regressions
+          path: |
+            ${{ runner.temp }}/noa-*.log
+            ${{ runner.temp }}/epoch-preparation.log
+            ${{ runner.temp }}/consensus-replay.log
+            ${{ runner.temp }}/consensus-authority-names.log
+
+  cargo-check:
+    name: Cargo Test Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Setup SSH
+        uses: ./.github/actions/setup-ssh
+        with:
+          deploy-key: ${{ secrets.GH_DEPLOY_KEY }}
+
+      - name: Install Rust ${{ env.rust_stable }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_stable }}
+          targets: x86_64-unknown-linux-gnu
+      - name: Install Target
+        run: rustup target add x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check (ika-core tests)
+        run: cargo check -p ika-core --features test-utils --tests --target x86_64-unknown-linux-gnu
+      - name: Sui Validity checkpoint compatibility
+        run: |
+          set -o pipefail
+          cargo test -p ika-sui-client --lib -- --exact \
+            grpc::tests::validity_checkpoint_preserves_transaction_bytes_and_certified_contents \
+            | tee "$RUNNER_TEMP/sui-validity-checkpoint.log"
+          grep -qE '^test result: ok\. 1 passed' "$RUNNER_TEMP/sui-validity-checkpoint.log"
+      - name: Sui RPC vs. response error split pins
+        # `ika_sui_client_sui_rpc_errors` is what the fleet's Sui-uplink alert
+        # fires on, and the split that keeps a decoding defect off it is
+        # enforced by nothing but these tests: which counter a failure reaches
+        # is invisible to the type checker, so a regression compiles clean and
+        # only shows up as an on-call page against a healthy fullnode. This
+        # job is otherwise compile-only and nothing else on PR CI executes
+        # ika-sui-client's tests, so they must be named here or they never
+        # run. The crate is already compiled by the ika-core check above, and
+        # no MPC crypto is involved, so the debug profile is fine.
+        run: |
+          set -o pipefail
+          cargo test -p ika-sui-client --lib -- \
+            a_decode_failure_on_a_successful_rpc_is_not_an_rpc_error \
+            a_transport_failure_is_an_rpc_error_only \
+            the_retry_wrappers_route_by_error_variant \
+            an_unlisted_error_variant_stays_on_the_rpc_counter \
+            | tee "$RUNNER_TEMP/rpc-response-split-pins.log"
+          # cargo exits 0 when a name filter matches nothing, so a renamed
+          # test would silently disable this gate. Require the exact count:
+          # unlike a `[1-9][0-9]*` floor, this also catches renaming SOME of
+          # the pins. Bump the number when adding one.
+          grep -qE '^test result: ok\. 4 passed' "$RUNNER_TEMP/rpc-response-split-pins.log"
+      - name: Seed-rotation pins (#2119)
+        # Same reason as the step above: this job is otherwise compile-only,
+        # and NOTHING else on PR CI executes these crates' tests — the
+        # seed-rotation suite would ship with no PR gate at all. The exact
+        # counts are the gate: `cargo test` exits 0 when a name filter matches
+        # nothing, so a renamed test would silently disable this. Bump a number
+        # when adding a test to that filter.
+        #
+        # DEBUG PROFILE ONLY — every test named here is pure decision logic,
+        # config parsing, or a metric-registry read. The seed-rotation tests
+        # that DERIVE an mpc_data bundle are deliberately absent:
+        # `derivable_digest_set_has_exactly_the_encodings_this_binary_emits`
+        # (~1090s) and the two `seed_rotation_store` tests (~1770s together)
+        # run real class-groups derivation at opt-level 0. They execute in the
+        # release-profile suites instead — `test-cluster.yaml` and
+        # `upgrade-test.yaml` build `-p ika-core` in release — and locally via
+        # `cargo test --release -p ika-core --lib seed_rotation`.
+        run: |
+          set -o pipefail
+          # The pure resolution rule: all four outcomes, the closed state-label
+          # set the alert expression is written against, and which decisions
+          # run MPC at all.
+          cargo test -p ika-core --lib -- --exact \
+            dwallet_mpc::seed_rotation::tests::resolution_covers_current_previous_neither_and_both \
+            dwallet_mpc::seed_rotation::tests::only_the_rotation_case_runs_on_the_previous_seed \
+            dwallet_mpc::seed_rotation::tests::state_labels_are_a_closed_pinned_set \
+            dwallet_mpc::seed_rotation::tests::validator_key_metrics_clear_stale_selection_and_distinguish_unknown \
+            dwallet_mpc::mpc_diagnostics::local_authority_malicious_reason_tests::every_reason_label_is_pre_materialized \
+            epoch_tasks::mpc_data_announcement_sender::tests::seed_identity_reports_a_frozen_mismatch_over_the_announcement \
+            epoch_tasks::mpc_data_announcement_sender::tests::an_unreadable_previous_seed_reaches_the_sender_as_none \
+            | tee "$RUNNER_TEMP/seed-rotation-core-pins.log"
+          grep -qE '^test result: ok\. 7 passed' "$RUNNER_TEMP/seed-rotation-core-pins.log"
+          # The optional previous-seed config field: accepted absent (every
+          # deployed validator config), parsed present, discarded unread by
+          # non-validator preparation, and — the one that must never regress —
+          # unreadable is an error rather than a panic.
+          cargo test -p ika-config --lib -- --exact \
+            node::tests::validator_config_without_a_previous_root_seed_is_accepted \
+            node::tests::validator_config_with_a_previous_root_seed_round_trips \
+            node::tests::notifier_preparation_discards_previous_root_seed_without_reading_it \
+            node::tests::fullnode_preparation_discards_previous_root_seed_without_reading_it \
+            node::tests::an_unreadable_previous_root_seed_is_an_error_not_a_panic \
+            node::tests::a_validator_with_an_unreadable_previous_root_seed_still_prepares \
+            | tee "$RUNNER_TEMP/seed-rotation-config-pins.log"
+          grep -qE '^test result: ok\. 6 passed' "$RUNNER_TEMP/seed-rotation-config-pins.log"
+          # The exported-metric-family set: catches both a family that stops
+          # being exported (`ika_dwallet_mpc_seed_identity_state`, whose alert
+          # would go silent; `ika_dwallet_mpc_self_malicious_total`, whose
+          # zero would stop meaning anything) and one added unnoticed.
+          #
+          # Only the validator pin is named here, deliberately: this step is
+          # #2119's gate and must not depend on a step named for other work.
+          # The full per-mode set (this test included) runs in the step below,
+          # so the one overlapping test executes twice — a second ~0.01s run
+          # against an already-built binary.
+          cargo test -p ika-node --lib -- --exact \
+            metrics::per_mode_registration::a_validator_exports_every_family \
+            | tee "$RUNNER_TEMP/seed-rotation-metric-pins.log"
+          grep -qE '^test result: ok\. 1 passed' "$RUNNER_TEMP/seed-rotation-metric-pins.log"
+      - name: Per-mode metric export pins (#2106, #2124)
+        # What each `NodeMode` registers, per family. Same reason as the steps
+        # around it: `Cargo Test Check` is otherwise compile-only and is the
+        # ONLY PR job that executes ika-node's tests, so a test not named here
+        # never runs on a PR. The notifier and fullnode pins were in exactly
+        # that position until #2124 — and they are the only two that see one
+        # side of a per-mode DIFFERENCE, which is to say a family leaking onto
+        # a mode that does not drive it (ika #2051, the regression the whole
+        # set exists for) had no PR gate at all.
+        #
+        # Two of the five are controls on the comparison itself, one per
+        # direction: `missing` (compose a notifier with `SuiClientMetrics`
+        # omitted) and `unexpected` (diff the notifier against its own list
+        # with the `ika_sui_client_*` names removed). Without them the three
+        # positive pins can degrade into asserting nothing — every one of them
+        # only ever requires both halves to be EMPTY.
+        #
+        # SCOPE, so nobody reads more into a green run than is there: the
+        # tests compose the start sequence's constructors BY HAND into their
+        # own registry. Nothing checks that composition against
+        # `IkaNode::start_with_mode`. A mode gate applied at the real call
+        # site, or a struct added to the start sequence and not to the
+        # composition, is invisible to every test in this step. Closing that
+        # needs a booted-node `/metrics` scrape per mode, which lives in
+        # ika-test-cluster, not here.
+        #
+        # Debug profile: five registry builds, no MPC crypto, no I/O.
+        run: |
+          set -o pipefail
+          cargo test -p ika-node --lib -- --exact \
+            metrics::per_mode_registration::a_validator_exports_every_family \
+            metrics::per_mode_registration::a_notifier_exports_only_the_families_it_drives \
+            metrics::per_mode_registration::a_fullnode_exports_only_the_families_it_drives \
+            metrics::per_mode_registration::omitting_the_sui_client_metrics_reports_them_missing \
+            metrics::per_mode_registration::a_family_the_notifier_list_does_not_name_is_reported_unexpected \
+            | tee "$RUNNER_TEMP/per-mode-metric-pins.log"
+          # cargo exits 0 when a name filter matches nothing, so a renamed test
+          # would silently disable this gate. Require the exact count: unlike a
+          # `[1-9][0-9]*` floor, this also catches renaming SOME of the pins.
+          # Bump the number when adding one.
+          grep -qE '^test result: ok\. 5 passed' "$RUNNER_TEMP/per-mode-metric-pins.log"
+      - name: Deprecated on-chain mpc_data placeholder pins
+        # What a candidate registers in the deprecated on-chain
+        # `mpc_data_bytes` field is a byte-format contract (#2119): exactly
+        # `[0x00, 0x00]`, in exactly one TableVec entry. It is deliberately
+        # well-formed BCS, because `get_epoch_start_system` fails the whole
+        # epoch-start read for every node when an active member's record does
+        # not decode -- so a change here is a fleet-wide read break, not a
+        # local one. This job is otherwise compile-only, and nothing else on
+        # PR CI executes ika-sui-client's tests, so the pins must be named
+        # here or they never run. The crate is already compiled by the
+        # ika-core check above, and no MPC crypto is involved, so the debug
+        # profile is fine.
+        run: |
+          set -o pipefail
+          cargo test -p ika-sui-client --lib -- \
+            placeholder_encodes_to_the_documented_two_bytes \
+            placeholder_round_trips_as_versioned_mpc_data \
+            empty_table_vec_would_not_decode \
+            registration_ptb_pushes_exactly_the_placeholder_chunk \
+            | tee "$RUNNER_TEMP/mpc-data-placeholder-pins.log"
+          # cargo exits 0 when a name filter matches nothing, so a renamed
+          # test would silently disable this gate. Require the exact count:
+          # unlike a `[1-9][0-9]*` floor, this also catches renaming SOME of
+          # the pins. Bump the number when adding one.
+          grep -qE '^test result: ok\. 4 passed' "$RUNNER_TEMP/mpc-data-placeholder-pins.log"

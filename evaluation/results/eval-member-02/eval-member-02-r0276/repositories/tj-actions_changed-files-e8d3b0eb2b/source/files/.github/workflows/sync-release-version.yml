@@ -1,0 +1,50 @@
+name: Update release version
+
+permissions:
+   contents: write
+   pull-requests: write
+
+on:
+  release:
+    types: [published]
+
+
+jobs:
+  update-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Run release-tagger
+        uses: tj-actions/release-tagger@970a1f5f827a7b90902b0adc904f3bb70c1074e7 # v6.0.6
+      - name: Sync release version.
+        uses: tj-actions/sync-release-version@2a7ef0deb39b3ecce887ee99d2261c6cef989d84 # v13.16
+        id: sync-release-version
+        with:
+          pattern: '${{ github.repository }}@'
+          only_major: true
+          use_tag_commit_hash: true
+          paths: |
+            README.md
+      - name: Sync release package version.
+        uses: tj-actions/sync-release-version@2a7ef0deb39b3ecce887ee99d2261c6cef989d84 # v13.16
+        id: sync-release-package-version
+        with:
+          pattern: '"version": "'
+          strip_prefix: "v"
+          paths: |
+            package.json
+      - name: Run git-cliff
+        uses: tj-actions/git-cliff@679041f051a4d2ab452f7e5e7b0eed2abee21131 # v2.2.0
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          base: "main"
+          labels: "merge when passing"
+          sign-commits: true
+          title: "Upgraded to ${{ steps.sync-release-version.outputs.new_version }}"
+          branch: "upgrade-to-${{ steps.sync-release-version.outputs.new_version }}"
+          commit-message: "Upgraded from ${{ steps.sync-release-version.outputs.old_version }} -> ${{ steps.sync-release-version.outputs.new_version }}"
+          body: "View [CHANGES](https://github.com/${{ github.repository }}/compare/${{ steps.sync-release-version.outputs.old_version }}...${{ steps.sync-release-version.outputs.new_version }})"
+          token: ${{ secrets.GITHUB_TOKEN }}
