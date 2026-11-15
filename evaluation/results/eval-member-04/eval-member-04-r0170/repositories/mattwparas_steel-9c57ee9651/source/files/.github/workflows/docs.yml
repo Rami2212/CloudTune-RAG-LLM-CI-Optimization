@@ -1,0 +1,53 @@
+name: Deploy
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # To push a branch
+      pull-requests: write  # To create a PR from that branch
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - name: Install latest mdbook
+      run: |
+        # tag=$(curl 'https://api.github.com/repos/rust-lang/mdbook/releases/latest' | jq -r '.tag_name')
+        tag="v0.5.2"
+        url="https://github.com/rust-lang/mdbook/releases/download/${tag}/mdbook-${tag}-x86_64-unknown-linux-gnu.tar.gz"
+        pagetoc_tag=$(curl 'https://api.github.com/repos/slowsage/mdbook-pagetoc/releases/latest' | jq -r '.tag_name')
+        pagetoc_url="https://github.com/slowsage/mdbook-pagetoc/releases/download/${pagetoc_tag}/mdbook-pagetoc-${pagetoc_tag}-x86_64-unknown-linux-gnu.tar.gz"
+        mkdir mdbook
+        curl -sSL $url | tar -xz --directory=./mdbook
+        curl -sSL $pagetoc_url | tar -xz --directory=./mdbook
+        echo `pwd`/mdbook >> $GITHUB_PATH
+    - name: Deploy GitHub Pages
+      run: |
+        cd docs
+        mdbook build
+        git worktree add gh-pages
+        git config user.name "Deploy from CI"
+        git config user.email ""
+        cd gh-pages
+        # Pull the benchmarks if they exist to keep them around through
+        # the book builds
+        git checkout origin/gh-pages -- dev/bench || true
+        # Delete the ref to avoid keeping history.
+        git update-ref -d refs/heads/gh-pages
+        # Delete everything except the book
+        mv dev/bench .. || true
+        rm -rf *
+        rm -rf .github
+        rm .gitignore
+        # There are benchmarks stored in dev/bench/ that we would like to
+        # keep around. Otherwise, this just adds the book as a separate
+        # directory.
+        mv ../dev/bench . || true
+        mv ../book/ .
+        git add .
+        git commit -m "Deploy $GITHUB_SHA to gh-pages"
+        git push --force --set-upstream origin gh-pages

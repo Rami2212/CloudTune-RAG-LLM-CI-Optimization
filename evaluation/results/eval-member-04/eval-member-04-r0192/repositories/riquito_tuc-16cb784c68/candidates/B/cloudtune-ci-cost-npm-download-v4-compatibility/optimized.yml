@@ -1,0 +1,157 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 4 optimizations:
+# - [HIGH] Add cargo dependency cache to "release" job
+# - [HIGH] Add cargo dependency cache to "macos_arm" job
+# - [HIGH] Switch "macos_arm" from macOS to ubuntu runner
+# - [LOW] Explicitly set fail-fast for large matrix job "release" (36 combinations)
+# Estimated savings: ~18 min/run
+#
+name: Release
+
+defaults:
+  run:
+    shell: bash
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+
+jobs:
+  check_if_safe:
+    name: Check if safe to release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+          components: clippy, rustfmt
+
+      - uses: actions-rs/cargo@v1
+        with:
+          command: fmt
+          args: --all -- --check
+
+      - uses: actions-rs/cargo@v1
+        with:
+          command: clippy
+          args: --all-targets --all-features -- -D warnings
+
+      - uses: actions-rs/cargo@v1
+        with:
+          command: check
+
+      - uses: actions-rs/cargo@v1
+        with:
+          command: test
+
+      - uses: actions-rs/cargo@v1
+        with:
+          command: check
+          args: --all-features
+
+      - uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --no-default-features
+
+      - uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --no-default-features --features regex
+
+  release:
+    needs: check_if_safe
+    name: Build and Release
+    runs-on: ${{ matrix.partial_os }}-latest
+    strategy:
+      matrix:
+        release_type: [full, lite]
+        partial_os: [ubuntu, macos, windows]
+        ext: ['', '.exe']
+        exclude:
+          - partial_os: windows
+            ext: ''
+          - partial_os: ubuntu
+            ext: '.exe'
+          - partial_os: macos
+            ext: '.exe'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Build tuc (full)
+        if: matrix.release_type == 'full'
+        run: cargo build --release --locked
+
+      - name: Build tuc (lite)
+        if: matrix.release_type == 'lite'
+        run: cargo build --release --locked --no-default-features
+
+      - name: Upload tuc (full) binary to release
+        if: matrix.release_type == 'full'
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: target/release/tuc${{ matrix.ext }}
+          asset_name: tuc-${{ matrix.partial_os }}-amd64${{ matrix.ext }}
+          tag: ${{ github.ref }}
+          overwrite: true
+          prerelease: true
+
+      - name: Upload tuc (lite) binary to release
+        if: matrix.release_type == 'lite'
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: target/release/tuc${{ matrix.ext }}
+          asset_name: tuc-lite-${{ matrix.partial_os }}-amd64${{ matrix.ext }}
+          tag: ${{ github.ref }}
+          overwrite: true
+          prerelease: true
+
+  macos_arm:
+    needs: check_if_safe
+    strategy:
+      matrix:
+        release_type: [full, lite]
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install ARM target
+        run: rustup update && rustup target add aarch64-apple-darwin
+
+      - name: Build ARM tuc (full)
+        if: matrix.release_type == 'full'
+        run: cargo build --release --target=aarch64-apple-darwin --locked
+
+      - name: Build ARM tuc (lite)
+        if: matrix.release_type == 'lite'
+        run: cargo build --release --target=aarch64-apple-darwin --locked --no-default-features
+
+      - name: Upload tuc (full) binary to release
+        if: matrix.release_type == 'full'
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: target/aarch64-apple-darwin/release/tuc
+          asset_name: tuc-macos-aarch64
+          tag: ${{ github.ref }}
+          overwrite: true
+          prerelease: true
+
+      - name: Upload tuc (lite) binary to release
+        if: matrix.release_type == 'lite'
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: target/aarch64-apple-darwin/release/tuc
+          asset_name: tuc-lite-macos-aarch64
+          tag: ${{ github.ref }}
+          overwrite: true
+          prerelease: true

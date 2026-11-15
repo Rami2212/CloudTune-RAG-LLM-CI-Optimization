@@ -1,0 +1,68 @@
+name: Validate Framework Mappings
+
+# Runs on changes to EITHER side of the mapping relationship:
+#   - a map.json can start pointing at a check that does not exist
+#   - renaming or deleting a check in a reporter.json can orphan an existing
+#     mapping that was previously valid
+#
+# A dangling mapping renders as a green "compliant" tick in the framework report
+# rather than as an error (see scripts/validate_frameworks.py), so it is a silent
+# false pass in a compliance document. Always validate the full set — unlike the
+# reporter validator there is no benefit to restricting to changed files, since a
+# reporter change can break a map file that was not itself touched.
+
+on:
+  pull_request:
+    paths:
+      - 'frameworks/**/map.json'
+      - 'services/**/*.reporter.json'
+      - 'scripts/validate_frameworks.py'
+  push:
+    paths:
+      - 'frameworks/**/map.json'
+      - 'services/**/*.reporter.json'
+      - 'scripts/validate_frameworks.py'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      # validate_frameworks.py reads only JSON via the standard library, so the
+      # project requirements are not needed here.
+      - name: Validate all framework mappings
+        run: python scripts/validate_frameworks.py
+
+      - name: Comment on PR
+        if: failure() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: [
+                '❌ **Framework mapping validation failed.**',
+                '',
+                'One or more `frameworks/*/map.json` entries point at a service or check that does not exist.',
+                '',
+                'This matters more than a typo normally would: `Framework.getContent()` treats an',
+                'unresolvable check as **compliant**, so a dangling mapping renders as a green tick in',
+                'the compliance report instead of raising an error — a silent false pass.',
+                '',
+                'Run `python3 scripts/validate_frameworks.py` locally to see the failures and their',
+                'suggested corrections.'
+              ].join('\n')
+            });

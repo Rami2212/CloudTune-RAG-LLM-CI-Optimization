@@ -1,0 +1,28 @@
+name: Slow CPU
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+  workflow_dispatch:
+  schedule:
+    - cron: "30 0 * * 0"
+    - cron: "30 0 * * 1-6"
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  cpu-slow:
+    if: >-
+      github.event_name != 'pull_request' ||
+      (!github.event.pull_request.draft &&
+       contains(github.event.pull_request.labels.*.name, 'run-cpu-slow') &&
+       (github.event.action != 'labeled' || github.event.label.name == 'run-cpu-slow' || github.event.label.name == 'run-tests-full' || github.event.label.name == 'run-cpu-full'))
+    concurrency:
+      group: cpu-slow-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    uses: ./.github/workflows/distributed-cpu.yml
+    with:
+      slow: true
+      python_pytorch_matrix: '[{"python_version":"3.14.9","pytorch_version":"2.14.1"}]'

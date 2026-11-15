@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*" # v0.8.1
+
+jobs:
+  build:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Check sdk-version file
+        run: |
+          SDK_VERSION="$(head -n1 version/sdk-version)"
+          SDK_VERSION_GIT="refs/tags/${SDK_VERSION}"
+          if [[ "${SDK_VERSION_GIT}" != "${{ github.ref }}" ]]; then
+            echo "File version/sdk-version (${SDK_VERSION}) needs to be updated to ${{ github.ref }}"
+            exit 1
+          fi
+        shell: bash
+
+      - name: Tidy
+        run: make tidy
+
+      - name: Test
+        run: make test
+
+  # Release creation, split out from build/test so the notifier can watch just
+  # this job.
+  release:
+    name: Create Release on Tag
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Release Main
+        uses: actions/create-release@v1
+        if: ${{ !contains(github.ref , 'rc') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: Release ${{ github.ref }}
+          body: Automatic Go Dapr client release
+          draft: false
+          prerelease: false
+
+      - name: Release RC
+        uses: actions/create-release@v1
+        if: ${{ contains(github.ref, 'rc') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: Release ${{ github.ref }}
+          body: Automatic Go Dapr client release
+          draft: false
+          prerelease: true
+
+      - name: Notify
+        uses: rjstone/discord-webhook-notify@v1
+        with:
+          severity: info
+          details: Release ${{ github.ref }} published
+          description: Release
+          webhookUrl: ${{ secrets.DISCORD_WEBHOOK }}
+          avatarUrl: https://github.githubassets.com/images/modules/logos_page/Octocat.png
+
+  # Opens (or comments on) a tracking issue only when the release job itself
+  # fails; build/test failures skip release, so its result isn't 'failure'.
+  notify-on-failure:
+    needs: [release]
+    if: always() && needs.release.result == 'failure'
+    permissions:
+      issues: write
+      actions: read
+    uses: dapr/.github/.github/workflows/open-issue-on-failure.yml@main
+    with:
+      title: "Release workflow failed: ${{ github.workflow }} (${{ github.ref_name }})"
+      labels: "release,ci/release-failure"
+      mention: "@dapr/maintainers-go-sdk @dapr/approvers-go-sdk"

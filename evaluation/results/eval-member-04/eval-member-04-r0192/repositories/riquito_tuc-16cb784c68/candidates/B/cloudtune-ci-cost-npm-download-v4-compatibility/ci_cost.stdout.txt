@@ -1,0 +1,88 @@
+[2mAnalyzing workflows in C:\Users\hirun\AppData\Local\Temp\cloudtune-ci-cost-2w7elsya\.github\workflows...[0m
+[2mFound 1 workflow file[0m
+
+[1m[36mci-cost[0m â€” GitHub Actions Cost Analyzer
+
+[2mAnalyzed 1 workflow Â· 3 jobs Â· 4 recommendations[0m
+
+[1mSEVERITY  RECOMMENDATION                                        ESTIMATED SAVINGS[0m
+[2mâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€[0m
+[31m[1mHIGH  [0m  Add cargo dependency cache to "release" job           [32m~8 min per run[0m
+[31m[1mHIGH  [0m  Add cargo dependency cache to "macos_arm" job         [32m~8 min per run[0m
+[31m[1mHIGH  [0m  Switch "macos_arm" from macOS to ubuntu runner        [32m~$0.072/min saved (10x cost reduction)[0m
+[34m[1mLOW   [0m  Explicitly set fail-fast for large matrix job "re...  [32m~2 min per run[0m
+
+[2mâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€[0m
+
+[1mRecommendations:[0m
+
+[1m1. [31m[HIGH][0m[1m Add cargo dependency cache to "release" job[0m
+   [2mFile: release.yml Â· Job: release[0m
+   Job "release" installs cargo dependencies without caching. Add `actions/cache` before the install step to restore the cargo cache across runs. This is one of the highest-impact optimizations for most CI workflows.
+
+   [36mFix:[0m
+   [2m# Add before your cargo install step in job "release":[0m
+   [2m      - name: Cache cargo registry[0m
+   [2m        uses: actions/cache@v4[0m
+   [2m        with:[0m
+   [2m          path: |[0m
+   [2m            ~/.cargo/registry[0m
+   [2m            ~/.cargo/git[0m
+   [2m            target[0m
+   [2m          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}[0m
+   [2m          restore-keys: |[0m
+   [2m            ${{ runner.os }}-cargo-[0m
+
+[1m2. [31m[HIGH][0m[1m Add cargo dependency cache to "macos_arm" job[0m
+   [2mFile: release.yml Â· Job: macos_arm[0m
+   Job "macos_arm" installs cargo dependencies without caching. Add `actions/cache` before the install step to restore the cargo cache across runs. This is one of the highest-impact optimizations for most CI workflows.
+
+   [36mFix:[0m
+   [2m# Add before your cargo install step in job "macos_arm":[0m
+   [2m      - name: Cache cargo registry[0m
+   [2m        uses: actions/cache@v4[0m
+   [2m        with:[0m
+   [2m          path: |[0m
+   [2m            ~/.cargo/registry[0m
+   [2m            ~/.cargo/git[0m
+   [2m            target[0m
+   [2m          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}[0m
+   [2m          restore-keys: |[0m
+   [2m            ${{ runner.os }}-cargo-[0m
+
+[1m3. [31m[HIGH][0m[1m Switch "macos_arm" from macOS to ubuntu runner[0m
+   [2mFile: release.yml Â· Job: macos_arm[0m
+   Job "macos_arm" uses `macos-latest` (10x more expensive than ubuntu) but doesn't appear to need macOS-specific tools. macOS runners cost $0.08/min vs $0.008/min for ubuntu. Unless you're building iOS/macOS apps, switch to ubuntu.
+
+   [36mFix:[0m
+   [2m# In job "macos_arm", change:[0m
+   [2m  macos_arm:[0m
+   [2m    runs-on: ubuntu-latest   # was: macos-latest[0m
+
+[1m4. [34m[LOW][0m[1m Explicitly set fail-fast for large matrix job "release" (36 combinations)[0m
+   [2mFile: release.yml Â· Job: release[0m
+   Matrix job "release" has 36 combinations. Explicitly setting `fail-fast: true` ensures the workflow cancels remaining combinations as soon as one fails, saving up to 35 runner-minutes per broken run.
+
+   [36mFix:[0m
+   [2m# In job "release", explicitly set fail-fast:[0m
+   [2m  release:[0m
+   [2m    strategy:[0m
+   [2m      fail-fast: true[0m
+   [2m      matrix:[0m
+   [2m        # ... your matrix config[0m
+
+[2mâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€[0m
+
+[1mSummary[0m
+
+  Estimated monthly cost:   [33m~$153.60/month[0m
+  Time savings per run:     [32m~18 min/run[0m
+  Estimated monthly savings: [32m~$28.80/month[0m
+
+  Issues:  [31m3 HIGH[0m  [34m1 LOW[0m
+
+  [2mRun with [0m[36m--fix[0m[2m to generate optimized workflow files[0m
+
+[2mGenerating optimized workflow files in C:\Users\hirun\AppData\Local\Temp\cloudtune-ci-cost-2w7elsya\.github\workflows\optimized...[0m
+[32mGenerated 1 optimized workflow file:[0m
+  [36mC:\Users\hirun\AppData\Local\Temp\cloudtune-ci-cost-2w7elsya\.github\workflows\optimized\release.yml[0m

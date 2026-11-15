@@ -1,0 +1,319 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "The new version number. Use 3 digits for a release (e.g., 2.1.0) and 4 digits for a canary (e.g., 2.1.0.1-canary)."
+        required: true
+      is_canary:
+        description: "This a canary (pre-release) build?"
+        type: boolean
+        default: true
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      version: ${{ github.event.inputs.version }}
+      previous_stable: ${{ steps.prev.outputs.tag }}
+    steps:
+      - name: ⛔ Validate Version Format
+        run: |
+          IS_CANARY='${{ github.event.inputs.is_canary }}'
+          VERSION='${{ github.event.inputs.version }}'
+
+          if [[ "$IS_CANARY" == "true" ]]; then
+            # Rule: Must be 4 digits, optional suffix
+            if [[ ! $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+              echo "::error::Canary releases must use a 4-digit version (e.g., 2.1.0.1 or 2.1.0.1-canary)."
+              exit 1
+            fi
+            echo "Version format is valid for canary."
+          else
+            # Rule: Must be exactly 3 digits
+            if [[ ! $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Full releases must use a 3-digit version (e.g., 2.1.0)."
+              exit 1
+            fi
+            echo "Version format is valid for release."
+          fi
+
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Find previous stable tag
+        id: prev
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          TAG=$( { git tag --list 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | grep -vx "v$VERSION"; echo "v$VERSION"; } \
+            | sort -V \
+            | awk -v current="v$VERSION" '$0 == current { print previous; exit } { previous = $0 }')
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Use Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: "22.x"
+
+      - name: Install dependencies
+        run: |
+          npm install
+          npm install --no-save @biomejs/cli-linux-x64@2.0.4 @rspack/binding-linux-x64-gnu@1.5.8
+
+      - name: Run Typescript
+        run: npm run typecheck
+
+      - name: Update version in files
+        run: npm run update-version -- ${{ github.event.inputs.version }}
+
+      - name: Build extension
+        env:
+          RELEASE_TYPE: ${{ github.event.inputs.is_canary == 'true' && 'canary' || '' }}
+          SOURCEMAPS_BASE_URL: ${{ vars.SOURCEMAPS_API_URL }}
+          R2_ENDPOINT: ${{ vars.R2_SOURCEMAPS_ENDPOINT }}
+          R2_BUCKET: ${{ vars.R2_SOURCEMAPS_BUCKET }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_SOURCEMAPS_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SOURCEMAPS_SECRET_ACCESS_KEY }}
+        run: npm run build:ci
+
+      # https://github.com/planetscale/ghcommit-action/issues/43#issuecomment-2313129696
+      - name: Stage all changes
+        id: stage
+        run: |
+          git add .
+          if ! git diff --staged --quiet; then
+            echo "changes_exist=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit version changes
+        if: steps.stage.outputs.changes_exist == 'true'
+        uses: planetscale/ghcommit-action@v0.2.19
+        with:
+          commit_message: "Release version ${{ github.event.inputs.version }}"
+          repo: ${{ github.repository }}
+          branch: ${{ github.ref_name }}
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      - name: Create and push tag
+        if: steps.stage.outputs.changes_exist == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin ${{ github.ref_name }}
+          git reset --hard origin/${{ github.ref_name }}
+          git tag -a "v${{ github.event.inputs.version }}" -m "Version ${{ github.event.inputs.version }}"
+          git push origin "v${{ github.event.inputs.version }}"
+
+      # Uploading raw build directories for other jobs
+      - name: Upload Chrome build
+        uses: actions/upload-artifact@v4
+        with:
+          name: chrome-build
+          path: dist/chrome
+
+      - name: Upload Edge build
+        uses: actions/upload-artifact@v4
+        with:
+          name: edge-build
+          path: dist/edge
+
+      - name: Upload Firefox build
+        uses: actions/upload-artifact@v4
+        with:
+          name: firefox-build
+          path: dist/firefox
+
+  publish-chrome:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-node@v3
+        with:
+          node-version: "22.x"
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download Chrome build
+        uses: actions/download-artifact@v4
+        with:
+          name: chrome-build
+          path: dist/chrome
+
+      - name: Zip Chrome artifact
+        run: |
+          VERSION=${{ needs.release.outputs.version }}
+          cd dist/chrome
+          zip -r ../chrome-v$VERSION.zip .
+
+      - name: Upload Chrome Zip for release
+        uses: actions/upload-artifact@v4
+        with:
+          name: chrome-release-asset
+          path: dist/chrome-v${{ needs.release.outputs.version }}.zip
+
+      - name: Publish to Chrome Web Store
+        if: github.event.inputs.is_canary == 'false'
+        env:
+          EXTENSION_ID: ${{ secrets.GOOGLE_EXTENSION_ID }}
+          PUBLISHER_ID: ${{ secrets.GOOGLE_PUBLISHER_ID }}
+          CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET}}
+          REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+        run: npx tsx tooling/publish-chrome.ts dist/chrome-v${{ needs.release.outputs.version }}.zip
+
+  publish-firefox:
+    needs: release
+    runs-on: ubuntu-latest
+    env:
+      FIREFOX_JWT_ISSUER: ${{ secrets.FIREFOX_JWT_ISSUER }}
+      FIREFOX_JWT_SECRET: ${{ secrets.FIREFOX_JWT_SECRET }}
+      RELEASE_VERSION: ${{ needs.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-node@v3
+        with:
+          node-version: "22.x"
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download Firefox build
+        uses: actions/download-artifact@v4
+        with:
+          name: firefox-build
+          path: dist/firefox
+
+      - name: Install web-ext
+        run: npm install -g web-ext
+
+      - name: Sign Firefox Add-on (Canary - Unlisted)
+        if: github.event.inputs.is_canary == 'true'
+        run: |
+          web-ext sign --channel=unlisted \
+                       --api-key=${{ env.FIREFOX_JWT_ISSUER }} \
+                       --api-secret=${{ env.FIREFOX_JWT_SECRET }} \
+                       --artifacts-dir=dist/signed-firefox \
+                       --source-dir=dist/firefox
+          echo "Canary version signed."
+
+      - name: Sign and Publish Firefox Add-on (Regular - Listed)
+        if: github.event.inputs.is_canary == 'false'
+        run: |
+          web-ext sign --channel=listed \
+                       --api-key=${{ env.FIREFOX_JWT_ISSUER }} \
+                       --api-secret=${{ env.FIREFOX_JWT_SECRET }} \
+                       --upload-source-code \
+                       --artifacts-dir=dist/signed-firefox \
+                       --source-dir=dist/firefox
+          echo "Regular version signed and published."
+
+      - name: Rename signed artifact
+        run: |
+          ARTIFACT_DIR=dist/signed-firefox
+          SIGNED_FILE=$(find $ARTIFACT_DIR -name "*.xpi")
+          if [ -n "$SIGNED_FILE" ]; then
+            mv "$SIGNED_FILE" "$ARTIFACT_DIR/firefox-v${{ env.RELEASE_VERSION }}.xpi"
+            echo "Renamed artifact to firefox-v${{ env.RELEASE_VERSION }}.xpi"
+          else
+            echo "::error::Signed .xpi file not found!"
+            exit 1
+          fi
+
+      - name: Upload Firefox XPI for release
+        uses: actions/upload-artifact@v4
+        with:
+          name: firefox-release-asset
+          path: dist/signed-firefox/firefox-v${{ env.RELEASE_VERSION }}.xpi
+
+  publish-edge:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-node@v3
+        with:
+          node-version: "22.x"
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download Edge build
+        uses: actions/download-artifact@v4
+        with:
+          name: edge-build
+          path: dist/edge
+
+      - name: Zip Edge artifact
+        run: |
+          VERSION=${{ needs.release.outputs.version }}
+          node -e "const fs=require('fs');const f='dist/edge/manifest.json';const m=JSON.parse(fs.readFileSync(f,'utf8'));delete m.key;delete m.update_url;fs.writeFileSync(f,JSON.stringify(m,null,2))"
+          cd dist/edge
+          zip -r ../edge-v$VERSION.zip .
+          
+      - name: Upload Edge Zip for release
+        uses: actions/upload-artifact@v4
+        with:
+          name: edge-release-asset
+          path: dist/edge-v${{ needs.release.outputs.version }}.zip
+
+      - name: Publish to Edge Add-ons
+        if: github.event.inputs.is_canary == 'false'
+        env:
+          CLIENT_ID: ${{ secrets.EDGE_CLIENT_ID }}
+          API_KEY: ${{ secrets.EDGE_API_KEY }}
+          PRODUCT_ID: ${{ secrets.EDGE_PRODUCT_ID }}
+        run: npx tsx tooling/publish-edge.ts dist/edge-v${{ needs.release.outputs.version }}.zip
+
+  create-github-release:
+    name: Create GitHub Release
+    needs: [release, publish-chrome, publish-edge, publish-firefox]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download chrome release files
+        uses: actions/download-artifact@v4
+        with:
+          name: chrome-release-asset
+          path: release-artifacts
+
+      - name: Download firefox release files
+        uses: actions/download-artifact@v4
+        with:
+          name: firefox-release-asset
+          path: release-artifacts
+
+      - name: Download edge release files
+        uses: actions/download-artifact@v4
+        with:
+          name: edge-release-asset
+          path: release-artifacts
+
+      - name: Create GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: "release-artifacts/*"
+          tag: "v${{ needs.release.outputs.version }}"
+          name: "v${{ needs.release.outputs.version }}"
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # Mark as pre-release if it's a canary build
+          prerelease: ${{ github.event.inputs.is_canary == 'true' }}
+          draft: true
+          generateReleaseNotes: true
+          generateReleaseNotesPreviousTag: ${{ github.event.inputs.is_canary == 'false' && needs.release.outputs.previous_stable || '' }}

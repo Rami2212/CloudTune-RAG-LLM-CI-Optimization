@@ -1,0 +1,261 @@
+name: Release
+
+on:
+  workflow_dispatch: # Allows manual triggering
+    inputs:
+      release_version:
+        description: "Optional manual release version (e.g. 2.1.0 or v2.1.0). If set, CI publishes even without releasable commits."
+        required: false
+        type: string
+
+jobs:
+  release_notes:
+    name: Write release notes
+    runs-on: ubuntu-latest
+    # Copilot CLI writes the notes from commit messages, which are untrusted,
+    # so it runs apart from the release with a token that can read the code and
+    # make Copilot requests (billed to the repository owner's Copilot seat) but
+    # cannot push, tag or publish.
+    permissions:
+      contents: read
+      copilot-requests: write
+    outputs:
+      written: ${{ steps.notes.outputs.written }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # The notes cover the commits since the latest release tag
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22.x"
+
+      # Neither step can fail the job, so a Copilot problem never blocks the
+      # release, which then lists the commits.
+      - name: Install Copilot CLI
+        continue-on-error: true
+        run: npm install -g @github/copilot@1.0.98
+
+      - name: Write release notes
+        id: notes
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          if node scripts/release/ai-release-notes.mjs > "$RUNNER_TEMP/release-notes.md"; then
+            echo "written=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning title=Release notes::Copilot could not write the release notes; the release lists the commits instead."
+            : > "$RUNNER_TEMP/release-notes.md"
+            echo "written=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload release notes
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-notes
+          path: ${{ runner.temp }}/release-notes.md
+          retention-days: 7
+
+  release:
+    name: Release to npm and GitHub
+    needs: release_notes
+    runs-on: ubuntu-latest
+    # Permissions needed for semantic-release to commit/tag/release
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      # id-token: write # Needed for OIDC trusted publishing (if not using NPM_TOKEN)
+    outputs:
+      # Output whether a new release was published
+      new_release_published: ${{ steps.release-result.outputs.new_release_published }}
+      new_release_version: ${{ steps.release-result.outputs.new_release_version }}
+    steps:
+      - name: Checkout code
+        # Need fetch-depth: 0 for semantic-release to analyze all relevant commits
+        # and commit package.json/CHANGELOG.md changes
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22.x" # Match engines requirement in package.json
+          registry-url: "https://registry.npmjs.org" # Specify npm registry
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download release notes
+        uses: actions/download-artifact@v8
+        with:
+          name: release-notes
+          path: ${{ runner.temp }}
+
+      - name: Determine release mode
+        id: release-mode
+        run: |
+          input_version='${{ github.event.inputs.release_version || '' }}'
+          input_version="${input_version#v}"
+
+          if [ -n "$input_version" ]; then
+            if [[ ! "$input_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+              echo "❌ Invalid release_version: '$input_version'. Use semver like 2.1.0 or 2.1.0-beta.1"
+              exit 1
+            fi
+            echo "manual_release=true" >> "$GITHUB_OUTPUT"
+            echo "release_version=$input_version" >> "$GITHUB_OUTPUT"
+          else
+            echo "manual_release=false" >> "$GITHUB_OUTPUT"
+            echo "release_version=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Determine next version (dry-run)
+        id: semantic-dry
+        if: steps.release-mode.outputs.manual_release != 'true'
+        uses: cycjimmy/semantic-release-action@v6
+        with:
+          dry_run: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Run build
+        run: npm run build
+        env:
+          POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
+          # Use manual input version when provided, otherwise semantic-release dry-run version.
+          APP_VERSION: ${{ steps.release-mode.outputs.release_version || steps.semantic-dry.outputs.new_release_version || '' }}
+
+      - name: Run semantic-release
+        id: semantic # Give step an ID to reference its outputs
+        if: steps.release-mode.outputs.manual_release != 'true'
+        uses: cycjimmy/semantic-release-action@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # Read by scripts/release/ai-release-notes.mjs
+          RELEASE_NOTES_FILE: ${{ runner.temp }}/release-notes.md
+
+      - name: Publish manual npm release
+        if: steps.release-mode.outputs.manual_release == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          version='${{ steps.release-mode.outputs.release_version }}'
+          npm version "$version" --no-git-tag-version
+          npm publish --access public
+
+      - name: Commit manual version bump
+        if: steps.release-mode.outputs.manual_release == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json
+          git commit -m "chore(release): ${{ steps.release-mode.outputs.release_version }} [skip ci]"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Tag manual release
+        if: steps.release-mode.outputs.manual_release == 'true'
+        run: |
+          version='${{ steps.release-mode.outputs.release_version }}'
+          git tag "v$version"
+          git push origin "v$version"
+
+      - name: Create GitHub release (manual)
+        if: steps.release-mode.outputs.manual_release == 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ steps.release-mode.outputs.release_version }}
+          body_path: ${{ runner.temp }}/release-notes.md
+          generate_release_notes: ${{ needs.release_notes.outputs.written != 'true' }}
+          name: v${{ steps.release-mode.outputs.release_version }}
+
+      - name: Resolve release outputs
+        id: release-result
+        run: |
+          if [ "${{ steps.release-mode.outputs.manual_release }}" = "true" ]; then
+            echo "new_release_published=true" >> "$GITHUB_OUTPUT"
+            echo "new_release_version=${{ steps.release-mode.outputs.release_version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "new_release_published=${{ steps.semantic.outputs.new_release_published }}" >> "$GITHUB_OUTPUT"
+            echo "new_release_version=${{ steps.semantic.outputs.new_release_version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+  docker_publish:
+    name: Build and Push Docker Image to GHCR
+    # Run only after the release job completes successfully
+    needs: release
+    # Run only if semantic-release actually published a new version
+    if: needs.release.outputs.new_release_published == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # Needed to check out the code
+      packages: write # Needed to push Docker image to GHCR
+      attestations: write # Needed for build attestations
+      id-token: write # Needed for OIDC (good practice)
+
+    steps:
+      - name: Checkout code
+        # Checkout the specific commit tagged by semantic-release
+        uses: actions/checkout@v6
+        with:
+          # Use the tag name determined by the release job
+          ref: v${{ needs.release.outputs.new_release_version }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # Use the version from the semantic-release output.
+          # NOTE: this is a YAML literal block scalar (`|`), so `#` here is NOT a YAML
+          # comment - it would be passed to the action as literal text and break tag
+          # parsing. Keep these lines free of inline comments.
+          #   type=raw,value=<version>              e.g. 2.4.3
+          #   type=semver,pattern={{version}}        e.g. 2.4.3
+          #   type=semver,pattern=v{{major}}.{{minor}}  e.g. v2.4
+          #   type=semver,pattern=v{{major}}         e.g. v2
+          #   type=raw,value=latest,enable=true      always tag latest on main branch release
+          tags: |
+            type=raw,value=${{ needs.release.outputs.new_release_version }}
+            type=semver,pattern={{version}},value=${{ needs.release.outputs.new_release_version }}
+            type=semver,pattern=v{{major}}.{{minor}},value=${{ needs.release.outputs.new_release_version }}
+            type=semver,pattern=v{{major}},value=${{ needs.release.outputs.new_release_version }}
+            type=raw,value=latest,enable=true
+
+      - name: Build and push Docker image
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64 # Build for both x86_64 and arm64 (Mac Silicon)
+          build-args: |
+            POSTHOG_API_KEY=${{ secrets.POSTHOG_API_KEY }}
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true

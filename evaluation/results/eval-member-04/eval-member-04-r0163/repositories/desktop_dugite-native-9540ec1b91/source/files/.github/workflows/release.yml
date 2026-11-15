@@ -1,0 +1,105 @@
+name: Publish release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: The version to release (e.g., "v1.2.3")
+        required: true
+      draft:
+        description: Publish the release as a draft
+        required: false
+        default: false
+        type: boolean
+      prerelease:
+        description: Publish the release as a prerelease
+        required: false
+        default: false
+        type: boolean
+      dry-run:
+        description: Perform a dry run without creating a release
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  prerequisites:
+    name: Check release prerequisites
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify tag format
+        run: |
+          if [[ ! "${{ github.event.inputs.version }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$ ]]; then
+            echo "Error: Version tag '${{ github.event.inputs.version }}' is not in the correct format (e.g., v1.2.3 or v1.2.3-beta.1)"
+            exit 1
+          fi
+      - name: Verify tag does not already exist by using ls-remote
+        run: |
+          if git ls-remote --tags ${{ github.server_url }}/${{github.repository}} | grep -q "${{ github.event.inputs.version }}"; then
+            echo "Error: Tag '${{ github.event.inputs.version }}' already exists."
+            exit 1
+          fi
+  build:
+    needs: [prerequisites]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+  release:
+    name: Create GitHub release
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: './artifacts'
+          merge-multiple: true
+
+      - name: Display structure of downloaded files
+        run: ls -aR
+        working-directory: './artifacts'
+
+      - name: Install dependencies
+        run: npm i
+      - name: Generate release notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx tsx script/generate-release-notes.mts
+      - name: Get author name
+        id: get_author
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo name=`gh api users/${{ github.actor }} | jq -j .name` >> $GITHUB_OUTPUT
+      - name: Create tag
+        env:
+          GIT_AUTHOR_NAME: ${{steps.get_author.outputs.name || github.actor}}
+          GIT_AUTHOR_EMAIL: ${{github.actor_id}}+${{github.actor}}@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: |
+          git tag ${{ github.event.inputs.version }}
+          git push origin ${{ github.event.inputs['dry-run'] == 'true' && '--dry-run ' || ''  }}${{ github.event.inputs.version }}
+      - name: Release
+        if: ${{ github.event.inputs['dry-run'] != 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create ${{ github.event.inputs.version }} \
+            --notes-file ${{ github.workspace }}/script/release_notes.txt \
+            ${{ github.event.inputs.draft == 'true' && '--draft' || '' }} \
+            ${{ github.event.inputs.prerelease == 'true' && '--prerelease' || '' }} \
+            ${{ github.workspace }}/artifacts/dugite-*

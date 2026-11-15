@@ -1,0 +1,78 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+env:
+  HAS_R2_SECRETS: ${{ secrets.R2_SOURCEMAPS_ACCESS_KEY_ID != '' && secrets.R2_SOURCEMAPS_SECRET_ACCESS_KEY != '' && vars.R2_SOURCEMAPS_ENDPOINT != '' && vars.R2_SOURCEMAPS_BUCKET != '' && vars.SOURCEMAPS_API_URL != '' }}
+  
+jobs:
+  build:
+    runs-on: ubuntu-latest
+      
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Use Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: "22.x"
+          cache: 'npm'
+
+      - name: Get version and hash
+        id: version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          HASH=$(git rev-parse --short HEAD)
+          echo "NIGHTLY_VERSION=$VERSION-dev ($HASH) ${{ github.run_number }}" >> $GITHUB_ENV
+
+      - name: Install dependencies
+        run: |
+          npm install
+          npm install --no-save @biomejs/cli-linux-x64@2.0.4 @rspack/binding-linux-x64-gnu@1.5.8
+
+      - name: Run Typescript
+        run: npm run typecheck
+
+      - name: Run self-checks
+        run: npm run selfcheck
+
+      - name: Update version in files
+        run: npm run update-version -- "${{ env.NIGHTLY_VERSION }}"
+
+      - name: Build extension (with sourcemap upload)
+        if: ${{ env.HAS_R2_SECRETS == 'true' }}
+        env:
+          SOURCEMAPS_BASE_URL: ${{ vars.SOURCEMAPS_API_URL }}
+          R2_ENDPOINT: ${{ vars.R2_SOURCEMAPS_ENDPOINT }}
+          R2_BUCKET: ${{ vars.R2_SOURCEMAPS_BUCKET }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_SOURCEMAPS_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SOURCEMAPS_SECRET_ACCESS_KEY }}
+        run: npm run build:ci
+
+      - name: Build extension (without sourcemap upload)
+        if: ${{ env.HAS_R2_SECRETS == 'false' }}
+        run: npm run build
+
+      - name: Upload Chrome artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chrome-v${{ env.NIGHTLY_VERSION }}
+          path: dist/chrome
+
+      - name: Upload Edge artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: edge-v${{ env.NIGHTLY_VERSION }}
+          path: dist/edge
+
+      - name: Upload Firefox artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firefox-v${{ env.NIGHTLY_VERSION }}
+          path: dist/firefox
