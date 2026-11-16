@@ -1,0 +1,37 @@
+name: Automatic synchronization of application.yml to ors-config.yml and ors-config.env
+on:
+  pull_request:
+    branches:
+      - main
+      - releases/**
+    types: [ opened, ready_for_review, reopened, synchronize ]
+    paths:
+      - 'ors-api/src/main/resources/application.yml'
+
+permissions: {}
+
+jobs:
+  sync_config:
+    name: Synchronize changes in application.yml to ors-config.yml and ors-config.env
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    if: (! github.event.pull_request.draft) && github.event.pull_request.state == 'open'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.head_ref }}
+      - name: yq - portable yaml processor
+        uses: mikefarah/yq@f2944b823f84906a127dbd29e4c2a3e60c4e550e # v4.54.3
+        with:
+          cmd: yq --version
+      - name: validate application.yml
+        run: .github/utils/yml_config_validation.sh ors-api/src/main/resources/application.yml
+      - name: Convert application.yml to ors-config.yml and ors-config.env
+        run: |
+          .github/utils/yml_config_to_ors_config_conversion.sh ors-api/src/main/resources/application.yml ors-config.yml
+          .github/utils/yml_config_to_properties_conversion.sh ors-api/src/main/resources/application.yml ors-config.env
+      - uses: MichaelsJP/git-auto-commit-action@8756aa072ef5b4a080af5dc8fef36c5d586e521d # v5
+        with:
+          commit_message: 'chore(config): automatic conversion of application.yml to ors-config.yml and ors-config.env'

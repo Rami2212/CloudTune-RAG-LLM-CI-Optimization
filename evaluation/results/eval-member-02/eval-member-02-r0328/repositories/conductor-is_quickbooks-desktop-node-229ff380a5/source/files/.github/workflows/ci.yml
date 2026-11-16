@@ -1,0 +1,133 @@
+name: CI
+on:
+  push:
+    branches:
+      - '**'
+      - '!integrated/**'
+      - '!stl-preview-head/**'
+      - '!stl-preview-base/**'
+      - '!generated'
+      - '!codegen/**'
+      - 'codegen/stl/**'
+  pull_request:
+    branches-ignore:
+      - 'stl-preview-head/**'
+      - 'stl-preview-base/**'
+
+jobs:
+  lint:
+    timeout-minutes: 10
+    name: lint
+    runs-on: ${{ startsWith(github.repository, 'stainless-sdks/') && 'depot-ubuntu-24.04' || 'ubuntu-latest' }}
+    if: (github.event_name == 'push' || github.event.pull_request.head.repo.fork) && (github.event_name != 'push' || github.event.head_commit.message != 'codegen metadata')
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+
+      - name: Bootstrap
+        run: ./scripts/bootstrap
+
+      - name: Check types
+        run: ./scripts/lint
+
+  build:
+    timeout-minutes: 5
+    name: build
+    runs-on: ${{ startsWith(github.repository, 'stainless-sdks/') && 'depot-ubuntu-24.04' || 'ubuntu-latest' }}
+    if: (github.event_name == 'push' || github.event.pull_request.head.repo.fork) && (github.event_name != 'push' || github.event.head_commit.message != 'codegen metadata')
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+
+      - name: Bootstrap
+        run: ./scripts/bootstrap
+
+      - name: Check build
+        run: ./scripts/build
+
+      - name: Get GitHub OIDC Token
+        if: |-
+          github.repository == 'stainless-sdks/conductor-typescript' &&
+          !startsWith(github.ref, 'refs/heads/stl/')
+        id: github-oidc
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: core.setOutput('github_token', await core.getIDToken());
+
+      - name: Upload tarball
+        if: |-
+          github.repository == 'stainless-sdks/conductor-typescript' &&
+          !startsWith(github.ref, 'refs/heads/stl/')
+        env:
+          URL: https://pkg.stainless.com/s
+          AUTH: ${{ steps.github-oidc.outputs.github_token }}
+          SHA: ${{ github.sha }}
+        run: ./scripts/utils/upload-artifact.sh
+
+      - name: Upload MCP Server tarball
+        if: |-
+          github.repository == 'stainless-sdks/conductor-typescript' &&
+          !startsWith(github.ref, 'refs/heads/stl/')
+        env:
+          URL: https://pkg.stainless.com/s?subpackage=mcp-server
+          AUTH: ${{ steps.github-oidc.outputs.github_token }}
+          SHA: ${{ github.sha }}
+          BASE_PATH: packages/mcp-server
+        run: ./scripts/utils/upload-artifact.sh
+  test:
+    timeout-minutes: 10
+    name: test
+    runs-on: ${{ startsWith(github.repository, 'stainless-sdks/') && 'depot-ubuntu-24.04' || 'ubuntu-latest' }}
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.fork
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+
+      - name: Bootstrap
+        run: ./scripts/bootstrap
+
+      - name: Build
+        run: ./scripts/build
+
+      - name: Run MCP server tests
+        run: cd packages/mcp-server && ./node_modules/.bin/jest
+
+      - name: Set up Deno (current stable)
+        uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: v2.x
+
+      - name: MCP execute smoke test (Deno stable)
+        run: cd packages/mcp-server && node tests/execute-smoke.mjs
+
+      # The hosted image runs Deno 2.9.8 (packages/mcp-server/Dockerfile). The
+      # stable job above meets the next base-image bump early; this one pins the
+      # version production runs, so a stable release that breaks execute cannot
+      # hide a regression there. Bump the pin together with the base image.
+      # Both versions are >= 2.9, so the worker's < 2.9 read/write-grant path
+      # (packages/mcp-server/src/deno-http-worker) is no longer exercised here.
+      - name: Set up Deno 2.9.8 (hosted image)
+        uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: '2.9.8'
+
+      - name: MCP execute smoke test (Deno 2.9.8)
+        run: cd packages/mcp-server && node tests/execute-smoke.mjs
+
+      - name: Run tests
+        run: ./scripts/test

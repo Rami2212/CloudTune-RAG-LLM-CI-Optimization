@@ -1,0 +1,38 @@
+name: Integration Tests for MariaDB
+
+on:
+  pull_request:
+    branches: ["trunk", "0.9.x"]
+
+jobs:
+  mariadb-integration-tests-pr:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        mariadb-version:
+          ['10.0', '10.1', '10.2.15', '10.2', '10.3.7', '10.3', '10.5.1', '10.5', '10.6', '10.11']
+    name: Integration test with MariaDB ${{ matrix.mariadb-version }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Temurin 8
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 8
+          cache: maven
+      - name: Shutdown the Default MySQL
+        run: sudo service mysql stop
+      - name: Integration test with MariaDB ${{ matrix.mysql-version }}
+        run: |
+          set -o pipefail
+          ./mvnw -B verify -Dmaven.javadoc.skip=true \
+          -Dmaven.surefire.skip=true \
+          -Dtest.db.type=mariadb \
+          -Dtest.db.version=${{ matrix.mariadb-version }} \
+          -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=WARN \
+          -Dio.netty.leakDetectionLevel=paranoid \
+          -Dio.netty.leakDetection.targetRecords=32 \
+          | tee test.log
+          set +o pipefail
+      - name: ensure no leaks
+        run: ./.github/scripts/ensure_no_leak.sh test.log

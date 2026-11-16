@@ -1,0 +1,366 @@
+name: Python checks
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [v*]
+  pull_request:
+
+env:
+  FORCE_COLOR: 1
+  # renovate: datasource=pypi depName=uv-dynamic-versioning
+  UV_DYNAMIC_VERSIONING_VERSION: 0.14.1
+  # renovate: datasource=pypi depName=twine
+  TWINE_VERSION: 7.0.0
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  prek-preflight:
+    runs-on: ubuntu-latest
+    name: "Prek preflight"
+    outputs:
+      skip-prek: ${{ steps.check-skip.outputs.skip-prek }}
+
+    permissions:
+      contents: read
+
+    steps:
+    - name: Check for skip label
+      id: check-skip
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        REPOSITORY_URL: "${{ format('{0}/{1}', github.server_url, github.repository) }}"
+      run: |
+        # check each commit message for a '[skip prek]' string
+        set -euo pipefail
+        COMMIT_DATA_PATH=${GITHUB_EVENT_PATH}
+        if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+          COMMIT_DATA_PATH="$(mktemp)"
+          # for pull requests, GITHUB_REF_NAME is set to "<pr_number>/merge"
+          gh pr view --json commits "${REPOSITORY_URL}/pull/${GITHUB_REF_NAME%/merge}" > "${COMMIT_DATA_PATH}"
+        fi
+        echo "::group::Commit data (JSON)"
+        jq '{"commits"}' "${COMMIT_DATA_PATH}"
+        echo "::endgroup::"
+
+        if jq --exit-status '.commits | any(.message // .messageBody | contains("[skip prek]"))' "${COMMIT_DATA_PATH}" > /dev/null; then
+          echo "::warning title=Skipping prek run::Found [skip prek] string in commit message, skipping validation with prek"
+          echo 'skip-prek=true' >> "$GITHUB_OUTPUT"
+        else
+          JQSTATUS="$?"
+          if (( JQSTATUS != 1 )); then
+            echo "::error title=Unexpected jq exit status::jq script exited with status ${JQSTATUS}"
+            exit 1
+          fi
+          echo 'skip-prek=false' >> "$GITHUB_OUTPUT"
+        fi
+
+  prek:
+    runs-on: ubuntu-latest
+    name: "Prek git-hook checks"
+    needs: prek-preflight
+    if: ${{ ! fromJSON(needs.prek-preflight.outputs.skip-prek) }}
+
+    env:
+      UV_FROZEN: true
+
+    permissions:
+      contents: read
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+        # fetch the full git history, but without file contents, so prek can determine
+        # what files have changed.
+        filter: blob:none
+        fetch-depth: 0
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      with:  # zizmor: ignore[cache-poisoning] on tag pushes, cache is automatically disabled by the action
+        cache-dependency-glob: "uv.lock"
+
+    - name: Install dependencies
+      run: uv sync
+
+    - name: Determine reference sha
+      id: ref-sha
+      run: |
+        # Determine the reference sha for changed files
+        set -euo pipefail
+        FROM_REF='HEAD^'
+        if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+                FROM_REF="$GITHUB_REF_NAME"
+            else
+                FROM_REF="$(jq -r '.before' "${GITHUB_EVENT_PATH}")"
+            fi
+        fi
+        echo "Validating changed files for ${FROM_REF}...HEAD"
+        echo "from-ref=${FROM_REF}" >> "${GITHUB_OUTPUT}"
+
+    - name: Run prek
+      uses: j178/prek-action@44924fe9ef4a6f88253c4b6b1bf11c689d3ce53d # v3.1.0
+      with:
+        # Only check for changed files in the commits in this push / PR
+        extra-args: "--from-ref ${{ steps.ref-sha.outputs.from-ref }}"
+
+  linting:
+    runs-on: ubuntu-latest
+    name: "Python linting"
+    permissions:
+      contents: read
+    env:
+      UV_FROZEN: true
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    - name: Set up Python 🐍
+      id: python
+      uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      with:
+        python-version-file: "pyproject.toml"
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      with:  # zizmor: ignore[cache-poisoning] on tag pushes, cache is automatically disabled by the action
+        cache-dependency-glob: "uv.lock"
+        python-version: ${{ steps.python.outputs.python-path }}
+        activate-environment: true
+
+    - name: Check lock is up-to-date
+      run: |
+        uv lock --check
+
+    - name: Install dependencies
+      run: |
+        uv sync
+
+    - name: Check file formatting
+      uses: astral-sh/ruff-action@278981a28ce3188b1e39527901f38254bf3aac89 # v4.1.0
+      with:
+        args: "format --check"
+
+    - name: Lint with ruff
+      env:
+        RUFF_OUTPUT_FORMAT: github
+      run: |
+        ruff check
+
+    - name: Typecheck with pyright
+      uses: jakebailey/pyright-action@8ec14b5cfe41f26e5f41686a31eb6012758217ef # v3.0.2
+      with:
+        version: PATH
+
+    - name: Check documentation
+      run: |
+        set -euo pipefail
+        uv run towncrier build --draft
+        cd docs || exit 1
+        make spelling
+
+    - name: Check packaging
+      run: |
+        uv build
+        uvx twine@"$TWINE_VERSION" check --strict dist/*
+
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["ubuntu-latest", "windows-latest", "macos-latest"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.14t", "3.15-dev", "3.15t-dev"]
+
+    name: Python tests (${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write  # needed for the codecov actions to obtain a OIDC token
+    env:
+      UV_FROZEN: true
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    - name: Set up Python ${{ matrix.python-version }} 🐍
+      id: python
+      uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+      with:  # zizmor: ignore[cache-poisoning] on tag pushes, cache is automatically disabled by the action
+        cache-dependency-glob: "uv.lock"
+        python-version: ${{ steps.python.outputs.python-path }}
+
+    - name: Install dependencies
+      run: uv sync
+
+    - name: Test with pytest
+      run: |
+        # codecov requires that the test results are shared in xunit1 / legacy format.
+        uv run pytest -v --junitxml=junit.xml -o junit_family=legacy
+
+    - name: Upload coverage reports to Codecov
+      uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+      with:
+        use_oidc: true
+
+    - name: Upload test results to Codecov
+      if: ${{ !cancelled() }}
+      uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+      with:
+        report_type: test_results
+        use_oidc: true
+
+  test-summary:
+    name: Test matrix status
+    runs-on: ubuntu-latest
+    needs:
+      - prek-preflight
+      - prek
+      - linting
+      - tests
+    env:
+      RESULTS_WITHOUT_PREK: ${{ format('["{0}", "{1}", "{2}"]', needs.prek-preflight.result, needs.linting.result, needs.tests.result) }}
+    if: always()
+    steps:
+    - name: Decide whether the needed jobs succeeded or failed
+      env:
+        NEEDS_JSON: ${{ toJSON(needs) }}
+      run: |
+        echo '::group::Needs JSON object'
+        echo "${NEEDS_JSON}" | jq .
+        echo '::endgroup::'
+
+        # shellcheck disable=SC2016
+        FILTER='
+          # any failure or cancelled results?
+            (map_values(.|select(.result | test("^(failure|cancelled)$"))) | keys) as $unsuccessful
+          # any skipped results?
+          | (map_values(.|select(.result == "skipped")) | keys) as $skipped
+          # are we skipping prek?
+          | .["prek-preflight"].outputs["skip-prek"] == "false" as $expect_prek
+          | any($unsuccessful[], $skipped[] | select((. != "prek") or $expect_prek))
+        '
+
+        if echo "$NEEDS_JSON" | jq --exit-status "$FILTER" > /dev/null; then
+            echo "One or more required jobs failed, were skipped or cancelled"
+            exit 1
+        else
+          JQSTATUS="$?"
+          if (( JQSTATUS != 1 )); then
+            echo "::error title=Unexpected jq exit status::jq script exited with status ${JQSTATUS}"
+            exit 1
+          fi
+        fi
+        echo Success
+
+  build:
+    name: Build distribution 📦
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      UV_FROZEN: true
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags')
+    needs:
+      - test-summary
+
+    outputs:
+      version: ${{ steps.note.outputs.version }}
+      prerelease: ${{ steps.note.outputs.prerelease }}
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    - name: Set up Python 🐍
+      id: python
+      uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      with:
+        python-version-file: "pyproject.toml"
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      with:
+        enable-cache: false
+        cache-dependency-glob: "uv.lock"
+        python-version: ${{ steps.python.outputs.python-path }}
+
+    - name: Build the Python 🐍 binary wheel and source tarball 📦
+      id: build-dist
+      run: |
+        uv build
+        rm -f dist/.gitignore  # get-releasenotes can't handle non-dist files here
+        echo "version=$(uvx uv-dynamic-versioning@"$UV_DYNAMIC_VERSIONING_VERSION")" >> "$GITHUB_OUTPUT"
+
+    - name: Prepare Release Note
+      id: note
+      uses: aio-libs/get-releasenote@b0fcc7f3e5f5cc7c8b01e2f75516b1732f6bd8b2 # v1.4.5
+      with:
+        changes_file: CHANGELOG.md
+        output_file: release_notes.md
+        version: ${{ steps.build-dist.outputs.version }}
+        start_line: '<!-- Towncrier release notes start -->'
+        head_line: '## {name} {version} \({date}\)'
+        name: '[aA]iolimiter'
+        dist_dir: dist
+
+    - name: Store the Python 🐍 distribution 📦
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: python-package-distributions
+        path: |
+          dist/
+          release_notes.md
+
+  pypi-publish:
+    name: Upload release to PyPI
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags')
+    needs:
+      - build
+    environment:
+      name: pypi
+      url: https://pypi.org/p/aiolimiter
+    permissions:
+      id-token: write  # IMPORTANT: this permission is mandatory for trusted publishing
+      contents: write  # required for creating GH releases
+
+    steps:
+    - name: Download Python 🐍 distribution 📦
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        name: python-package-distributions
+
+    - name: Publish Python 🐍 distribution 📦 to PyPI
+      uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+
+    - name: GitHub release
+      env:
+        RELEASE_TITLE: Aiolimiter ${{ needs.build.outputs.version }}
+        PRERELEASE_SWITCH: ${{ case(fromJSON(needs.build.outputs.prerelease), '--prerelease', '') }}
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GH_REPO: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        args=( --title "$RELEASE_TITLE" --notes-file release_notes.md  )
+        if [[ -n "$PRERELEASE_SWITCH" ]]; then
+            args+=( "$PRERELEASE_SWITCH" )
+        fi
+        echo "::debug::Executing gh release create $(printf '%q ' "${args[@]}")$GITHUB_REF_NAME dist/*"
+        gh release create "${args[@]}" "${GITHUB_REF_NAME}" dist/*

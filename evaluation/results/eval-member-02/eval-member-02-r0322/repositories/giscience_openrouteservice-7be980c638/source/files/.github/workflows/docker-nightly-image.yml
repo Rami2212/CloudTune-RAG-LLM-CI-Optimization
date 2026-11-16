@@ -1,0 +1,223 @@
+name: Docker Nightly Image CI
+run-name: Build ${{ inputs.branch }} - ${{ inputs.user }}
+
+on:
+  schedule:
+    - cron: '15 1 * * *'
+  # checkov:skip=CKV_GHA_7: not relevant for this workflow, which only builds and publishes images. The inputs are only used to determine whether the workflow runs and what tag to build.
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'GitHub branch to create image off.'
+        required: true
+        default: 'main'
+      tag:
+        description: 'Name of the docker tag to create.'
+        required: true
+        default: 'nightly'
+      ignore-24h-commit-check:
+        description: 'Build image regardless of last commit date.'
+        required: true
+        type: boolean
+        default: false
+      user:
+        description: ''
+        required: false
+        default: 'schedule'
+
+permissions: {}
+
+jobs:
+  setup-build-environment:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      new_commits: ${{ steps.check.outputs.NEW_COMMITS }}
+      publish_image_tag: ${{ steps.image-tags.outputs.publish_image_tag }}
+      slim_image_tag: ${{ steps.image-tags.outputs.slim_image_tag }}
+      heigit_publish_image_tag: ${{ steps.image-tags.outputs.heigit_publish_image_tag }}
+      heigit_slim_image_tag: ${{ steps.image-tags.outputs.heigit_slim_image_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.branch || 'main' }}
+
+      - name: Check for new commits since 24 h ago
+        id: check
+        run: |
+          export LOG_LINES=$(git log --oneline --since '24 hours ago')
+          export NUM_LINES=$(echo "$LOG_LINES" | grep -c .)
+          if [ "$NUM_LINES" -eq "0" ]; then
+            export NEW_COMMITS="false"
+          else
+            export NEW_COMMITS="true"
+          fi
+          echo "NEW_COMMITS=$NEW_COMMITS" >> "$GITHUB_OUTPUT"
+      - name: Set Docker image tag
+        id: image-tags
+        run: |
+          BASE_TAG=openrouteservice/openrouteservice:"${{ inputs.tag || 'nightly' }}"
+          HEIGIT_BASE_TAG=heigit/openrouteservice:"${{ inputs.tag || 'nightly' }}"
+          echo "publish_image_tag=${BASE_TAG}" >> $GITHUB_OUTPUT
+          echo "slim_image_tag=${BASE_TAG}-slim" >> $GITHUB_OUTPUT
+          echo "heigit_publish_image_tag=${HEIGIT_BASE_TAG}" >> $GITHUB_OUTPUT
+          echo "heigit_slim_image_tag=${HEIGIT_BASE_TAG}-slim" >> $GITHUB_OUTPUT
+          echo "Docker publish stage image tag: ${BASE_TAG}"
+          echo "Docker slim stage image tag: ${BASE_TAG}-slim"
+          echo "HeiGIT publish stage image tag: ${HEIGIT_BASE_TAG}"
+          echo "HeiGIT slim stage image tag: ${HEIGIT_BASE_TAG}-slim"
+  
+  build_and_push_publish_images:
+    permissions:
+      contents: read
+      security-events: write
+    needs:
+      - setup-build-environment
+    uses: ./.github/workflows/_reusable_build_docker_images.yml
+    if: inputs.ignore-24h-commit-check || needs.setup-build-environment.outputs.new_commits == 'true'
+    with:
+      dockerfile_path: 'Dockerfile'
+      image_stage: 'publish'
+      java_version: 25
+      build_amd64: true
+      build_arm64: true
+      push_by_digest: true
+      docker_login: true
+      docker_tag: openrouteservice/openrouteservice # push by digest needs no tag suffix
+      branch: ${{ inputs.branch }}
+      scan_before_push: true
+      fail_on_severity: '' # nightly is report-only on vulnerability severity, never gates
+      vex_file: openvex.json
+      upload_sarif: true
+    secrets:
+      registry_username: ${{ secrets.DOCKER_USERNAME }}
+      registry_password: ${{ secrets.DOCKER_PASSWORD }}
+
+  build_and_push_slim_images:
+    permissions:
+      contents: read
+      security-events: write
+    needs:
+      - setup-build-environment
+    uses: ./.github/workflows/_reusable_build_docker_images.yml
+    if: inputs.ignore-24h-commit-check || needs.setup-build-environment.outputs.new_commits == 'true'
+    with:
+      dockerfile_path: 'Dockerfile'
+      image_stage: 'slim'
+      java_version: 25
+      build_amd64: true
+      build_arm64: true
+      push_by_digest: true
+      docker_login: true
+      docker_tag: openrouteservice/openrouteservice # push by digest needs no tag suffix
+      branch: ${{ inputs.branch }}
+      scan_before_push: true
+      fail_on_severity: '' # nightly is report-only on vulnerability severity, never gates
+      vex_file: openvex.json
+      upload_sarif: true
+    secrets:
+      registry_username: ${{ secrets.DOCKER_USERNAME }}
+      registry_password: ${{ secrets.DOCKER_PASSWORD }}
+
+  combine_and_push_multi_arch_manifests:
+    permissions:
+      contents: read
+    needs:
+      - setup-build-environment
+      - build_and_push_publish_images
+      - build_and_push_slim_images
+    name: Combine multi-arch manifests and push to DockerHub
+    runs-on: ubuntu-latest
+    if: inputs.ignore-24h-commit-check || needs.setup-build-environment.outputs.new_commits == 'true'
+    strategy:
+      matrix:
+        include:
+          - image_stage: 'publish'
+            image_tag: ${{ needs.setup-build-environment.outputs.publish_image_tag }}
+            heigit_image_tag: ${{ needs.setup-build-environment.outputs.heigit_publish_image_tag }}
+            digest_amd64: ${{ needs.build_and_push_publish_images.outputs.image_digest_amd64 }}
+            digest_arm64: ${{ needs.build_and_push_publish_images.outputs.image_digest_arm64 }}
+          - image_stage: 'slim'
+            image_tag: ${{ needs.setup-build-environment.outputs.slim_image_tag }}
+            heigit_image_tag: ${{ needs.setup-build-environment.outputs.heigit_slim_image_tag }}
+            digest_amd64: ${{ needs.build_and_push_slim_images.outputs.image_digest_amd64 }}
+            digest_arm64: ${{ needs.build_and_push_slim_images.outputs.image_digest_arm64 }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.branch || 'main' }}
+      - name: Set up build environment
+        uses: ./.github/actions/setup-build-environment
+        with:
+          with_java: false
+          with_docker: true
+          with_qemu: false
+          with_docker_cache_injection: false
+          docker_login: true
+          docker_username: ${{ secrets.DOCKER_USERNAME }}
+          docker_password: ${{ secrets.DOCKER_PASSWORD }}
+          docker_login_additional: true
+          docker_additional_registry: registry-1.docker.io
+          docker_additional_username: ${{ secrets.DOCKER_HEIGIT_USERNAME }}
+          docker_additional_password: ${{ secrets.DOCKER_HEIGIT_TOKEN }}
+      - name: Create and push manifest list for ${{ matrix.image_stage }} to heigit
+        env:
+          IMAGE_REPO: ${{ matrix.image_tag }}
+          DIGEST_AMD64: ${{ matrix.digest_amd64 }}
+          DIGEST_ARM64: ${{ matrix.digest_arm64 }}
+          HEIGIT_IMAGE_REPO: ${{ matrix.heigit_image_tag }}
+        run: |
+          if [ -z "$DIGEST_AMD64" ] || [ -z "$DIGEST_ARM64" ]; then
+            echo "Error: Missing digests for multi-arch manifest"
+            echo "AMD64: $DIGEST_AMD64"
+            echo "ARM64: $DIGEST_ARM64"
+            exit 1
+          fi
+          
+          echo "Create and push manifest list for $IMAGE_REPO"
+          docker buildx imagetools create \
+            -t "$IMAGE_REPO" \
+            "${IMAGE_REPO%:*}@${DIGEST_AMD64}" \
+            "${IMAGE_REPO%:*}@${DIGEST_ARM64}"
+
+          echo "Successfully pushed multi-arch image: $IMAGE_REPO"
+          
+          echo "Create and push manifest list for $HEIGIT_IMAGE_REPO"
+          docker buildx imagetools create \
+            -t "registry-1.docker.io/$HEIGIT_IMAGE_REPO" \
+            "$IMAGE_REPO"
+
+          echo "Successfully pushed multi-arch image: $HEIGIT_IMAGE_REPO"
+
+  scan_published_images:
+    name: Trivy scan published ${{ matrix.tag }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image_stage: publish
+            tag: latest
+          - image_stage: slim
+            tag: latest-slim
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Scan the published image
+        uses: ./.github/actions/trivy-scan
+        with:
+          scan_type: image-ref
+          target: docker.io/openrouteservice/openrouteservice:${{ matrix.tag }}
+          scanners: vuln,secret
+          summary_title: Trivy scan — published ${{ matrix.tag }} (report-only)
+          sarif_category: Trivy-Published-Image-${{ matrix.image_stage }}
+          sarif_category_secrets: Trivy-Published-Image-Secrets-${{ matrix.image_stage }}
+          upload_sarif: true

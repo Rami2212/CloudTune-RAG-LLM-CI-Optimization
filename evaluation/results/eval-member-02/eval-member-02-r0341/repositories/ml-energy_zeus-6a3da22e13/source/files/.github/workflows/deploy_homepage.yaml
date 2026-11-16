@@ -1,0 +1,47 @@
+name: Deploy homepage
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'examples/**'
+      - 'docs/**'
+      - 'zeus/**'
+      - 'mkdocs.yml'
+      - 'docker/Dockerfile'
+      - '.github/workflows/deploy_homepage.yaml'
+
+env:
+  SITE_ANALYTICS: google
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: github.repository_owner == 'ml-energy'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.10"
+          version: "latest"
+      - run: echo "cache_id=$(date --utc '+%V')" >> $GITHUB_ENV
+      - uses: actions/cache@v6
+        with:
+          key: mkdocs-material-${{ env.cache_id }}
+          path: .cache
+          restore-keys: |
+            mkdocs-material-
+      - name: Install Zeus and dependencies
+        run: uv sync --group docs
+      - name: Build homepage
+        run: uv run mkdocs gh-deploy --force
+        env:
+          BUILD_SOCIAL_CARD: true
