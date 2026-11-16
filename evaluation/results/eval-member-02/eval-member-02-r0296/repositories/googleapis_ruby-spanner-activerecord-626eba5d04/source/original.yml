@@ -1,0 +1,56 @@
+name: nightly acceptance tests on emulator
+
+permissions:
+  contents: read
+
+on:
+  schedule:
+    # 06:00 UTC
+    - cron:  '0 6 * * *'
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      emulator:
+        image: gcr.io/cloud-spanner-emulator/emulator:1.5.59
+        ports:
+          - 9010:9010
+          - 9020:9020
+
+    strategy:
+      max-parallel: 4
+      matrix:
+        ruby: ["3.2", "3.3", "3.4", "4.0"]
+        ar: ["7.1", "7.2", "8.0", "8.1"]
+        # Exclude combinations that are not supported.
+        exclude:
+          - ruby: "3.4"
+            ar: "7.1"
+          - ruby: "3.4"
+            ar: "7.2"
+          - ruby: "4.0"
+            ar: "7.1"
+          - ruby: "4.0"
+            ar: "7.2"
+    env:
+      BUNDLE_GEMFILE: ${{ github.workspace }}/gemfiles/${{ matrix.ar }}.gemfile
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Set up Ruby
+      uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1.338.0
+      with:
+        # Disable caching as we are overriding the ActiveRecord below.
+        bundler-cache: false
+        ruby-version: ${{ matrix.ruby }}
+    - name: Install dependencies
+      run: bundle install
+    - name: Run acceptance tests on emulator
+      run: bundle exec rake acceptance
+      env:
+        SPANNER_EMULATOR_HOST: localhost:9010
+        SPANNER_TEST_PROJECT: test-project
+        SPANNER_TEST_INSTANCE: test-instance
