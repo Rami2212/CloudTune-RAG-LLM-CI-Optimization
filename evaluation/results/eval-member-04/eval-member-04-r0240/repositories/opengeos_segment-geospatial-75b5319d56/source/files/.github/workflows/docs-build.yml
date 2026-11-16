@@ -1,0 +1,50 @@
+name: docs-build
+on:
+    pull_request:
+        branches:
+            - main
+jobs:
+    deploy:
+        runs-on: ubuntu-latest
+        defaults:
+            run:
+                shell: bash -el {0}
+        steps:
+            - uses: actions/checkout@v7
+              with:
+                  fetch-depth: 0
+            - name: Setup micromamba
+              uses: mamba-org/setup-micromamba@v3
+              with:
+                  environment-name: docs-env
+                  create-args: >-
+                      python=3.12
+                      gdal
+                      pyproj
+                      -c conda-forge
+                  cache-environment: true
+            - name: Test GDAL installation
+              run: |
+                  python -c "from osgeo import gdal"
+                  gdalinfo --version
+            - name: Install dependencies
+              run: |
+                  pip install --no-cache-dir Cython
+                  pip install -r requirements.txt -r requirements_dev.txt -r requirements_docs.txt
+                  pip install .
+            - run: python scripts/convert_notebooks.py
+            - run: zensical build --clean --strict
+            - name: Deploy to Netlify
+              uses: nwtgck/actions-netlify@v4.0
+              with:
+                  publish-dir: "./site"
+                  production-branch: master
+                  github-token: ${{ secrets.GITHUB_TOKEN }}
+                  deploy-message: "Deploy from GitHub Actions"
+                  enable-pull-request-comment: true
+                  enable-commit-comment: false
+                  overwrites-pull-request-comment: true
+              env:
+                  NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+                  NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+              timeout-minutes: 10

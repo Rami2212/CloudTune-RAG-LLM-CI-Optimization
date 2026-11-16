@@ -1,0 +1,66 @@
+name: lint
+
+env:
+  # It's really `--all-features`, but not adding the mutually exclusive features from rkyv
+  ALL_NON_EXCLUSIVE_FEATURES: --features "default unstable-locales rkyv-64 rkyv-validation serde arbitrary"
+
+on:
+  push:
+    branches: [main, 0.5.x]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu, x86_64-pc-windows-msvc
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check -- --color=always
+      - run: cargo fmt --check --manifest-path fuzz/Cargo.toml
+      - run: cargo fmt --check --manifest-path bench/Cargo.toml
+      - run: |
+          cargo clippy ${{ env.ALL_NON_EXCLUSIVE_FEATURES }} --all-targets --color=always \
+            -- -D warnings
+      - run: |
+          cargo clippy --target=x86_64-pc-windows-msvc --all-targets --color=always \
+            -- -D warnings
+      - run: |
+          cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --color=always \
+            -- -D warnings
+      - run: |
+          cargo clippy --manifest-path bench/Cargo.toml --all-targets --color=always \
+            -- -D warnings
+        env:
+          RUSTFLAGS: "-Dwarnings"
+
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  check-doc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-deadlinks
+      - run: cargo deadlinks -- ${{ env.ALL_NON_EXCLUSIVE_FEATURES }}
+      - run: cargo doc ${{ env.ALL_NON_EXCLUSIVE_FEATURES }} --no-deps
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+
+  cffconvert:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: citation-file-format/cffconvert-github-action@2.0.0
+        with:
+          args: --validate

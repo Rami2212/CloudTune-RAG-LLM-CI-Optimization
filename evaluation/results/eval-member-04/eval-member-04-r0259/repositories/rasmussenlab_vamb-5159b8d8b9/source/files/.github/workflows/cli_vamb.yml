@@ -1,0 +1,63 @@
+name: Command line interface tests
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+  workflow_dispatch:
+    inputs:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11"]
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+        cache: 'pip' # caching pip dependencies
+        cache-dependency-path: '**/pyproject.toml'
+    - name: Download fixtures
+      run: |
+        wget https://www.dropbox.com/scl/fi/10tdf0w0kf70pf46hy8ks/ci_data.zip\?rlkey\=smlcinkesuwiw557zulgbb59l\&st\=hhokiqma\&dl\=0 -O ci_data.zip
+        unzip -o ci_data.zip
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install flake8 pytest
+        pip install -e .
+    - name: Run VAMB
+      run: |
+        vamb bin default --outdir outdir_vamb --fasta catalogue_mock.fna.gz --abundance abundance_mock.npz -l 32 -e 10 -q 2 -o C --minfasta 200000 --compress -t 10
+        ls -la outdir_vamb
+        cat outdir_vamb/log.txt
+    - name: Run TaxVAMB
+      run: |
+        vamb bin taxvamb --outdir outdir_taxvamb --fasta catalogue_mock.fna.gz --abundance abundance_mock.npz --taxonomy taxonomy_mock.tsv -pe 10 -pt 10 -e 10 -q 2 3 -t 10 -o C --minfasta 200000
+        ls -la outdir_taxvamb
+        cat outdir_taxvamb/log.txt
+        vamb bin taxvamb --outdir outdir_taxvamb_no_predict --no_predictor --fasta catalogue_mock.fna.gz --abundance abundance_mock.npz --taxonomy taxonomy_mock.tsv -e 10 -q 2 3 -t 10 -o C --minfasta 200000
+        ls -la outdir_taxvamb_no_predict
+        cat outdir_taxvamb_no_predict/log.txt
+        vamb bin taxvamb --outdir outdir_taxvamb_preds --fasta catalogue_mock.fna.gz --abundance abundance_mock.npz  --no_predictor --taxonomy outdir_taxvamb/results_taxometer.tsv -e 10 -q 2 -t 10 -o C --minfasta 200000
+        ls -la outdir_taxvamb_preds
+        cat outdir_taxvamb_preds/log.txt
+    - name: Run Taxometer
+      run: |
+        vamb taxometer --outdir outdir_taxometer --fasta catalogue_mock.fna.gz --abundance abundance_mock.npz --taxonomy taxonomy_mock.tsv -pe 10 -pt 10
+        ls -la outdir_taxometer
+        cat outdir_taxometer/log.txt
+    - name: Run k-means reclustering
+      run: |
+        vamb recluster --outdir outdir_recluster --fasta catalogue_mock.fna.gz --abundance abundance_mock.npz --latent_path outdir_taxvamb/vaevae_latent.npz --clusters_path outdir_taxvamb/vaevae_clusters_split.tsv --markers markers_mock.npz --algorithm kmeans --minfasta 200000
+        ls -la outdir_recluster
+        cat outdir_recluster/log.txt

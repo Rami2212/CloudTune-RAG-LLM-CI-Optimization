@@ -1,0 +1,69 @@
+name: deploy
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  actions: read
+  contents: write
+
+# Two pushes in quick succession would otherwise race to force-push `gh-pages`,
+# and with `single-commit` the loser silently overwrites the newer site.
+concurrency:
+  group: deploy-pages
+  cancel-in-progress: true
+
+jobs:
+  main:
+    runs-on: ubuntu-latest
+    # Runs only on `main`, so it always uses the read-write cache token.
+    env:
+      NX_CLOUD_ACCESS_TOKEN: ${{ secrets.NX_CLOUD_ACCESS_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # pnpm version comes from the "packageManager" field in package.json
+      - uses: pnpm/action-setup@v4
+      # Cache node_modules
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: 'pnpm'
+      - run: pnpm install --frozen-lockfile
+
+      # Cache the Playwright browser binary (only `core`'s browser test needs it).
+      - uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('pnpm-lock.yaml') }}
+      - run: pnpm exec playwright install chromium --with-deps
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+      # On a cache hit the binary is restored but the apt system deps aren't, so
+      # install just those (fast) to avoid missing-library flakiness.
+      - run: pnpm exec playwright install-deps chromium
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+
+      - uses: nrwl/nx-set-shas@v4
+
+      - run: pnpm exec nx generate @ng-icons/workspace-plugin:svg-to-ts
+      - run: pnpm exec nx generate @ng-icons/workspace-plugin:update-readmes
+      - run: pnpm exec nx-cloud record -- nx format:check
+      - run: pnpm exec nx affected -t lint test build
+      - run: pnpm exec nx build documentation
+
+      - name: Deploy 🚀
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          # Analog's prerendered output: an index.html per route plus the
+          # generated icon browser data. It contains a `.nojekyll` (from
+          # `src/public`) because Vite names some chunks `_router-chunk-*.js`
+          # and Jekyll refuses to publish anything starting with an underscore.
+          folder: dist/apps/documentation/analog/public
+          # The icon data is ~100 MB per build, so keep gh-pages to a single
+          # commit rather than accumulating a copy in history every deploy.
+          single-commit: true
