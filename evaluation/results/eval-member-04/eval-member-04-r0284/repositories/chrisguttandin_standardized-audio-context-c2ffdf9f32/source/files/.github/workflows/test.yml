@@ -1,0 +1,68 @@
+name: Test
+
+on:
+    push:
+        branches:
+            - master
+    pull_request:
+        branches:
+            - master
+
+jobs:
+    build:
+        runs-on: ubuntu-latest
+
+        strategy:
+            matrix:
+                include:
+                    - node-version: 22.x
+                      target: chrome
+                      type: integration
+                    - node-version: 22.x
+                      target: chromium
+                      type: memory
+                    - node-version: 22.x
+                      target: node
+                      type: integration
+                node-version: [22.x]
+                target: [firefox]
+                type: [unit]
+            max-parallel: 3
+
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v7
+
+            - name: Install Node.js ${{ matrix.node-version }}
+              uses: actions/setup-node@v7
+              with:
+                  node-version: ${{ matrix.node-version }}
+
+            - name: Update npm
+              run: |
+                  npm install --global npm@12
+                  npm --version
+
+            - name: Cache node modules
+              uses: actions/cache@v6
+              with:
+                  path: ~/.npm
+                  key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+                  restore-keys: |
+                      ${{ runner.os }}-node-
+
+            - name: Install dependencies
+              run: npm ci
+
+            - name: Install Chrome
+              run: npx puppeteer browsers install chrome
+
+            - env:
+                  TARGET: ${{ matrix.target }}
+                  TYPE: ${{ matrix.type }}
+              name: Run ${{ matrix.type }} tests
+              run: |
+                  export CHROME_DEVEL_SANDBOX=/opt/google/chrome/chrome-sandbox
+                  sudo chown root /opt/google/chrome/chrome-sandbox
+                  sudo chmod 4755 /opt/google/chrome/chrome-sandbox
+                  npm test
