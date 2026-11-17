@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+jobs:
+  phpunit:
+    name: "PHPUnit"
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        php-version:
+          - "7.4"
+          - "8.0"
+          - "8.1"
+          - "8.2"
+          - "8.3"
+          - "8.4"
+          - "8.5"
+        dependencies:
+          - "lowest"
+          - "highest"
+#        include:
+#          - php-version: '8.6'
+#            dependencies: 'highest'
+#            composer-stability: 'dev'
+
+    env:
+      JMS_TESTS_SHOW_DEPRECATIONS: 1
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php-version }}
+
+      - name: Composer config
+        if: ${{ matrix.composer-stability }}
+        run: composer config minimum-stability ${{ matrix.composer-stability }}
+
+      - name: Remove symfony/clock for PHP < 8.1
+        if: ${{ matrix.php-version < '8.1' }}
+        run: |
+          composer remove --dev symfony/clock --no-update
+          composer remove --dev twig/twig --no-update
+
+      - name: Fix lowest deps
+        if: ${{ matrix.php-version > '8.3' && matrix.dependencies == 'lowest' }}
+        run: |
+          composer require --dev symfony/form:^8.0.0 --no-update
+
+      - name: Install dependencies with Composer
+        uses: ramsey/composer-install@v4
+        with:
+          dependency-versions: "${{ matrix.dependencies }}"
+          composer-options: "${{ matrix.composer-options }}"
+
+      - name: Run tests
+        run: |
+          export $ENV
+          echo $ENV
+          vendor/bin/phpunit

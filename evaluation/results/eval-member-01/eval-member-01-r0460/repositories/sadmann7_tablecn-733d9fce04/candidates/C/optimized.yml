@@ -1,0 +1,106 @@
+name: Code check
+
+on:
+  pull_request:
+    branches: ["*"]
+  push:
+    branches: ["main"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  FORCE_COLOR: 3
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    name: Format
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v7
+      - uses: ./.github/setup
+
+      - name: Check formatting
+        run: pnpm format:check
+
+  lint:
+    runs-on: ubuntu-latest
+    name: Lint
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v7
+      - uses: ./.github/setup
+
+      - run: pnpm lint
+      - run: pnpm check:bases
+
+  typecheck:
+    runs-on: ubuntu-latest
+    name: Typecheck
+    timeout-minutes: 20
+    env:
+      SKIP_ENV_VALIDATION: true
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v7
+      - uses: ./.github/setup
+
+      - run: pnpm typecheck
+
+  test:
+    runs-on: ubuntu-latest
+    name: Test
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v7
+      - uses: ./.github/setup
+
+      - run: pnpm test
+
+  e2e:
+    runs-on: ubuntu-latest
+    name: E2E
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17.4
+        env:
+          POSTGRES_USER: tablecn
+          POSTGRES_PASSWORD: securepassword
+          POSTGRES_DB: tablecn
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tablecn -d tablecn"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://tablecn:securepassword@localhost:5432/tablecn
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v7
+      - uses: ./.github/setup
+
+      - name: Enable extensions
+        run: pnpm exec tsx src/db/extensions.ts
+
+      - name: Create the database
+        run: pnpm exec drizzle-kit push --force
+
+      - name: Seed
+        run: pnpm exec tsx src/db/seed.ts
+
+      - name: Install Playwright
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Build
+        run: pnpm exec next build
+
+      - name: Test
+        run: pnpm test:e2e

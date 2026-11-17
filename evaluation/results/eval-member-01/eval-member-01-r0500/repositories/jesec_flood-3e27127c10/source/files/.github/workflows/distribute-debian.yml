@@ -1,0 +1,33 @@
+name: Distribute for Debian
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ['Release']
+    types:
+      - completed
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-debian.yml
+    secrets: inherit
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Parse version
+        id: parse_version
+        run: echo VERSION=`jq .version package.json -r` >> $GITHUB_OUTPUT
+
+      - name: Download Debian artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: flood-debian
+
+      - name: Publish release assets
+        run: gh release upload v${{ steps.parse_version.outputs.VERSION }} flood-linux-arm64.deb flood-linux-x64.deb
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,26 @@
+name: Checks
+# The NixOS host has no hardware exercising it, so check every system to catch
+# regressions that local Darwin rebuilds would never surface. Darwin hosts are
+# covered by eval-only checks; `.#lint` runs `nix flake check --all-systems`,
+# which evaluates them without building.
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '0 6 * * 1'
+permissions: {}
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The job never pushes, so do not leave the token in .git/config.
+          persist-credentials: false
+      - uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6 # v1.0.0
+      # Flake checks plus zizmor's online audits; the token only reads public
+      # action repositories.
+      - name: Lint
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: nix run --no-write-lock-file .#lint

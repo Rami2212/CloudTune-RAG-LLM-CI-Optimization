@@ -1,0 +1,74 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Compile the library without CLI feature unification. This catches
+  # dependencies accidentally supplied only by the CLI or test harness.
+  library:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-gnu, wasm32-unknown-unknown]
+    steps:
+    - uses: actions/checkout@v7
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+    - uses: Swatinem/rust-cache@v2
+    - name: Check library feature isolation
+      env:
+        TARGET: ${{ matrix.target }}
+      run: |
+        if [ "$TARGET" = wasm32-unknown-unknown ]; then
+          cargo check --locked --lib --no-default-features --features wasm --target "$TARGET"
+        else
+          cargo check --locked --lib --no-default-features --target "$TARGET"
+        fi
+
+  # Formatting and lint gates — mirror `make format-check` / `make lint`,
+  # i.e. the two halves of `make format`. Fails the build when a workspace
+  # crate is unformatted or clippy reports any warning.
+  format:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt
+    - name: Check formatting
+      run: make format-check
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+    - uses: Swatinem/rust-cache@v2
+    - name: Run clippy
+      run: make lint
+
+  # Fast correctness suite — mirrors `make test`. The heavy script
+  # snapshots (see `slow_script_test!`) and the wikidata live-API tests are
+  # gated behind the `slow-tests` cargo feature and run in the nightly
+  # workflow (nightly.yml) instead.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: nextest
+    - name: Run tests
+      run: make test

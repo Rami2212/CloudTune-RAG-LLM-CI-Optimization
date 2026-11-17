@@ -1,0 +1,112 @@
+/*
+ * Copyright 2016 Google, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+import java.util.zip.ZipFile
+
+plugins {
+  id "com.gradleup.shadow"
+}
+
+dependencies {
+  api project(':spectator-api')
+  implementation 'org.springframework.boot:spring-boot-autoconfigure'
+  implementation 'org.springframework:spring-beans'
+  implementation 'org.springframework:spring-web'
+  implementation 'com.fasterxml.jackson.core:jackson-databind'
+}
+
+jar {
+  // We only want to generate the shadow jar that hides the use of
+  // Jackson to prevent issues with other uses
+  enabled = false
+  manifest {
+    attributes(
+      "Automatic-Module-Name": "com.netflix.spectator.spring"
+    )
+  }
+}
+
+jar.dependsOn("checkShadowJar")
+
+static boolean shouldBeShaded(String name) {
+  name.startsWith("jackson-")
+}
+
+shadowJar {
+  archiveClassifier.set('')
+  configurations = [project.configurations.runtimeClasspath]
+  dependencies {
+    exclude { dependency ->
+      !shouldBeShaded(dependency.moduleName)
+    }
+  }
+  minimize()
+  exclude('module-info.class')
+  exclude('META-INF/versions/**')
+  exclude('META-INF/maven/com.fasterxml.jackson.*/**')
+  exclude('META-INF/services/com.fasterxml.*')
+  relocate('com.fasterxml.jackson', 'com.netflix.spectator.controllers.shaded.spectator-spring.json')
+}
+
+// Remove the Jackson dependencies from the POM file
+afterEvaluate {
+  publishing {
+    publications {
+      withType(MavenPublication) {
+        pom.withXml {
+          asNode()
+              .dependencies
+              .dependency
+              .findAll {
+                shouldBeShaded(it.artifactId.text())
+              }
+              .each { it.parent().remove(it) }
+        }
+      }
+    }
+  }
+}
+
+
+// Sanity check the shadow jar to ensure something hasn't crept in that is
+// not properly relocated.
+task checkShadowJar {
+  doLast {
+    configurations.archives.allArtifacts.forEach {
+      if (it.name == "spectator-web-spring" && it.extension == "jar") {
+        Set<String> metadataFiles = [
+            "META-INF/MANIFEST.MF",
+            "META-INF/spectator-web-spring.properties"
+        ]
+        ZipFile zf = new ZipFile(it.file)
+        try {
+          zf.stream()
+              .filter { !it.directory }
+              .filter { !it.name.startsWith("com/netflix/spectator/controllers/") }
+              .filter { !it.name.matches("^META-INF/[^/]*LICENSE\$") }
+              .filter { !it.name.matches("^META-INF/[^/]*NOTICE\$") }
+              .filter { !metadataFiles.contains(it.name) }
+              .forEach {
+                throw new IllegalStateException(
+                    "Unexpected file included in jar (${it.name}). Check shadow configuration.")
+              }
+        } finally {
+          zf.close()
+        }
+      }
+    }
+  }
+}
+checkShadowJar.dependsOn(shadowJar)

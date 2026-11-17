@@ -1,0 +1,126 @@
+module github.com/couchbase/sync_gateway
+
+go 1.27.4
+
+require (
+	dario.cat/mergo v1.0.2
+	github.com/KimMachineGun/automemlimit v1.0.1
+	github.com/caarlos0/env/v11 v11.4.1
+	github.com/coder/websocket v1.8.14
+	github.com/coreos/go-oidc/v3 v3.21.0
+	github.com/couchbase/cbgt v1.4.15-0.20260925074949-0c7e969a5c41
+	github.com/couchbase/clog v0.1.0
+	github.com/couchbase/go-blip v0.0.0-20260106113615-002c1b20b67a
+	github.com/couchbase/gocb/v2 v2.13.0
+	github.com/couchbase/gocbcore/v10 v10.10.0
+	github.com/couchbase/gomemcached v0.3.3
+	github.com/couchbase/sg-bucket v0.0.0-20260714130240-329df715dd61
+	github.com/couchbasedeps/fast-skiplist v0.0.0-20250722125747-e0dd031fe2ac
+	github.com/couchbaselabs/go-fleecedelta v0.0.0-20220909152808-6d09efa7a338
+	github.com/couchbaselabs/rosmar v0.0.0-20261009154319-27bd760ee233
+	github.com/elastic/gosigar v0.14.4
+	github.com/felixge/fgprof v0.9.5
+	github.com/go-jose/go-jose/v4 v4.1.9
+	github.com/google/uuid v1.6.0
+	github.com/gorilla/mux v1.8.1
+	github.com/grafana/grafana-foundation-sdk/go v0.0.22
+	github.com/json-iterator/go v1.1.12
+	github.com/kardianos/service v1.3.0
+	github.com/pkg/errors v0.9.1
+	github.com/prometheus/client_golang v1.25.0
+	github.com/prometheus/client_model v0.6.3
+	github.com/prometheus/common v0.72.0
+	github.com/quasilyte/go-ruleguard/dsl v0.3.23
+	github.com/robertkrimen/otto v0.0.0-20211024170158-b87d35c0b86f
+	github.com/samuel/go-metrics v0.0.0-20260131233133-1193a855cc76
+	github.com/shirou/gopsutil/v4 v4.26.10
+	github.com/stretchr/testify v1.12.1
+	go.uber.org/zap v1.28.0
+	golang.org/x/crypto v0.58.0
+	golang.org/x/exp v0.0.0-20260908205506-85c1c2202aba
+	golang.org/x/net v0.62.0
+	golang.org/x/oauth2 v0.38.0
+	golang.org/x/sync v0.25.0
+	gopkg.in/natefinch/lumberjack.v2 v2.2.1
+)
+
+require (
+	github.com/beorn7/perks v1.0.1 // indirect
+	github.com/bitfield/gotestdox v0.2.2 // indirect
+	github.com/bmatcuk/doublestar/v4 v4.0.2 // indirect
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/couchbase/blance v0.1.6 // indirect
+	github.com/couchbase/cbauth v0.1.23-0.20260807235904-eda1f2edba77 // indirect
+	github.com/couchbase/go-couchbase v0.1.1 // indirect
+	github.com/couchbase/gocbcoreps v0.1.5-0.20261005161736-7de374b343fa // indirect
+	github.com/couchbase/goprotostellar v1.0.6-0.20261005130525-13bdd85cd6ce // indirect
+	github.com/couchbase/goutils v0.3.0 // indirect
+	github.com/couchbase/tools-common/cloud/v8 v8.1.4 // indirect
+	github.com/couchbase/tools-common/fs v1.0.3 // indirect
+	github.com/couchbase/tools-common/testing v1.0.3 // indirect
+	github.com/couchbase/tools-common/types/v2 v2.2.2 // indirect
+	github.com/couchbaselabs/gocbconnstr/v2 v2.0.0 // indirect
+	github.com/dnephin/pflag v1.0.7 // indirect
+	github.com/ebitengine/purego v0.11.2 // indirect
+	github.com/fatih/color v1.18.0 // indirect
+	github.com/fsnotify/fsnotify v1.9.0 // indirect
+	github.com/go-logr/logr v1.4.4 // indirect
+	github.com/go-logr/stdr v1.2.2 // indirect
+	github.com/go-ole/go-ole v1.3.0 // indirect
+	github.com/golang/snappy v1.0.0 // indirect
+	github.com/google/addlicense v1.2.0 // indirect
+	github.com/google/flatbuffers v24.3.25+incompatible // indirect
+	github.com/google/pprof v0.0.0-20260709232956-b9395ee17fa0 // indirect
+	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510 // indirect
+	github.com/gorilla/websocket v1.5.3 // indirect
+	github.com/klauspost/compress v1.20.1 // indirect
+	github.com/lufia/plan9stats v0.0.0-20260627054121-477a66015f15 // indirect
+	github.com/mattn/go-colorable v0.1.13 // indirect
+	github.com/mattn/go-isatty v0.0.20 // indirect
+	github.com/mattn/go-sqlite3 v1.14.52 // indirect
+	github.com/mattn/goveralls v0.0.12 // indirect
+	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
+	github.com/modern-go/reflect2 v1.0.2 // indirect
+	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
+	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58 // indirect
+	github.com/petermattis/goid v0.0.0-20250813065127-a731cc31b4fe // indirect
+	github.com/power-devops/perfstat v0.0.0-20260805114148-88456608a4f6 // indirect
+	github.com/prometheus/procfs v0.22.0 // indirect
+	github.com/rcrowley/go-metrics v0.0.0-20250401214520-65e299d6c5c9 // indirect
+	github.com/sasha-s/go-deadlock v0.3.9 // indirect
+	github.com/sergi/go-diff v1.4.0 // indirect
+	github.com/stretchr/objx v0.5.3 // indirect
+	github.com/tklauser/go-sysconf v0.4.0 // indirect
+	github.com/tklauser/numcpus v0.12.0 // indirect
+	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78 // indirect
+	github.com/yusufpapurcu/wmi v1.2.4 // indirect
+	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
+	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.71.0 // indirect
+	go.opentelemetry.io/otel v1.47.0 // indirect
+	go.opentelemetry.io/otel/log v1.47.0 // indirect
+	go.opentelemetry.io/otel/metric v1.47.0 // indirect
+	go.opentelemetry.io/otel/trace v1.47.0 // indirect
+	go.uber.org/multierr v1.11.0 // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
+	golang.org/x/mod v0.41.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/telemetry v0.0.0-20260924152758-ed294f943157 // indirect
+	golang.org/x/term v0.47.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
+	golang.org/x/time v0.16.0 // indirect
+	golang.org/x/tools v0.51.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260928230214-8a89bd6388cc // indirect
+	google.golang.org/grpc v1.84.0 // indirect
+	google.golang.org/protobuf v1.36.12 // indirect
+	gopkg.in/sourcemap.v1 v1.0.5 // indirect
+	gotest.tools/gotestsum v1.13.0 // indirect
+)
+
+replace github.com/coder/websocket => github.com/couchbasedeps/websocket v1.8.15-0.20260116134543-30951104b23a
+
+tool (
+	github.com/google/addlicense
+	github.com/mattn/goveralls
+	golang.org/x/tools/cmd/goimports
+	gotest.tools/gotestsum
+)

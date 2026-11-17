@@ -1,0 +1,28 @@
+name: Build & publish haiku.rag to pypi
+on:
+  workflow_run:
+    workflows: ["Build & publish haiku.rag-slim to pypi"]
+    types:
+      - completed
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version-file: "pyproject.toml"
+      - name: Build haiku.rag
+        run: uv build
+      - name: Publish haiku.rag
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: uvx twine upload dist/* --non-interactive

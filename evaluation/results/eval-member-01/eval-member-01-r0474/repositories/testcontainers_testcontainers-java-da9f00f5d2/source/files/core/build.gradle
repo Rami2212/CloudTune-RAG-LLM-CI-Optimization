@@ -1,0 +1,150 @@
+apply plugin: 'com.gradleup.shadow'
+
+description = "Testcontainers Core"
+
+sourceSets {
+    jarFileTest
+}
+
+test.maxParallelForks = 4
+
+idea.module.testSourceDirs += sourceSets.jarFileTest.allSource.srcDirs
+
+jar {
+    manifest {
+        attributes('Implementation-Version': project.getProperty("version"))
+    }
+}
+
+shadowJar {
+    [
+        'META-INF/NOTICE',
+        'META-INF/NOTICE.txt',
+        'META-INF/LICENSE',
+        'META-INF/LICENSE.txt',
+        'META-INF/maven/',
+        'META-INF/proguard/',
+        'META-INF/versions/*/module-info.class',
+        'META-INF/services/java.security.Provider',
+    ].each { exclude(it) }
+}
+
+task jarFileTest(type: Test) {
+    useJUnitPlatform()
+    testClassesDirs = sourceSets.jarFileTest.output.classesDirs
+    classpath = sourceSets.jarFileTest.runtimeClasspath
+
+    inputs.files(shadowJar).withPathSensitivity(PathSensitivity.RELATIVE)
+    systemProperty("jarFile", project.projectDir.toPath().relativize(shadowJar.outputs.files.singleFile.toPath()).toString())
+
+    dependsOn(shadowJar)
+}
+project.tasks.check.dependsOn(jarFileTest)
+
+tasks.japicmp {
+    packageExcludes = [
+        "com.github.dockerjava.*",
+        "org.testcontainers.shaded.*",
+    ]
+
+    classExcludes = []
+
+    methodExcludes = []
+
+    fieldExcludes = []
+}
+
+configurations.all {
+    resolutionStrategy {
+        force 'com.fasterxml.jackson.core:jackson-core:2.18.12'
+        force 'com.fasterxml.jackson.core:jackson-databind:2.18.12'
+        force 'com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.18.12'
+        // docker-java-core still pulls in Bouncy Castle 1.82. Remove these forces once a docker-java release ships 1.86 or newer (docker-java/docker-java#2696).
+        force 'org.bouncycastle:bcprov-jdk18on:1.86'
+        force 'org.bouncycastle:bcutil-jdk18on:1.86'
+        force 'org.bouncycastle:bcpkix-jdk18on:1.86'
+    }
+}
+
+dependencies {
+    api 'org.slf4j:slf4j-api:1.7.36'
+    compileOnly 'org.jetbrains:annotations:26.1.0'
+    testCompileOnly 'org.jetbrains:annotations:26.1.0'
+    api 'org.apache.commons:commons-compress:1.28.0'
+    api ('org.rnorth.duct-tape:duct-tape:1.0.8') {
+        exclude(group: 'org.jetbrains', module: 'annotations')
+    }
+
+    provided('com.google.cloud.tools:jib-core:0.28.2') {
+        exclude group: 'com.google.guava', module: 'guava'
+        exclude group: 'com.fasterxml.jackson.datatype', module: 'jackson-datatype-jsr310'
+        exclude group: 'com.fasterxml.jackson.core', module: 'jackson-core'
+        exclude group: 'com.fasterxml.jackson.core', module: 'jackson-databind'
+        exclude group: 'org.apache.commons', module: 'commons-compress'
+    }
+
+    shaded 'org.awaitility:awaitility:4.3.0'
+
+    api platform('com.github.docker-java:docker-java-bom:3.7.1')
+    shaded platform('com.github.docker-java:docker-java-bom:3.7.1')
+
+    api "com.github.docker-java:docker-java-api"
+
+    shaded('com.github.docker-java:docker-java-core') {
+        exclude group: 'com.google.guava', module: 'guava'
+    }
+
+    api 'com.github.docker-java:docker-java-transport-zerodep'
+
+    shaded 'com.google.guava:guava:33.3.1-jre'
+    shaded "org.yaml:snakeyaml:2.6"
+
+    shaded 'org.glassfish.main.external:trilead-ssh2-repackaged:4.1.2'
+
+    shaded 'org.zeroturnaround:zt-exec:1.13.0'
+
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.14.3'
+
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.13.4'
+    testImplementation('com.google.cloud.tools:jib-core:0.28.2')  {
+        exclude group: 'com.google.guava', module: 'guava'
+    }
+    testImplementation 'org.apache.httpcomponents:httpclient:4.5.14'
+    testImplementation 'redis.clients:jedis:7.4.1'
+    testImplementation 'com.rabbitmq:amqp-client:5.35.0'
+    testImplementation 'org.mongodb:mongo-java-driver:3.12.14'
+
+    testImplementation ('org.mockito:mockito-core:4.11.0') {
+        exclude(module: 'hamcrest-core')
+    }
+    // Synthetic JAR used for MountableFileTest and DirectoryTarResourceTest
+    testImplementation files('testlib/repo/fakejar/fakejar/0/fakejar-0.jar')
+
+    testImplementation 'org.assertj:assertj-core:3.27.7'
+    testImplementation 'io.rest-assured:rest-assured:5.5.7'
+
+    jarFileTestCompileOnly "org.projectlombok:lombok:${lombok.version}"
+    jarFileTestAnnotationProcessor "org.projectlombok:lombok:${lombok.version}"
+    jarFileTestRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.14.3'
+    jarFileTestImplementation 'org.junit.jupiter:junit-jupiter:5.13.4'
+    jarFileTestImplementation 'org.assertj:assertj-core:3.27.7'
+    jarFileTestImplementation 'org.ow2.asm:asm-debug-all:5.2'
+}
+
+tasks.generatePomFileForMavenJavaPublication.finalizedBy(
+    tasks.register('checkPOMdependencies', org.testcontainers.build.ComparePOMWithLatestReleasedTask) {
+        ignore = [
+        ]
+    }
+)
+
+compileTestJava {
+    javaCompiler = javaToolchains.compilerFor {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+    options.release.set(17)
+}
+
+test {
+    useJUnitPlatform()
+}

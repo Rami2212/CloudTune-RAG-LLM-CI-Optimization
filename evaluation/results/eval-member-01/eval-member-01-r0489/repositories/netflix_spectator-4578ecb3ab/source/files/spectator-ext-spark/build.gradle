@@ -1,0 +1,59 @@
+plugins {
+  id "com.gradleup.shadow"
+}
+
+dependencies {
+  api project(':spectator-api')
+  implementation project(':spectator-ext-gc')
+  implementation project(':spectator-ext-jvm')
+  implementation project(':spectator-reg-sidecar')
+  implementation "com.typesafe:config"
+  compileOnly 'io.dropwizard.metrics:metrics-core:4.2.39'
+  compileOnly 'org.apache.spark:spark-core_2.12:3.5.9'
+  testImplementation 'io.dropwizard.metrics:metrics-core:3.1.5'
+  testImplementation 'org.apache.spark:spark-core_2.12:3.5.9'
+}
+
+jar {
+  manifest {
+    attributes(
+      "Automatic-Module-Name": "com.netflix.spectator.spark"
+    )
+  }
+}
+
+shadowJar {
+  archiveClassifier = 'shadow'
+
+  // Combine all the reference.conf and application.conf so all default props will be
+  // available
+  append 'reference.conf'
+  append 'application.conf'
+
+  // Avoid:
+  // shadow.org.apache.tools.zip.Zip64RequiredException: archive contains more than 65535 entries.
+  zip64 = true
+
+  // The dependencies not listed here should come from the spark distribution
+  dependencies {
+    include project(':spectator-api')
+    include project(':spectator-ext-gc')
+    include project(':spectator-ext-ipc')
+    include project(':spectator-ext-jvm')
+    include project(':spectator-reg-sidecar')
+    include dependency('com.typesafe:config')
+  }
+  minimize()
+
+  exclude 'module-info.class'
+
+  // Relocate all deps other than spectator-api. The api jar is needed by other spark distribution jars
+  // so we cannot change the package here.
+  relocate 'com.netflix.spectator.gc', 'spectator-ext-spark.gc'
+  relocate 'com.netflix.spectator.impl', 'spectator-ext-spark.impl'
+  relocate 'com.netflix.spectator.ipc', 'spectator-ext-spark.ipc'
+  relocate 'com.netflix.spectator.jvm', 'spectator-ext-spark.jvm'
+  relocate 'com.netflix.spectator.sidecar', 'spectator-ext-spark.sidecar'
+  relocate 'com.typesafe', 'spectator-ext-spark.com.typesafe'
+}
+

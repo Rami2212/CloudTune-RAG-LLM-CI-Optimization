@@ -1,0 +1,210 @@
+name: CI
+
+on:
+  pull_request:
+    paths-ignore:
+      - '.github/ISSUE_TEMPLATE/*.yaml'
+      - '.github/CODEOWNERS'
+      - '.github/pull_request_template.md'
+      - 'docs/**/*.css'
+      - 'docs/**/*.html'
+      - 'docs/**/*.ico'
+      - 'docs/**/*.md'
+      - 'docs/**/*.png'
+      - 'docs/**/*.svg'
+      - 'mkdocs.yml'
+      - 'README.md'
+      - 'RELEASING.md'
+      - '.sdkmanrc'
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '.github/ISSUE_TEMPLATE/*.yaml'
+      - '.github/CODEOWNERS'
+      - '.github/pull_request_template.md'
+      - 'docs/**/*.css'
+      - 'docs/**/*.html'
+      - 'docs/**/*.ico'
+      - 'docs/**/*.md'
+      - 'docs/**/*.png'
+      - 'docs/**/*.svg'
+      - 'mkdocs.yml'
+      - 'README.md'
+      - 'RELEASING.md'
+      - '.sdkmanrc'
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.head_ref || github.sha }}"
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+
+jobs:
+  core:
+    runs-on: ubuntu-22.04
+    permissions:
+      checks: write
+    strategy:
+      matrix:
+        java: [ '17', '21' ]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-build
+        with:
+          java-version: ${{ matrix.java }}
+      - name: Build and test with Gradle
+        run: |
+          ./gradlew :testcontainers:check --no-daemon --continue --scan
+      - uses: ./.github/actions/setup-junit-report
+
+  turbo-mode:
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-22.04
+    permissions:
+      checks: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-build
+      - name: Setup Testcontainers Cloud Client
+        uses: atomicjar/testcontainers-cloud-setup-action@main
+        with:
+          token: ${{ secrets.TC_CLOUD_TOKEN }}
+          args: --max-concurrency=4
+      - name: Test using Testcontainers Cloud with Turbo Mode enabled
+        working-directory: ./smoke-test/
+        run: |
+          ./gradlew check --no-daemon --continue --scan --info
+      - uses: ./.github/actions/setup-junit-report
+
+  find_gradle_jobs:
+    needs: [core]
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-build
+      - id: set-matrix
+        env:
+          # Since we override the tests executor,
+          # we should not push empty results to the cache
+          READ_ONLY_REMOTE_GRADLE_CACHE: true
+        run: |
+          set -euo pipefail
+          MATRIX_FILE="$RUNNER_TEMP/test-matrix.json"
+          ./gradlew --no-daemon --parallel -q testMatrix -PtestMatrixOutput="$MATRIX_FILE"
+          TASKS=$(jq --compact-output --exit-status '
+            if type == "array" and length > 0 and all(.[]; type == "string" and startswith(":"))
+            then map(select(. != ":testcontainers:check" and (startswith(":docs:") | not)))
+            else error("testMatrix output must be a non-empty array of Gradle task paths")
+            end
+            | if length > 0 then . else error("testMatrix produced no core Gradle tasks") end
+          ' "$MATRIX_FILE")
+          echo "$TASKS"
+          printf 'matrix={"gradle_args":%s}\n' "$TASKS" >> "$GITHUB_OUTPUT"
+  check:
+    needs: [find_gradle_jobs]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.find_gradle_jobs.outputs.matrix) }}
+    runs-on: ubuntu-22.04
+    permissions:
+      checks: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-build
+      - name: Build and test with Gradle (${{matrix.gradle_args}})
+        run: |
+          ./gradlew --no-daemon --continue --scan ${{matrix.gradle_args}}
+      - uses: ./.github/actions/setup-junit-report
+
+  find_examples_jobs:
+    needs: [check]
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-build
+      - id: set-matrix
+        working-directory: ./examples/
+        env:
+          # Since we override the tests executor,
+          # we should not push empty results to the cache
+          READ_ONLY_REMOTE_GRADLE_CACHE: true
+        run: |
+          set -euo pipefail
+          MATRIX_FILE="$RUNNER_TEMP/examples-test-matrix.json"
+          ./gradlew --no-daemon --parallel -q testMatrix -PtestMatrixOutput="$MATRIX_FILE"
+          TASKS=$(jq --compact-output --exit-status '
+            if type == "array" and length > 0 and all(.[]; type == "string" and startswith(":"))
+            then .
+            else error("testMatrix output must be a non-empty array of Gradle task paths")
+            end
+          ' "$MATRIX_FILE")
+          echo "$TASKS"
+          printf 'matrix={"gradle_args":%s}\n' "$TASKS" >> "$GITHUB_OUTPUT"
+  check_examples:
+    needs: [find_examples_jobs]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.find_examples_jobs.outputs.matrix) }}
+    runs-on: ubuntu-22.04
+    permissions:
+      checks: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-build
+      - name: Build and test Examples with Gradle (${{matrix.gradle_args}})
+        working-directory: ./examples/
+        run: |
+          ./gradlew --no-daemon --continue --scan --info ${{matrix.gradle_args}}
+      - uses: ./.github/actions/setup-junit-report
+
+  find_docs_examples_jobs:
+    needs: [check_examples]
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-build
+      - id: set-matrix
+        env:
+          # Since we override the tests executor,
+          # we should not push empty results to the cache
+          READ_ONLY_REMOTE_GRADLE_CACHE: true
+        run: |
+          set -euo pipefail
+          MATRIX_FILE="$RUNNER_TEMP/docs-test-matrix.json"
+          ./gradlew --no-daemon --parallel -q testMatrix -PtestMatrixOutput="$MATRIX_FILE"
+          TASKS=$(jq --compact-output --exit-status '
+            if type == "array" and length > 0 and all(.[]; type == "string" and startswith(":"))
+            then map(select(startswith(":docs:")))
+            else error("testMatrix output must be a non-empty array of Gradle task paths")
+            end
+            | if length > 0 then . else error("testMatrix produced no docs Gradle tasks") end
+          ' "$MATRIX_FILE")
+          echo "$TASKS"
+          printf 'matrix={"gradle_args":%s}\n' "$TASKS" >> "$GITHUB_OUTPUT"
+  check_docs_examples:
+    needs: [find_docs_examples_jobs]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.find_docs_examples_jobs.outputs.matrix) }}
+    runs-on: ubuntu-22.04
+    permissions:
+      checks: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-build
+      - name: Build and test with Gradle (${{matrix.gradle_args}})
+        run: |
+          ./gradlew --no-daemon --continue --scan ${{matrix.gradle_args}}
+      - uses: ./.github/actions/setup-junit-report

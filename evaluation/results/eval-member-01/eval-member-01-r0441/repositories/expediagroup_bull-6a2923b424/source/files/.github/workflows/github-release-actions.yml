@@ -1,0 +1,85 @@
+name: BULL Release
+on:
+  push:
+    branches:
+      - "!*"
+    tags-ignore:
+      - "*-jdk11"
+jobs:
+  job:
+    name: "BULL Release"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: "Cache Maven repository"
+        uses: actions/cache@v6.1.0
+        with:
+          path: $HOME/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+      - name: "Extract build information"
+        id: build_info
+        run: |
+          echo "SOURCE_NAME=${GITHUB_REF#refs/*/}" >> "$GITHUB_OUTPUT"
+          echo "SOURCE_BRANCH=${GITHUB_REF#refs/heads/}" >> "$GITHUB_OUTPUT"
+          echo "TAG_NAME=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+      - name: "Project version set"
+        env:
+          TAG_NAME: ${{ steps.build_info.outputs.TAG_NAME }}
+        run: |
+          mvn versions:set -D newVersion=${TAG_NAME}
+      - name: "JDK set-up"
+        uses: actions/setup-java@v6
+        with:
+          java-version: '26'
+          distribution: 'temurin'
+          server-id: central # Value of the distributionManagement/repository/id field of the pom.xml
+          server-username-env-var: SONATYPE_USERNAME # env variable for Central Portal token username
+          server-password-env-var: SONATYPE_PASSWORD # env variable for Central Portal token password
+          # only signed artifacts will be released to maven central. this sets up things for the maven-gpg-plugin
+          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }} # Value of the GPG private key to import
+          gpg-passphrase: GPG_PASSPHRASE # env variable for GPG private key passphrase
+          settings-path: ${{ github.workspace }}
+      - name: "Build and Test execution"
+        uses: nick-invision/retry@v4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_BRANCH: ${{ steps.build_info.outputs.SOURCE_BRANCH }}
+        with:
+          max_attempts: 10
+          timeout_minutes: 15
+          retry_on: error
+          command: |
+            mvn install -P compatibility-mode -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn -q
+      - name: "Site build"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mvn org.apache.maven.plugins:maven-site-plugin:site javadoc:aggregate -P site-release -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn -q -DskipTests=true
+      - name: "Deploy GitHub Pages"
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          personal_token: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
+          publish_dir: ./target/site
+          user_name: eg-oss-ci
+          user_email: oss@expediagroup.com
+      - name: "Release artifacts"
+        env:
+          SONATYPE_USERNAME: ${{ secrets.SONATYPE_USERNAME }}
+          SONATYPE_PASSWORD: ${{ secrets.SONATYPE_PASSWORD }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PRIVATE_KEY_PASSPHRASE }}
+        run: |
+          # Use the Maven wrapper (3.8.4) on purpose: Maven 3.10+ (resolver 2.x) adds maven-metadata-local.xml and
+          # _remote.repositories files to the Central bundle, which Central rejects ("content that does NOT have a .pom file").
+          ./mvnw deploy --settings $GITHUB_WORKSPACE/settings.xml -B -U -P release -DskipTests=true
+      - name: "Send Slack Notification"
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_CHANNEL: releases
+          SLACK_COLOR: ${{ job.status }}
+          SLACK_ICON: https://raw.githubusercontent.com/ExpediaGroup/bull/master/docs/site/resources/images/bell.png
+          SLACK_TITLE: "BULL version: ${{ steps.build_info.outputs.TAG_NAME }} available."
+          SLACK_MESSAGE: "<https://github.com/ExpediaGroup/bull/blob/master/CHANGELOG.md|Check out the implemented changes in the *CHANGELOG* file>"
+          SLACK_USERNAME: "bull-notifier"
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_FOOTER: "Powered by BULL notifier"

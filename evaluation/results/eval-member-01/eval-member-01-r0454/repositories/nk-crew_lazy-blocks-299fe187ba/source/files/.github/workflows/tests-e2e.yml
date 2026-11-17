@@ -1,0 +1,78 @@
+name: End-to-End Tests
+
+on:
+  workflow_call:
+  # Allow manually triggering the workflow.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  playwright:
+    name: Playwright${{ matrix.wordpress == 'trunk' && ' (WordPress trunk)' || '' }}
+    # 2 vCPU, not 4. `workers: 1` does not make this job single-threaded -- the
+    # browser and the wp-env stack use the other cores, and measuring the switch
+    # showed `playwright test` getting 40-70% slower. It still wins: Blacksmith
+    # bills per vCPU and meters the free tier in 2 vCPU minutes, so halving the
+    # rate more than covers the extra wall time. Move back to 4 vCPU if a slower
+    # release stops being worth the saving.
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 30
+    # A WordPress trunk breakage should be visible without blocking a release.
+    continue-on-error: ${{ matrix.wordpress == 'trunk' }}
+    if: ${{ github.repository == 'nk-crew/lazy-blocks' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # `latest` runs the WordPress version from .wp-env.json. `trunk` runs
+        # WordPress/WordPress, which tracks core trunk and carries the next beta.
+        wordpress: ['latest', 'trunk']
+    env:
+      WP_ENV_CORE: ${{ matrix.wordpress == 'trunk' && 'WordPress/WordPress' || '' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js and install dependencies
+        uses: ./.github/setup-node
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-
+
+      - name: Npm build
+        run: npm run build
+
+      # Chromium only. The shared preset gates its webkit and firefox projects
+      # behind `@webkit` and `@firefox` tags and no spec carries either, so the
+      # other two browsers were downloaded on every run and never launched. Tag a
+      # spec and add the browser back here if that changes.
+      - name: Install Playwright dependencies
+        run: |
+          npx playwright install --with-deps chromium
+
+      - name: Install WordPress and start the server
+        run: |
+          npm run wp-env start
+
+      - name: Run the tests
+        env:
+          PLAYWRIGHT_JSON_OUTPUT_FILE: artifacts/playwright.json
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1280x960x24" -- npm run test:e2e
+
+      - name: Archive debug artifacts (screenshots, traces)
+        uses: actions/upload-artifact@v4
+        if: ${{ always() && !cancelled() }}
+        with:
+          name: failures-artifacts${{ matrix.wordpress == 'trunk' && '-wp-trunk' || '' }}
+          path: |
+            artifacts/test-results
+            artifacts/playwright.json
+            flaky-tests
+          if-no-files-found: ignore

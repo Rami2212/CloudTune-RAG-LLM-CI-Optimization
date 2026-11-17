@@ -1,0 +1,228 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 7 optimizations:
+# - [HIGH] Add gradle dependency cache to "test-jvm-web" job
+# - [HIGH] Add gradle dependency cache to "build-android-multiplatform-sample" job
+# - [HIGH] Add gradle dependency cache to "build-android-sample" job
+# - [HIGH] Add gradle dependency cache to "build-android-java-sample" job
+# - [HIGH] Add gradle dependency cache to "build-desktop-app" job
+# - [HIGH] Add gradle dependency cache to "build-wasm-sample" job
+# - [MEDIUM] 8 jobs clone the repo — consider artifact sharing
+# Estimated savings: ~31 min/run
+#
+name: PR Checks
+on:
+  push:
+    branches:
+      - 'master'
+  pull_request:
+    branches:
+      - '*'
+
+# A newer push to the same branch or PR supersedes the run in progress,
+# so stale runs stop holding the limited macOS runners.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-jvm-web:
+    name: Run JVM, Android and web tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: set up JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'zulu'
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Test
+        run: ./gradlew :rssparser:jvmTest :rssparser:testAndroidHostTest :rssparser:jsTest :rssparser:wasmJsTest :rssparser:jvmApiCheck
+
+      - name: (Fail-only) Bundle test reports
+        if: failure()
+        run: find . -type d -name 'reports' | zip -@ -r build-reports.zip
+
+      - name: (Fail-only) Upload the build report
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: error-report-jvm-web
+          path: build-reports.zip
+
+  test-apple:
+    name: Run Apple tests and klib API check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: set up JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'zulu'
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Read Kotlin version
+        id: kotlin
+        run: echo "version=$(sed -n 's/^kotlin = "\(.*\)"/\1/p' gradle/libs.versions.toml)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache KMP tooling
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.konan
+          key: ${{ runner.os }}-konan-${{ steps.kotlin.outputs.version }}
+          restore-keys: |
+            ${{ runner.os }}-konan-
+
+      - name: Test
+        run: ./gradlew :rssparser:iosSimulatorArm64Test :rssparser:macosArm64Test :rssparser:tvosSimulatorArm64Test :rssparser:watchosSimulatorArm64Test :rssparser:klibApiCheck
+
+      - name: (Fail-only) Bundle test reports
+        if: failure()
+        run: find . -type d -name 'reports' | zip -@ -r build-reports.zip
+
+      - name: (Fail-only) Upload the build report
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: error-report-apple
+          path: build-reports.zip
+
+  build-android-multiplatform-sample:
+    name: Build Android Multiplatform Sample
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: set up JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'zulu'
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Build Android Sample
+        run: ./gradlew :samples:multiplatform:androidApp:assembleRelease
+
+  build-android-sample:
+    name: Build Android Sample
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: set up JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'zulu'
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Build Android Sample
+        run: ./gradlew :samples:android:assembleRelease
+
+  build-android-java-sample:
+    name: Build Android Java Sample
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: set up JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'zulu'
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Build Android Sample
+        run: ./gradlew :samples:java:assembleRelease
+
+  build-desktop-app:
+    name: Build Desktop App
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: set up JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'zulu'
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Build Desktop App
+        run: ./gradlew :samples:multiplatform:desktopApp:packageDistributionForCurrentOS
+
+  build-wasm-sample:
+    name: Build Wasm Sample
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: set up JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'zulu'
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Build Wasm Sample
+        run: ./gradlew :samples:multiplatform:webApp:wasmJsBrowserDistribution
+
+  # All Apple samples share one macOS runner: the free plan allows only a few
+  # macOS jobs at once, and the Kotlin framework build is shared between them.
+  build-apple-samples:
+    name: Build Apple Samples
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: set up JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'zulu'
+          java-version: 21
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: 26.5
+
+      - name: Xcode version
+        run: /usr/bin/xcodebuild -version
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Read Kotlin version
+        id: kotlin
+        run: echo "version=$(sed -n 's/^kotlin = "\(.*\)"/\1/p' gradle/libs.versions.toml)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache KMP tooling
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.konan
+          key: ${{ runner.os }}-xcode-26.5-konan-${{ steps.kotlin.outputs.version }}
+          restore-keys: |
+            ${{ runner.os }}-xcode-26.5-konan-
+
+      - name: Build iOS Sample
+        run: set -o pipefail && xcodebuild -project samples/multiplatform/iosApp/iosApp.xcodeproj -configuration Debug -scheme iosApp -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' build | xcbeautify --renderer github-actions
+
+      - name: Build macOS Sample
+        run: set -o pipefail && xcodebuild -project samples/multiplatform/iosApp/iosApp.xcodeproj -configuration Debug -scheme iosApp -destination 'platform=macOS,arch=arm64' CODE_SIGNING_ALLOWED=NO MACOSX_DEPLOYMENT_TARGET=26.0 build | xcbeautify --renderer github-actions
+
+      - name: Build tvOS Sample
+        run: set -o pipefail && xcodebuild -project samples/multiplatform/iosApp/iosApp.xcodeproj -configuration Debug -scheme 'iosApp' -destination 'generic/platform=tvOS Simulator' ARCHS=arm64 ONLY_ACTIVE_ARCH=YES build | xcbeautify --renderer github-actions
+
+      - name: Build watchOS Sample
+        run: set -o pipefail && xcodebuild -project samples/multiplatform/iosApp/iosApp.xcodeproj -scheme 'RssParserDemo Watch App' -destination 'generic/platform=watchOS Simulator' -configuration Debug ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO build | xcbeautify --renderer github-actions

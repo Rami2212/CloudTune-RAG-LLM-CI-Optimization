@@ -1,0 +1,221 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 3 optimizations:
+# - [HIGH] Add npm dependency cache to "test-php" job
+# - [HIGH] Add npm dependency cache to "lint" job
+# - [MEDIUM] 3 jobs clone the repo — consider artifact sharing
+# Estimated savings: ~9 min/run
+#
+name: Unit Tests
+
+on:
+  workflow_call:
+  # Allow manually triggering the workflow.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-php:
+    name: PHP ${{ matrix.php }}${{ matrix.wordpress == 'previous' && ' (previous WP)' || '' }}
+    # 2 vCPU, not 4: PHPUnit is single-threaded and the rest of the job waits on
+    # Docker and the network. Blacksmith bills per vCPU and meters the free tier
+    # in 2 vCPU minutes, so a 4 vCPU runner costs exactly double for no gain.
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 20
+    if: ${{ github.repository == 'nk-crew/lazy-blocks' }}
+    strategy:
+      fail-fast: true
+      matrix:
+        # Corners only. Adjacent PHP minors run the same code paths through the
+        # same suite, so the third and fourth legs were re-proving the first two;
+        # the static compatibility guarantee across the whole supported range
+        # comes from the PHPCompatibility sniffs in the phpcs job, not from here.
+        include:
+          - php: '8.3'
+            wordpress: 'latest'
+          - php: '8.4'
+            wordpress: 'latest'
+          - php: '8.3'
+            wordpress: 'previous'
+
+    env:
+      WP_ENV_PHP_VERSION: ${{ matrix.php }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      ##
+      # Before the Node setup, because `npm ci` triggers the `postinstall` script
+      # and that runs `composer install`. With this step after it, the PHP
+      # dependencies were resolved against whatever PHP the runner image ships
+      # rather than against matrix.php, so the matrix quietly tested one
+      # dependency set on every leg.
+      ##
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '${{ matrix.php }}'
+          ini-file: development
+          coverage: none
+
+      # Ensure that Composer installs the correct versions of packages.
+      - name: Override PHP version in composer.json
+        run: composer config platform.php ${{ matrix.php }}
+
+      - name: Setup Node.js and install dependencies
+        uses: ./.github/setup-node
+
+      # Since Composer dependencies are installed using `composer update` and no lock file is in version control,
+      # passing a custom cache suffix ensures that the cache is flushed at least once per week.
+      - name: Install Composer dependencies
+        uses: ramsey/composer-install@v2
+        with:
+          custom-cache-suffix: $(/bin/date -u --date='last Mon' "+%F")
+
+      # Only the `previous` legs need to resolve a version; the others let
+      # wp-env track WordPress trunk. Replaces a dedicated job that spent a whole
+      # runner on one curl and made the entire matrix wait on it.
+      - name: Resolve WordPress version
+        shell: bash
+        run: |
+          if [ "${{ matrix.wordpress }}" != 'previous' ]; then
+            echo "WP_ENV_CORE=WordPress/WordPress" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          curl --fail --silent --show-error --location \
+            -H "Accept: application/json" \
+            -o versions.json \
+            "https://api.wordpress.org/core/stable-check/1.0/"
+          LATEST_WP_VERSION=$(jq --raw-output 'with_entries(select(.value=="latest"))|keys[]' versions.json)
+          IFS='.' read LATEST_WP_MAJOR LATEST_WP_MINOR LATEST_WP_PATCH <<< "${LATEST_WP_VERSION}"
+          if [[ ${LATEST_WP_MINOR} == "0" ]]; then
+            PREVIOUS_WP_SERIES="$((LATEST_WP_MAJOR - 1)).9"
+          else
+            PREVIOUS_WP_SERIES="${LATEST_WP_MAJOR}.$((LATEST_WP_MINOR - 1))"
+          fi
+          PREVIOUS_WP_VERSION=$(jq --raw-output --arg series "${PREVIOUS_WP_SERIES}" 'with_entries(select(.key|startswith($series)))|keys[-1]' versions.json)
+          rm versions.json
+
+          echo "Testing against WordPress ${PREVIOUS_WP_VERSION}."
+          echo "WP_ENV_CORE=https://wordpress.org/wordpress-${PREVIOUS_WP_VERSION}.zip" >> "$GITHUB_ENV"
+
+      - name: Npm build
+        run: npm run build
+
+      - name: Running unit tests
+        run: |
+          set -o pipefail
+          mkdir -p artifacts
+          npm run test:unit:php -- --log-junit=/var/www/html/wp-content/plugins/lazy-blocks/artifacts/phpunit.xml | tee phpunit.log
+
+      - name: Archive PHPUnit timing report
+        if: ${{ always() && !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: phpunit-${{ matrix.php }}-${{ matrix.wordpress }}
+          path: artifacts/phpunit.xml
+
+      # Verifies that PHPUnit actually runs in the first place. We want visibility
+      # into issues which can cause it to fail silently, so we check the output
+      # to verify that at least 5 tests have passed. This is an arbitrary
+      # number, but makes sure a drastic change doesn't happen without us noticing.
+      - name: Check number of passed tests
+        run: |
+          # Note: relies on PHPUnit execution to fail on test failure.
+          # Extract the number of executed tests from the log file.
+          if ! num_tests=$(grep -Eo 'OK \([0-9]+ tests' phpunit.log) ; then
+            if ! num_tests=$(grep -Eo 'Tests: [0-9]+, Assertions:' phpunit.log) ; then
+              echo "PHPUnit failed or did not run. Check the PHPUnit output in the previous step to debug." && exit 1
+            fi
+          fi
+          # Extract just the number of tests from the string.
+          num_tests=$(echo "$num_tests" | grep -Eo '[0-9]+')
+          if [ $num_tests -lt 5 ] ; then
+            echo "Only $num_tests tests passed, which is much fewer than expected." && exit 1
+          fi
+          echo "$num_tests tests passed."
+
+      # Was three unconditional steps printing docker, php and locale dumps on
+      # every green run. Nobody reads those; on a red run they are worth having.
+      - name: Debug environment on failure
+        if: ${{ failure() }}
+        run: |
+          docker -v || true
+          docker compose version || true
+          npm --version || true
+          node --version || true
+          docker ps -a || true
+          npm run wp-env run tests-mysql mysql -- --version || true
+          npm run wp-env run tests-wordpress php -- --version || true
+          npm run wp-env run tests-wordpress php -m || true
+          npm run wp-env run tests-wordpress php -i || true
+          npm run wp-env run tests-wordpress /var/www/html/wp-content/plugins/lazy-blocks/vendor/bin/phpunit -- --version || true
+          npm run wp-env run tests-wordpress locale -a || true
+
+  lint:
+    name: Lint JS + CSS
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js and install dependencies
+        uses: ./.github/setup-node
+
+      # No `npm run build` here. `lint:js` is `biome check`, and the shared
+      # Biome config excludes `**/build`; `lint:css` globs the `assets` sources
+      # directly. Neither reads a single file the build produces.
+      - name: Running the lint
+        run: npm run lint
+
+  phpcs:
+    name: PHP coding standards
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          coverage: none
+          tools: cs2pr
+
+      # This date is used to ensure that the PHPCS cache is cleared at least once every week.
+      # http://man7.org/linux/man-pages/man1/date.1.html
+      - name: "Get last Monday's date"
+        id: get-date
+        run: echo "date=$(/bin/date -u --date='last Mon' "+%F")" >> $GITHUB_OUTPUT
+
+      - name: Cache PHPCS scan cache
+        uses: actions/cache@v4
+        with:
+            path: .cache/phpcs.json
+            key: ${{ runner.os }}-date-${{ steps.get-date.outputs.date }}-phpcs-cache-${{ hashFiles('**/composer.json', 'phpcs.xml.dist') }}
+
+      # Since Composer dependencies are installed using `composer update` and no lock file is in version control,
+      # passing a custom cache suffix ensures that the cache is flushed at least once per week.
+      - name: Install Composer dependencies
+        uses: ramsey/composer-install@v2
+        with:
+          custom-cache-suffix: ${{ steps.get-date.outputs.date }}
+
+      - name: Make Composer packages available globally
+        run: echo "${PWD}/vendor/bin" >> $GITHUB_PATH
+
+      - name: Run PHPCS on all Lazy Blocks files
+        id: phpcs-lazy-blocks
+        run: phpcs --report-full --report-checkstyle=./.cache/phpcs-report.xml
+
+      - name: Show PHPCS results in PR
+        if: ${{ always() && steps.phpcs-lazy-blocks.outcome == 'failure' }}
+        run: cs2pr ./.cache/phpcs-report.xml
+
+      - name: Ensure version-controlled files are not modified during the tests
+        run: git diff --exit-code

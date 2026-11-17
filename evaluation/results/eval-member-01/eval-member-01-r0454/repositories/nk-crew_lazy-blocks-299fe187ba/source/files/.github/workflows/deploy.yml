@@ -1,0 +1,48 @@
+name: Deploy to WordPress.org
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  unit:
+    name: Unit Tests
+    uses: ./.github/workflows/tests.yml
+
+  e2e:
+    name: End-to-End Tests
+    uses: ./.github/workflows/tests-e2e.yml
+
+  deploy:
+    needs: [unit, e2e]
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Disable xDebug - fixes PHP Fatal Error for `i18n make-pot`
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          coverage: none
+
+      - name: Setup Node.js and install dependencies
+        uses: ./.github/setup-node
+
+      - name: Run Production Task
+        run: npm run build:prod
+
+      - name: Install SVN
+        run: |
+          sudo apt-get update
+          sudo apt-get install subversion
+
+      - name: WordPress Plugin Deploy
+        uses: nk-o/action-wordpress-plugin-deploy@master
+        env:
+          SVN_PASSWORD: ${{ secrets.SVN_PASSWORD }}
+          SVN_USERNAME: ${{ secrets.SVN_USERNAME }}
+          SOURCE_DIR: dist-zip/lazy-blocks/
+          SLUG: lazy-blocks

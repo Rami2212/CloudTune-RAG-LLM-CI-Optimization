@@ -1,0 +1,105 @@
+name: "Build"
+on:
+  push:
+    branches-ignore:
+      - "*-jdk11"
+      - "*/*-jdk11"
+    tags-ignore:
+      - "*"
+  pull_request:
+    branches:
+      - master
+jobs:
+  build:
+    name: "Build"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: "Cache Maven repository"
+        uses: actions/cache@v6.1.0
+        with:
+          path: $HOME/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+      - name: "JDK set-up"
+        uses: actions/setup-java@v6
+        with:
+          java-version: '26'
+          distribution: 'temurin'
+      - name: "Build"
+        run: |
+          mvn clean install -B -DskipTests -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn -P compatibility-mode
+  test-and-quality-check:
+    name: "Test and quality check"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: "Cache Maven repository"
+        uses: actions/cache@v6.1.0
+        with:
+          path: $HOME/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+      - name: "Extract build information"
+        id: build_info
+        run: |
+          echo "SOURCE_BRANCH=${GITHUB_REF#refs/heads/}" >> "$GITHUB_OUTPUT"
+      - name: "JDK set-up"
+        uses: actions/setup-java@v6
+        with:
+          java-version: '26'
+          distribution: 'temurin'
+      - name: "Test and Quality check"
+        uses: nick-invision/retry@v4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_BRANCH: ${{ steps.build_info.outputs.SOURCE_BRANCH }}
+        with:
+          max_attempts: 10
+          timeout_minutes: 15
+          retry_on: error
+          command: |
+            mvn verify jacoco:report-aggregate -P compatibility-mode
+      - name: "Upload coverage baseline"
+        if: github.ref == 'refs/heads/master'
+        uses: actions/upload-artifact@v7
+        with:
+          name: jacoco-coverage-baseline
+          path: bull-report/target/site/jacoco-aggregate/jacoco.xml
+          retention-days: 90
+      - name: "Submit coverage to Coveralls"
+        if: ${{ env.COVERALLS_IO_TOKEN != '' }}
+        env:
+          COVERALLS_IO_TOKEN: ${{ secrets.COVERALLS_IO_TOKEN }}
+        run: |
+          mvn coveralls:report -DrepoToken=$COVERALLS_IO_TOKEN
+  security-check:
+    name: "Security check"
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - name: "Cache Maven repository"
+        uses: actions/cache@v6.1.0
+        with:
+          path: $HOME/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+      - name: "JDK set-up"
+        uses: actions/setup-java@v6
+        with:
+          java-version: '26'
+          distribution: 'temurin'
+      - name: "Checkout repository"
+        uses: actions/checkout@v7
+      # Initializes the CodeQL tools for scanning.
+      - name: "Initialize CodeQL"
+        uses: github/codeql-action/init@v4.39.3
+        with:
+          languages: 'java'
+      - run: |
+          mvn clean install -B -DskipTests -P fast
+      - name: "Perform Analysis"
+        uses: github/codeql-action/analyze@v4.39.3

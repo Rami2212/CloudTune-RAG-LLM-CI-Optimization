@@ -1,0 +1,46 @@
+name: Build all wheels
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 0 * * 1'
+  push:
+    branches:
+      - "master"
+
+jobs:
+  build_wheels:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip setuptools
+
+    - name: Install cibuildwheel
+      run: |
+        python -m pip install cibuildwheel==3.1.4
+
+    - name: Build wheels
+      env:
+        CIBW_SKIP: "cp*musl* cp38* *i686 *win32" # remove pypy on mac and win (wrong version)
+        CIBW_ARCHS_MACOS: x86_64 universal2 arm64
+      run: |
+        python -m cibuildwheel --output-dir wheelhouse
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: wheels-${{ strategy.job-index }}
+        path: ./wheelhouse

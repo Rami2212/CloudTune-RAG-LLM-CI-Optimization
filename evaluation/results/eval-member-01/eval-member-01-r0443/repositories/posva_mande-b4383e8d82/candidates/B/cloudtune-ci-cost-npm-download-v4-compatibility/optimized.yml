@@ -1,0 +1,37 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [HIGH] Split "build" into parallel jobs (lint + test + build)
+# Estimated savings: ~6 min/run
+#
+name: ci
+
+on:
+  push:
+    branches:
+      - '**'
+    tags-ignore:
+      - '**'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run lint
+      - run: pnpm -C nuxt-module dev:prepare
+      - run: pnpm run test:unit --coverage
+      - run: pnpm run build
+      - run: pnpm run test:types
+      - run: pnpm run size
+
+      - uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}

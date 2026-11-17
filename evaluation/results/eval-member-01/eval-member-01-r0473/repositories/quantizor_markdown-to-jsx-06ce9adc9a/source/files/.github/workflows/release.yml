@@ -1,0 +1,74 @@
+name: release
+
+on:
+  push:
+    branches:
+      - 'main'
+
+concurrency: ${{ github.workflow }}-${{ github.ref }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    outputs:
+      published: ${{ steps.changesets.outputs.published }}
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Changelog attribution asks git which commits touched each changeset
+          # file. In a shallow checkout the tip commit has no parent, so it
+          # reads as the commit that added every file, and the release notes
+          # credit whoever pushed last instead of whoever wrote the change.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      # Pinned to a major: npm 12 changed `npm info --json` to return an array,
+      # which silently broke the published-version check in @changesets/cli
+      # below 2.31.1 and made every no-changeset push to main try to republish
+      # the current version. Move this pin deliberately, with a changesets
+      # version known to handle the new output.
+      - name: Update npm
+        run: npm install -g npm@12
+
+      - name: Setup bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Unit tests
+        run: bun test
+
+      - name: Create Release Pull Request
+        id: changesets
+        # v2 requires Changesets CLI v3 and refuses to start on 2.x; move both together
+        uses: changesets/action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          createGithubReleases: true
+          publish: bun run changeset-publish
+          # Version bumps change workspace versions recorded in bun.lock
+          version: bun run changeset-version
+
+  # Releases created here use GITHUB_TOKEN, and events made with that token
+  # don't trigger other workflows, so website.yml's `release` trigger never
+  # fires for them. Deploy the site directly after a publish instead.
+  website:
+    needs: release
+    if: needs.release.outputs.published == 'true'
+    permissions:
+      id-token: write
+      contents: read
+      pages: write
+    uses: ./.github/workflows/website.yml

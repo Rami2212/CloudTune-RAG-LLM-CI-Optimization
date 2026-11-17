@@ -1,0 +1,57 @@
+name: Benchmarks
+
+on:
+  push:
+    branches-ignore:
+      - '*-no-ci'
+    tags:
+      - '*'
+  pull_request:
+    branches:
+      - main
+  schedule:
+    # * is a special character in YAML and must be quoted
+    - cron: '55 2 */7 * *'
+  # Manually triggered workflow
+  workflow_dispatch:
+
+env:
+  UV_VERSION: 0.13.7
+
+jobs:
+  generate-jobs:
+    runs-on: ubuntu-latest
+    outputs:
+      session: ${{ steps.set-matrix.outputs.session }}
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Install nox
+      uses: wntrblm/nox@afa3983bbac3143bab5c8406244327581f76a3d7  # 2026.10.20 - https://github.com/wntrblm/nox/releases
+
+    - name: Build GH Actions test matrix from nox sessions
+      id: set-matrix
+      shell: bash
+      run: echo session=$(nox -e benchmarks --list --json | jq -c '[.[].session]') | tee --append $GITHUB_OUTPUT
+
+  benchmark:
+    name: ${{ matrix.session }}
+    needs: [generate-jobs]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        session: ${{ fromJson(needs.generate-jobs.outputs.session) }}
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Install nox
+      uses: wntrblm/nox@afa3983bbac3143bab5c8406244327581f76a3d7  # 2026.10.20 - https://github.com/wntrblm/nox/releases
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3, see https://github.com/astral-sh/setup-uv/releases
+      with:
+        version: ${{ env.UV_VERSION }}
+
+    - name: Run benchmarks
+      run: nox -s "${{ matrix.session }}"

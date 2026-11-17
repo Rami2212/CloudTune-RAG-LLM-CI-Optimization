@@ -1,0 +1,88 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [HIGH] Add pip dependency cache to "test-minimum" job
+# - [MEDIUM] Add concurrency group to "validate.yml"
+# Estimated savings: ~5 min/run
+#
+name: Validate
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * *"
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions: {}
+
+jobs:
+  hassfest: # https://developers.home-assistant.io/blog/2020/04/16/hassfest
+    name: Hassfest Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v7
+
+      - name: Run hassfest validation
+        uses: home-assistant/actions/hassfest@master
+
+  hacs: # https://github.com/hacs/action
+    name: HACS Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v7
+
+      - name: Run HACS validation
+        uses: hacs/action@main
+        with:
+          category: integration
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      - name: Install requirements
+        run: scripts/setup
+
+      - name: Run
+        run: pytest
+
+  test-minimum:
+    name: Tests (minimum Home Assistant version)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      # pytest-homeassistant exists only from Home Assistant 2026.11, so this job
+      # uses the discontinued pytest-homeassistant-custom-component.
+      # 0.13.272 pins Home Assistant 2025.8.3, the minimum in hacs.json.
+      # pycares 5 is incompatible with the aiodns version of that release.
+      - name: Install requirements
+        run: python3 -m pip install "pytest-homeassistant-custom-component==0.13.272" "pycares<5"
+
+      # Coverage is checked by the "Tests" job (some code runs only on newer versions).
+      - name: Run
+        run: pytest --no-cov

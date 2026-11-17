@@ -1,0 +1,48 @@
+name: Benchmarks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+jobs:
+  phpbench:
+    name: "PHPBench"
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        php-version:
+          - "7.4"
+          - "8.5"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php-version }}
+
+      - name: Remove symfony/clock for PHP < 8.1
+        if: ${{ matrix.php-version < '8.1' }}
+        run: |
+          composer remove --dev symfony/clock --no-update
+          composer remove --dev twig/twig --no-update
+
+      - name: Install dependencies with Composer
+        uses: ramsey/composer-install@v4
+
+      - name: Run performance benchmarks
+        run: |
+          vendor/bin/phpbench run tests/Benchmark/Performance --report=aggregate
+
+      - name: Check JSON serialiser memory leaks
+        run: |
+          vendor/bin/phpbench run tests/Benchmark/Memory/Json* --report=memory --iterations=1
+
+      - name: Check XML serialiser memory leaks
+        run: |
+          vendor/bin/phpbench run tests/Benchmark/Memory/Xml* --report=memory --iterations=1

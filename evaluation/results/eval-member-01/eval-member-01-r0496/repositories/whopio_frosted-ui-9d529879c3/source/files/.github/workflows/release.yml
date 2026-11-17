@@ -1,0 +1,124 @@
+on:
+  push:
+    branches:
+      - main
+
+name: Build, test, release
+
+concurrency:
+  group: 'release'
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Publish to npm and release on github
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          ref: ${{ github.head_ref }}
+
+      - name: Check package.json for version increase
+        id: check
+        uses: whopio/turbo-module@v0.1.0-canary.3
+        with:
+          action: check
+          token: ${{ github.token }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - name: Setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          check-latest: true
+          cache: pnpm
+
+      - name: Debug OIDC env presence (no secrets)
+        run: |
+          echo "GITHUB_ACTIONS=$GITHUB_ACTIONS"
+          echo "ACTIONS_ID_TOKEN_REQUEST_URL: $([ -n "$ACTIONS_ID_TOKEN_REQUEST_URL" ] && echo present || echo missing)"
+          echo "ACTIONS_ID_TOKEN_REQUEST_TOKEN: $([ -n "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" ] && echo present || echo missing)"
+          echo "node: $(node -v)"
+          echo "npm: $(npm -v)"
+
+      - name: Upgrade npm for OIDC trusted publishing
+        if: steps.check.outputs.can-publish == 'true'
+        run: |
+          corepack disable npm 2>/dev/null || true
+          npm i -g npm@latest --force
+
+      - name: Clear npm auth to force OIDC
+        run: |
+          npm config delete //registry.npmjs.org/:_authToken || true
+          npm config delete @whop:registry || true
+        if: steps.check.outputs.can-publish == 'true'
+
+      - name: Install dependencies
+        run: pnpm i
+
+      - name: Fix bin permissions
+        run: chmod +x node_modules/.bin/* packages/*/node_modules/.bin/* 2>/dev/null || true
+        if: steps.check.outputs.can-publish == 'true'
+
+      - name: Run turbo release flow
+        env:
+          NPM_CONFIG_PROVENANCE: 'true'
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org
+          NPM_CONFIG_ALWAYS_AUTH: 'false'
+          NPM_CONFIG_LOGLEVEL: 'warn'
+          TURBO_FORCE: 'true'
+          TURBO_ENVIRONMENT_VARIABLES: ACTIONS_ID_TOKEN_REQUEST_URL,ACTIONS_ID_TOKEN_REQUEST_TOKEN,NPM_CONFIG_PROVENANCE,NPM_CONFIG_REGISTRY,NPM_CONFIG_ALWAYS_AUTH
+          NODE_AUTH_TOKEN: ''
+        run: pnpm turbo release ${{ steps.check.outputs.filter }} --env-mode=loose
+        if: steps.check.outputs.can-publish == 'true'
+
+      - name: Github Release
+        id: release
+        uses: whopio/turbo-module@v0.1.0-canary.3
+        with:
+          action: release
+          token: ${{ github.token }}
+          version: ${{ steps.check.outputs.version }}
+          initial-commit: 3d821dfeec0e67a8b33de2993ba292e58b315d06
+        if: steps.check.outputs.can-publish == 'true'
+
+      - name: Notify whop-monorepo upgrade automation
+        if: steps.check.outputs.can-publish == 'true' && steps.release.outputs.published == 'true'
+        env:
+          WEBHOOK_URL: ${{ secrets.CURSOR_AUTOMATION_WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.CURSOR_AUTOMATION_WEBHOOK_SECRET }}
+        run: |
+          if [ -z "$WEBHOOK_URL" ]; then
+            echo "CURSOR_AUTOMATION_WEBHOOK_URL is not set; skipping notification."
+            exit 0
+          fi
+
+          # Payload is optional: the Cursor automation's agent instructions
+          # resolve the latest versions via `npm view`, so the body only needs
+          # to name the packages the downstream automation should upgrade.
+          # This release may publish other packages too, but the automation
+          # only handles these two.
+          echo "Notifying Cursor Automation webhook to upgrade frosted-ui and @frosted-ui/icons"
+          curl --fail --silent --show-error \
+            --request POST "$WEBHOOK_URL" \
+            --header "Content-Type: application/json" \
+            --header "Authorization: Bearer $WEBHOOK_SECRET" \
+            --data '{"packages":["frosted-ui","@frosted-ui/icons"]}'
+
+      - name: Sync auto-release PRs
+        if: always()
+        uses: whopio/turbo-module@v0.1.0-canary.3
+        with:
+          action: sync
+          token: ${{ secrets.PAT_TOKEN }}
+          published: ${{ steps.release.outputs.published }}
+          initial-commit: 3d821dfeec0e67a8b33de2993ba292e58b315d06

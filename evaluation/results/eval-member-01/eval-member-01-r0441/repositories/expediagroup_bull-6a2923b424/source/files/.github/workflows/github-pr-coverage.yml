@@ -1,0 +1,56 @@
+name: "PR Coverage Build"
+
+on:
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    name: "Build and Generate Coverage"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout Repository"
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: "Cache Maven repository"
+        uses: actions/cache@v6.1.0
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+
+      - name: "JDK set-up"
+        uses: actions/setup-java@v6
+        with:
+          java-version: '26'
+          distribution: 'temurin'
+
+      - name: "Build and Test"
+        uses: nick-invision/retry@v4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          max_attempts: 3
+          timeout_minutes: 15
+          retry_on: error
+          command: |
+            mvn verify jacoco:report-aggregate -B -P compatibility-mode -DskipPerformanceTests=true \
+              -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn
+
+      - name: "Save PR number"
+        run: echo "${{ github.event.pull_request.number }}" > pr_number.txt
+
+      - name: "Upload coverage and PR metadata"
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr-coverage-report
+          path: |
+            bull-report/target/site/jacoco-aggregate/jacoco.xml
+            pr_number.txt
+          retention-days: 1

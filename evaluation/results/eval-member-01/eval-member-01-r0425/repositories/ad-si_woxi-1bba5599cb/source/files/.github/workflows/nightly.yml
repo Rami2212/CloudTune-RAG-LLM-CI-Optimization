@@ -1,0 +1,151 @@
+name: Nightly
+
+on:
+  schedule:
+    # Every day at 03:00 UTC
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Correctness of all tests gated behind the `slow-tests` cargo feature —
+  # the ~24 heavy script snapshots (see `slow_script_test!`; too slow for
+  # every push/PR) and the wikidata tests that query the live wikidata.org
+  # API (excluded from the offline suite). Runs once per night via
+  # `make test-slow`. Performance of the heavy scripts is tracked by the
+  # benchmarks.
+  test-slow:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: nextest
+    # Z3 is a development dependency, so `make test-slow` leaves the Reduce
+    # backend's semantic oracle out (`make test-reduce-smt-oracle` below is
+    # what runs it) and this job is the one place it is installed.
+    - name: Install the Z3 oracle
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends z3
+    - name: Run slow and network tests
+      run: make test-slow
+    # The one place the Reduce backend's generated formulas are checked
+    # against an independent solver.
+    - name: Run the Z3 oracle for the Reduce backend
+      # Runs even when a slow test already failed, so one night reports both.
+      if: '!cancelled()'
+      run: make test-reduce-smt-oracle
+
+  # Release-ready archives of the interpreter CLI and the Studio notebook
+  # editor for every platform a release ships (see build-archives.yml).
+  # Only Linux is covered by the per-push CI, so this is where
+  # platform-specific build breakage surfaces — on the night it lands
+  # rather than on release day — and it doubles as a nightly download.
+  build:
+    uses: ./.github/workflows/build-archives.yml
+
+  # The full unit test suite on Windows. Neither the Linux-only CI nor the
+  # `test-slow` job above covers it, so this is the only place
+  # Windows-specific test failures show up; the wolframscript/scrut
+  # conformance tests need tools unavailable here.
+  test-windows:
+    runs-on: windows-latest
+    steps:
+    - name: Set git to use LF
+      run: |
+        git config --global core.autocrlf input
+        git config --global core.eol lf
+    - uses: actions/checkout@v7
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: nextest
+    # Mirrors `make test` (the fast correctness suite the Linux CI runs),
+    # invoked directly since `make` is not available on the Windows runner.
+    # `--no-fail-fast` because this is the only place Windows-specific
+    # breakage shows up: stopping at the first failure would hide the rest
+    # and turn one bad night into a chain of them.
+    - name: Run unit tests
+      run: cargo nextest run --no-fail-fast --show-progress=none --status-level=fail --failure-output=final
+
+  # Coverage-guided crash fuzzing of the parser and interpreter (see
+  # fuzz/README.md). A few minutes per target per night compounds into
+  # deep coverage over time; crashing inputs are uploaded as artifacts.
+  fuzz:
+    runs-on: ubuntu-latest
+    # Overrides rust-toolchain.toml's stable channel; cargo-fuzz needs -Z flags.
+    env:
+      RUSTUP_TOOLCHAIN: nightly
+    steps:
+    - uses: actions/checkout@v7
+    - uses: dtolnay/rust-toolchain@nightly
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: |
+          .
+          fuzz
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-fuzz
+    # fuzz/seeds_from_tests.ts extracts the unit- and doc-test snippets;
+    # Node runs the TypeScript directly.
+    - uses: actions/setup-node@v7
+      with:
+        node-version: '24'
+    # Each corpus gets a different sample of the test-suite
+    # snippets each night (FUZZ_SAMPLE_SEED defaults to the date).
+    - name: Seed corpora from the test suite
+      run: make fuzz-corpus
+    # The prebuilt cargo-fuzz binary is a static musl build and defaults to
+    # its own compile-time triple (x86_64-unknown-linux-musl), which cannot
+    # link ASan ("sanitizer is incompatible with statically linked libc").
+    # Pass the host triple explicitly so the fuzz targets build against glibc.
+    - name: Determine host target triple
+      run: |
+        echo "HOST_TARGET=$(rustc -vV | sed -n 's/host: //p')" >> "$GITHUB_ENV"
+    - name: Fuzz the parser
+      run: cargo fuzz run parse --target "$HOST_TARGET" -- -dict="$GITHUB_WORKSPACE/fuzz/woxi.dict" -timeout=10 -max_len=4096 -max_total_time=300
+    - name: Fuzz the interpreter
+      # Runs even when the parse target already found a crash, so one
+      # night reports both.
+      if: '!cancelled()'
+      # -rss_limit_mb is raised above the 2048 default because some corpus
+      # seeds (tests/scripts/*.wls) are legitimately memory-hungry
+      # computations, and ASan roughly triples their footprint.
+      #
+      # -timeout is deliberately *larger* than -max_total_time. The campaign
+      # stops handing out new inputs after 300s, but whichever one is still
+      # in flight gets 1200s to finish, so the step's worst case is 25min.
+      #
+      # Cost is the property this target does not test — it tests that no
+      # input panics, aborts or overflows the stack — so a bound that a
+      # terminating program can cross only buys false positives. The fuzzer
+      # mutates a seed's *data*, not just its shape, and plenty of Wolfram
+      # builtins are superlinear in theirs: raising an `n` in
+      # `Permutations[Range[n]]` turns a millisecond seed into a minute-long
+      # (but perfectly terminating) program. ASan then multiplies that again,
+      # by far more than the ~3x it costs in memory: symbolic blowup is
+      # allocation-bound, and its redzone bookkeeping dominates. The input
+      # that took the 300s budget down (`timeout-5a47ee67…`, a `Fold` whose
+      # accumulator nests the whole previous list each step) needs 21s in a
+      # native release build and 367s under ASan — a ~17x multiplier, and it
+      # does finish. CI killed it at 319s; 1200s leaves ~3x headroom.
+      #
+      # Three nightly runs were lost this way before the bound was widened.
+      # A true infinite loop is still reported, 15min later than it used to
+      # be, on the night it first appears. Exponential growth has no upper
+      # bound either, so this lowers the false-positive rate rather than
+      # ending it; if a night is lost to a terminating input again, prefer
+      # denylisting its head (see fuzz_targets/interpret.rs) over raising
+      # this further.
+      run: cargo fuzz run interpret --target "$HOST_TARGET" -- -dict="$GITHUB_WORKSPACE/fuzz/woxi.dict" -timeout=1200 -max_len=2048 -max_total_time=300 -rss_limit_mb=8192
+    - name: Upload crashing inputs
+      if: failure()
+      uses: actions/upload-artifact@v7
+      with:
+        name: fuzz-artifacts
+        path: fuzz/artifacts/

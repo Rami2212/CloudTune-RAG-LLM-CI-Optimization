@@ -1,0 +1,270 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  filter:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.compute.outputs.should_run }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Decide if CI should run
+        id: compute
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+
+          # The release workflow pushes its own commits back to master - the
+          # `chore(release): x.y.z` version bump from @semantic-release/git, and the
+          # workflow-mutations commit after it - both tagged `[skip ci]`. Their contents
+          # are a version bump and a changelog, produced from a tree CI already validated
+          # one commit earlier, and both touch package.json, which is not in the docs-only
+          # pattern below. So every release used to re-run the full three-Node matrix and
+          # package-test on code nothing had changed.
+          #
+          # Honour the marker the release workflow is already writing.
+          HEAD_MSG="$(git log -1 --pretty=%B "${{ github.sha }}" || true)"
+          if [ "$EVENT_NAME" != "pull_request" ] && printf '%s' "$HEAD_MSG" | grep -qF '[skip ci]'; then
+            echo "Head commit is marked [skip ci]; not running."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$EVENT_NAME" = "pull_request" ] && [ -n "${BASE_REF:-}" ]; then
+            git fetch --no-tags --prune --depth=1 origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+            RANGE="origin/${BASE_REF}...HEAD"
+          else
+            PREV="${{ github.event.before }}"
+            CUR="${{ github.sha }}"
+            if [ -z "$PREV" ] || [ "$PREV" = "0000000000000000000000000000000000000000" ]; then
+              RANGE="$CUR~1..$CUR"
+            else
+              RANGE="$PREV..$CUR"
+            fi
+          fi
+
+          echo "Using range: $RANGE"
+
+          # Collect changed files in range
+          CHANGED=$(git diff --name-only $RANGE || true)
+          echo "Changed files:\n$CHANGED"
+
+          # Determine if all changes are non-code only
+          # Non-code: docs site, markdown/docs, recipes, images/assets, and workflow config
+          DOCS_ONLY=true
+          if [ -n "$CHANGED" ]; then
+            if echo "$CHANGED" | grep -Ev '^(website/|README\.md$|CHANGELOG\.md$|CLAUDE\.md$|LICENSE$|zodSchemas\.png$|recipes/|\.github/workflows/)' >/dev/null 2>&1; then
+              DOCS_ONLY=false
+            fi
+          fi
+
+          # Check commit messages for allowed types or breaking change
+          HAS_ALLOWED=false
+          if git log --format=%s $RANGE | grep -Ei '^(feat|fix|perf|revert|refactor|test|build|ci)(\(|!:|:)' >/dev/null 2>&1; then
+            HAS_ALLOWED=true
+          elif git log --format=%B $RANGE | grep -q 'BREAKING CHANGE'; then
+            HAS_ALLOWED=true
+          fi
+
+          SHOULD_RUN=false
+          if [ "$DOCS_ONLY" = false ] || [ "$HAS_ALLOWED" = true ]; then
+            SHOULD_RUN=true
+          fi
+
+          echo "docs_only=$DOCS_ONLY"
+          echo "has_allowed=$HAS_ALLOWED"
+          echo "should_run=$SHOULD_RUN"
+          echo "should_run=$SHOULD_RUN" >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: filter
+    if: needs.filter.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [20.19.0, 22.x, 24.x]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.1
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build project
+        run: pnpm run gen-example
+
+      - name: Run type checking
+        run: pnpm run typecheck
+
+      # Reported but not blocking. `|| echo` *and* continue-on-error meant a lint failure
+      # could not even be seen in the job's conclusion; continue-on-error alone still
+      # surfaces it while keeping the build green.
+      - name: Run linting
+        run: pnpm run lint
+        continue-on-error: true
+
+      # `pnpm test` runs every file matched by the vitest include glob, not a
+      # hand-maintained list, so a new test file can never be silently left out of
+      # CI. No database services are required: the provider suites only run
+      # `prisma generate`, they never connect.
+      - name: Run full test suite
+        run: pnpm test
+        timeout-minutes: 45
+
+      # The coverage ratchet, run once rather than on all three Node versions. Thresholds are
+      # calibrated for a checkout without the private Pro submodule — what this job and every
+      # fork has — where 19 files skip. Measured *after* `pnpm run gen-example`, because that build
+      # step writes several hundred generated schemas into src/schemas; counting those (tsconfig
+      # excludes them, the coverage config did not) put CI 10 points below the same measurement
+      # taken locally without them, which is how the first run of this gate failed. They sit below the lower of that and the with-submodule figure
+      # (91.6/88.0/72.5) so the same script passes either way; both were measured before these
+      # numbers were set. Without this step the gate only ever ran when someone remembered to run
+      # it locally.
+      #
+      # Function coverage reads low in both: c8 merges in-process src/*.ts coverage with remapped
+      # lib/*.js coverage, and a method exercised both ways gets two function-map entries, one of
+      # which always reads zero. It is understated by roughly 20 points — treat statements and
+      # branches as the meaningful figures.
+      #
+      # It re-runs the suite under c8 rather than reusing the run above, because c8 has to own
+      # the process tree: most of these tests spawn `prisma generate`, and in-process coverage
+      # cannot see child processes at all.
+      - name: Check coverage thresholds
+        if: matrix.node-version == '24.x'
+        run: pnpm run test:coverage:ci
+        timeout-minutes: 45
+
+  package-test:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Init Pro submodule
+        env:
+          PRO_KEY: ${{ secrets.SUBMODULE_DEPLOY_KEY }}
+        run: |
+          if [ -z "$PRO_KEY" ]; then
+            echo "SUBMODULE_DEPLOY_KEY secret is not set"
+            exit 1
+          fi
+          if ! command -v ssh-agent >/dev/null; then
+            echo "ssh-agent not available"
+            exit 1
+          fi
+          eval "$(ssh-agent -s)"
+          mkdir -p ~/.ssh
+          ssh_key_path=~/.ssh/id_pro
+          if printf '%s' "$PRO_KEY" | tr -d '\r' | base64 -d > "$ssh_key_path" 2>/dev/null; then
+            echo "Submodule key decoded from base64"
+          else
+            echo "Submodule key not base64-encoded; trying to normalise raw key"
+            printf '%s' "$PRO_KEY" | sed 's/\r//g; s/\\n/\n/g' > "$ssh_key_path"
+          fi
+          chmod 600 "$ssh_key_path"
+          ssh-add "$ssh_key_path"
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          git config --global url."git@github.com:".insteadOf "https://github.com/"
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24.x'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.1
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The whole suite again, and deliberately so: this is the only job that checks out
+      # the private submodule, and roughly two dozen suites skip themselves without it.
+      # The `test` job above has no submodule, so every `tests/pro-*.test.ts` self-skips
+      # there — 20 of the 21 never executed anywhere in CI, and the one that did
+      # (pro-ui-output-compiles) only because it has its own step below. A real failure
+      # in them was invisible until someone ran the suite on a machine with the
+      # submodule checked out.
+      #
+      # It runs the full glob rather than `tests/pro-*.test.ts` because the pro-prefixed
+      # files are not the whole set: cli-commands and issue-375-shadcn-form-compat gate
+      # on the submodule too, and a hand-written pattern would drift the same way the
+      # old curated test script did.
+      #
+      # Placed before packaging so a failure reports quickly, and so it runs against a
+      # normal `lib/` rather than the obfuscated one package.sh produces.
+      - name: Run the full test suite with the Pro submodule
+        run: pnpm test
+        timeout-minutes: 30
+
+      - name: Build and package
+        run: |
+          pnpm run gen-example
+          ./package.sh
+
+      - name: Test package integrity
+        run: |
+          cd package
+          npm pack --dry-run
+
+      # `npm pack --dry-run` above lists what would be shipped without installing any of it, so
+      # nothing here verified that the tarball installs, that its bin entries resolve, or that
+      # `provider = "prisma-zod-generator"` works — the form every doc and every user writes, and
+      # which no test in the suite uses (they all run `node ./lib/generator.js`). This installs the
+      # package into a throwaway project, generates through it, type-checks the output and parses a
+      # payload through an emitted schema.
+      - name: Verify the packaged generator from a consumer project
+        run: pnpm run test:package-consumer
+        timeout-minutes: 15
+
+      # The only job with the private submodule, so the only place these can run. They generate
+      # the Form UX and Contract Testing packs and type-check the result against the real MUI,
+      # Chakra, Mantine and Pact packages, which live in tests/typecheck-fixtures rather than the
+      # root install — 322 transitive packages that nothing else here needs. The test skips
+      # itself when that package is absent, so it was previously never running anywhere.
+      #
+      # Uncompilable emitted output is the most common defect these packs have had, and it is
+      # invisible to every other check.
+      - name: Type-check emitted Pro UI output
+        run: pnpm run test:typecheck-fixtures
+        timeout-minutes: 20
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: package-build
+          path: package/
+          retention-days: 7

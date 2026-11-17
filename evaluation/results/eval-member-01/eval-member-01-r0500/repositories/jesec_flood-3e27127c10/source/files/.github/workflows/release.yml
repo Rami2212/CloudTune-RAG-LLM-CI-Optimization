@@ -1,0 +1,126 @@
+name: Publish Packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  package:
+    uses: ./.github/workflows/package.yml
+
+  npm-publish:
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Download package artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: npm-package
+          path: artifacts
+
+      - name: Locate package tarball
+        id: package_tarball
+        run: echo "path=$(ls artifacts/*.tgz)" >> "$GITHUB_OUTPUT"
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: latest
+
+      - name: Exchange OIDC token for npm publish token
+        id: npm_token
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const idToken = await core.getIDToken('npm:registry.npmjs.org');
+            const res = await fetch('https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/flood', {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${idToken}`,
+                'Content-Type': 'application/json',
+              },
+            });
+            if (!res.ok) {
+              const body = await res.text();
+              throw new Error(`Token exchange failed (${res.status}): ${body}`);
+            }
+            const { token } = await res.json();
+            core.setSecret(token);
+            core.setOutput('token', token);
+
+      - name: Publish to npm with provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ steps.npm_token.outputs.token }}
+        run: pnpm publish --access public --provenance --ignore-scripts --no-git-checks "./${{ steps.package_tarball.outputs.path }}"
+
+  pkg:
+    needs: package
+    uses: ./.github/workflows/build-binary.yml
+
+  debian:
+    needs: package
+    uses: ./.github/workflows/build-debian.yml
+
+  docker:
+    needs: package
+    uses: ./.github/workflows/build-docker.yml
+    permissions:
+      contents: read
+      packages: write
+    secrets: inherit
+    with:
+      push: true
+      platforms: linux/amd64,linux/arm64
+      flood-version: ${{ needs.package.outputs.version }}
+      flood-tags: |
+        jesec/flood:latest
+        jesec/flood:${{ needs.package.outputs.version }}
+        ghcr.io/jesec/flood:latest
+        ghcr.io/jesec/flood:${{ needs.package.outputs.version }}
+
+  github-release:
+    needs:
+      - npm-publish
+      - pkg
+      - debian
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download pkg artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: pkg-binaries
+          path: release-assets
+
+      - name: Download debian artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: flood-debian
+          path: release-assets
+        continue-on-error: true
+
+      - name: Fetch release body
+        run: |
+          git fetch origin ${{ github.ref }}
+          git for-each-ref ${{ github.ref }} --format="%(contents)" > body
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          name: Release ${{ github.ref_name }}
+          body_path: body
+          files: release-assets/**/*

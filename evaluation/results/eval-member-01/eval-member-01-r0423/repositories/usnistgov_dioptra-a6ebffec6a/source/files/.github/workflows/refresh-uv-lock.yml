@@ -1,0 +1,97 @@
+# This Software (Dioptra) is being made available as a public service by the
+# National Institute of Standards and Technology (NIST), an Agency of the United
+# States Department of Commerce. This software was developed in part by employees of
+# NIST and in part by NIST contractors. Copyright in portions of this software that
+# were developed by NIST contractors has been licensed or assigned to NIST. Pursuant
+# to Title 17 United States Code Section 105, works of NIST employees are not
+# subject to copyright protection in the United States. However, NIST may hold
+# international copyright in software created by its employees and domestic
+# copyright (or licensing rights) in portions of software that were assigned or
+# licensed to NIST. To the extent that NIST holds copyright in this software, it is
+# being made available under the Creative Commons Attribution 4.0 International
+# license (CC BY 4.0). The disclaimers of the CC BY 4.0 license apply to all parts
+# of the software developed or licensed by NIST.
+#
+# ACCESS THE FULL CC BY 4.0 LICENSE HERE:
+# https://creativecommons.org/licenses/by/4.0/legalcode
+name: Refresh uv.lock
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: Branch to refresh from.
+        required: true
+        default: dev
+        type: choice
+        options:
+          - main
+          - dev
+      dry_run:
+        description: Preview PR and branch operations without remote writes or validation dispatch.
+        required: true
+        default: false
+        type: boolean
+  schedule:
+    - cron: "37 8 * * 1"
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(github.event_name == 'schedule' && '["main","dev"]' || format('["{0}"]', inputs.target_branch)) }}
+    concurrency:
+      group: refresh-uv-lock-${{ matrix.target }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DRY_RUN: ${{ inputs.dry_run || false }}
+      TARGET_BRANCH: ${{ matrix.target }}
+
+    steps:
+      - name: Check target
+        run: |
+          case "$TARGET_BRANCH" in
+            main|dev) ;;
+            *) echo "Unsupported target: $TARGET_BRANCH" >&2; exit 1 ;;
+          esac
+
+      # This checkout runs after acquiring the target's concurrency group.
+      # Both targets must contain the helper and monitor before enabling the schedule.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ matrix.target }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          python-version: "3.11"
+
+      - name: Refresh candidate
+        id: candidate
+        run: |
+          uv run --no-project python .github/actions/refresh-uv-lock/refresh.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --target "$TARGET_BRANCH" \
+            --dry-run "$DRY_RUN"
+
+      - name: Monitor validation workflows
+        if: ${{ steps.candidate.outputs.changed == 'true' && env.DRY_RUN != 'true' }}
+        uses: ./.github/actions/monitor-refresh-validation
+        with:
+          repository: ${{ github.repository }}
+          pr-number: ${{ steps.candidate.outputs.pr_number }}
+          head-branch: automation/refresh-uv-lock-${{ matrix.target }}
+          source-branch: ${{ matrix.target }}
+          head-sha: ${{ steps.candidate.outputs.head_sha }}
+          dispatch-started-at: ${{ steps.candidate.outputs.dispatch_started_at }}

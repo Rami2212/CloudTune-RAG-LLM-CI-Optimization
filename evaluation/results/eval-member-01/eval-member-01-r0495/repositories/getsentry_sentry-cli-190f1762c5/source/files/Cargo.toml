@@ -1,0 +1,158 @@
+[package]
+build = "build.rs"
+name = "sentry-cli"
+version = "3.8.2"
+edition = "2021"
+rust-version = "1.91"
+
+[workspace]
+
+[dependencies]
+anylog = "0.6.3"
+anyhow = { version = "1.0.69", features = ["backtrace"] }
+bytecount = "0.6.3"
+chrono = { version = "0.4.31", features = ["serde"] }
+clap = { version = "4.1.6", default-features = false, features = [
+  "derive",
+  "std",
+  "suggestions",
+  "wrap_help",
+  "string",
+  "help",
+  "usage",
+  "error-context",
+] }
+clap_complete = "4.4.3"
+console = "0.15.5"
+curl = "0.4.46"
+dirs = "4.0.0"
+dotenvy = "0.15.7"
+elementtree = "1.2.3"
+flate2 = { version = "1.0.25", default-features = false, features = [
+  "rust_backend",
+] }
+futures-util = "0.3"
+git2 = { version = "0.21.0", default-features = false }
+glob = "0.3.1"
+http = "1.4.0"
+if_chain = "1.0.2"
+ignore = "0.4.20"
+imagesize = "0.14.0"
+# Do not update due to https://github.com/console-rs/indicatif/issues/317 and https://github.com/getsentry/sentry-cli/pull/1055
+indicatif = "0.14.0"
+itertools = "0.10.5"
+java-properties = "2.0.0"
+lazy_static = "1.4.0"
+libc = "0.2.139"
+log = { version = "0.4.17", features = ["std"] }
+objectstore-client = { version = "0.1.12" , default-features = false, features = ["native-tls"] }
+open = "3.2.0"
+parking_lot = "0.12.1"
+percent-encoding = "2.2.0"
+plist = "1.4.0"
+prettytable-rs = "0.10.0"
+proguard = { version = "5.0.0", features = ["uuid"] }
+r2d2 = "0.8.10"
+rayon = "1.6.1"
+regex = "1.7.3"
+runas = "1.0.0"
+rust-ini = "0.18.0"
+semver = "1.0.16"
+sentry = { version = "0.46.0", default-features = false, features = [
+  "anyhow",
+  "curl",
+  "contexts",
+] }
+serde = { version = "1.0.152", features = ["derive"] }
+serde_json = "1.0.93"
+sha1_smol = { version = "1.0.0", features = ["serde", "std"] }
+sha2 = "0.10.9"
+sourcemap = { version = "9.3.0", features = ["ram_bundle"] }
+symbolic = { version = "13.1.1", features = ["debuginfo-serde", "il2cpp"] }
+thiserror = "1.0.38"
+tokio = { version = "1.47", features = ["rt"] }
+url = "2.3.1"
+uuid = { version = "1.3.0", features = ["v4", "serde"] }
+walkdir = "2.3.2"
+which = "4.4.0"
+whoami = "1.5.2"
+zip = "2.4.2"
+zstd = "0.13.3"
+data-encoding = "2.3.3"
+magic_string = "0.3.4"
+chrono-tz = "0.8.4"
+secrecy = { version = "0.8.0", features = ["serde"] }
+lru = "0.16.3"
+backon = { version = "1.5.2", features = ["std", "std-blocking-sleep"] }
+
+[dev-dependencies]
+assert_cmd = "2.0.11"
+insta = { version = "1.26.0", features = ["redactions", "yaml"] }
+mockito = "1.6.1"
+rstest = "0.18.2"
+serial_test = "3.1.1"
+tempfile = "3.8.1"
+trycmd = "0.14.11"
+
+[features]
+default = []
+managed = []
+with_crash_reporting = []
+
+[workspace.lints.clippy]
+allow-attributes = "warn"
+dbg-macro = "warn"
+elidable-lifetime-names = "warn"
+implicit-clone = "warn"
+str-to-string = "warn"
+tests-outside-test-module = "warn"
+unnecessary-wraps = "warn"
+uninlined-format-args = "warn"
+unused-trait-names = "warn"
+unwrap-used = "warn"
+
+[lints]
+workspace = true
+
+[target]
+
+[target."cfg(target_os = \"macos\")"]
+
+[target."cfg(all(target_os = \"macos\", target_arch = \"aarch64\"))".dependencies]
+apple-catalog-parsing = { path = "apple-catalog-parsing" }
+
+[target."cfg(target_os = \"macos\")".dependencies]
+mac-process-info = "0.2.0"
+
+[target."cfg(unix)"]
+
+[target."cfg(unix)".dependencies]
+openssl-probe = "0.1.5"
+
+[target."cfg(windows)"]
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.59.0", features = ["Win32_Storage_FileSystem"] }
+
+# Use static curl/SSL on non-macOS platforms
+# We link dynamically on macOS; that way we can support self-signed certificates
+# trusted in the macOS keychain.
+[target."cfg(not(target_os = \"macos\"))".dependencies]
+curl = { version = "0.4.46", features = ["static-curl", "static-ssl"] }
+
+# On macOS, curl links the system libcurl, but `openssl-sys` still needs OpenSSL
+# headers at build time. We cross-compile for Intel Macs on ARM runners, where no
+# x86_64 OpenSSL is available, so `static-ssl` builds it from source. Without
+# `static-curl`, libcurl stays dynamic, and the linker drops OpenSSL from the binary.
+[target."cfg(all(target_os = \"macos\", target_arch = \"x86_64\"))".dependencies]
+curl = { version = "0.4.46", features = ["static-ssl"] }
+
+# We optimize the release build for size.
+[profile.release]
+opt-level = 2       # I obtained the smallest binary size with opt-level 2 on my system.
+panic = "abort"
+strip = "debuginfo" # Only strip debuginfo (not symbols) to keep backtraces useful.
+codegen-units = 1   # Parallel compilation prevents some optimizations.
+# We do not enable link-time optimizations (lto) because they cause the
+# CLI to timeout when run in Xcode Cloud.
+

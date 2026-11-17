@@ -1,0 +1,57 @@
+name: CI-Docker-Rootless
+
+on:
+  pull_request:
+    paths-ignore:
+      - '.github/ISSUE_TEMPLATE/*.yaml'
+      - '.github/CODEOWNERS'
+      - '.github/pull_request_template.md'
+      - 'docs/**/*.css'
+      - 'docs/**/*.html'
+      - 'docs/**/*.ico'
+      - 'docs/**/*.md'
+      - 'docs/**/*.png'
+      - 'docs/**/*.svg'
+      - 'mkdocs.yml'
+      - 'README.md'
+      - 'RELEASING.md'
+      - '.sdkmanrc'
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '.github/ISSUE_TEMPLATE/*.yaml'
+      - '.github/CODEOWNERS'
+      - '.github/pull_request_template.md'
+      - 'docs/**/*.css'
+      - 'docs/**/*.html'
+      - 'docs/**/*.ico'
+      - 'docs/**/*.md'
+      - 'docs/**/*.png'
+      - 'docs/**/*.svg'
+      - 'mkdocs.yml'
+      - 'README.md'
+      - 'RELEASING.md'
+      - '.sdkmanrc'
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.head_ref || github.sha }}"
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    permissions:
+      checks: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup rootless Docker
+        uses: docker/setup-docker-action@v5
+        with:
+          rootless: true
+      - uses: ./.github/actions/setup-build
+      - name: Build with Gradle
+        run: ./gradlew --no-daemon --scan testcontainers:test --tests '*GenericContainerRuleTest'
+      - uses: ./.github/actions/setup-junit-report

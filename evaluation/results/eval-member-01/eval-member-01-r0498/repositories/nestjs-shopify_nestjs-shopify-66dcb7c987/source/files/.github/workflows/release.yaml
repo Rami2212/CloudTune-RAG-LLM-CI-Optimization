@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  NX_BRANCH: ${{ github.event.pull_request.head.ref }}
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Nx set SHAs
+        uses: nrwl/nx-set-shas@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: '.node-version'
+          cache: npm
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Build packages
+        run: npm run build
+
+      - name: Creating .npmrc
+        run: |
+          cat << EOF > "$HOME/.npmrc"
+            //registry.npmjs.org/:_authToken=$NPM_TOKEN
+          EOF
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Modify workspace
+        run: sed -e 's|"packages\/|"dist\/packages\/|' package.json > package-new.json && mv package-new.json package.json
+
+      - name: Debug workspace
+        run: cat package.json
+
+      - name: Run Changesets Release
+        id: changesets
+        uses: changesets/action@v1
+        with:
+          # This expects you to have a script called release which does a build for your packages and calls changeset publish
+          publish: npm run release
+          commit: 'chore(): update packages for release'
+        env:
+          GITHUB_TOKEN: ${{ secrets.CHANGESETS_GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}

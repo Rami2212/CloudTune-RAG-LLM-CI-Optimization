@@ -1,0 +1,120 @@
+name: website
+
+on:
+  push:
+    branches:
+      - '*-release'
+  workflow_dispatch:
+
+concurrency: website-gh-pages
+
+permissions:
+  contents: read
+
+jobs:
+  check_branch:
+    runs-on: ubuntu-22.04
+    outputs:
+      should_deploy: ${{ steps.deploy_config.outputs.should_deploy }}
+      target_folder: ${{ steps.deploy_config.outputs.target_folder }}
+      website_base_url: ${{ steps.deploy_config.outputs.website_base_url }}
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Get version
+        id: get_version
+        run: |
+          packageFile=$(if [ -d modules ]; then ls modules/core/package.json | head -n 1; else echo package.json; fi)
+          packageName=$(jq -r '.name' $packageFile)
+          LATEST=$(npm show "${packageName}@latest" version | grep -o -E "^[0-9]+\.[0-9]+")
+          echo "latest=${LATEST}-release" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve deploy config
+        id: deploy_config
+        env:
+          LATEST_RELEASE_BRANCH: ${{ steps.get_version.outputs.latest }}
+        run: |
+          if [ "${GITHUB_REF_NAME}" = "master" ]; then
+            echo "should_deploy=true" >> "$GITHUB_OUTPUT"
+            echo "target_folder=next" >> "$GITHUB_OUTPUT"
+            echo "website_base_url=/next/" >> "$GITHUB_OUTPUT"
+          elif [ "${GITHUB_REF_NAME}" = "${LATEST_RELEASE_BRANCH}" ]; then
+            echo "should_deploy=true" >> "$GITHUB_OUTPUT"
+            echo "target_folder=" >> "$GITHUB_OUTPUT"
+            echo "website_base_url=/" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_deploy=false" >> "$GITHUB_OUTPUT"
+            echo "target_folder=" >> "$GITHUB_OUTPUT"
+            echo "website_base_url=/" >> "$GITHUB_OUTPUT"
+          fi
+
+  deploy:
+    runs-on: ubuntu-22.04
+    needs: check_branch
+
+    env:
+      WEBSITE_BASE_URL: ${{ needs.check_branch.outputs.website_base_url }}
+
+    permissions:
+      contents: write
+
+    if: ${{ github.repository_owner == 'visgl' && needs.check_branch.outputs.should_deploy }}
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          token: ${{ secrets.WEBSITE_DEPLOY_TOKEN }}
+
+      - name: Setup Node (with Corepack)
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Enable Corepack / Yarn 4
+        run: |
+          corepack enable
+          corepack prepare yarn@4.13.0 --activate
+          yarn -v
+
+      - name: Cache Yarn Berry artifacts
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.yarn/berry/cache
+            .yarn/install-state.gz
+          key: ${{ runner.os }}-yarn4-${{ hashFiles('yarn.lock', '.yarnrc.yml', 'package.json') }}
+
+      - name: Install website dependencies
+        run: yarn install --immutable
+
+      - name: Build workspace packages
+        run: yarn build
+
+      - name: Synchronize website example assets
+        run: node website/scripts/sync-example-assets.mjs
+
+      - name: Build standalone website examples
+        run: yarn workspace website-docusaurus build:standalone-examples
+
+      - name: Build Docusaurus website
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
+        run: yarn workspace website-docusaurus docusaurus build
+
+      - name: Normalize LLM documentation output
+        run: node website/scripts/normalize-llm-output.mjs
+
+      - name: Validate LLM documentation output
+        run: node website/scripts/check-llm-output.mjs
+
+      - name: Deploy website to GitHub Pages
+        uses: JamesIves/github-pages-deploy-action@d92aa235d04922e8f08b40ce78cc5442fcfbfa2f # 4.8.0
+        with:
+          token: ${{ secrets.WEBSITE_DEPLOY_TOKEN }}
+          branch: gh-pages
+          folder: website/build
+          target-folder: ${{ needs.check_branch.outputs.target_folder }}
+          clean: true
+          clean-exclude: |
+            next

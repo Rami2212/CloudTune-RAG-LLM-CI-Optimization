@@ -1,0 +1,155 @@
+name: UI tests
+
+# Runs the Appium UI tests (tests/Plugin.Maui.Calendar.UITests) on an iOS simulator and an Android emulator for
+# every pull request into main, after every merge into main, and on demand.
+on:
+  pull_request:
+    branches: [ "main" ]
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+# A new push to a pull request cancels the run for the previous one; every merge into main is checked.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# The SDK, the workload set and Xcode the tests were last checked with. Each .NET for iOS version needs one Xcode
+# version (the workload set 10.0.401.1 brings .NET for iOS 27, which needs Xcode 27), so update them together.
+env:
+  DOTNET_SDK_VERSION: 10.0.400
+  DOTNET_WORKLOAD_VERSION: 10.0.400.1
+  XCODE_VERSION: '26.6'
+
+jobs:
+  ios:
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      UITEST_PLATFORM: ios
+      UITEST_DEVICE: iPhone 17
+      UITEST_PLATFORM_VERSION: '26.5'
+      # The simulator the iOS baselines were recorded on, so the screenshots are compared too.
+      UITEST_SCREENSHOTS: 'on'
+    steps:
+    - uses: actions/checkout@v5
+    - name: Select Xcode
+      run: sudo xcode-select --switch /Applications/Xcode_${{ env.XCODE_VERSION }}.app
+    # The first boot of a simulator takes minutes: it boots while the next steps run.
+    - name: Start booting the simulator
+      run: |
+        udid=$(xcrun simctl list devices available --json | jq -r \
+          --arg runtime "com.apple.CoreSimulator.SimRuntime.iOS-${UITEST_PLATFORM_VERSION//./-}" --arg name "$UITEST_DEVICE" \
+          '.devices[$runtime][]? | select(.name == $name) | .udid')
+        if [ -z "$udid" ]; then
+          echo "::error::There is no $UITEST_DEVICE simulator with iOS $UITEST_PLATFORM_VERSION on this runner."
+          exit 1
+        fi
+        echo "SIMULATOR_UDID=$udid" >> "$GITHUB_ENV"
+        xcrun simctl boot "$udid"
+    - uses: actions/setup-dotnet@v5
+      with:
+        dotnet-version: ${{ env.DOTNET_SDK_VERSION }}
+    - uses: actions/setup-node@v5
+      with:
+        node-version: 22
+    - name: Install .NET MAUI
+      run: dotnet workload install maui --version ${{ env.DOTNET_WORKLOAD_VERSION }}
+    - name: Install Appium
+      working-directory: tests/Plugin.Maui.Calendar.UITests
+      run: npm ci
+    # Otherwise Appium builds it when the first test starts, which together with the boot takes longer than
+    # the tests wait for the app to start.
+    - name: Build WebDriverAgent
+      working-directory: tests/Plugin.Maui.Calendar.UITests
+      env:
+        APPIUM_HOME: ${{ github.workspace }}/tests/Plugin.Maui.Calendar.UITests
+      run: npx appium driver run xcuitest build-wda --name "$UITEST_DEVICE" --sdk "$UITEST_PLATFORM_VERSION"
+    - name: Build the host app
+      run: dotnet build tests/Plugin.Maui.Calendar.UITests.HostApp -f net10.0-ios -c Debug
+    - name: Wait for the simulator
+      run: xcrun simctl bootstatus "$SIMULATOR_UDID"
+    - name: Run the UI tests
+      run: dotnet test tests/Plugin.Maui.Calendar.UITests --logger trx --logger "console;verbosity=normal"
+    # Shows the results of every test in the run's summary. It writes the job summary rather than a check run,
+    # so it needs no write permission and works for pull requests from forks too. The test step already fails
+    # the job when a test fails.
+    - name: Publish the test results
+      uses: dorny/test-reporter@v3
+      if: ${{ !cancelled() }}
+      with:
+        name: UI tests (iOS)
+        report-title: UI tests (iOS)
+        path: tests/Plugin.Maui.Calendar.UITests/TestResults/*.trx
+        reporter: dotnet-trx
+        fail-on-error: false
+        fail-on-empty: false
+    - uses: actions/upload-artifact@v6
+      if: always()
+      with:
+        name: ui-tests-ios
+        path: tests/Plugin.Maui.Calendar.UITests/TestResults/
+
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      UITEST_PLATFORM: android
+      # The emulator is not the device the Android baselines were recorded on, so only the behavior is checked.
+      UITEST_SCREENSHOTS: 'off'
+    steps:
+    - uses: actions/checkout@v5
+    - uses: actions/setup-dotnet@v5
+      with:
+        dotnet-version: ${{ env.DOTNET_SDK_VERSION }}
+    - uses: actions/setup-node@v5
+      with:
+        node-version: 22
+    - uses: actions/setup-java@v5
+      with:
+        distribution: microsoft
+        java-version: 21
+    - name: Enable KVM for the emulator
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm
+    - name: Install .NET MAUI
+      run: dotnet workload install maui-android --version ${{ env.DOTNET_WORKLOAD_VERSION }}
+    - name: Install Appium
+      working-directory: tests/Plugin.Maui.Calendar.UITests
+      run: npm ci
+    - name: Build the host app
+      run: dotnet build tests/Plugin.Maui.Calendar.UITests.HostApp -f net10.0-android -c Debug
+    - name: Run the UI tests on an emulator
+      uses: reactivecircus/android-emulator-runner@v2
+      with:
+        api-level: 35
+        arch: x86_64
+        target: google_apis
+        # A phone the size of the Pixel 9 the tests were written on, so the state texts under the calendar, which
+        # the tests read, fit on the screen.
+        profile: pixel_7
+        cores: 4
+        disable-animations: true
+        # The emulator is slow on the runner, and system apps such as the launcher stop responding at times. Their
+        # "isn't responding" dialogs would cover the app, so they are turned off and the one already open is closed.
+        script: |
+          adb shell settings put global hide_error_dialogs 1
+          adb shell am broadcast -a android.intent.action.CLOSE_SYSTEM_DIALOGS
+          dotnet test tests/Plugin.Maui.Calendar.UITests --logger trx --logger "console;verbosity=normal"
+    - name: Publish the test results
+      uses: dorny/test-reporter@v3
+      if: ${{ !cancelled() }}
+      with:
+        name: UI tests (Android)
+        report-title: UI tests (Android)
+        path: tests/Plugin.Maui.Calendar.UITests/TestResults/*.trx
+        reporter: dotnet-trx
+        fail-on-error: false
+        fail-on-empty: false
+    - uses: actions/upload-artifact@v6
+      if: always()
+      with:
+        name: ui-tests-android
+        path: tests/Plugin.Maui.Calendar.UITests/TestResults/

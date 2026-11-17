@@ -1,0 +1,45 @@
+name: Release
+on:
+  push:
+    branches: [master]
+    tags: ["*"]
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    if: github.repository == 'scapegoat-scala/scapegoat'
+    steps:
+      - uses: actions/checkout@v7
+      - run: git fetch --prune --unshallow
+      - uses: actions/setup-java@v6.1.0
+        with:
+          cache: sbt
+          distribution: temurin
+          java-version: 17
+      - run: |
+          sudo apt-get update && sudo apt-get -y install gnupg2
+          mkdir ~/.gnupg && chmod 700 ~/.gnupg
+          echo use-agent >> ~/.gnupg/gpg.conf
+          echo pinentry-mode loopback >> ~/.gnupg/gpg.conf
+          echo allow-loopback-pinentry >> ~/.gnupg/gpg-agent.conf
+          chmod 600 ~/.gnupg/*
+          echo RELOADAGENT | gpg-connect-agent
+          echo $PGP_SECRET | base64 --decode | gpg --import --no-tty --batch --yes
+        env:
+          PGP_SECRET: ${{secrets.PGP_SECRET}}
+      - uses: sbt/setup-sbt@v1
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/coursier
+          key: coursier-${{hashFiles('**/*.sbt')}}
+          restore-keys: coursier-
+      - uses: actions/cache@v6
+        with:
+          path: ~/.sbt
+          key: sbt-${{hashFiles('**/*.sbt')}}-${{hashFiles('project/build.properties')}}
+          restore-keys: sbt-
+      - run: sbt 'clean; ci-release'
+        env:
+          PGP_PASSPHRASE: ${{secrets.PGP_PASSPHRASE}}
+          PGP_SECRET: ${{secrets.PGP_SECRET}}
+          SONATYPE_PASSWORD: ${{secrets.SONATYPE_PASSWORD}}
+          SONATYPE_USERNAME: ${{secrets.SONATYPE_USERNAME}}

@@ -1,0 +1,39 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [HIGH] Add pip dependency cache to "docs" job
+# Estimated savings: ~3 min/run
+#
+name: documentation
+
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: write
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+      - name: Install dependencies
+        run: |
+          pip install uv
+          uv sync --group docs
+      - name: Sphinx build
+        run: |
+          uv run sphinx-build docs/source docs/build
+      - name: Assemble site
+        run: |
+          mkdir -p _site/docs
+          cp -r homepage/* _site/
+          cp -r docs/build/* _site/docs/
+          touch _site/.nojekyll
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        with:
+          publish_branch: gh-pages
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: _site
+          force_orphan: true

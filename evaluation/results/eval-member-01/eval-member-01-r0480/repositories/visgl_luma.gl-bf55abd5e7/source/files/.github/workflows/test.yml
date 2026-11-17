@@ -1,0 +1,458 @@
+name: test
+
+# Validate pull requests, merge queue commits, and pushes to master.
+on:
+  push:
+    branches:
+    - master
+  pull_request:
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build_packages:
+    name: Build shared packages
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Setup Node (with Corepack)
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Enable Corepack / Yarn 4
+        run: |
+          corepack enable
+          corepack prepare yarn@4.13.0 --activate
+          yarn -v
+
+      - name: Cache Yarn Berry artifacts
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.yarn/berry/cache
+            .yarn/install-state.gz
+          key: ${{ runner.os }}-yarn4-${{ hashFiles('yarn.lock', '.yarnrc.yml', 'package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn4-
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Build packages once
+        run: yarn build
+
+      - name: Archive package outputs
+        run: tar -cf "${RUNNER_TEMP}/luma-package-build.tar" modules/*/dist
+
+      - name: Upload package outputs
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: luma-package-build
+          path: ${{ runner.temp }}/luma-package-build.tar
+          compression-level: 1
+          retention-days: 35
+          if-no-files-found: error
+
+  presentation:
+    name: GPU canvas presentation
+    runs-on: ubuntu-22.04
+    # Allow cold dependency/browser installs; the canary itself remains bounded to two minutes.
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Setup Node (with Corepack)
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Enable Corepack / Yarn 4
+        run: |
+          corepack enable
+          corepack prepare yarn@4.13.0 --activate
+          yarn -v
+
+      - name: Restore Yarn Berry artifacts
+        id: yarn-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.yarn/berry/cache
+            .yarn/install-state.gz
+          key: ${{ runner.os }}-yarn4-${{ hashFiles('yarn.lock', '.yarnrc.yml', 'package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn4-
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Save Yarn Berry artifacts
+        if: steps.yarn-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.yarn/berry/cache
+            .yarn/install-state.gz
+          key: ${{ steps.yarn-cache.outputs.cache-primary-key }}
+
+      - name: Cache Playwright Chromium
+        id: playwright-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-ms-playwright-${{ hashFiles('yarn.lock', 'package.json') }}
+
+      - name: Install Playwright Chromium
+        run: yarn exec playwright install chromium
+
+      - name: Check WebGPU and WebGL canvas capture
+        timeout-minutes: 2
+        run: xvfb-run -a yarn test-presentation
+
+  browser_coverage:
+    name: Browser coverage (${{ matrix.group }} ${{ matrix.shard }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    env:
+      LUMA_TEST_BROWSER_GROUP: ${{ matrix.group }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep physics on pull requests and master pushes, outside the merge queue.
+        include: ${{ fromJSON(github.event_name == 'merge_group' &&
+          '[{"group":"general","runner":"ubuntu-22.04","shard":"1/3"},
+            {"group":"general","runner":"ubuntu-22.04","shard":"2/3"},
+            {"group":"general","runner":"ubuntu-22.04","shard":"3/3"},
+            {"group":"compute","runner":"ubuntu-22.04","shard":"1/1"}]' ||
+          '[{"group":"general","runner":"ubuntu-22.04","shard":"1/3"},
+            {"group":"general","runner":"ubuntu-22.04","shard":"2/3"},
+            {"group":"general","runner":"ubuntu-22.04","shard":"3/3"},
+            {"group":"compute","runner":"ubuntu-22.04","shard":"1/1"},
+            {"group":"physics","runner":"macos-15","shard":"1/2"},{"group":"physics","runner":"macos-15","shard":"2/2"}]') }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Setup Node (with Corepack)
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Enable Corepack / Yarn 4
+        run: |
+          corepack enable
+          corepack prepare yarn@4.13.0 --activate
+          yarn -v
+
+      - name: Restore Yarn Berry artifacts
+        id: yarn-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.yarn/berry/cache
+            .yarn/install-state.gz
+          key: ${{ runner.os }}-yarn4-${{ hashFiles('yarn.lock', '.yarnrc.yml', 'package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn4-
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Save Yarn Berry artifacts
+        if: steps.yarn-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.yarn/berry/cache
+            .yarn/install-state.gz
+          key: ${{ steps.yarn-cache.outputs.cache-primary-key }}
+
+      - name: Cache Playwright Chromium
+        id: playwright-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cache/ms-playwright
+            ~/Library/Caches/ms-playwright
+          key: ${{ runner.os }}-ms-playwright-${{ hashFiles('yarn.lock', 'package.json') }}
+
+      - name: Install Playwright Chromium
+        run: yarn exec playwright install chromium
+
+      - name: Verify WebGL and WebGPU presentation
+        timeout-minutes: 2
+        run: ${{ runner.os == 'Linux' && 'xvfb-run -a yarn test-presentation' || 'yarn test-presentation' }}
+
+      - name: Reclaim install cache and report disk usage
+        run: |
+          rm -rf "${HOME}/.yarn/berry/cache"
+          df -h .
+          du -sh . "${HOME}/.yarn" "${HOME}/Library/Caches/ms-playwright" "${RUNNER_TEMP}" 2>/dev/null || true
+
+      - name: Run headless tests and generate coverage
+        env:
+          # Include browser process failures alongside WebGPU test assertions.
+          DEBUG: pw:browser
+        run: |
+          yarn test-coverage --shard=${{ matrix.shard }} --coverage.reporter=lcovonly
+
+      - name: Report disk usage after coverage
+        if: always()
+        run: |
+          df -h .
+          du -sh . coverage "${HOME}/.yarn" "${HOME}/.cache/ms-playwright" "${RUNNER_TEMP}" 2>/dev/null || true
+
+      - name: Sanitize lcov for Coveralls
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const coveragePath = 'coverage/lcov.info';
+          const lines = fs.readFileSync(coveragePath, 'utf8').split(/\r?\n/);
+          const records = [];
+          let currentRecord = [];
+
+          for (const line of lines) {
+            currentRecord.push(line);
+            if (line === 'end_of_record') {
+              const sourceFileLine = currentRecord.find(recordLine => recordLine.startsWith('SF:'));
+              const sourceFile = sourceFileLine ? sourceFileLine.slice(3).trim() : '';
+              if (sourceFile) {
+                records.push(currentRecord.join('\n'));
+              }
+              currentRecord = [];
+            }
+          }
+
+          if (currentRecord.length) {
+            const sourceFileLine = currentRecord.find(recordLine => recordLine.startsWith('SF:'));
+            const sourceFile = sourceFileLine ? sourceFileLine.slice(3).trim() : '';
+            if (sourceFile) {
+              records.push(currentRecord.join('\n'));
+            }
+          }
+
+          fs.writeFileSync(coveragePath, `${records.join('\n')}\n`);
+          NODE
+
+      - name: Upload browser coverage artifact
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: browser-coverage-lcov-${{ matrix.group }}-${{ strategy.job-index }}
+          path: coverage/lcov.info
+          if-no-files-found: error
+          retention-days: 1
+
+  node_coverage:
+    name: Node coverage
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Setup Node (with Corepack)
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Enable Corepack / Yarn 4
+        run: |
+          corepack enable
+          corepack prepare yarn@4.13.0 --activate
+          yarn -v
+
+      - name: Cache Yarn Berry artifacts
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.yarn/berry/cache
+            .yarn/install-state.gz
+          key: ${{ runner.os }}-yarn4-${{ hashFiles('yarn.lock', '.yarnrc.yml', 'package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn4-
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Run all Node tests
+        run: yarn test-node
+
+      - name: Collect focused Node coverage
+        run: yarn test-node-coverage
+
+      - name: Upload Node coverage artifact
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: node-coverage-lcov
+          path: coverage-node/lcov.info
+          if-no-files-found: error
+          retention-days: 1
+
+  test:
+    name: Aggregate test coverage
+    needs: [browser_coverage, node_coverage, presentation, build_packages]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code for coverage reporting
+        if: ${{ needs.browser_coverage.result == 'success' && needs.node_coverage.result == 'success' }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Download browser coverage artifacts
+        if: ${{ needs.browser_coverage.result == 'success' && needs.node_coverage.result == 'success' }}
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: browser-coverage-lcov-*
+          path: coverage/shards
+
+      - name: Download Node coverage artifact
+        if: ${{ needs.browser_coverage.result == 'success' && needs.node_coverage.result == 'success' }}
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: node-coverage-lcov
+          path: coverage/shards/node-coverage-lcov
+
+      - name: Merge browser and Node coverage reports
+        if: ${{ needs.browser_coverage.result == 'success' && needs.node_coverage.result == 'success' }}
+        run: |
+          node ./test/utils/merge-lcov.mjs \
+            --output coverage/lcov.info \
+            coverage/shards/browser-coverage-lcov-*/lcov.info \
+            coverage/shards/node-coverage-lcov/lcov.info
+
+      - name: Upload combined coverage to Coveralls
+        # Queue runs intentionally omit physics; do not publish partial coverage.
+        if: ${{ github.event_name != 'merge_group' && needs.browser_coverage.result == 'success' && needs.node_coverage.result == 'success' }}
+        uses: coverallsapp/github-action@648a8eb78e6d50909eff900e4ec85cab4524a45b # v2.3.6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          file: coverage/lcov.info
+          # Reruns must not upload into a build that a previous attempt closed.
+          build-number: ${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Verify all coverage and prerequisite jobs passed
+        if: always()
+        env:
+          BROWSER_COVERAGE_RESULT: ${{ needs.browser_coverage.result }}
+          NODE_COVERAGE_RESULT: ${{ needs.node_coverage.result }}
+          PRESENTATION_RESULT: ${{ needs.presentation.result }}
+          PACKAGE_BUILD_RESULT: ${{ needs.build_packages.result }}
+        run: |
+          if [ "$PACKAGE_BUILD_RESULT" != "success" ]; then
+            echo "::error::Shared package build finished with status: $PACKAGE_BUILD_RESULT"
+            exit 1
+          fi
+          if [ "$PRESENTATION_RESULT" != "success" ]; then
+            echo "::error::GPU presentation finished with status: $PRESENTATION_RESULT"
+            exit 1
+          fi
+          if [ "$BROWSER_COVERAGE_RESULT" != "success" ]; then
+            echo "::error::Browser coverage shards finished with status: $BROWSER_COVERAGE_RESULT"
+            exit 1
+          fi
+          if [ "$NODE_COVERAGE_RESULT" != "success" ]; then
+            echo "::error::Node coverage job finished with status: $NODE_COVERAGE_RESULT"
+            exit 1
+          fi
+
+  examples:
+    needs: build_packages
+    name: Build, lint, Node tests, examples, and website
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Setup Node (with Corepack)
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Enable Corepack / Yarn 4
+        run: |
+          corepack enable
+          corepack prepare yarn@4.13.0 --activate
+          yarn -v
+
+      - name: Cache Yarn Berry artifacts
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.yarn/berry/cache
+            .yarn/install-state.gz
+          key: ${{ runner.os }}-yarn4-${{ hashFiles('yarn.lock', '.yarnrc.yml', 'package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn4-
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Check bundle-size budgets
+        run: |
+          bundleSizeStatus=0
+          yarn bundle-size --output .bundle-size || bundleSizeStatus=$?
+          cat .bundle-size/report.md >> "$GITHUB_STEP_SUMMARY"
+          exit "$bundleSizeStatus"
+
+      - name: Upload bundle-size report
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: bundle-size-report
+          path: .bundle-size
+          if-no-files-found: error
+          include-hidden-files: true
+
+      - name: Download package outputs
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: luma-package-build
+          path: ${{ runner.temp }}
+
+      - name: Restore package outputs
+        run: tar -xf "${RUNNER_TEMP}/luma-package-build.tar"
+
+      - name: Verify experimental geospatial package imports
+        run: yarn test-geospatial-package
+
+      - name: Check attribution and package notices
+        run: yarn check:attributions --pack
+
+      - name: Run lint
+        run: |
+          yarn lint
+
+      - name: Typecheck examples
+        run: |
+          yarn examples:typecheck
+
+      - name: Synchronize website example assets
+        run: node website/scripts/sync-example-assets.mjs
+
+      - name: Build standalone website examples
+        run: yarn workspace website-docusaurus build:standalone-examples
+
+      - name: Build Docusaurus website
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
+        run: yarn workspace website-docusaurus docusaurus build
+
+      - name: Normalize LLM documentation output
+        run: node website/scripts/normalize-llm-output.mjs
+
+      - name: Validate LLM documentation output
+        run: node website/scripts/check-llm-output.mjs

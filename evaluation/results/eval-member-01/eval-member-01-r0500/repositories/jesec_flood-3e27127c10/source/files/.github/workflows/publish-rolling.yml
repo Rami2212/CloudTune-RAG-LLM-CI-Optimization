@@ -1,0 +1,113 @@
+name: Publish Rolling Docker Image
+
+on:
+  push:
+    branches:
+      - master
+
+env:
+  PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN: 'false'
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      build_version: ${{ steps.build.outputs.version }}
+    steps:
+      - name: Compute build version
+        id: build
+        run: echo "version=0.0.0-master.${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+  package:
+    needs: version
+    uses: ./.github/workflows/package.yml
+    with:
+      package-name: '@jesec/flood'
+      package-version: ${{ needs.version.outputs.build_version }}
+
+  npm-publish:
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download package artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: npm-package
+          path: artifacts
+
+      - name: Locate package tarball
+        id: package_tarball
+        run: echo "path=$(ls artifacts/*.tgz)" >> "$GITHUB_OUTPUT"
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: latest
+
+      - name: Exchange OIDC token for npm publish token
+        id: npm_token
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const idToken = await core.getIDToken('npm:registry.npmjs.org');
+            const res = await fetch('https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/%40jesec%2Fflood', {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${idToken}`,
+                'Content-Type': 'application/json',
+              },
+            });
+            if (!res.ok) {
+              const body = await res.text();
+              throw new Error(`Token exchange failed (${res.status}): ${body}`);
+            }
+            const { token } = await res.json();
+            core.setSecret(token);
+            core.setOutput('token', token);
+
+      - name: Publish to npm with provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ steps.npm_token.outputs.token }}
+        run: pnpm publish --access public --provenance --tag master --ignore-scripts --no-git-checks "./${{ steps.package_tarball.outputs.path }}"
+
+  docker:
+    needs: package
+    uses: ./.github/workflows/build-docker.yml
+    permissions:
+      contents: read
+      packages: write
+    secrets: inherit
+    with:
+      push: true
+      platforms: linux/amd64,linux/arm64
+      flood-version: master
+      flood-tags: |
+        jesec/flood:master
+        ghcr.io/jesec/flood:master
+
+  pkg:
+    needs: package
+    uses: ./.github/workflows/build-binary.yml
+
+  docker-distroless:
+    needs: pkg
+    uses: ./.github/workflows/build-docker-distroless.yml
+    permissions:
+      contents: read
+      packages: write
+    secrets: inherit
+    with:
+      push: true
+      platforms: linux/amd64,linux/arm64
+      flood-version: master
+      flood-tags: |
+        jesec/flood:master-distroless
+        ghcr.io/jesec/flood:master-distroless

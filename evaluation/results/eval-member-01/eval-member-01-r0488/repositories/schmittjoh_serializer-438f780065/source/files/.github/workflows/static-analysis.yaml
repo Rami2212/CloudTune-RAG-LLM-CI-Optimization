@@ -1,0 +1,54 @@
+name: "Static Analysis"
+
+on:
+  pull_request:
+  push:
+    branches:
+      - "master"
+
+jobs:
+  static-analysis-phpstan:
+    name: "Static Analysis with PHPStan"
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        php-version:
+          - "7.4"
+          - "8.0"
+          - "8.1"
+          - "8.2"
+          - "8.3"
+          - "8.4"
+          - "8.5"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: "Install PHP"
+        uses: "shivammathur/setup-php@v2"
+        with:
+          coverage: "none"
+          php-version: "${{ matrix.php-version }}"
+          tools: "cs2pr"
+          extensions: pdo_sqlite
+
+      - name: Remove symfony/clock for PHP < 8.1
+        if: ${{ matrix.php-version < '8.1' }}
+        run: |
+          composer remove --dev symfony/clock --no-update
+          composer remove --dev twig/twig --no-update
+
+      - name: Install dependencies with Composer
+        uses: ramsey/composer-install@v4
+        with:
+          composer-options: "${{ matrix.composer-options }}"
+
+      - name: "Run a static analysis with phpstan/phpstan"
+        run: "vendor/bin/phpstan analyse --error-format=checkstyle | cs2pr"
+
+      - name: "Run a static analysis with rector/rector"
+        if: ${{ matrix.php-version == 8.5 }}
+        run: "vendor/bin/rector --dry-run"
