@@ -1,0 +1,83 @@
+name: GitHub CI
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - master
+      - '8'
+  pull_request:
+    branches:
+      - master
+      - '8'
+
+defaults:
+  run:
+    shell: 'bash -o errexit -o nounset -o pipefail {0}'
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        directory:
+          - jdk17-jammy
+          - jdk17-noble
+          - jdk17-resolute
+          - jdk17-alpine
+          - jdk17-corretto
+          - jdk17-ubi10
+          - jdk17-ubi9
+          - jdk17-jammy-graal
+          - jdk17-noble-graal
+          - jdk17-resolute-graal
+          - jdk21-jammy
+          - jdk21-noble
+          - jdk21-resolute
+          - jdk21-alpine
+          - jdk21-corretto
+          - jdk21-ubi10
+          - jdk21-ubi9
+          - jdk21-jammy-graal
+          - jdk21-noble-graal
+          - jdk21-resolute-graal
+          - jdk25-noble
+          - jdk25-resolute
+          - jdk25-alpine
+          - jdk25-corretto
+          - jdk25-ubi10
+          - jdk25-noble-graal
+          - jdk25-resolute-graal
+          - jdk27-resolute
+          - jdk27-alpine
+          - jdk27-corretto
+          - jdk27-ubi10
+          - jdk-lts-and-current
+          - jdk-lts-and-current-alpine
+          - jdk-lts-and-current-corretto
+    steps:
+      - name: checkout
+        uses: actions/checkout@v7.0.1
+      - name: build
+        run: |
+          cd "${{ matrix.directory }}"
+          grep "FROM " Dockerfile | cut -d' ' -f2 | xargs -I{} docker pull {}
+          docker build --tag "gradle:${{ matrix.directory }}" .
+      - name: test
+        env:
+          expectedGradleVersion: '9.9.1'
+        run: |
+          if [[ "${{ matrix.directory }}" = *-and-current* ]]; then
+            javaVersion=$(grep 'JAVA_CURRENT_HOME=' ${{ matrix.directory }}/Dockerfile | grep --extended-regex --only-matching '[0-9]+')
+          else
+            javaVersion=$(echo "${{ matrix.directory }}" | grep --extended-regex --only-matching 'jdk[0-9]+' | grep --extended-regex --only-matching '[0-9]+')
+          fi
+          if [[ "${{ matrix.directory }}" = *graal* ]]; then
+            cd test-graal
+            sed --in-place "s/JavaLanguageVersion.of(00)/JavaLanguageVersion.of(${javaVersion})/" app/build.gradle
+          else
+            cd test
+            sed --in-place "s/JavaLanguageVersion.of(00)/JavaLanguageVersion.of(${javaVersion})/" lib/build.gradle.kts
+          fi
+          ./run.sh "gradle:${{ matrix.directory }}" "${expectedGradleVersion}"

@@ -1,0 +1,127 @@
+name: Generate Mystery and Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      location:
+        description: 'Specific location for the mystery'
+        required: false
+        type: choice
+        default: ''
+        options:
+          - ''
+          - egypt
+          - castle
+          - train
+          - ship
+          - space station
+          - mansion
+          - museum
+          - island
+          - zoo
+          - hospital
+          - sport club
+          - abandoned school
+  workflow_call:
+  schedule:
+    - cron: "0 1 * * *"
+  push:
+    branches: [ code ]
+    paths:
+      - setup.py
+      - bin/**
+      - config/**
+      - DetectiveMysteryOMatic/**
+      - mystery_o_matic/**
+      - static/**
+      - scenarios/**
+      - .github/**
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.8'
+
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Checkout story
+      # private repo: needs a PAT_STORY_TOKEN secret with read access
+      uses: actions/checkout@v4
+      with:
+        repository: mystery-o-matic/story
+        path: story
+        token: ${{ secrets.PAT_STORY_TOKEN }}
+
+    - name: Install packages
+      run: |
+        sudo apt-get update
+        sudo apt-get install libsecp256k1-dev
+        sudo cp /usr/lib/x86_64-linux-gnu/libsecp256k1.so.1 /usr/lib/x86_64-linux-gnu/libsecp256k1.so.2
+
+    - name: Install Echidna
+      run: |
+        wget https://github.com/crytic/echidna/releases/download/v2.3.0-RC1/echidna-2.3.0-RC1-x86_64-linux.tar.gz
+        tar -xvf echidna-2.3.0-RC1-x86_64-linux.tar.gz
+        sudo cp ./echidna /usr/bin
+        echidna --version
+
+    - name: Install solc using solc-select
+      run: |
+        pip install solc-select
+        solc-select install 0.8.17
+        solc-select use 0.8.17
+
+    - name: Install fonts
+      run: |
+        sudo apt-get remove fonts-noto-color-emoji
+        mkdir -p ~/.local/share/fonts
+        unzip -u "fonts/Raleway.zip" -d ~/.local/share/fonts
+        rm -Rf ~/.local/share/fonts/OFL.txt
+        rm -Rf ~/.local/share/fonts/README.txt
+        unzip -u "fonts/Noto_Emoji.zip" -d ~/.local/share/fonts
+        rm -Rf ~/.local/share/fonts/README.txt
+        mkdir ~/.config/fontconfig
+        cp fonts/fonts.conf ~/.config/fontconfig
+        fc-cache -f -v
+
+    - name: Install mystery-o-matic
+      run: |
+        pip3 install .
+
+    - name: Generate Murder Mystery
+      run: |
+        LOCATION_ARGS=()
+        if [ -n "${{ inputs.location }}" ]; then
+          LOCATION_ARGS=(--location "${{ inputs.location }}")
+        fi
+        if [ $(( $(date +%u) % 2 )) -eq 1 ]; then # Harder puzzles half of the days
+          mystery-o-matic scenarios/simple.template.sol static out --today --workers 1 --season 3 --nplaces 5 --nchars 4 --llm "${LOCATION_ARGS[@]}"
+        else
+          mystery-o-matic scenarios/simple.template.sol static out --today --workers 1 --season 3 --llm "${LOCATION_ARGS[@]}"
+        fi
+        rm -f out/result.json
+        rm -f out/err.out
+        rm -f out/model.sol
+        rm -f out/en/index.template.html
+        rm -f out/es/index.template.html
+        sed -ie "s/\${DATE}/$(date -I)/" out/sitemap.xml
+
+    - name: Upload artifact
+      uses: actions/upload-pages-artifact@v3
+      with:
+          # Upload the resulting folder
+          path: 'out'
+
+    - name: Deploy to GitHub Pages
+      id: deployment
+      uses: actions/deploy-pages@v4

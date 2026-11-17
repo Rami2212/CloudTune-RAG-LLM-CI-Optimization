@@ -1,0 +1,58 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
+# SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
+
+# .github/workflows/compiler-support.yml
+
+name: 'Check supported Compilers'
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 1 * * 1'
+
+jobs:
+  gcc-build:
+    name: ${{ matrix.platform.id }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ { id: gcc-13, base_image: gcc:13-bookworm },
+                    { id: gcc-15, base_image: gcc:15-trixie } ]
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: 'Checkout repository code'
+        uses: actions/checkout@v6
+
+      - name: 'Build Project with ${{ matrix.platform.id }}'
+        run: |
+          docker build \
+            --build-arg BASE_IMAGE=${{ matrix.platform.base_image }} \
+            -t minifi-${{ matrix.platform.id }} \
+            -f docker/compiler-test/gcc.Dockerfile \
+            .
+
+  clang-build:
+    name: ${{ matrix.platform.id }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ { id: clang-20, base_image: silkeh/clang:20-bookworm },
+                    { id: clang-21, base_image: silkeh/clang:21-trixie } ]
+
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: 'Checkout repository code'
+        uses: actions/checkout@v6
+
+      - name: 'Build Project with ${{ matrix.platform.id }}'
+        run: |
+          docker build \
+            --build-arg BASE_IMAGE=${{ matrix.platform.base_image }} \
+            -t minifi-${{ matrix.platform.id }} \
+            -f docker/compiler-test/clang.Dockerfile \
+            .

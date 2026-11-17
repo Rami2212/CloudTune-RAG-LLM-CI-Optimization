@@ -1,0 +1,52 @@
+name: Lint
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Dependencies
+        run: |
+          set -eux
+
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+          pip install --pre torch torchvision torchcomms --index-url https://download.pytorch.org/whl/nightly/cu126
+          pip install .[dev] -v
+
+          # install recent version of Rust via rustup
+          curl https://sh.rustup.rs -sSf | sh -s -- --default-toolchain=stable --profile=default -y
+          . "$HOME/.cargo/env"
+
+          rustup install nightly
+          rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
+
+          lintrunner init
+      - name: Run lintrunner
+        run: |
+          set -eux
+
+          lintrunner --skip PYREFLY,FLAKE --force-color --all-files
+      - name: Run Pyrefly
+        run: |
+          set -eux
+
+          pyrefly check --config pyrefly.toml
+      - name: Run Rust Lint
+        run: |
+          set -eux
+
+          cargo +nightly fmt --check

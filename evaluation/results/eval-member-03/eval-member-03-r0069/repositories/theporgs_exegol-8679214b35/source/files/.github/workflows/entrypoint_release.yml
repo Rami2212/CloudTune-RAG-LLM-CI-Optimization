@@ -1,0 +1,43 @@
+# Pinned GitHub Actions
+# - actions/checkout v6.0.2 @ de0fac2e4500dabe0009e67214ff5f5447ce83dd
+#   - Repo: https://github.com/actions/checkout
+#   - Version: https://github.com/actions/checkout/tree/v6.0.2
+#   - Pinned: https://github.com/actions/checkout/commit/de0fac2e4500dabe0009e67214ff5f5447ce83dd
+# - pdm-project/setup-pdm v4 @ 94a823180e06fcde4ad29308721954a521c96ed0
+#   - Repo: https://github.com/pdm-project/setup-pdm
+#   - Version: https://github.com/pdm-project/setup-pdm/tree/v4
+#   - Pinned: https://github.com/pdm-project/setup-pdm/commit/94a823180e06fcde4ad29308721954a521c96ed0
+name: Release
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+
+jobs:
+  test:
+    name: Python tests and checks
+    uses: ./.github/workflows/sub_testing.yml
+
+  build-n-publish:
+    name: Build and publish Python 🐍 distributions to PyPI 📦
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      # IMPORTANT: this permission is mandatory for trusted publishing
+      id-token: write
+    needs: test
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          submodules: true
+      - name: Set up PDM
+        uses: pdm-project/setup-pdm@94a823180e06fcde4ad29308721954a521c96ed0
+        with:
+          python-version: "3.12"
+      - name: Build Exegol
+        run: pdm build
+      - name: Publish distribution 📦 to Test PyPI
+        run: pdm publish --no-build --repository https://test.pypi.org/legacy/ --skip-existing
+      - name: Publish distribution 📦 to PyPI (prod)
+        run: pdm publish --no-build

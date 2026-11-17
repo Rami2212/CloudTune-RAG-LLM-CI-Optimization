@@ -1,0 +1,85 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+name: Dependency inventory audit
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  check-dependency-license:
+    runs-on: ubuntu-latest
+    env:
+      SCRIPT_DEPENDENCY: hugegraph-dist/scripts/dependency
+      MAVEN_OPTS: -Xmx3g -XX:MaxMetaspaceSize=768m
+      NODE_OPTIONS: --max-old-space-size=4096
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+      - name: Set up JDK 17
+        uses: ./.github/actions/setup-java-env
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+      - name: Use pinned Hubble Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: hugegraph-hubble/hubble-fe/.node-version
+      - name: Activate pinned pnpm
+        id: pnpm
+        working-directory: hugegraph-hubble/hubble-fe
+        run: |
+          corepack enable
+          pnpm --version
+          echo "store=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+          echo "version=$(node -p 'require("./package.json").packageManager')" >> "$GITHUB_OUTPUT"
+          echo "node=$(node --version)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm downloads
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.pnpm.outputs.store }}
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.pnpm.outputs.node }}-${{ steps.pnpm.outputs.version }}-${{ hashFiles('hugegraph-hubble/hubble-fe/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-${{ steps.pnpm.outputs.node }}-${{ steps.pnpm.outputs.version }}-
+
+      - name: Install locked candidate SDK
+        uses: ./.github/actions/setup-candidate-sdk
+
+      - name: mvn install
+        run: |
+          mvn install -DskipTests=true -ntp
+      - name: generate current dependencies
+        run: |
+          bash "$SCRIPT_DEPENDENCY/regenerate_known_dependencies.sh" current-dependencies.txt
+      - name: check third dependencies
+        run: |
+          bash "$SCRIPT_DEPENDENCY/check_dependencies.sh"
+
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 'Checkout Repository'
+        uses: actions/checkout@v7
+      - name: 'Dependency Review'
+        uses: actions/dependency-review-action@v5.0.0

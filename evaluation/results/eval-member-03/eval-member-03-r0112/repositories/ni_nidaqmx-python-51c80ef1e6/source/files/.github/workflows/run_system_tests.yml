@@ -1,0 +1,62 @@
+name: Run system tests
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  run_system_tests:
+    name: Run system tests
+    runs-on:
+      - self-hosted
+      - windows
+      - x64
+      - rdss-nidaqmxbot-${{ matrix.configuration }}
+    strategy:
+      matrix:
+        configuration: ["win-10-py32", "win-10-py64"]
+      # Fail-fast skews the pass/fail ratio and seems to make pytest produce
+      # incomplete JUnit XML results.
+      fail-fast: false
+    timeout-minutes: 90
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Import DAQmx config
+        run: C:\nidaqmxconfig\targets\win64U\x64\msvc2022\release\nidaqmxconfig.exe --eraseconfig --import tests\max_config\nidaqmxMaxConfig.ini
+      - name: Set up Python
+        uses: ni/python-actions/setup-python@edaf1454897cb4cd5f6fc0757cb62dee455e57fd # v0.10.1
+        id: setup-python
+      - name: Set up Poetry
+        uses: ni/python-actions/setup-poetry@edaf1454897cb4cd5f6fc0757cb62dee455e57fd # v0.10.1
+      - name: Cache virtualenvs
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .venv
+            .tox
+          key: run-system-tests-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version }}-${{ matrix.configuration }}-${{ hashFiles('poetry.lock') }}
+      - name: Install dependencies
+        run: poetry install
+      - name: Run system tests
+        run: poetry run tox
+      - name: Rename test results
+        # TODO: Add Git Bash to the path on self-hosted Windows runners
+        run: Get-ChildItem test_results/*.xml | Rename-Item -NewName { $_.Name -replace '.xml','-${{ matrix.configuration }}.xml' }
+        if: always() && runner.os == 'Windows'
+      - name: Rename test results
+        run: |
+          for result in test_results/*.xml; do
+            mv $result ${result%.xml}-${{ matrix.configuration }}.xml
+          done
+        if: always() && runner.os != 'Windows'
+      - name: Upload test results
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test_results_system_${{ matrix.configuration }}
+          path: test_results/*.xml
+        if: always()

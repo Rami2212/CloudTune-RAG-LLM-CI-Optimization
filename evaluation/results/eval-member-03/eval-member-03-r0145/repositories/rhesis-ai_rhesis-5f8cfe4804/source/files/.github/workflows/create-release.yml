@@ -1,0 +1,129 @@
+# This workflow creates the release branch, bumps versions, generates changelogs, and opens a PR.
+# Staging deployment is handled by release.yml, which triggers on push to release/* branches.
+# This ensures the build uses the release branch (with bumped versions), not main.
+name: "[Release] 2. Create and deploy (stg)"
+
+on:
+  workflow_dispatch:  # Allows manual triggering
+
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+    steps:
+
+      - name: Generate a token
+        id: generate-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.RHEO_APP_ID }}
+          private-key: ${{ secrets.RHEO_APP_PRIVATE_KEY }}
+
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: true  # the release-branch push below needs the app token on disk
+          fetch-depth: 0
+          token: ${{ steps.generate-token.outputs.token }}
+
+      - name: Set up Git
+        run: |
+            git config user.name "rheo-app[bot]"
+            git config user.email "237771051+rheo-app[bot]@users.noreply.github.com"
+
+
+      - name: Check release config
+        id: check-config
+        run: |
+          if [ ! -f "release_config.json" ]; then
+            echo "Error: release_config.json not found"
+            exit 1
+          fi
+          echo "release_config.json found"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install uv for SDK
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+            version: latest
+
+      - name: Run release script
+        run: |
+          python3 .github/release --bump-config-file release_config.json
+          uv lock --project ./apps/backend
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Run Prettier to format frontend code
+        working-directory: apps/frontend
+        run: |
+          # Use the lockfile's version: lint.yml checks with it, and newer 3.x formats differently
+          PRETTIER_VERSION=$(node -p "require('./package-lock.json').packages['node_modules/prettier'].version")
+          npx --yes "prettier@${PRETTIER_VERSION}" --version
+          npx --yes "prettier@${PRETTIER_VERSION}" --write .
+
+      - name: Commit changes
+        run: |
+          rm -rf release_config.json
+          git add .
+          git commit -m "Prepare release"
+
+      - name: Push release branch
+        run: |
+          git push origin $(git branch --show-current)
+
+      - name: Create Pull Request
+        run: |
+          BRANCH_NAME=$(git branch --show-current)
+
+          # Check if version changes JSON file exists
+          if [ ! -f "/tmp/version_changes.json" ]; then
+            echo "Error: /tmp/version_changes.json not found. Cannot create PR without version changes."
+            exit 1
+          fi
+
+          # Extract version changes dynamically
+          VERSION_CHANGES=$(jq -r 'to_entries | map("\(.key): \(.value)") | join(", ")' /tmp/version_changes.json)
+
+          # Create title with dynamic version changes
+          PR_TITLE="Release: $VERSION_CHANGES"
+
+          # Create body with dynamic version changes
+          PR_BODY="This PR contains the automated release changes for:
+          $(jq -r 'to_entries | map("- \(.key | ascii_upcase): \(.value)") | join("\n")' /tmp/version_changes.json)
+
+
+          ## How the release process works
+          1. The current pull request contains the version changes in the configuration files and changelogs
+          2. Review the generated changelogs
+          3. Check if the version changes are correct
+          4. Check if the SDK and backend tests pass
+          5. Give the team time for review and hotfixes. Hotfixes must be merged into the release branch.
+          6. Once the release branch is approved, run the \"[Release] 3. Publish\" workflow. **The workflow must be run on the release branch.** It tags the release, which uploads the new version of the SDK to PyPI. It does not merge this PR and does not deploy.
+          7. Merge this pull request into main. Merge after publishing, not before: the tags are cut from the release branch, and merging can delete it.
+          8. Deploy to production separately: run the \"[Build & Deploy] All for K8s\" workflow with environment \`prd\`.
+
+
+
+          ## Changes
+          - Version files updated
+          - Changelog updated
+          - Release branch created
+
+          "
+
+          gh pr create --title "$PR_TITLE" \
+            --body "$PR_BODY" \
+            --base main \
+            --head $BRANCH_NAME
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}

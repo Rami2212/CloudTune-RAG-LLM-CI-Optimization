@@ -1,0 +1,166 @@
+name: Build Docker Images (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      upload_image_as_artifact:
+        description: Upload Docker image as artifact
+        type: boolean
+        default: false
+      push_by_digest:
+        description: Push images directly to registry using push-by-digest (for multi-arch manifest combining)
+        type: boolean
+        default: false
+      docker_login:
+        description: Login to Docker registry (required when push_by_digest is true)
+        type: boolean
+        default: false
+      build_arm64:
+        description: Build both amd64 and arm64 platforms (if false, only builds specified platform)
+        type: boolean
+        default: false
+      build_amd64:
+        description: Build amd64 platform
+        type: boolean
+        default: true
+      image_stage:
+        description: Dockerfile target stage to build (e.g., 'publish' or 'slim')
+        type: string
+        required: true
+      docker_tag:
+        description: Docker tag(s) for the built image (comma-separated for multiple tags)
+        type: string
+        required: true
+      java_version:
+        description: Java version to use for Maven builds
+        type: string
+        default: '25'
+      dockerfile_path:
+        description: Path to the Dockerfile to use
+        type: string
+        default: 'Dockerfile'
+      branch:
+        description: Branch, tag, or SHA to check out
+        type: string
+        default: 'main'
+      scan_before_push:
+        description: >-
+          When true (and push_by_digest is true), scan the built image with
+          Trivy before it is pushed anywhere external.
+        type: boolean
+        default: false
+      fail_on_severity:
+        description: Comma-separated severities that fail the pre-push scan (e.g. 'CRITICAL,HIGH'). Empty means report-only.
+        type: string
+        default: ''
+      vex_file:
+        description: Repo-relative path to an OpenVEX document used to suppress accepted-risk findings in the pre-push scan
+        type: string
+        default: ''
+      upload_sarif:
+        description: Upload the pre-push scan's SARIF results to the code scanning (Security) tab. Requires the caller job to grant security-events:write.
+        type: boolean
+        default: false
+    secrets:
+      registry_username:
+        description: Docker registry username (optional, for authentication)
+        required: false
+      registry_password:
+        description: Docker registry password (optional, for authentication)
+        required: false
+    outputs:
+      artifact_name_amd64:
+        description: Name of the built image artifact for linux/amd64
+        value: ${{ jobs.build_docker_image.outputs.artifact_name_amd64 || '' }}
+      artifact_name_arm64:
+        description: Name of the built image artifact for linux/arm64
+        value: ${{ jobs.build_docker_image.outputs.artifact_name_arm64 || '' }}
+      image_hash_amd64:
+        description: Hash of the built image for linux/amd64
+        value: ${{ jobs.build_docker_image.outputs.image_hash_amd64 || '' }}
+      image_hash_arm64:
+        description: Hash of the built image for linux/arm64
+        value: ${{ jobs.build_docker_image.outputs.image_hash_arm64 || '' }}
+      image_digest_amd64:
+        description: Digest of the pushed image for linux/amd64 (when push_by_digest is true)
+        value: ${{ jobs.build_docker_image.outputs.image_digest_amd64 || '' }}
+      image_digest_arm64:
+        description: Digest of the pushed image for linux/arm64 (when push_by_digest is true)
+        value: ${{ jobs.build_docker_image.outputs.image_digest_arm64 || '' }}
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+
+  build_docker_image:
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            build: ${{ inputs.build_amd64 }}
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            build: ${{ inputs.build_arm64 }}
+    
+    name: Build ${{ inputs.image_stage }} for ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    outputs:
+      image_hash_amd64: ${{ matrix.platform == 'linux/amd64' && steps.build-image.outputs.imageid || '' }}
+      image_hash_arm64: ${{ matrix.platform == 'linux/arm64' && steps.build-image.outputs.imageid || '' }}
+      artifact_name_amd64: ${{ matrix.platform == 'linux/amd64' && steps.build-image.outputs.artifact_name || '' }}
+      artifact_name_arm64: ${{ matrix.platform == 'linux/arm64' && steps.build-image.outputs.artifact_name || '' }}
+      image_digest_amd64: ${{ matrix.platform == 'linux/amd64' && steps.build-image.outputs.digest || '' }}
+      image_digest_arm64: ${{ matrix.platform == 'linux/arm64' && steps.build-image.outputs.digest || '' }}
+    steps:
+      - name: Validate docker_login and push_by_digest
+        if: ${{ inputs.push_by_digest && !inputs.docker_login }}
+        run: |
+          echo "Error: docker_login must be true when push_by_digest is true."
+          exit 1
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with: # make sure we check out the configured branch on manual trigger
+          ref: ${{ inputs.branch || 'main' }}
+
+      - name: Set up build environment
+        if: matrix.build == true
+        uses: ./.github/actions/setup-build-environment
+        with:
+          java_version: ${{ inputs.java_version }}
+          dockerfile: ${{ inputs.dockerfile_path }}
+          docker_login: ${{ inputs.docker_login }}
+          docker_username: ${{ secrets.registry_username }}
+          docker_password: ${{ secrets.registry_password }}
+
+      - name: Build Docker image
+        if: matrix.build == true
+        id: build-image
+        uses: ./.github/actions/build-docker-image
+        with:
+          dockerfile_path: ${{ inputs.dockerfile_path }}
+          image_stage: ${{ inputs.image_stage }}
+          docker_tag: ${{ inputs.docker_tag }}
+          platform: ${{ matrix.platform }}
+          push_image: ${{ inputs.push_by_digest }}
+          # Empty means "action picks the tarball location and reports it back".
+          output_type: ${{ inputs.push_by_digest && 'push-by-digest=true,type=image' || '' }}
+          scan_before_push: ${{ inputs.scan_before_push }}
+          fail_on_severity: ${{ inputs.fail_on_severity }}
+          vex_file: ${{ inputs.vex_file }}
+          upload_sarif: ${{ inputs.upload_sarif }}
+
+      - name: Upload image artifact
+        if: ${{ matrix.build && inputs.upload_image_as_artifact && !inputs.push_by_digest }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ${{ steps.build-image.outputs.artifact_name }}
+          # The tarball itself, not the directory it sits in.
+          path: ${{ steps.build-image.outputs.artifact_full_path }}
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true

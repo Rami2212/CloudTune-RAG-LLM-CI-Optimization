@@ -1,0 +1,240 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types:
+      - opened
+      - synchronize
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  code-format:
+    name: Code format check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone
+        uses: actions/checkout@v5
+
+      - name: clang-format
+        run: find src -type f -name \*.c -o -name \*.h | xargs clang-format --dry-run --Werror
+
+  android:
+    name: Android
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v5
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+
+      - name: Cache
+        uses: actions/cache@v5
+        with:
+          path: android/app/.cxx
+          key: android-cmake-v7
+
+      - name: Setup signing config
+        if: env.KEYSTORE_FILE_BASE64 != '' && env.KEYSTORE_PROPERTIES_FILE_BASE64 != ''
+        run: |
+          cd android
+          echo "$KEYSTORE_FILE_BASE64" | base64 --decode > debug.keystore
+          echo "$KEYSTORE_PROPERTIES_FILE_BASE64" | base64 --decode > debug-keystore.properties
+        env:
+          KEYSTORE_FILE_BASE64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_FILE_BASE64 }}
+          KEYSTORE_PROPERTIES_FILE_BASE64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_PROPERTIES_FILE_BASE64 }}
+
+      - name: Build
+        run: |
+          cd android
+          ./gradlew assembleDebug
+
+      - name: Upload
+        uses: actions/upload-artifact@v6
+        with:
+          name: arcanum-ce-debug.apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 7
+
+  ios:
+    name: iOS
+    runs-on: macos-14
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v5
+
+      - name: Cache
+        uses: actions/cache@v5
+        with:
+          path: out/build/ios
+          key: ios-cmake-v7
+
+      - name: Configure
+        run: cmake --preset ios
+
+      - name: Build
+        run: cmake --build --preset ios-debug
+
+      - name: Pack
+        run: cpack --config out/build/ios/CPackConfig.cmake -C Debug -B out/build/ios
+
+      - name: Upload
+        uses: actions/upload-artifact@v6
+        with:
+          name: arcanum-ce.ipa
+          path: out/build/ios/arcanum-ce.ipa
+          retention-days: 7
+
+  linux:
+    name: Linux (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86
+            runner: ubuntu-22.04
+          - arch: x64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+
+    steps:
+      - name: Dependencies (x86)
+        if: matrix.arch == 'x86'
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt update
+          sudo apt install \
+            g++-multilib \
+            libx11-dev:i386 \
+            libxext-dev:i386 \
+            libxrandr-dev:i386 \
+            libxi-dev:i386 \
+            libxinerama-dev:i386 \
+            libxcursor-dev:i386 \
+            libasound2-dev:i386 \
+            libpulse-dev:i386 \
+            libxss-dev:i386 \
+            libxtst-dev:i386 \
+            ${NULL+}
+
+      - name: Dependencies (${{ matrix.arch }})
+        if: matrix.arch == 'x64' || matrix.arch == 'arm64'
+        run: |
+          sudo apt update
+          sudo apt install \
+            libx11-dev \
+            libxext-dev \
+            libxrandr-dev \
+            libxi-dev \
+            libxinerama-dev \
+            libxcursor-dev \
+            libasound2-dev \
+            libpulse-dev \
+            libxss-dev \
+            libxtst-dev \
+            ${NULL+}
+
+      - name: Clone
+        uses: actions/checkout@v5
+
+      - name: Cache
+        uses: actions/cache@v5
+        with:
+          path: out/build/linux-${{ matrix.arch }}-debug
+          key: linux-${{ matrix.arch }}-debug-cmake-v7
+
+      - name: Configure
+        run: cmake --preset linux-${{ matrix.arch }}-debug
+
+      - name: Build
+        run: cmake --build --preset linux-${{ matrix.arch }}-debug
+
+      - name: Upload
+        uses: actions/upload-artifact@v6
+        with:
+          name: arcanum-ce-linux-${{ matrix.arch }}
+          path:  out/build/linux-${{ matrix.arch }}-debug/arcanum-ce
+          retention-days: 7
+
+  macos:
+    name: macOS
+    runs-on: macos-14
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v5
+
+      - name: Cache
+        uses: actions/cache@v5
+        with:
+          path: out/build/macos
+          key: macos-cmake-v7
+
+      - name: Configure
+        run: cmake --preset macos
+
+      - name: Build
+        run: cmake --build --preset macos-debug
+
+      - name: Pack
+        run: cpack --config out/build/macos/CPackConfig.cmake -C Debug -B out/build/macos
+
+      - name: Upload
+        uses: actions/upload-artifact@v6
+        with:
+          name: arcanum-ce-macos.dmg
+          path: out/build/macos/Arcanum Community Edition.dmg
+          retention-days: 7
+
+  windows:
+    name: Windows (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86
+            runner: windows-2022
+          - arch: x64
+            runner: windows-2022
+          - arch: arm64
+            runner: windows-11-arm
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v5
+
+      - name: Cache
+        uses: actions/cache@v5
+        with:
+          path: out/build/windows-${{ matrix.arch }}
+          key: windows-${{ matrix.arch }}-cmake-v7
+
+      - name: Configure
+        run: cmake --preset windows-${{ matrix.arch }}
+
+      - name: Build
+        run: cmake --build --preset windows-${{ matrix.arch }}-debug
+
+      - name: Upload
+        uses: actions/upload-artifact@v6
+        with:
+          name: arcanum-ce-windows-${{ matrix.arch }}
+          path:  out/build/windows-${{ matrix.arch }}/Debug/arcanum-ce.exe
+          retention-days: 7

@@ -1,0 +1,96 @@
+on:
+  workflow_run:
+    workflows: ['Tests and build']
+    types:
+      - completed
+  pull_request:
+    types:
+      - closed
+name: Preview
+jobs:
+  publish:
+    name: 'Publish Preview'
+    if: |
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.repository.fork == false &&
+      !startsWith(github.event.workflow_run.head_branch, 'release-please--')
+    runs-on: ubuntu-latest
+    steps:
+      - name: '[Prepare] Checkout'
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+      - name: '[Prepare] Setup CI (mise + dependencies)'
+        uses: ./.github/actions/ci-setup
+      - name: '[Prepare] Check if a preview already exists'
+        id: check_preview
+        run: |
+          if pnpm run preview:get "${BRANCH}" > /dev/null 2>&1; then
+            echo "exists=yes" >> $GITHUB_OUTPUT
+          else
+            echo "exists=no" >> $GITHUB_OUTPUT
+          fi
+        env:
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          PREVIEWS_CELLAR_KEY_ID: ${{ secrets.PREVIEWS_CELLAR_KEY_ID }}
+          PREVIEWS_CELLAR_SECRET_KEY: ${{ secrets.PREVIEWS_CELLAR_SECRET_KEY }}
+
+      - name: '[Run] Build storybook'
+        run: pnpm run storybook:build
+      - name: '[Run] Publish preview'
+        run: pnpm run preview:publish "${BRANCH}"
+        env:
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          PREVIEWS_CELLAR_KEY_ID: ${{ secrets.PREVIEWS_CELLAR_KEY_ID }}
+          PREVIEWS_CELLAR_SECRET_KEY: ${{ secrets.PREVIEWS_CELLAR_SECRET_KEY }}
+
+      - name: '[Finalize] Add comment'
+        if: steps.check_preview.outputs.exists == 'no'
+        uses: actions/github-script@v8
+        env:
+          PREVIEW_BASE_URL: https://clever-components-preview.cellar-c2.services.clever-cloud.com
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+        with:
+          script: |
+            const prNumber = context.payload.workflow_run.pull_requests[0].number;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: `🔎 A preview has been automatically published : ${process.env.PREVIEW_BASE_URL}/${process.env.BRANCH}/index.html.\n\n_This preview will be deleted once this PR is closed._`
+            });
+  delete:
+    if: |
+      github.event.action == 'closed' && 
+      github.event.repository.fork == false &&
+      !startsWith(github.event.pull_request.head.ref, 'release-please--')
+    name: 'Delete Preview'
+    runs-on: ubuntu-latest
+    steps:
+      - name: '[Prepare] Checkout'
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: '[Prepare] Setup CI (mise + dependencies)'
+        uses: ./.github/actions/ci-setup
+
+      - name: '[Run] Delete preview'
+        run: pnpm run preview:delete "${BRANCH}"
+        env:
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+          PREVIEWS_CELLAR_KEY_ID: ${{ secrets.PREVIEWS_CELLAR_KEY_ID }}
+          PREVIEWS_CELLAR_SECRET_KEY: ${{ secrets.PREVIEWS_CELLAR_SECRET_KEY }}
+
+      - name: '[Finalize] Add comment'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            await github.rest.issues.createComment({
+             owner: context.repo.owner,
+             repo: context.repo.repo,
+             issue_number: context.issue.number,
+              body: `🔎 The preview has been automatically deleted.`
+            });

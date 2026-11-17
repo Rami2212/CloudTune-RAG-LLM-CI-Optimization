@@ -1,0 +1,31 @@
+name: Unit tests
+
+on:
+  pull_request:
+    branches: ["trunk", "0.9.x"]
+
+jobs:
+  unit-tests-pr:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        java-version: [8, 11, 17, 21]
+    name: linux-java-${{ matrix.java-version }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Java ${{ matrix.java-version }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: zulu
+          java-version: ${{ matrix.java-version }}
+          cache: maven
+      - name: Unit test with Maven
+        run: |
+          set -o pipefail
+          ./mvnw -B test -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=WARN \
+          -Dio.netty.leakDetectionLevel=paranoid \
+          -Dio.netty.leakDetection.targetRecords=32 \
+          | tee test.log
+            set +o pipefail
+      - name: ensure no leaks
+        run: ./.github/scripts/ensure_no_leak.sh test.log

@@ -1,0 +1,1338 @@
+name: Test 
+
+# Run CI on push, PR, and weekly.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths-ignore: # prevent from running if only docs are updated
+      - '**.md'
+      - 'docs/**'
+      - '**/*README*'
+      - '**.rst'
+  push:
+    branches:
+      - 'master'
+  schedule:
+    - cron: "0 0 * * 0 " # weekly
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Environment variables
+env:
+  # Customize the CMake build type here (Release, Debug, RelWithDebInfo, etc.)
+  BUILD_TYPE: release
+  DOCKER_REPO: ${{ secrets.DOCKER_REPO }}
+  # (Boolean) Setting this value to True, will force linux tet always
+  IGNORE_DOCKER_TEST: ${{ secrets.IGNORE_DOCKER_TEST }}
+  REPO_OWNER: ${{ github.repository_owner }}
+
+# Multiple job to tests
+jobs:
+  change_detect:
+    name: "Detect code changes"
+    runs-on: ubuntu-latest
+    outputs:
+      # this is output as string, see https://docs.github.com/en/actions/reference/workflow-syntax-for-github-actions#jobsjob_idoutputs
+      source_modified: ${{ steps.changes.outputs.status_code == '1' }}
+      force_upload: false
+      sha_short: ${{ steps.changes.outputs.sha_short }}
+      docker_repo: ${{ steps.changes.outputs.docker_repo }}
+    steps:
+      - name: Cancel previous
+        uses: styfle/cancel-workflow-action@0.12.1
+        with:
+          access_token: ${{ github.token }}
+          
+      - name: Checkout OpenFPGA repo
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check for source code changes
+        id: changes
+        run: |
+          git diff origin/master HEAD --name-status -- . ':!openfpga_flow' ':!docs'
+          if git diff origin/master HEAD --name-status --exit-code -- . ':!openfpga_flow' ':!docs'; then
+            echo "::set-output name=status_code::0"
+          else
+            echo "::set-output name=status_code::$?"
+          fi
+          if [[ (${GITHUB_REF} == 'refs/heads/master') || -n "${IGNORE_DOCKER_TEST}"  ]]; then
+            echo "Current branch is master forcing source_modified"
+            echo "::set-output name=status_code::1"
+          fi
+          if [[ -n "${DOCKER_REPO}" ]]; then
+            echo "name=docker_repo::$REPO_OWNER"
+            echo "::set-output name=docker_repo::$REPO_OWNER"
+          else
+            echo "name=docker_repo::lnis-uofu"
+            echo "::set-output name=docker_repo::lnis-uofu"
+          fi
+          echo "::set-output name=sha_short::$(git rev-parse --short HEAD)"
+
+  # Test the compilation compatibility
+  macos_build:
+    needs: change_detect
+    if: ${{ fromJSON(needs.change_detect.outputs.source_modified) }}
+    name: ${{ matrix.config.name }}
+    runs-on: ${{ matrix.config.os }}
+    # Note: dependencies are installed in the container. See details about dependency list in docker/Dockerfile.master
+    # Comment the line out when base image is built again
+    #container: ghcr.io/${{ needs.change_detect.outputs.docker_repo }}/openfpga-build-${{ matrix.config.cc}}
+    # Branch on different OS and settings
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: "Build (Clang, MacOS 15)"
+            os: macos-15
+            cc: clang
+            cxx: clang++
+            cmake_flags: "-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+          - name: "Build (Clang, MacOS 26)"
+            os: macos-26
+            cc: clang
+            cxx: clang++
+            cmake_flags: "-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+    # Define the steps to run the build job
+    env:
+      CC: ${{ matrix.config.cc }}
+      CXX: ${{ matrix.config.cxx }}
+    steps:
+      - name: Cancel previous
+        uses: styfle/cancel-workflow-action@0.9.1
+        with:
+          access_token: ${{ github.token }}
+          
+      - name: Checkout repo
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Show build environment
+        run: |
+          sw_vers
+          uname -m
+          xcodebuild -version
+          clang --version
+          clang++ --version
+          cmake --version
+          ninja --version
+
+      - name: Install dependencies
+        run: |
+          ./.github/workflows/build_dependency_${{ matrix.config.os}}.sh
+          python3 -m venv myenv
+          source myenv/bin/activate
+          python3 -m pip install --upgrade pip setuptools
+          python3 -m pip install -r requirements.txt
+          echo "==== Checking python packages ===="
+          python -c "import yaml; print('Installed')"      
+          echo "---- Sleep 10 seconds before copy file consider system glitching ----"
+          sleep 10s
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ runner.os }}-macos-${{ github.job }}-${{ matrix.config.prefix }}-${{ hashFiles('**/CMakeLists.txt', '**/Makefile') }}
+          restore-keys: |
+            ${{ runner.os }}-macos-${{ github.job }}-${{ matrix.config.prefix }}-
+            ${{ runner.os }}-macos-${{ github.job }}-
+
+      - name: Get number of CPU cores
+        uses: SimenB/github-actions-cpu-cores@v3
+        id: cpu-cores
+
+      - name: Build
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+        run: |
+          make all BUILD_TYPE=$BUILD_TYPE CMAKE_FLAGS="${{ matrix.config.cmake_flags }}" -j${{ steps.cpu-cores.outputs.count}}
+
+  # Yosys-slang plugin has issues on linking library to Yosys in Msys2. Suspect the root of cause is on the linking path. Disable it for now.
+  win_msys2_installer:
+    needs: change_detect
+    if: ${{ fromJSON(needs.change_detect.outputs.source_modified) }}
+    name: ${{ matrix.config.name }}
+    runs-on: windows-latest
+    # Note: dependencies are installed in the container. See details about dependency list in docker/Dockerfile.master
+    # Comment the line out when base image is built again
+    #container: ghcr.io/${{ needs.change_detect.outputs.docker_repo }}/openfpga-build-${{ matrix.config.cc}}
+    # Branch on different OS and settings
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: "Installer (GCC, Windows Msys2-UCRT64)"
+            cc: gcc
+            cxx: g++
+            os: UCRT64
+            prefix: ucrt64
+            cmake_flags: "-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+    defaults:
+      run:
+        # This ensures all 'run' steps use the MSYS2 bash shell by default
+        shell: msys2 {0}
+    # Define the steps to run the build job
+    env:
+      CC: ${{ matrix.config.cc }}
+      CXX: ${{ matrix.config.cxx }}
+    steps:
+      - name: Cancel previous
+        uses: styfle/cancel-workflow-action@0.9.1
+        with:
+          access_token: ${{ github.token }}
+          
+      - name: Checkout repo
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.config.os }}
+          update: true
+          # Optional: Pre-install core tools needed to run your script
+          install: >-
+            wget
+            git
+            tree
+
+      #In MSYS2, the flex package is an MSYS-native tool, meaning it installs its headers to /usr/include/FlexLexer.h. However, if you are using a MinGW-w64 environment (e.g., UCRT64, MINGW64), the compiler only looks for headers in /mingw64/include or similar toolchain-specific paths. The most common workaround is to copy or link the header from the MSYS directory to your active MinGW-w64 include directory. 
+      # For python build from sources
+      - name: Install dependencies
+        run: |
+          ./.github/workflows/build_dependency_win-msys2-${{ matrix.config.os}}.sh
+          python3 -m venv myenv
+          source myenv/bin/activate
+          python3 -m pip install --upgrade pip setuptools
+          python3 -m pip install -r msys2_requirements.txt
+          echo "==== Checking python packages ===="
+          python -c "import yaml; print('Installed')"      
+          echo "---- Sleep 10 seconds before copy file consider system glitching ----"
+          sleep 10s
+          cp /usr/include/FlexLexer.h /${{ matrix.config.prefix}}/include/
+
+      - name: Dump tool versions
+        run: |
+          which cmake
+          cmake --version
+          which ${CC}
+          ${CC} --version
+          which ${CXX}
+          ${CXX} --version
+          which ld
+          ld --version
+          which python3
+          python3 --version
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ runner.os }}-msys2-${{ github.job }}-${{ matrix.config.prefix }}-${{ hashFiles('**/CMakeLists.txt', '**/Makefile') }}
+          restore-keys: |
+            ${{ runner.os }}-msys2-${{ github.job }}-${{ matrix.config.prefix }}-
+            ${{ runner.os }}-msys2-${{ github.job }}-
+
+      - name: Get number of CPU cores
+        uses: SimenB/github-actions-cpu-cores@v3
+        id: cpu-cores
+
+      - name: Create installer
+        shell: msys2 {0}
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+        run: |
+          make checkout_build
+          make prebuild BUILD_TYPE=$BUILD_TYPE INSTALLER_TYPE=IFW INSTALL_DOC=OFF CMAKE_FLAGS="${{ matrix.config.cmake_flags }}" -j${{ steps.cpu-cores.outputs.count}}
+          make installer BUILD_TYPE=$BUILD_TYPE INSTALLER_TYPE=IFW INSTALL_DOC=OFF CMAKE_FLAGS="${{ matrix.config.cmake_flags }}" -j${{ steps.cpu-cores.outputs.count}}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        if: ${{ failure() }}
+        with:
+          name: failed_msys2_installer_log
+          retention-days: 1
+          path: |
+            _CPack_Packages/win64/IFW/PreinstallOutput.log 
+
+      - name: Upload artifact installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: win_msys2_installer
+          retention-days: 1
+          path: |
+            OpenFPGA-tool-suites-*-win64.exe
+
+
+  # Test the compilation compatibility
+  # Yosys-slang plugin has issues on linking library to Yosys in Msys2. Suspect the root of cause is on the linking path. Disable it for now.
+  win_msys2_build:
+    needs: change_detect
+    if: ${{ fromJSON(needs.change_detect.outputs.source_modified) }}
+    name: ${{ matrix.config.name }}
+    runs-on: windows-latest
+    # Note: dependencies are installed in the container. See details about dependency list in docker/Dockerfile.master
+    # Comment the line out when base image is built again
+    #container: ghcr.io/${{ needs.change_detect.outputs.docker_repo }}/openfpga-build-${{ matrix.config.cc}}
+    # Branch on different OS and settings
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: "Build (GCC, Windows Msys2-UCRT64)"
+            cc: gcc
+            cxx: g++
+            os: UCRT64
+            prefix: ucrt64
+            cmake_flags: "-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+    defaults:
+      run:
+        # This ensures all 'run' steps use the MSYS2 bash shell by default
+        shell: msys2 {0}
+    # Define the steps to run the build job
+    env:
+      CC: ${{ matrix.config.cc }}
+      CXX: ${{ matrix.config.cxx }}
+    steps:
+      - name: Cancel previous
+        uses: styfle/cancel-workflow-action@0.9.1
+        with:
+          access_token: ${{ github.token }}
+          
+      - name: Checkout repo
+        uses: actions/checkout@v6
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.config.os }}
+          update: true
+          # Optional: Pre-install core tools needed to run your script
+          install: >-
+            wget
+            git
+            tree
+
+      #In MSYS2, the flex package is an MSYS-native tool, meaning it installs its headers to /usr/include/FlexLexer.h. However, if you are using a MinGW-w64 environment (e.g., UCRT64, MINGW64), the compiler only looks for headers in /mingw64/include or similar toolchain-specific paths. The most common workaround is to copy or link the header from the MSYS directory to your active MinGW-w64 include directory. 
+      # For python build from sources
+      - name: Install dependencies
+        run: |
+          ./.github/workflows/build_dependency_win-msys2-${{ matrix.config.os}}.sh
+          cp /usr/include/FlexLexer.h /${{ matrix.config.prefix}}/include/
+          python3 -m venv myenv
+          source myenv/bin/activate
+          python3 -m pip install --upgrade pip setuptools
+          python3 -m pip install -r msys2_requirements.txt
+          echo "==== Checking python3 packages ===="
+          python3 -c "import envyaml; import humanize; import coloredlogs; import pyverilog; print('Installed')"      
+
+      - name: Dump tool versions
+        run: |
+          which cmake
+          cmake --version
+          which ${CC}
+          ${CC} --version
+          which ${CXX}
+          ${CXX} --version
+          which ld
+          ld --version
+          echo "==== Checking python3 packages ===="
+          source myenv/bin/activate
+          echo "PYTHON_EXEC=$(which python3)" >> $GITHUB_ENV
+          echo "OPENFPGA_PATH=$(pwd)" >> $GITHUB_ENV
+          python3 --version
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ runner.os }}-msys2-${{ github.job }}-${{ matrix.config.prefix }}-${{ hashFiles('**/CMakeLists.txt', '**/Makefile') }}
+          restore-keys: |
+            ${{ runner.os }}-msys2-${{ github.job }}-${{ matrix.config.prefix }}
+            ${{ runner.os }}-msys2-${{ github.job }}
+
+      - name: Get number of CPU cores
+        uses: SimenB/github-actions-cpu-cores@v3
+        id: cpu-cores
+
+      - name: Build
+        shell: msys2 {0}
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+        run: |
+          make all BUILD_TYPE=debug CMAKE_FLAGS="${{ matrix.config.cmake_flags }}" -j${{ steps.cpu-cores.outputs.count}}
+
+      - name: Build file tree
+        shell: msys2 {0}
+        run: |
+          tree build
+
+      - name: Check DLL linkg
+        shell: msys2 {0}
+        run: |
+          # This will print exactly which DLL file is missing/unresolved
+          ldd ./build/openfpga/openfpga.exe
+
+      - name: checkout reg test submodules
+        run: |
+          make checkout_regtest
+
+# Reg test script has issues on handling windows paths. For example, 
+# Not able to locate default file CAD TOOL PATH under 
+#   D:/a/OpenFPGA/OpenFPGA/openfpga_flow/tasks/compilation_verification/run001/aOpenFPGAOpenFPGA/openfpga_flow/misc/fpgaflow_default_tool_path_msys2_mingw64.conf
+      - name: Quick Test
+        shell: msys2 {0}
+        run: |
+          echo "==== Activate python3 virtual environment ===="
+          source myenv/bin/activate
+
+          echo "==== Use python3 under ${PYTHON_EXEC} ===="
+          python3 -c "import envyaml; import humanize; import coloredlogs; import pyverilog; print('Installed')"      
+
+          echo "==== Resolve default tool path ===="
+          DEFAULT_TOOL_PATH="$(cygpath -m "$GITHUB_WORKSPACE")/openfpga_flow/misc/fpgaflow_default_tool_path_msys2_mingw64.conf"
+          echo "DEFAULT_TOOL_PATH=${DEFAULT_TOOL_PATH}"
+          test -f "${DEFAULT_TOOL_PATH}"
+
+          echo "==== Run a quick test ===="
+          python3 openfpga_flow/scripts/run_fpga_task.py openfpga_flow/tasks/compilation_verification --debug --show_thread_logs --default_tool_path "${DEFAULT_TOOL_PATH}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        if: ${{ failure() }}
+        with:
+          name: failed_${{matrix.config.name}}_regression_log
+          retention-days: 1
+          path: openfpga_flow/**/*.log
+
+  # Add an installer creation for MSVC build
+  win_msvc_installer:
+    needs: change_detect
+    name: ${{ matrix.config.name }}
+    runs-on: windows-2025
+    # Note: dependencies are installed in the container. See details about dependency list in docker/Dockerfile.master
+    # Comment the line out when base image is built again
+    #container: ghcr.io/${{ needs.change_detect.outputs.docker_repo }}/openfpga-build-${{ matrix.config.cc}}
+    # Branch on different OS and settings
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: "Installer w/o doc (MsBuild Windows-latest)"
+            cmake_flags: "-DOPENFPGA_WITH_SWIG=OFF -DWITH_ABC=OFF -DOPENFPGA_WITH_YOSYS=OFF -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+    steps:
+      - name: Cancel previous
+        uses: styfle/cancel-workflow-action@0.12.1
+        with:
+          access_token: ${{ github.token }}
+          
+      - name: Checkout OpenFPGA repo
+        uses: actions/checkout@v6
+
+      - name: vcpkg build
+        uses: johnwason/vcpkg-action@v7
+        id: vcpkg
+        with:
+          # vcpkg will automatically find and use the vcpkg.json in your repo root
+          token: ${{ secrets.GITHUB_TOKEN }}
+          manifest-dir: ${{ github.workspace }} # Set to the directory containing your vcpkg.json file
+          triplet: x64-windows-release # This must be set with a valid vcpkg triplet
+
+      - name: Install WinFlexBison
+        shell: powershell
+        run: |
+          choco install winflexbison3 wget eigen
+          choco install magicsplat-tcl-tk --version=1.16.0
+          # Make tools visible to CMake
+          echo "C:\Program Files (x86)\GnuWin32\bin" | Out-File -Append -FilePath $env:GITHUB_PATH
+          echo "C:\ProgramData\chocolatey\lib\winflexbison3\tools" | Out-File -Append -FilePath $env:GITHUB_PATH
+
+      - name: Dump tool versions
+        shell: powershell
+        run: |
+          cmake --version
+          where curl
+          win_flex --version
+          win_bison --version
+          tclsh --version
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          tools: 'tools_ifw'
+
+#      - name: Verify Installation
+#        run: binarycreator --version
+
+      - name: Checkout all the submodules
+        shell: powershell
+        run: |
+          make checkout_submodule
+
+      - name: Ensure curl is available
+        shell: powershell
+        run: |
+          $curlPath = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
+          if (-not $curlPath) {
+            choco install curl
+            $curlPath = (Get-Command curl.exe).Source
+          }
+          echo "CURL_PATH=$curlPath" >> $env:GITHUB_ENV
+
+      - name: Setup MSVC
+        uses: TheMrMilchmann/setup-msvc-dev@v4
+        with:
+          arch: x64
+      
+      - name: Check MSVC Version
+        run: cl
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ runner.os }}-msvc-${{ github.sha }}
+          restore-keys: ${{ runner.os }}-msvc-
+
+      - name: Get number of CPU cores
+        uses: SimenB/github-actions-cpu-cores@v3
+        id: cpu-cores
+
+      # Adapt from https://github.com/tangxifan/yosys/blob/41a4b5a039d1f6e04d9c577d3f186ba85f6f1f01/.github/workflows/extra-builds.yml#L60-L80
+      - name: Build yosys
+        shell: powershell
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+        run: |
+          cd yosys
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DYOSYS_COMPILER_LAUNCHER=ccache
+          cmake --build build --config Release --parallel ${{ steps.cpu-cores.outputs.count }}
+          cmake --install build --prefix ${{ github.workspace }}/yosys_installed
+
+      - name: Build
+        shell: powershell
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+        run: |
+          make all VCPKG_PATH="${{ github.workspace }}/vcpkg" INSTALLER_TYPE=IFW INSTALL_DOC=OFF CMAKE_FLAGS="${{ matrix.config.cmake_flags }}" -j${{ steps.cpu-cores.outputs.count}}
+
+      - name: Create installer
+        shell: powershell
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+        run: |
+          make installer VCPKG_PATH="${{ github.workspace }}/vcpkg" INSTALLER_TYPE=IFW INSTALL_DOC=OFF CMAKE_FLAGS="${{ matrix.config.cmake_flags }}" -j${{ steps.cpu-cores.outputs.count}}
+
+      - name: Create Python virtual environment
+        shell: powershell
+        run: |
+          python -m venv myenv
+
+      - name: Install Icarus Verilog
+        shell: powershell
+        run: |
+          choco install iverilog
+          where.exe iverilog
+          where.exe vvp
+
+      - name: Quick Test
+        shell: powershell
+        run: |
+          echo "==== Activate python virtual environment ===="
+          .\myenv\Scripts\Activate.ps1
+
+          echo "==== Set OpenFPGA path ===="
+          $env:OPENFPGA_PATH = "${{ github.workspace }}"
+
+          echo "==== Add DLL directories to PATH ===="
+          $dllPaths = @(
+            "${{ github.workspace }}\yosys_installed",
+            "${{ github.workspace }}\build\openfpga\Release",
+            "${{ github.workspace }}\build\libs\libopenfpgashell\Release",
+            "${{ github.workspace }}\build\libs\libpcf\Release",
+            "${{ github.workspace }}\build\vtr-verilog-to-routing\vpr\Release",
+            "C:\Program Files\Tcl\bin"
+          ) | Where-Object { $_ -and (Test-Path $_) }
+
+          $env:PATH = ($dllPaths -join ";") + ";" + $env:PATH
+
+          echo "==== Install Python dependencies ===="
+          python -m pip install --upgrade pip
+          python -m pip install "setuptools<81"
+          python -m pip install -r requirements.txt
+
+          echo "==== Show Python path ===="
+          python -c "import sys; print(sys.executable)"
+          python -c "import envyaml; import humanize; import coloredlogs; import pyverilog; print('Installed')"
+
+          echo "==== Check Icarus Verilog ===="
+          where.exe iverilog
+          where.exe vvp
+
+          echo "==== Run a quick test ===="
+          python openfpga_flow\scripts\run_fpga_task.py openfpga_flow\tasks\compilation_verification --debug --show_thread_logs --default_tool_path "${{ github.workspace }}\openfpga_flow\misc\fpgaflow_default_tool_path_win_msvc.conf"
+
+      - name: Upload regression logs
+        uses: actions/upload-artifact@v7
+        if: ${{ failure() }}
+        with:
+          name: failed_win_msvc_installer_regression_log
+          retention-days: 1
+          path: |
+            openfpga_flow/**/*.log
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        if: ${{ failure() }}
+        with:
+          name: failed_msys2_installer_log
+          retention-days: 1
+          path: |
+            _CPack_Packages/win64/IFW/PreinstallOutput.log 
+
+      - name: Upload artifact installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: win_msvc_installer
+          retention-days: 1
+          path: |
+            build/OpenFPGA-tool-suites-*-win64.exe
+
+  # Test the compilation compatibility on Linux
+  linux_build:
+    needs: change_detect
+    if: ${{ fromJSON(needs.change_detect.outputs.source_modified) }}
+    name: ${{ matrix.config.name }}
+    runs-on: ubuntu-22.04
+    # Note: dependencies are installed in the container. See details about dependency list in docker/Dockerfile.master
+    # Comment the line out when base image is built again
+    #container: ghcr.io/${{ needs.change_detect.outputs.docker_repo }}/openfpga-build-${{ matrix.config.cc}}
+    # Branch on different OS and settings
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: "Build: GCC-13 (Ubuntu 22.04)"
+            cc: gcc-13
+            cxx: g++-13
+          - name: "Build: GCC-12 (Ubuntu 22.04)"
+            cc: gcc-12
+            cxx: g++-12
+    # Define the steps to run the build job
+    env:
+      CC: ${{ matrix.config.cc }}
+      CXX: ${{ matrix.config.cxx }}
+    steps:
+      - name: Cancel previous
+        uses: styfle/cancel-workflow-action@0.12.1
+        with:
+          access_token: ${{ github.token }}
+          
+      - name: Checkout OpenFPGA repo
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: sudo bash ./.github/workflows/install_dependencies_build_ubuntu.sh
+      
+      - name: Dump tool versions
+        run: |
+          cmake --version
+          ${CC} --version
+          ${CXX} --version
+
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          # Generates a unique key based on the specific job and matrix parameters
+          key: ${{ github.job }}-${{ runner.os }}-${{ matrix.config.cc}}
+          # Defines the fallback prefix if an exact match is missing
+          restore-keys: |
+            ${{ github.job }}-${{ runner.os }}-
+
+      - name: Get number of CPU cores
+        uses: SimenB/github-actions-cpu-cores@v3
+        id: cpu-cores
+
+      - name: Build
+        shell: bash
+        run: |
+           export PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH"
+           make all BUILD_TYPE=$BUILD_TYPE CMAKE_FLAGS="-DOPENFPGA_SWIG_PYTHON=ON -DPython3_EXECUTABLE=/usr/bin/python3" -j${{ steps.cpu-cores.outputs.count}}
+
+      - name: Clear error log
+        if: ${{ failure() }}
+        shell: bash
+        run: |
+          make all BUILD_TYPE=$BUILD_TYPE CMAKE_FLAGS="-DOPENFPGA_SWIG_PYTHON=ON -DPython3_EXECUTABLE=/usr/bin/python3" -j1
+
+      - name: checkout reg test submodules
+        run: |
+          make checkout_regtest
+
+      # Check the cache size and see if it is over the limit
+      - name: Check ccache size
+        run: ccache -s
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        if: ${{ matrix.config.cc == 'gcc-12'}}
+        with:
+          name: openfpga
+          path: |
+            build/vtr-verilog-to-routing/abc/abc
+            build/vtr-verilog-to-routing/abc/libabc.a
+            build/vtr-verilog-to-routing/ace2/ace
+            build/vtr-verilog-to-routing/vpr/libvpr.a
+            build/vtr-verilog-to-routing/vpr/vpr
+            build/openfpga/libopenfpga.a
+            build/openfpga/openfpga_shell.so
+            build/openfpga/_openfpga.so
+            build/openfpga/openfpga.py
+            build/openfpga/openfpga
+            build/openfpga/share
+            build/openfpga/yosys-abc
+            build/yosys/yosys
+            build/yosys/yosys-abc
+            build/yosys/yosys-config
+            build/yosys/libyosys-abc.a
+            build/yosys/libyosys.so
+            build/yosys/share
+            build/yosys-smtbmc
+            build/yosys-witness
+            openfpga_flow
+            openfpga.sh
+
+  linux_build_opt:
+    needs: change_detect
+    if: ${{ fromJSON(needs.change_detect.outputs.source_modified) }}
+    name: ${{ matrix.config.name }}
+    runs-on: ubuntu-22.04
+    # Note: dependencies are installed in the container. See details about dependency list in docker/Dockerfile.master
+    # Comment the line out when base image is built again
+    #container: ghcr.io/${{ needs.change_detect.outputs.docker_repo }}/openfpga-build-${{ matrix.config.cc}}
+    # Branch on different OS and settings
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: "Build w/o Yosys (Ubuntu 22.04)"
+            cc: gcc-12
+            cxx: g++-12
+            cmake_flags: "-DOPENFPGA_WITH_YOSYS=OFF"
+          - name: "Build w/o test (Ubuntu 22.04)"
+            cc: gcc-12
+            cxx: g++-12
+            cmake_flags: "-DOPENFPGA_WITH_TEST=OFF"
+          - name: "Build w/o version number (Ubuntu 22.04)"
+            cc: gcc-12
+            cxx: g++-12
+            cmake_flags: "-DOPENFPGA_WITH_VERSION=OFF"
+          - name: "Build w/o SWIG support (Ubuntu 22.04)"
+            cc: gcc-12
+            cxx: g++-12
+            cmake_flags: "-DOPENFPGA_WITH_SWIG=OFF"
+          - name: "Build with capnproto update (Ubuntu 22.04)"
+            cc: gcc-12
+            cxx: g++-12
+            cmake_flags: "-DOPENFPGA_UPDATE_UNIQUE_BLOCK_CAPN=ON"
+          - name: "Build with libedit (Ubuntu 22.04)"
+            cc: gcc-12
+            cxx: g++-12
+            cmake_flags: "-DOPENFPGA_READLINE_MODE=libedit"
+          - name: "Build with std::getline (Ubuntu 22.04)"
+            cc: gcc-12
+            cxx: g++-12
+            cmake_flags: "-DOPENFPGA_READLINE_MODE=standard"
+    # Define the steps to run the build job
+    env:
+      CC: ${{ matrix.config.cc }}
+      CXX: ${{ matrix.config.cxx }}
+    steps:
+      - name: Cancel previous
+        uses: styfle/cancel-workflow-action@0.12.1
+        with:
+          access_token: ${{ github.token }}
+          
+      - name: Checkout OpenFPGA repo
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: sudo bash ./.github/workflows/install_dependencies_build_ubuntu.sh
+      
+      - name: Dump tool versions
+        run: |
+          cmake --version
+          ${CC} --version
+          ${CXX} --version
+
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          # Generates a unique key based on the specific job and matrix parameters
+          key: ${{ github.job }}-${{ runner.os }}-${{ matrix.config.cc}}-${{ matrix.config.cmake_flags}}
+          # Defines the fallback prefix if an exact match is missing
+          restore-keys: |
+            ${{ github.job }}-${{ runner.os }}-${{ matrix.config.cc}}-
+
+      - name: Get number of CPU cores
+        uses: SimenB/github-actions-cpu-cores@v3
+        id: cpu-cores
+
+      - name: Build
+        shell: bash
+        run: |
+          export PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH"
+          make all BUILD_TYPE=$BUILD_TYPE CMAKE_FLAGS="${{ matrix.config.cmake_flags }}" -j${{ steps.cpu-cores.outputs.count}}
+
+  alma_support:
+    needs: change_detect
+    if: ${{ fromJSON(needs.change_detect.outputs.source_modified) }}
+    name: ${{ matrix.config.name }}
+    runs-on: ubuntu-latest
+    container:
+      image: almalinux:8
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: "Build (GCC on Alma-8)"
+            cc: gcc
+            cxx: g++
+            dependency_version: "alma8"
+    # Define the steps to run the build job
+    env:
+      CC: ${{ matrix.config.cc }}
+      CXX: ${{ matrix.config.cxx }}
+    steps:
+      - name: Check OS version
+        run: |
+          cat /etc/os-release
+          echo "===== Repositories ====="
+          dnf repolist --all
+          echo "===== PowerTools ====="
+          dnf repolist --all | grep -i power
+          echo "===== Install Git as the default one is too old ===="
+          dnf install -y git
+          echo "===== Git version ====="
+          git --version
+
+      - name: Checkout OpenFPGA repo
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          # Alma8 container does not allow sudo
+          bash ./.github/workflows/build_dependency_${{ matrix.config.dependency_version }}.sh
+          # To use gcc-12 in the current step and export paths for subsequent steps:
+          echo "CC=/opt/rh/gcc-toolset-12/root/usr/bin/gcc" >> $GITHUB_ENV
+          echo "CXX=/opt/rh/gcc-toolset-12/root/usr/bin/g++" >> $GITHUB_ENV
+
+      - name: Install CMake
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: 4.0.0
+      
+      - name: Dump tool versions
+        run: |
+          cmake --version
+          ${CC} --version
+          ${CXX} --version
+
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          # Generates a unique key based on the specific job and matrix parameters
+          key: ${{ github.job }}-${{ runner.os }}-${{ matrix.config.cc}}-${{ matrix.config.dependency_version}}
+          # Defines the fallback prefix if an exact match is missing
+          restore-keys: |
+            ${{ github.job }}-${{ runner.os }}-${{ matrix.config.cc}}-
+
+      - name: Get number of CPU cores
+        uses: SimenB/github-actions-cpu-cores@v3
+        id: cpu-cores
+
+      - name: Build
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: |
+          source /opt/rh/gcc-toolset-12/enable
+          export PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH"
+          echo "PWD: $PWD"
+          echo "WORKSPACE: $GITHUB_WORKSPACE"
+          # Check if the workspace has a git control
+          ls -la .git
+          git config --global --add safe.directory '*'
+          git status
+          make all BUILD_TYPE=$BUILD_TYPE  -j${{ steps.cpu-cores.outputs.count}}
+
+  centos_support:
+    needs: change_detect
+    if: ${{ fromJSON(needs.change_detect.outputs.source_modified) }}
+    name: ${{ matrix.config.name }}
+    runs-on: ubuntu-22.04
+    container: ${{ matrix.config.docker_image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: "Build (GCC on CentOS 9)"
+            cc: gcc
+            cxx: g++
+            dependency_version: "centos9"
+            docker_image: "ghcr.io/easybuilders/centosstream-9:2025-03-03-13626131526.124"
+    # Define the steps to run the build job
+    env:
+      CC: ${{ matrix.config.cc }}
+      CXX: ${{ matrix.config.cxx }}
+    steps:
+      - name: Checkout OpenFPGA repo
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          sudo bash ./.github/workflows/install_dependencies_build_${{ matrix.config.dependency_version }}.sh
+          # To use gcc-12 in the current step and export paths for subsequent steps:
+          echo "CC=/opt/rh/gcc-toolset-12/root/usr/bin/gcc" >> $GITHUB_ENV
+          echo "CXX=/opt/rh/gcc-toolset-12/root/usr/bin/g++" >> $GITHUB_ENV
+      
+      - name: Dump tool versions
+        run: |
+          cmake --version
+          ${CC} --version
+          ${CXX} --version
+
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          # Generates a unique key based on the specific job and matrix parameters
+          key: ${{ github.job }}-${{ runner.os }}-${{ matrix.config.cc}}-${{ matrix.config.dependency_version}}
+          # Defines the fallback prefix if an exact match is missing
+          restore-keys: |
+            ${{ github.job }}-${{ runner.os }}-${{ matrix.config.cc}}-
+
+
+      - name: Get number of CPU cores
+        uses: SimenB/github-actions-cpu-cores@v3
+        id: cpu-cores
+
+      - name: Build
+        shell: bash
+        run: |
+          source /opt/rh/gcc-toolset-12/enable
+          export PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH"
+          git config --global --add safe.directory '*'
+          make all BUILD_TYPE=$BUILD_TYPE  -j${{ steps.cpu-cores.outputs.count}}
+
+  # Support 24.04
+  ubuntu_support:
+    needs: change_detect
+    if: ${{ fromJSON(needs.change_detect.outputs.source_modified) }}
+    name: ${{ matrix.config.name }}
+    runs-on: ${{ matrix.config.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: "Build (GCC on Ubuntu 24.04)"
+            cc: gcc-13
+            cxx: g++-13
+            os: ubuntu-24.04
+          - name: "Build (GCC on Ubuntu 26.04)"
+            cc: gcc-15
+            cxx: g++-15
+            os: ubuntu-26.04
+    # Define the steps to run the build job
+    env:
+      CC: ${{ matrix.config.cc }}
+      CXX: ${{ matrix.config.cxx }}
+    steps:
+      - name: Cancel previous
+        uses: styfle/cancel-workflow-action@0.12.1
+        with:
+          access_token: ${{ github.token }}
+          
+      - name: Checkout OpenFPGA repo
+        uses: actions/checkout@v6
+  
+      - name: Install dependencies
+        run: |
+          sudo bash ./.github/workflows/install_dependencies_build_ubuntu.sh
+          sudo bash ./.github/workflows/install_dependencies_run_ubuntu.sh
+      
+      - name: Dump tool versions
+        run: |
+          cmake --version
+          ${CC} --version
+          ${CXX} --version
+          python3 --version
+  
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          # Generates a unique key based on the specific job and matrix parameters
+          key: ${{ github.job }}-${{ runner.os }}-${{ matrix.config.cc}}
+          # Defines the fallback prefix if an exact match is missing
+          restore-keys: |
+            ${{ github.job }}-${{ runner.os }}-
+
+      - name: Get number of CPU cores
+        uses: SimenB/github-actions-cpu-cores@v3
+        id: cpu-cores
+
+      - name: Build
+        shell: bash
+        run: |
+          export PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH"
+          make all BUILD_TYPE=$BUILD_TYPE -j${{ steps.cpu-cores.outputs.count}} 
+
+      - name: checkout reg test submodules
+        run: |
+          make checkout_regtest
+
+      - name: Quick Test
+        shell: bash
+        run: |
+          echo "==== Activate python3 virtual environment ===="
+          python3 -m venv venv
+          source venv/bin/activate
+          ./venv/bin/python3 -m pip install --upgrade pip setuptools wheel
+          ./venv/bin/python3 -m pip install -r requirements.txt
+          ./venv/bin/python3 openfpga_flow/scripts/run_fpga_task.py openfpga_flow/tasks/compilation_verification --debug --show_thread_logs
+
+  debug_build:
+    needs: change_detect
+    if: ${{ fromJSON(needs.change_detect.outputs.source_modified) }}
+    # Prevents from running on forks where no custom runners are available
+    #if: ${{ fromJSON(needs.change_detect.outputs.source_modified) }} && ${{ github.repository_owner == 'lnis-uofu' }}
+    name: ${{ matrix.config.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: "Debug Build (Ubuntu 24.04)"
+            cc: gcc-13
+            cxx: g++-13
+            build_type: debug
+    # Define the steps to run the build job
+    env:
+      CC: ${{ matrix.config.cc }}
+      CXX: ${{ matrix.config.cxx }}
+    steps:
+      - name: Cancel previous
+        uses: styfle/cancel-workflow-action@0.12.1
+        with:
+          access_token: ${{ github.token }}
+          
+      - name: Checkout OpenFPGA repo
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          sudo bash ./.github/workflows/install_dependencies_build_ubuntu.sh
+          sudo bash ./.github/workflows/install_dependencies_run_ubuntu.sh
+          sudo python3 -m pip install -r requirements.txt
+
+      - name: Dump tool versions
+        run: |
+          cmake --version
+          ${CC} --version
+          ${CXX} --version
+          python3 --version
+
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          # Generates a unique key based on the specific job and matrix parameters
+          key: ${{ github.job }}-${{ runner.os }}-${{ matrix.config.cc}}
+          # Defines the fallback prefix if an exact match is missing
+          restore-keys: |
+            ${{ github.job }}-${{ runner.os }}-
+
+      - name: Get number of CPU cores
+        uses: SimenB/github-actions-cpu-cores@v3
+        id: cpu-cores
+
+      - name: Build
+        shell: bash
+        run: |
+          export PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH"
+          make all BUILD_TYPE=${{ matrix.config.build_type }} -j${{ steps.cpu-cores.outputs.count}}
+
+      - name: checkout reg test submodules
+        run: |
+          make checkout_regtest
+
+      - name: Quick Test
+        shell: bash
+        run: |
+          source openfpga.sh && run-task compilation_verification --debug --show_thread_logs
+
+  no_warning_build:
+    needs: change_detect
+    if: ${{ fromJSON(needs.change_detect.outputs.source_modified) }}
+    name: ${{ matrix.config.name }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: "No-warning Build (Ubuntu 22.04)"
+            cc: gcc-11
+            cxx: g++-11
+            build_type: release
+    # Define the steps to run the build job
+    env:
+      CC: ${{ matrix.config.cc }}
+      CXX: ${{ matrix.config.cxx }}
+    steps:
+      - name: Cancel previous
+        uses: styfle/cancel-workflow-action@0.12.1
+        with:
+          access_token: ${{ github.token }}
+          
+      - name: Checkout OpenFPGA repo
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          sudo bash ./.github/workflows/install_dependencies_build_ubuntu.sh
+          sudo bash ./.github/workflows/install_dependencies_run_ubuntu.sh
+          sudo python3 -m pip install -r requirements.txt
+
+      - name: Dump tool versions
+        run: |
+          cmake --version
+          ${CC} --version
+          ${CXX} --version
+
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          # Generates a unique key based on the specific job and matrix parameters
+          key: ${{ github.job }}-${{ runner.os }}-${{ matrix.config.cc}}
+          # Defines the fallback prefix if an exact match is missing
+          restore-keys: |
+            ${{ github.job }}-${{ runner.os }}-
+
+      - name: Get number of CPU cores
+        uses: SimenB/github-actions-cpu-cores@v3
+        id: cpu-cores
+
+      - name: Build
+        shell: bash
+        run: |
+          export PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH"
+          make all BUILD_TYPE=${{ matrix.config.build_type }} -j${{ steps.cpu-cores.outputs.count}} CMAKE_FLAGS="-DOPENFPGA_ENABLE_STRICT_COMPILE=ON -DOPENFPGA_WITH_YOSYS=OFF"
+
+      - name: checkout reg test submodules
+        run: |
+          make checkout_regtest
+
+      - name: Quick Test
+        shell: bash
+        run: |
+          source openfpga.sh && run-task compilation_verification --debug --show_thread_logs
+
+  linux_installer:
+    needs: change_detect
+    if: ${{ fromJSON(needs.change_detect.outputs.source_modified) }}
+    name: ${{ matrix.config.name }}
+    runs-on: ubuntu-22.04
+    # Note: dependencies are installed in the container. See details about dependency list in docker/Dockerfile.master
+    # Comment the line out when base image is built again
+    #container: ghcr.io/${{ needs.change_detect.outputs.docker_repo }}/openfpga-build-${{ matrix.config.cc}}
+    # Branch on different OS and settings
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: "Installer w/o doc (Ubuntu 22.04)"
+            cc: gcc-12
+            cxx: g++-12
+    # Define the steps to run the build job
+    env:
+      CC: ${{ matrix.config.cc }}
+      CXX: ${{ matrix.config.cxx }}
+    steps:
+      - name: Cancel previous
+        uses: styfle/cancel-workflow-action@0.12.1
+        with:
+          access_token: ${{ github.token }}
+          
+      - name: Checkout OpenFPGA repo
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: sudo bash ./.github/workflows/install_dependencies_build_ubuntu.sh
+      
+      - name: Dump tool versions
+        run: |
+          cmake --version
+          ${CC} --version
+          ${CXX} --version
+
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          # Generates a unique key based on the specific job and matrix parameters
+          key: ${{ github.job }}-${{ runner.os }}-${{ matrix.config.cc}}
+          # Defines the fallback prefix if an exact match is missing
+          restore-keys: |
+            ${{ github.job }}-${{ runner.os }}-
+
+      - name: Get number of CPU cores
+        uses: SimenB/github-actions-cpu-cores@v3
+        id: cpu-cores
+
+      - name: Build
+        shell: bash
+        run: |
+          export PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH"
+          make checkout_build
+          make prebuild BUILD_TYPE=$BUILD_TYPE INSTALL_DOC=OFF -j${{ steps.cpu-cores.outputs.count}}
+          make installer BUILD_TYPE=$BUILD_TYPE INSTALL_DOC=OFF -j${{ steps.cpu-cores.outputs.count}}
+
+  docker_distribution:
+    name: Build docker image for distribution
+    runs-on: ubuntu-22.04
+    needs: [linux_build, change_detect]
+    steps:
+      - name: Cancel previous
+        uses: styfle/cancel-workflow-action@0.12.1
+        with:
+          access_token: ${{ github.token }}
+          
+      - name: Checkout OpenFPGA repo
+        uses: actions/checkout@v6
+      - name: Download a built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: openfpga
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v1
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+      - name: Login to GitHub Container Registry
+        if: ${{ (github.ref == 'refs/heads/master' && (env.DOCKER_REPO)) || (needs.change_detect.outputs.force_upload == true) }}
+        uses: docker/login-action@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.CR_PAT }}
+      - name: Build and push master image
+        uses: docker/build-push-action@v2
+        with:
+          context: .
+          file: ./docker/Dockerfile.master
+          push: ${{ (github.ref == 'refs/heads/master' && (env.DOCKER_REPO)) || needs.change_detect.outputs.force_upload }}
+          tags: |
+            ghcr.io/${{ needs.change_detect.outputs.docker_repo }}/openfpga-master:latest
+            ghcr.io/${{ needs.change_detect.outputs.docker_repo }}/openfpga-master:${{ needs.change_detect.outputs.sha_short }}
+
+  linux_regression_tests:
+    name: linux_regression_tests
+    runs-on: ubuntu-22.04
+    needs: [linux_build, change_detect]
+    container: ghcr.io/${{ needs.change_detect.outputs.docker_repo }}/openfpga-env
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: basic_reg_yosys_only_test
+          - name: basic_reg_test
+          - name: fpga_verilog_reg_test
+          - name: fpga_bitstream_reg_test
+          - name: fpga_sdc_reg_test
+          - name: fpga_spice_reg_test
+          - name: micro_benchmark_reg_test
+#          - name: quicklogic_reg_test
+          - name: vtr_benchmark_reg_test
+          - name: iwls_benchmark_reg_test
+          - name: tcl_reg_test
+          - name: python_binding_test
+    steps:
+      - name: Cancel previous
+        uses: styfle/cancel-workflow-action@0.12.1
+        with:
+          access_token: ${{ github.token }}
+    
+      - name: Checkout OpenFPGA repo
+        uses: actions/checkout@v6
+
+      - name: Download a built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: openfpga
+      - name: chmod
+        run: |
+          chmod +x build/vtr-verilog-to-routing/abc/abc
+          chmod +x build/vtr-verilog-to-routing/ace2/ace
+          chmod +x build/vtr-verilog-to-routing/vpr/vpr
+          chmod +x build/openfpga/openfpga
+          chmod +x build/openfpga/yosys-abc
+          chmod +x build/yosys/yosys
+          chmod +x build/yosys/yosys-abc
+          chmod +x build/yosys/yosys-config
+      - name: file tree
+        run: |
+          tree build/
+      - name: linker status
+        run: |
+          ldd build/openfpga/openfpga
+          ldd build/yosys/yosys
+      - name: ${{matrix.config.name}}_GCC-12_(Ubuntu 22.04)
+        shell: bash
+        run: |
+          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$(pwd)/build/yosys
+          source openfpga.sh && source openfpga_flow/regression_test_scripts/${{matrix.config.name}}.sh --debug --show_thread_logs
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        if: ${{ failure() }}
+        with:
+          name: failed_${{matrix.config.name}}_regression_log
+          retention-days: 1
+          path: |
+            openfpga_flow/**/*.log
+
+  docker_regression_tests:
+    needs: change_detect
+    if: ${{ !fromJSON(needs.change_detect.outputs.source_modified) }}
+    name: docker_regression_tests
+    runs-on: ubuntu-22.04
+    container: 
+      image: ghcr.io/${{ needs.change_detect.outputs.docker_repo }}/openfpga-master:latest
+      options: --user root --workdir /home/openfpga_user
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: basic_reg_yosys_only_test
+          - name: basic_reg_test
+          - name: fpga_verilog_reg_test
+          - name: fpga_bitstream_reg_test
+          - name: fpga_sdc_reg_test
+          - name: fpga_spice_reg_test
+          - name: micro_benchmark_reg_test
+#          - name: quicklogic_reg_test
+          - name: vtr_benchmark_reg_test
+          - name: iwls_benchmark_reg_test
+          - name: tcl_reg_test
+    steps:
+      - name: Cancel previous
+        uses: styfle/cancel-workflow-action@0.12.1
+        with:
+          access_token: ${{ github.token }}
+          
+      - name: Checkout OpenFPGA repo
+        uses: actions/checkout@v6
+
+      - name: ${{matrix.config.name}}_GCC-12_(Ubuntu 22.04)
+        shell: bash
+        run: |
+          bash .github/workflows/install_dependencies_run_ubuntu.sh
+          ${PYTHON_EXEC} -m pip install -r requirements.txt
+          rsync -am --exclude='openfpga_flow/**' /opt/openfpga/. .
+          unset OPENFPGA_PATH
+          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$(pwd)/build/yosys
+          source openfpga.sh && source openfpga_flow/regression_test_scripts/${{matrix.config.name}}.sh --debug --show_thread_logs
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        if: ${{ failure() }}
+        with:
+          name: failed_${{matrix.config.name}}_regression_log
+          retention-days: 1
+          path: openfpga_flow/**/*.log

@@ -1,0 +1,183 @@
+name: Code quality
+on: pull_request
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pylint:
+    runs-on: ${{ matrix.config.os }}
+    name: Pylint
+    strategy:
+      matrix:
+        config:
+          - os: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Bootstrap
+        uses: ./.github/bootstrap_platform
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r resources/build/linter-requirements.txt
+          python -m pip install -r src/openassetio-python/tests/requirements.txt
+
+      - name: Build
+        run: |
+          python -m pip install src/openassetio-python
+        env:
+          CMAKE_TOOLCHAIN_FILE: ${{ github.workspace }}/.conan/conan_paths.cmake
+
+      - name: Lint
+        uses: TheFoundryVisionmongers/fn-pylint-action@v2
+        with:
+          pylint-args: >
+            --recursive=y --disable=fixme
+            --rcfile=src/openassetio-python/pyproject.toml
+            src/openassetio-python/package/openassetio
+            src/openassetio-python/tests
+
+  black:
+    runs-on: ubuntu-22.04
+    name: Python formatting
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r resources/build/linter-requirements.txt
+
+      - name: Check Python formatting
+        run: black --config src/openassetio-python/pyproject.toml --check --diff .
+
+  markdown-link-check:
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v7
+    - uses: gaurav-nelson/github-action-markdown-link-check@v1
+      with:
+        # Suppress ftrack.com, which errors with http 520 when accessed
+        # via GitHub CI, for unknown reasons.
+        config-file: .github/markdown-link-check-config.json
+
+  # Note: in order to keep an `actions/cache` cache up to date, we must
+  # use the approach detailed in
+  # https://github.com/actions/cache/blob/main/workarounds.md#update-a-cache
+  # i.e. load the most recently created cache that matches a prefix,
+  # then create an entirely new cache with every run.
+
+  cpp-linters:
+    name: C++ linters
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        config:
+          - os: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Bootstrap
+        uses: ./.github/bootstrap_platform
+
+      - name: Cache ccache cache
+        uses: actions/cache@v6
+        with:
+          path: /tmp/ccache
+          key: ubuntu-22.04-ccache-lint-${{ github.run_id }}
+          restore-keys: ubuntu-22.04-ccache-lint-
+
+      - name: Install dependencies
+        # Configure the system and install library dependencies via
+        # conan packages.
+        run: |
+          python -m pip install -r resources/build/linter-requirements.txt
+          clang-tidy --version
+          clang-format --version
+          cpplint --version
+
+      - name: Configure CMake build
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_CXX_COMPILER_LAUNCHER=/usr/bin/ccache
+          -DCMAKE_C_COMPILER_LAUNCHER=/usr/bin/ccache
+          --install-prefix ${{ github.workspace }}/dist
+          --toolchain ${{ github.workspace }}/.conan/conan_paths.cmake
+          --preset lint
+
+      - name: Build and lint
+        run: |
+          /usr/bin/ccache -s
+          cmake --build build
+          /usr/bin/ccache -s
+        env:
+          CCACHE_DIR: /tmp/ccache
+
+  sanitizers:
+    name: Sanitizers
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        config:
+          - os: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Bootstrap
+        uses: ./.github/bootstrap_platform
+
+      - name: Cache ccache cache
+        uses: actions/cache@v6
+        with:
+          path: /tmp/ccache
+          key: ubuntu-22.04-ccache-sanitize-${{ github.run_id }}
+          restore-keys: ubuntu-22.04-ccache-sanitize-
+
+      - name: Configure CMake build
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_CXX_COMPILER_LAUNCHER=/usr/bin/ccache
+          -DCMAKE_C_COMPILER_LAUNCHER=/usr/bin/ccache
+          --install-prefix ${{ github.workspace }}/dist
+          --toolchain ${{ github.workspace }}/.conan/conan_paths.cmake
+          --preset sanitize
+
+      - name: Build and test
+        run: |
+          /usr/bin/ccache -s
+          ctest -VV --test-dir build --parallel 4
+          /usr/bin/ccache -s
+        env:
+          CCACHE_DIR: /tmp/ccache
+
+  abi-check:
+    name: ABI diff check
+    runs-on: ubuntu-latest
+    # We must test ABI on a consistent platform. So choose our VFX
+    # reference platform compatible Docker image, which we have
+    # pre-installed libabigail into for performing the ABI diff checks.
+    container:
+      image: ghcr.io/openassetio/openassetio-build
+
+    steps:
+      - uses: actions/checkout@v7 # Needs to be V3 because of GLIBC ver.
+        with:
+          path: src
+
+      - name: Build and check ABI
+        shell: bash
+        run: >
+          cd src
+
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          -DOPENASSETIO_ENABLE_TESTS=ON -DOPENASSETIO_ENABLE_TEST_ABI=ON
+
+          ctest --test-dir build --output-on-failure -R openassetio.test.abi --parallel 4

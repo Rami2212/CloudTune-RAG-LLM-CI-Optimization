@@ -1,0 +1,183 @@
+﻿name: Pull Request
+on:
+  pull_request:
+    paths-ignore:
+      - '.github/next-tag'
+      - CHANGELOG.md
+jobs:
+  build_and_analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the sources
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: true
+
+      - name: Check ffmpeg pin
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/ffmpeg-pin.sh check
+
+      - name: Setup dotnet
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      # Cache packages only; restore must still generate each job's build metadata.
+      - name: Cache NuGet packages
+        uses: actions/cache@v6
+        with:
+          path: ~/.nuget/packages
+          key: nuget-v1-${{ runner.os }}-${{ runner.arch }}-native-${{ hashFiles('**/*.csproj', '**/*.props', '**/*.targets', '**/packages.lock.json', '**/[Nn]u[Gg]et.[Cc]onfig', 'global.json') }}
+          restore-keys: |
+            nuget-v1-${{ runner.os }}-${{ runner.arch }}-native-
+
+      - name: Clean
+        run: dotnet clean --configuration Release
+
+      - name: Install dependencies
+        run: dotnet restore
+
+      - name: Prep project file
+        run: sed -i '/Scanner/d' ErsatzTV/ErsatzTV.csproj
+
+      - name: Build
+        run: dotnet build --configuration Release --no-restore /p:EnableThreadingAnalyzers=true
+  build_and_test_windows:
+    runs-on: windows-latest
+    steps:
+      - name: Get the sources
+        uses: actions/checkout@v7
+
+      - name: Setup dotnet
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      # Cache packages only; restore must still generate each job's build metadata.
+      - name: Cache NuGet packages
+        uses: actions/cache@v6
+        with:
+          path: ~/.nuget/packages
+          key: nuget-v1-${{ runner.os }}-${{ runner.arch }}-native-${{ hashFiles('**/*.csproj', '**/*.props', '**/*.targets', '**/packages.lock.json', '**/[Nn]u[Gg]et.[Cc]onfig', 'global.json') }}
+          restore-keys: |
+            nuget-v1-${{ runner.os }}-${{ runner.arch }}-native-
+
+      - name: Clean
+        run: dotnet clean --configuration Release
+
+      - name: Install dependencies
+        run: dotnet restore
+
+      - name: Prep project file
+        run: sed -i '/Scanner/d' ErsatzTV/ErsatzTV.csproj
+
+      - name: Build
+        run: dotnet build --configuration Release --no-restore
+
+      - name: Install age CLI
+        shell: bash
+        run: scripts/install-age-ci.sh
+
+      - name: Test
+        run: dotnet test --configuration Release --no-build --no-restore --blame-hang-timeout "2m" --verbosity normal
+  build_and_test_linux:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+          - os: ubuntu-latest
+            target: linux-musl-x64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+    steps:
+      - name: Get the sources
+        uses: actions/checkout@v7
+
+      - name: Setup dotnet
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      # Cache packages only; restore must still generate each job's build metadata.
+      - name: Cache NuGet packages
+        uses: actions/cache@v6
+        with:
+          path: ~/.nuget/packages
+          key: nuget-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('**/*.csproj', '**/*.props', '**/*.targets', '**/packages.lock.json', '**/[Nn]u[Gg]et.[Cc]onfig', 'global.json') }}
+          restore-keys: |
+            nuget-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-
+
+      - name: Clean
+        run: dotnet clean --configuration Release
+
+      - name: Install dependencies
+        run: dotnet restore -p:RestoreEnablePackagePruning=true -r "${{ matrix.target }}"
+
+      - name: Prep project file
+        run: sed -i '/Scanner/d' ErsatzTV/ErsatzTV.csproj
+
+      - name: Build
+        run: dotnet build ErsatzTV/ErsatzTV.csproj --runtime "${{ matrix.target }}" --configuration Release --no-restore && dotnet build --configuration Release --no-restore
+
+      - name: Install age CLI
+        shell: bash
+        run: scripts/install-age-ci.sh
+
+      # the contract is the same everywhere, so one job checks legacy's versions against the pinned next
+      - name: Download next
+        if: matrix.target == 'linux-x64'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .github/scripts/download-next.sh "${{ matrix.target }}" next-extracted
+          echo "ETV_TEST_NEXT_FOLDER=$PWD/next-extracted" >> "$GITHUB_ENV"
+
+      - name: Test
+        run: dotnet test --configuration Release --no-build --no-restore --blame-hang-timeout "2m" --verbosity normal
+  build_and_test_mac:
+    runs-on: macos-15
+    # mac runners sometimes hang in dotnet; normal runs take 7-14 min
+    timeout-minutes: 30
+    steps:
+      - name: Get the sources
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: true
+
+      - name: Setup dotnet
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      # Cache packages only; restore must still generate each job's build metadata.
+      - name: Cache NuGet packages
+        uses: actions/cache@v6
+        with:
+          path: ~/.nuget/packages
+          key: nuget-v1-${{ runner.os }}-${{ runner.arch }}-native-${{ hashFiles('**/*.csproj', '**/*.props', '**/*.targets', '**/packages.lock.json', '**/[Nn]u[Gg]et.[Cc]onfig', 'global.json') }}
+          restore-keys: |
+            nuget-v1-${{ runner.os }}-${{ runner.arch }}-native-
+
+      - name: Clean
+        run: dotnet clean --configuration Release
+
+      - name: Install dependencies
+        run: dotnet restore
+
+      - name: Prep project file
+        run: sed -i '' '/Scanner/d' ErsatzTV/ErsatzTV.csproj
+
+      - name: Build
+        run: dotnet build --configuration Release --no-restore
+
+      - name: Install age CLI
+        shell: bash
+        run: scripts/install-age-ci.sh
+
+      - name: Test
+        run: dotnet test --configuration Release --no-build --no-restore --blame-hang-timeout "2m" --verbosity normal

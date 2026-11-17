@@ -1,0 +1,282 @@
+name: Lint Check
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main, release/*]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  # Cancel only on PR branches. Two merges landing close together share one group
+  # on main, and cancelling there leaves the earlier commit with no test verdict.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.resolve.outputs.targets }}
+      python: ${{ steps.resolve.outputs.python }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Check for file changes
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            frontend:
+              - 'apps/frontend/**'
+              - 'ee/frontend/**'
+            docs:
+              - 'docs/src/**'
+              - 'docs/content/**'
+              - 'docs/scripts/**'
+            sdk:
+              - 'sdk/**'
+              - 'ruff.toml'
+            backend:
+              - 'apps/backend/**'
+              - 'ruff.toml'
+            penelope:
+              - 'penelope/**'
+              - 'ruff.toml'
+            migrations:
+              - 'apps/backend/src/rhesis/backend/alembic/versions/**'
+            skill:
+              - 'skills/rhesis/**'
+              - 'scripts/skill/**'
+            kubernetes:
+              - 'kubernetes/**'
+              - 'charts/rhesis/**'
+              - 'scripts/check-k8s-secret-overlap.sh'
+
+      - name: Resolve lint targets
+        id: resolve
+        env:
+          CHANGED: ${{ github.event_name == 'workflow_dispatch' && '["backend","sdk","penelope","frontend","docs","skill","kubernetes"]' || steps.filter.outputs.changes }}
+        run: |
+          set -euo pipefail
+          echo "Changed areas: $CHANGED"
+          echo "targets=$CHANGED" >> "$GITHUB_OUTPUT"
+
+          PYTHON=$(jq -nc --argjson changed "$CHANGED" '
+            [ {id: "backend",  dir: "apps/backend"},
+              {id: "sdk",      dir: "sdk"},
+              {id: "penelope", dir: "penelope"} ]
+            | map(select(.id as $id | $changed | index($id)))
+            | map(.dir)')
+          echo "python=$PYTHON" >> "$GITHUB_OUTPUT"
+          echo "Python matrix: $PYTHON"
+
+  python:
+    needs: changes
+    if: needs.changes.outputs.python != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: ${{ fromJSON(needs.changes.outputs.python) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: latest
+          enable-cache: true
+
+      - name: Run lint
+        run: make lint
+        working-directory: ${{ matrix.dir }}
+
+  migrations:
+    needs: changes
+    # Needs a base ref to diff against, so pull_request only.
+    if: github.event_name == 'pull_request' && contains(fromJSON(needs.changes.outputs.targets), 'migrations')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+
+      - name: Install dependencies
+        run: uv sync --dev
+        working-directory: apps/backend
+
+      - name: Check migration chain
+        run: scripts/check-alembic-head.sh
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
+
+  frontend:
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.targets), 'frontend')
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/frontend
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: apps/frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --legacy-peer-deps
+
+      - name: Run format check
+        run: npm run format:check
+
+      - name: Run lint
+        run: npm run lint
+
+      - name: Run type check
+        run: npm run type-check
+
+  styles:
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.targets), 'frontend')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          # Depth 1 makes check-hardcoded-styles.js scan every file, not the diff.
+          fetch-depth: 2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Check for hardcoded styles
+        run: |
+          set -euo pipefail
+          git diff --name-only --diff-filter=ACMR HEAD~1 HEAD \
+            | grep -E '^(apps|ee)/frontend/src/.*\.(ts|tsx|js|jsx)$' \
+            > "$RUNNER_TEMP/style-files.txt" || true
+          if [ ! -s "$RUNNER_TEMP/style-files.txt" ]; then
+            echo "No frontend source files changed."
+            exit 0
+          fi
+          cat "$RUNNER_TEMP/style-files.txt"
+          tr '\n' '\0' < "$RUNNER_TEMP/style-files.txt" \
+            | xargs -0 node scripts/check-hardcoded-styles.js
+
+  docs:
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.targets), 'docs')
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: docs/src
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: docs/src/package-lock.json
+
+      - name: Install dependencies
+        run: make install
+
+      - name: Run lint
+        run: make lint
+
+  skill:
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.targets), 'skill')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      # The published skill is mirrored to rhesis-ai/skills, where monorepo-relative
+      # paths no longer resolve. Catch that here rather than after it ships.
+      - name: Validate skill
+        run: python scripts/skill/validate.py
+
+  kubernetes:
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.targets), 'kubernetes')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      # secretRef is listed after configMapRef in every deployment's envFrom, so a
+      # key declared in both silently overrides the chart and values-*.yaml edits
+      # become no-ops with no warning. See issue #2420.
+      - name: Check ConfigMap/ExternalSecret key overlap
+        run: scripts/check-k8s-secret-overlap.sh
+
+  lint:
+    needs: [changes, python, migrations, frontend, styles, docs, skill, kubernetes]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check lint results
+        run: |
+          set -euo pipefail
+          FAILED=0
+          for RESULT in "changes=${{ needs.changes.result }}" \
+                        "python=${{ needs.python.result }}" \
+                        "migrations=${{ needs.migrations.result }}" \
+                        "frontend=${{ needs.frontend.result }}" \
+                        "styles=${{ needs.styles.result }}" \
+                        "docs=${{ needs.docs.result }}" \
+                        "skill=${{ needs.skill.result }}" \
+                        "kubernetes=${{ needs.kubernetes.result }}"; do
+            echo "$RESULT"
+            case "${RESULT#*=}" in
+              success|skipped) ;;
+              *) FAILED=1 ;;
+            esac
+          done
+          if [ "$FAILED" -ne 0 ]; then
+            echo "One or more lint jobs failed." >&2
+            exit 1
+          fi
+          echo "All lint checks passed."

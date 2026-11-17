@@ -1,0 +1,57 @@
+name: nimibot_rhel_64
+
+on:
+  pull_request:
+    branches:
+      - master
+      - releases/*
+    paths-ignore:
+      - CHANGELOG.md
+      - CONTRIBUTING.md
+      - .gitattributes
+      - LICENSE
+      - VERSION
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+  # Allows you to run this workflow manually from the Actions tab.
+  workflow_dispatch:
+jobs:
+  do-the-job1:
+    name: system_test
+    if: github.repository == 'ni/nimi-python'
+    runs-on: 
+      - self-hosted
+      - linux
+      - x64
+      - rdss-nimibot-rhel-96-py64
+    timeout-minutes: 40
+    strategy:
+      matrix:
+        module_name:
+          - nidcpower
+          - nidmm
+          - nifgen
+          - nimodinst
+          - nirfsa
+          - nirfsg
+          - niscope
+          - niswitch
+          - nitclk
+    steps:
+      - name: checkout repository
+        uses: actions/checkout@v3
+      - name: execute system tests
+        uses: ./.github/actions/linux
+        with:
+          module_name: ${{ matrix.module_name }}
+      - name: upload coverage
+        uses: codecov/codecov-action@v3
+        with:
+          # See ../PUBLIC_CODECOV_TOKEN_README.md
+          token: 4c58f03d-b74c-489a-889a-ab0a77b7809f
+          flags: ${{ matrix.module_name }}systemtests
+          name: ${{ matrix.module_name }}
+          files: ./generated/${{ matrix.module_name }}/coverage.xml

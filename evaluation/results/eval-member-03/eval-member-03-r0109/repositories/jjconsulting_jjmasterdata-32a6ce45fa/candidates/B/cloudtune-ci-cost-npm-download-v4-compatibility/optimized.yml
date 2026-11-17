@@ -1,0 +1,36 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [MEDIUM] Add concurrency group to "dotnet.yml"
+# Estimated savings: ~2 min/run
+#
+name: .NET
+
+on:
+  push:
+    branches: [ "main", "rc" ]
+  pull_request:
+    branches: [ "main", "rc" ]
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+
+    steps:
+    - uses: actions/checkout@v7.0.1
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v6.0.0
+      with:
+        dotnet-version: 10.0.x
+        
+    - name: Build
+      run: |
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          VERSION_SUFFIX="rc.${{ github.event.pull_request.number }}.${{ github.run_number }}"
+        else
+          VERSION_SUFFIX=""
+        fi
+        dotnet build -p:VersionSuffix="${VERSION_SUFFIX}" -p:ContinuousIntegrationBuild=true

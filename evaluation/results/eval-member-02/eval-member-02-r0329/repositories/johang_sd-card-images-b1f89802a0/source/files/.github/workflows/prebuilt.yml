@@ -1,0 +1,85 @@
+name: sd-card-images prebuilt
+
+on:
+  schedule:
+    # Every Monday evening
+    - cron: "00 21 * * 1"
+    # Every first day of month evening
+    - cron: "00 21 1 * *"
+
+jobs:
+  test-prebuilt:
+    runs-on: ubuntu-24.04-arm
+    name: test ${{ matrix.debian }}
+
+    strategy:
+      matrix:
+        include:
+          # Debian armhf
+          - boot: boot-qemu_arm_virt
+            debian: debian-trixie-armhf
+            debian_index: /index-debians-armhf.txt
+          - boot: boot-qemu_arm_virt
+            debian: debian-forky-armhf
+            debian_index: /index-debians-armhf.txt
+          - boot: boot-qemu_arm_virt
+            debian: debian-sid-armhf
+            debian_index: /index-debians-armhf.txt
+          # Debian arm64
+          - boot: boot-qemu_aarch64_virt
+            debian: debian-trixie-arm64
+            debian_index: /index-debians-arm64.txt
+          - boot: boot-qemu_aarch64_virt
+            debian: debian-forky-arm64
+            debian_index: /index-debians-arm64.txt
+          - boot: boot-qemu_aarch64_virt
+            debian: debian-sid-arm64
+            debian_index: /index-debians-arm64.txt
+          # Ubuntu arm64
+          - boot: boot-qemu_aarch64_virt
+            debian: ubuntu-jammy-arm64
+            debian_index: /index-debians-arm64.txt
+          - boot: boot-qemu_aarch64_virt
+            debian: ubuntu-noble-arm64
+            debian_index: /index-debians-arm64.txt
+      fail-fast: false
+
+    env:
+      BOOT: ${{ matrix.boot }}
+      BOOT_INDEX: /index-boots.txt
+      DEBIAN: ${{ matrix.debian }}
+      DEBIAN_INDEX: ${{ matrix.debian_index }}
+
+    steps:
+    - name: Install dependencies
+      timeout-minutes: 5
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo apt-get update
+        sudo apt-get --assume-yes \
+                     --no-install-recommends \
+                     install parted \
+                             pigz \
+                             qemu-system-x86 \
+                             qemu-system-arm \
+                             ssh \
+                             sshpass \
+                             wget
+
+    - name: Checkout
+      uses: actions/checkout@v7
+
+    - name: Download
+      timeout-minutes: 1
+      env:
+        CDN_BASE: https://cdn.sd-card-images.johang.se
+        DL_BASE: https://dl.sd-card-images.johang.se
+      run: |
+        wget $DL_BASE$(wget -O - $CDN_BASE$BOOT_INDEX | grep $BOOT | sort | tail -n 1 || echo /404)
+        wget $DL_BASE$(wget -O - $CDN_BASE$DEBIAN_INDEX | grep $DEBIAN | sort | tail -n 1 || echo /404)
+
+    - name: Test
+      timeout-minutes: 15
+      run: |
+        ./test/qemu.sh $BOOT*.bin.gz $DEBIAN*.bin.gz

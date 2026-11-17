@@ -1,0 +1,567 @@
+---
+name: Build and Test Pipeline
+permissions:
+  contents: write
+  pull-requests: write
+  checks: write
+  actions: read
+  statuses: write
+  deployments: write
+  issues: write
+  discussions: write
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'src/**'
+      - 'test/**'
+      - 'docs-site/examples/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.json'
+      - 'vitest.config.ts'
+      - 'playwright.config.ts'
+      - 'rollup.config.mjs'
+      - '.github/workflows/main.yml'
+  # No path filter on pull_request: the workflow runs on every PR so the
+  # "CI Gate" required check always reports. The `changes` job below routes
+  # which heavy jobs actually run based on what the PR touched.
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      lib: ${{ steps.detect.outputs.lib }}
+      docs: ${{ steps.detect.outputs.docs }}
+      example: ${{ steps.detect.outputs.example }}
+    steps:
+      - name: Detect changed paths
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ -z "$PR_NUMBER" ]; then
+            # Non-PR event (push / workflow_dispatch): run the full library pipeline.
+            echo "lib=true" >> "$GITHUB_OUTPUT"
+            echo "docs=false" >> "$GITHUB_OUTPUT"
+            echo "example=false" >> "$GITHUB_OUTPUT"
+            echo "Non-PR event: lib=true docs=false example=false"
+            exit 0
+          fi
+          files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename')
+          lib=false
+          docs=false
+          example=false
+          if printf '%s\n' "$files" | grep -qE '^(src/|test/|docs-site/examples/|package\.json$|package-lock\.json$|tsconfig\.json$|vitest\.config\.ts$|playwright\.config\.ts$|rollup\.config\.mjs$|\.github/workflows/main\.yml$)'; then
+            lib=true
+          fi
+          # The docs snippet check also scans README.md.
+          if printf '%s\n' "$files" | grep -qE '^(docs-site/|README\.md$)'; then
+            docs=true
+          fi
+          if printf '%s\n' "$files" | grep -qE '^(examples/react-native-offline/|docs-site/examples/)'; then
+            example=true
+          fi
+          echo "lib=$lib" >> "$GITHUB_OUTPUT"
+          echo "docs=$docs" >> "$GITHUB_OUTPUT"
+          echo "example=$example" >> "$GITHUB_OUTPUT"
+          echo "Detected changes: lib=$lib docs=$docs example=$example"
+
+  guard-dist:
+    name: Reject PRs changing dist/
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if PR modifies files in dist/
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const { owner, repo } = context.repo;
+            const files = await github.paginate(
+              github.rest.pulls.listFiles,
+              { owner, repo, pull_number: pr.number, per_page: 100 }
+            );
+            const changedInDist = files.filter(f => {
+              const cur = f.filename?.startsWith('dist/');
+              const prev = f.previous_filename?.startsWith?.('dist/');
+              return cur || prev;
+            });
+            if (changedInDist.length) {
+              const list = changedInDist.map(f => `- ${f.status}: ${f.filename}`).join('\n');
+              core.setFailed(`Changes in dist/ are not allowed in PRs.\n${list}`);
+            }
+
+  build-and-unit:
+    name: Build & Unit Tests
+    needs: changes
+    if: needs.changes.outputs.lib == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 25
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Create directories
+        run: mkdir -p reports dist docs test-results coverage/unit coverage/e2e coverage/merged
+
+      - name: Run unit tests with Vitest (coverage + JUnit)
+        run: npx vitest run --coverage --reporter=default --reporter=junit --outputFile=test-report.junit.xml
+
+      - name: Upload coverage reports to Codecov
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          report_type: test_results
+          files: test-report.junit.xml
+
+      - name: 'Report Coverage'
+        if: always()
+        uses: davelosert/vitest-coverage-report-action@v2.13.1
+        with:
+          json-summary-path: './coverage/unit/coverage-summary.json'
+          json-final-path: './coverage/unit/coverage-final.json'
+
+      - name: Build (prod)
+        run: npm run build:all:prod
+
+      - name: Package smoke test
+        run: npm run test:package
+
+      - name: Run oxlint
+        run: npx oxlint ./src
+
+      - name: Code complexity analysis
+        run: |
+          mkdir -p reports/complexity
+          printf '%s' '{"categories":{"correctness":"off"},"rules":{"complexity":["error",{"max":15}]}}' > reports/complexity/oxlintrc.json
+          npx oxlint ./src -c reports/complexity/oxlintrc.json --format json > reports/complexity/complexity-report.json || true
+          echo "Complexity report generated at reports/complexity/complexity-report.json"
+
+      - name: TypeScript type checking
+        run: npx tsc --noEmit
+
+      # Blocks master builds. On PRs it only reports: a new advisory against an
+      # existing dependency is not the PR's fault. OSV-Scanner's scan-pr job
+      # still fails PRs that add a vulnerable dependency.
+      - name: Dependency vulnerability scanning
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
+        run: npm audit --audit-level=moderate
+
+      # Upload build artifacts for integration tests
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-output
+          path: |
+            dist/
+            coverage/unit/
+          retention-days: 1
+
+  integration-tests:
+    name: Integration (${{ matrix.browser }}, Shard ${{ matrix.shard }}/4)
+    needs: build-and-unit
+    if: github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [ chromium, firefox ]
+        shard: [ 1, 2, 3, 4 ]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 25
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: build-output
+
+      # Cache Playwright browsers
+      - name: Cache Playwright browsers
+        uses: actions/cache@v6.1.0
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ matrix.browser }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Install Playwright browser
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps ${{ matrix.browser }}
+
+      - name: Install Playwright deps only
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: npx playwright install-deps ${{ matrix.browser }}
+
+      - name: Create coverage directories
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        run: mkdir -p coverage/e2e/shard-${{ matrix.shard }}
+
+      - name: Run integration tests (${{ matrix.browser }}, shard ${{ matrix.shard }}/4)
+        env:
+          COVERAGE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' && matrix.browser == 'chromium' && 'true' || 'false' }}
+          SHARD_INDEX: ${{ matrix.shard }}
+        run: npx playwright test --project=${{ matrix.browser }} --shard=${{ matrix.shard }}/4
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-results-${{ matrix.browser }}-shard-${{ matrix.shard }}
+          path: test-results/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Upload coverage artifact
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && matrix.browser == 'chromium'
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-shard-${{ matrix.shard }}
+          path: coverage/e2e/shard-${{ matrix.shard }}/
+          retention-days: 1
+
+  # Merge coverage from all shards - runs only on master after integration tests complete
+  merge-integration-coverage:
+    name: Merge Coverage Reports
+    needs: [ build-and-unit, integration-tests ]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 25
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download unit test coverage
+        uses: actions/download-artifact@v8
+        with:
+          name: build-output
+          path: .
+
+      - name: Create coverage directories
+        run: mkdir -p coverage/e2e coverage/merged
+
+      - name: Download coverage shard 1
+        uses: actions/download-artifact@v8
+        with:
+          name: coverage-shard-1
+          path: coverage/e2e/shard-1
+
+      - name: Download coverage shard 2
+        uses: actions/download-artifact@v8
+        with:
+          name: coverage-shard-2
+          path: coverage/e2e/shard-2
+
+      - name: Download coverage shard 3
+        uses: actions/download-artifact@v8
+        with:
+          name: coverage-shard-3
+          path: coverage/e2e/shard-3
+
+      - name: Download coverage shard 4
+        uses: actions/download-artifact@v8
+        with:
+          name: coverage-shard-4
+          path: coverage/e2e/shard-4
+
+      - name: List coverage files
+        run: |
+          echo "Unit coverage:"
+          ls -la coverage/unit/ || echo "No unit coverage"
+          echo "E2E coverage shards:"
+          ls -laR coverage/e2e/ || echo "No e2e coverage"
+
+      - name: Merge coverage reports
+        run: npx tsx scripts/merge-coverage.ts
+
+      - name: Upload combined coverage to Codecov
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/merged/lcov.info
+          flags: combined
+          name: combined-coverage
+
+      - name: Upload combined coverage report
+        uses: actions/upload-artifact@v7
+        with:
+          name: combined-coverage-report
+          path: coverage/merged/
+          retention-days: 30
+
+  performance-tests:
+    name: Performance Tests
+    needs: build-and-unit
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 25
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: build-output
+
+      - name: Run performance regression tests
+        id: performance_test
+        run: npm run test:performance
+        continue-on-error: true
+
+      - name: Upload performance benchmark results
+        uses: actions/upload-artifact@v7
+        with:
+          name: performance-benchmark
+          path: reports/performance-benchmark.json
+          retention-days: 30
+
+      - name: Create issue for performance regression
+        if: steps.performance_test.outcome == 'failure'
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            try {
+              const regressionFile = 'reports/performance-regressions.json';
+              if (fs.existsSync(regressionFile)) {
+                const regressionData = JSON.parse(fs.readFileSync(regressionFile, 'utf8'));
+
+                const issue = await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title: `🚨 Performance Regression Detected: ${regressionData.summary}`,
+                  body: `## Performance Regression Alert\n\nThe following performance regressions were detected in commit ${context.sha}:\n\n\`\`\`\n${regressionData.details}\n\`\`\`\n\nPlease investigate these regressions and fix them as soon as possible.\n\n[View workflow run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+                  labels: ['bug', 'performance']
+                });
+
+                console.log(`Created issue #${issue.data.number}: ${issue.data.title}`);
+              } else {
+                console.log('No regression file found, skipping issue creation');
+              }
+            } catch (error) {
+              console.error('Error creating issue:', error);
+            }
+
+  docs-build:
+    name: Docs Build
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 25
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint documentation code snippets
+        run: npx vitest run test/docs/docs_snippets.spec.ts
+
+      - name: Build scorm-again library
+        run: npm run build:all:prod
+
+      - name: Stage demo assets
+        # Mirror the Pages build's dist copy. The CDN demo-module download is
+        # intentionally skipped: those are runtime static assets, not needed to
+        # validate that the VitePress build compiles.
+        run: |
+          mkdir -p docs-site/public/demo/modules
+          cp -r dist docs-site/public/demo/
+
+      - name: Build documentation site
+        run: |
+          cd docs-site
+          npm ci
+          npm run build
+
+  # Type-check the React Native example and check its Expo dependencies. It
+  # cannot run the app, so a device test is still needed before a release.
+  example-check:
+    name: Example Check
+    needs: changes
+    if: needs.changes.outputs.example == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples/react-native-offline
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+        with:
+          # npm ci runs the example's dependency lifecycle scripts, and no step
+          # here needs a Git credential, so keep it out of .git/config.
+          persist-credentials: false
+
+      - name: Setup Node.js
+        # Expo SDK 58 supports Node 22, 24 and 26, not 25.
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 24
+          cache: "npm"
+          cache-dependency-path: examples/react-native-offline/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Packs the committed dist bundle, the docs bridge and the built-in
+      # course into the zips the app requires at bundle time.
+      - name: Build bundled assets
+        run: npm run prepare-assets
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Check Expo dependencies
+        run: npx expo-doctor
+
+      # Bundles the app's JavaScript and assets for both platforms without a
+      # device, so a broken import or a missing asset zip fails here.
+      - name: Bundle the app
+        run: npx expo export --platform android --platform ios --output-dir "$RUNNER_TEMP/expo-export"
+
+  # Single required status check for the master ruleset. It always runs, and
+  # passes unless a job that actually executed (i.e. not skipped) failed. This
+  # lets one ruleset check gate both library PRs (via build-and-unit) and
+  # docs-site PRs (via docs-build), even though each heavy job only runs for the
+  # paths it covers.
+  ci-gate:
+    name: CI Gate
+    needs: [ changes, guard-dist, build-and-unit, docs-build, example-check ]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify required jobs passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ',') }}
+        run: |
+          echo "Upstream results: $RESULTS"
+          IFS=','
+          for r in $RESULTS; do
+            if [ "$r" = "failure" ] || [ "$r" = "cancelled" ]; then
+              echo "::error::A required job did not pass (result=$r)"
+              exit 1
+            fi
+          done
+          echo "All required jobs passed or were skipped."
+
+  finalize:
+    name: Finalize & Commit
+    needs: [ build-and-unit, integration-tests, merge-integration-coverage, performance-tests ]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+        with:
+          # Do not persist checkout credentials into .git/config: this job runs
+          # third-party code (npm install lifecycle scripts, codecov bundle
+          # analyzer) that could read them. The dist/ push authenticates via
+          # scoped credentials set just before the commit step.
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 25
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm install
+
+      # download-artifact unpacks the fresh build *over* the dist/ that
+      # checkout just restored, so any bundle the build no longer emits (e.g.
+      # the removed AICC entry points) survives from the checkout and is never
+      # staged as a deletion. Clearing dist/ first makes the commit below
+      # reflect exactly what the build produced, nothing more.
+      - name: Clear stale dist before download
+        run: rm -rf dist
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: build-output
+
+      - name: Analyze bundle size
+        run: |
+          ls -la dist/*.js | awk '{print $5, $9}' > bundle-size.txt
+          cat bundle-size.txt
+
+      - name: Bundle analysis
+        run: npx @codecov/bundle-analyzer ./dist --bundle-name=scorm-again --upload-token=${{ secrets.CODECOV_TOKEN }}
+
+      - name: Format code with Prettier
+        run: npm run prettier
+
+      # Authenticate the dist/ push as the PAT owner (a master-ruleset bypass
+      # actor) via the remote URL, scoped to the final step only, so the PAT
+      # is never on disk while npm install or the bundle analyzer run. Falls
+      # back to the default token until DIST_COMMIT_TOKEN is configured.
+      - name: Set scoped push credentials
+        env:
+          PUSH_TOKEN: ${{ secrets.DIST_COMMIT_TOKEN || github.token }}
+        run: |
+          git remote set-url origin "https://x-access-token:${PUSH_TOKEN}@github.com/${{ github.repository }}.git"
+
+      - name: Commit and Push Changes
+        uses: stefanzweifel/git-auto-commit-action@v7.2.1
+        with:
+          commit_message: "[skip ci] Add changes during build"
+          file_pattern: "dist"
+          skip_dirty_check: false
