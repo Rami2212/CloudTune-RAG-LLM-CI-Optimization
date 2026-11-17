@@ -1,0 +1,57 @@
+# Definition of GitHub Actions.
+# Designed to working both LINE's and forked repository.
+#
+# Note:
+#  Memory:
+#    VM Spec = 2core, 7G RAM. as of 2019-10. https://help.github.com/en/github/automating-your-workflow-with-github-actions/virtual-environments-for-github-actions
+#    There are possiblity that speed up build by setting xmx manually. But using default now.
+#  Gradle Deamon:
+#    Disabled via appending ~/.gradle/gradle.properties
+name: CI
+on:
+  push:
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: test (JDK ${{ matrix.java }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        java: # We want to test on LTSs.
+          - '17'
+          - '21'
+    steps:
+      - name: actions/setup-java@v3 (JDK ${{ matrix.java }})
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: 'temurin'
+          java-version: ${{ matrix.java }}
+          architecture: x64
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+      - run: |
+          mkdir -p ~/.gradle
+          echo "org.gradle.daemon=false" >> ~/.gradle/gradle.properties
+      - run: ./gradlew -v
+      - run: cd generator && mvn package && cd ..
+      - run: python3 generate-code.py
+      - run: ./gradlew build
+
+  pinact:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run pinact
+        uses: suzuki-shunsuke/pinact-action@b1a1f46bb10f2908950d95f626ca8cc109e2cf7d # v3.1.0
+        with:
+          skip_push: "true"

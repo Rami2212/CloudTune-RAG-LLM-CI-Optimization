@@ -1,0 +1,34 @@
+name: sonarcloud.io
+
+on:
+  push:
+    branches:
+      - master
+  # Community version only allows running against 'main' branch, see https://docs.sonarsource.com/sonarqube/latest/devops-platform-integration/github-integration/
+
+jobs:
+  build:
+    # Do not run sonar on forks because SONAR_TOKEN is available only for project owner
+    if: github.repository_owner == 'damianszczepanik'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # Fetch all history for .GitInfo and .Lastmod
+
+      - uses: actions/setup-java@v6.1.0
+        with:
+          java-version: 17
+          distribution: temurin
+
+      - name: Build and analyse
+        run: >
+          mvn --batch-mode package org.sonarsource.scanner.maven:sonar-maven-plugin:sonar
+          -Dsonar.projectKey=damianszczepanik_cucumber-reporting
+          -Dsonar.organization=damianszczepanik
+          -Dsonar.host.url=https://sonarcloud.io
+          -Dsonar.token=$SONAR_TOKEN
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

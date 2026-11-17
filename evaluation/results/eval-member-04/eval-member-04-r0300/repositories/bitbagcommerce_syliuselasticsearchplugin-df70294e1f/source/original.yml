@@ -1,0 +1,194 @@
+name: Build
+
+on:
+    push:
+        branches-ignore:
+            - 'dependabot/**'
+        paths-ignore:
+            - "*.md"
+    pull_request:
+        paths-ignore:
+            - "*.md"
+    release:
+        types: [created]
+    schedule:
+        -
+            cron: "0 1 * * 6" # Run at 1am every Saturday
+    workflow_dispatch: ~
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    tests:
+        runs-on: ubuntu-latest
+
+        name: "Sylius ${{ matrix.sylius }}, PHP ${{ matrix.php }}, Symfony ${{ matrix.symfony }}, ${{ matrix.database == 'postgres' && format('PostgreSQL {0}', matrix.database_version) || format('MySQL {0}', matrix.database_version) }}, ES ${{ matrix.elasticsearch }}, State Machine Adapter ${{ matrix.state_machine_adapter }}"
+
+        strategy:
+            fail-fast: false
+            matrix:
+                php: [ "8.3", "8.4" ]
+                symfony: [ "^6.4", "^7.4", "^8.0" ]
+                sylius: [ "~2.2.0", "~2.3.0" ]
+                node: [ "24.x" ]
+                database: [ "mysql" ]
+                database_version: [ "8.4" ]
+                elasticsearch: [ "9.1.5" ]
+                elastica: [ "" ]
+                state_machine_adapter: [ "symfony_workflow" ]
+
+                exclude:
+                    # Symfony 8 requires PHP >= 8.4.1
+                    -
+                        php: "8.3"
+                        symfony: "^8.0"
+
+                    # Sylius 2.2 supports Symfony ^6.4.1 || ^7.4 only
+                    -
+                        sylius: "~2.2.0"
+                        symfony: "^8.0"
+
+                include:
+                    -
+                        php: "8.3"
+                        symfony: "^7.4"
+                        sylius: "~2.2.0"
+                        node: "24.x"
+                        database: "mysql"
+                        database_version: "8.4"
+                        elasticsearch: "8.19.4"
+                        elastica: "^8.0"
+                        state_machine_adapter: "symfony_workflow"
+
+                    -
+                        php: "8.4"
+                        symfony: "^8.0"
+                        sylius: "~2.3.0"
+                        node: "24.x"
+                        database: "postgres"
+                        database_version: "15.8"
+                        elasticsearch: "9.1.5"
+                        elastica: ""
+                        state_machine_adapter: "symfony_workflow"
+
+                    -
+                        php: "8.3"
+                        symfony: "^7.4"
+                        sylius: "~2.2.0"
+                        node: "24.x"
+                        database: "mysql"
+                        database_version: "8.4"
+                        elasticsearch: "9.1.5"
+                        elastica: ""
+                        state_machine_adapter: "winzou_state_machine"
+
+        env:
+            APP_ENV: test
+            DATABASE_URL: ${{ matrix.database == 'postgres' && format('pgsql://postgres:postgres@127.0.0.1/sylius?serverVersion={0}', matrix.database_version) || format('mysql://root:root@127.0.0.1/sylius?serverVersion={0}', matrix.database_version) }}
+            ELASTICSEARCH_URL: "http://127.0.0.1:9200/"
+            TEST_SYLIUS_STATE_MACHINE_ADAPTER: "${{ matrix.state_machine_adapter }}"
+
+        steps:
+            -
+                uses: actions/checkout@v4
+
+            -
+                name: Configure sysctl limits
+                run: |
+                    sudo swapoff -a
+                    sudo sysctl -w vm.swappiness=1
+                    sudo sysctl -w fs.file-max=262144
+                    sudo sysctl -w vm.max_map_count=262144
+
+            -
+                name: Run Elasticsearch
+                uses: elastic/elastic-github-actions/elasticsearch@master
+                with:
+                    stack-version: "${{ matrix.elasticsearch }}"
+                    security-enabled: false
+
+            -
+                name: Require Elastica version
+                if: "${{ matrix.elastica != '' }}"
+                run: composer require "ruflin/elastica:${{ matrix.elastica }}" --no-update --no-scripts --no-interaction
+
+            -
+                name: Require Winzou State Machine
+                if: "${{ matrix.state_machine_adapter == 'winzou_state_machine' }}"
+                run: |
+                    composer require winzou/state-machine:^0.4 --no-update
+                    composer require winzou/state-machine-bundle:^0.6 --no-update
+
+            -
+                name: Build Sylius Test Application
+                uses: SyliusLabs/BuildTestAppAction@v3.2.0
+                with:
+                    build_type: "plugin"
+                    e2e_js: "yes"
+                    cache_key: "${{ runner.os }}-php-${{ matrix.php }}-composer-${{ hashFiles('**/composer.json') }}"
+                    cache_restore_key: "${{ runner.os }}-php-${{ matrix.php }}-composer-"
+                    database: "${{ matrix.database }}"
+                    database_version: "${{ matrix.database_version }}"
+                    node_version: "${{ matrix.node }}"
+                    php_version: "${{ matrix.php }}"
+                    sylius_version: "${{ matrix.sylius }}"
+                    symfony_version: "${{ matrix.symfony }}"
+                    composer_prefer_stable: "yes"
+
+            -
+                name: Populate Elasticsearch indexes
+                run: vendor/bin/console fos:elastica:populate
+
+            -
+                name: Run security check
+                run: composer audit --abandoned=ignore
+
+            -
+                name: Validate composer.json
+                run: composer validate --ansi --strict
+
+            -
+                name: Run ECS
+                run: vendor/bin/ecs check
+
+            -
+                name: Run PHPStan
+                run: vendor/bin/phpstan analyse -c phpstan.neon
+
+            -
+                name: Run PHPSpec
+                run: vendor/bin/phpspec run --ansi -f progress --no-interaction
+
+            -
+                name: Run PHPUnit
+                run: vendor/bin/phpunit --colors=always
+
+            -
+                name: Run Behat
+                run: vendor/bin/behat --colors --strict -vvv --no-interaction -f progress --tags="~@todo" || vendor/bin/behat --colors --strict -vvv --no-interaction --tags="~@todo" --rerun
+
+            -
+                name: Upload Behat logs
+                uses: actions/upload-artifact@v4
+                if: failure()
+                with:
+                    name: "Behat logs - ${{ matrix.sylius }}-${{ matrix.symfony }}-${{ matrix.php }}-${{ github.run_id }}-${{ github.run_number }}"
+                    path: etc/build/
+                    if-no-files-found: ignore
+                    compression-level: 6
+                    overwrite: true
+
+            -
+                name: Failed build Slack notification
+                uses: rtCamp/action-slack-notify@v2
+                if: ${{ failure() && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
+                env:
+                    SLACK_CHANNEL: ${{ secrets.FAILED_BUILD_SLACK_CHANNEL }}
+                    SLACK_COLOR: ${{ job.status }}
+                    SLACK_ICON: https://github.com/rtCamp.png?size=48
+                    SLACK_MESSAGE: ':x:'
+                    SLACK_TITLE: Failed build on ${{ github.event.repository.name }} repository
+                    SLACK_USERNAME: ${{ secrets.FAILED_BUILD_SLACK_USERNAME }}
+                    SLACK_WEBHOOK: ${{ secrets.FAILED_BUILD_SLACK_WEBHOOK }}

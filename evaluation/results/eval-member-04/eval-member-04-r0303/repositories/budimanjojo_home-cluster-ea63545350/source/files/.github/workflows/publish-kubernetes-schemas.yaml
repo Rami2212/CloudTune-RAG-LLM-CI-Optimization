@@ -1,0 +1,67 @@
+---
+name: Publish Kubernetes schemas
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: 0 0 * * *
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/publish-kubernetes-schemas.yaml
+
+env:
+  UV_SYSTEM_PYTHON: "1"
+
+jobs:
+  main:
+    name: Publish Kubernetes schemas
+    runs-on: home-cluster-runner
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        # yamllint disable-line rule:comments
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install kubectl
+        # yamllint disable-line rule:comments
+        uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4.0.1
+
+      - name: Install uv
+        # yamllint disable-line rule:comments
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+
+      - name: Setup Python
+        # yamllint disable-line rule:comments
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: 3.15.x
+
+      - name: Install Python dependencies
+        run: uv pip install pyyaml
+
+      - name: Run crd-extractor
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/datreeio/CRDs-catalog/f3cdc86d7e26c959f2c366f19a29c5e5872bf9d6/Utilities/crd-extractor.sh -o crd-extractor.sh
+          curl -fsSL https://raw.githubusercontent.com/datreeio/CRDs-catalog/f3cdc86d7e26c959f2c366f19a29c5e5872bf9d6/Utilities/openapi2jsonschema.py -o openapi2jsonschema.py
+          chmod +x crd-extractor.sh && ./crd-extractor.sh
+
+      - name: Setup Node
+        # yamllint disable-line rule:comments
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24.x
+
+      - name: Publish schemas
+        # yamllint disable-line rule:comments
+        uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd # v3.15.0
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_PAGES_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: /home/runner/.datree/crdSchemas
+          command: pages deploy --project-name=kubernetes-schemas --branch main .
