@@ -1,0 +1,73 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 10 * * 0'
+
+env:
+  CHROME_BUILD_NUMBER: 131.0.6778.85
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        # https://github.com/federicocarboni/setup-ffmpeg/issues/21
+        # TODO linux arm64 when available https://github.com/orgs/community/discussions/19197
+        os: [macos-26, macos-26-intel, ubuntu-24.04, windows-2025]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      # Windows fix. See https://github.com/actions/checkout/issues/226
+      - run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Get yarn cache directory path
+        id: yarn-cache-dir-path
+        run: echo "::set-output name=dir::$(yarn config get cacheFolder)"
+
+      - name: Cache browser
+        id: cache-browser
+        uses: actions/cache@v3
+        with:
+          path: browser
+          key: ${{ runner.os }}-browser-${{ env.CHROME_BUILD_NUMBER }}
+
+      # https://github.com/federicocarboni/setup-ffmpeg/issues/21
+      - if: runner.os != 'macOS' || runner.arch != 'ARM64'
+        uses: FedericoCarboni/setup-ffmpeg@v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - if: runner.os == 'macOS' && runner.arch == 'ARM64'
+        run: brew install ffmpeg
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'yarn'
+
+      - run: npx @puppeteer/browsers install chrome@${{ env.CHROME_BUILD_NUMBER }} --path ${{ github.workspace }}/browser
+  
+      - run: yarn install --immutable
+      - run: yarn dedupe --check
+      - run: yarn tsc
+
+      - name: CPU and memory
+        run: node --experimental-default-type module -e 'import os from "os"; console.log("CPUs:", os.cpus().length, "mem:", (os.freemem()/1e9).toFixed(1), "/", (os.totalmem()/1e9).toFixed(1), "GB");'
+
+      - run: yarn test:e2e
+      - run: yarn lint
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: artifact
+          path: |
+            reactive-video-assets/test-output/
+            reactive-video-assets/test-image-snapshots/__diff_output__/

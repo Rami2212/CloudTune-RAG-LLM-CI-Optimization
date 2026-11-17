@@ -1,0 +1,54 @@
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "logprobs": null,
+      "message": {
+        "content": "{\n  \"decision\": \"APPLY\",\n  \"workflow_yaml\": \"# This workflow builds and unit tests both main Java API and also build/data tools for metadata generation.\\n\\nname: Testing Java API\\non: pull_request\\npermissions:\\n  contents: read\\n\\njobs:\\n  java-test:\\n    runs-on: ubuntu-latest\\n    steps:\\n    - name: Harden Runner\\n      uses: step-security/harden-runner@8ca2b8b2ece13480cda6dacd3511b49857a23c09 # v2.5.1\\n      with:\\n        egress-policy: audit # TODO: change to 'egress-policy: block' after couple of runs\\n\\n    - uses: actions/checkout@ee0669bd1cc54295c223e0bb666b733df41de1c5 # v2.7.0\\n    - name: Set up JDK 8 and Maven\\n      uses: actions/setup-java@cd89f46ac9d01407894225f350157564c9c7cee2 # v3.12.0\\n      with:\\n        java-version: '8'\\n        distribution: 'adopt'\\n    - name: Cache Maven packages\\n      uses: actions/cache@v4\\n      with:\\n        path: ~/.m2/repository\\n        key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}\\n        restore-keys: |\\n          ${{ runner.os }}-maven-\\n# Invoke the \\\"github-actions\\\" profile during Maven steps; see <profile> in pom.xml\\n# files. This is configured not to build the \\\"cpp-build\\\" module.\\n# The \\\"mvn install\\\" command will run by default during the \\\"install\\\" phase by\\n# Github Actions, without the profile flag. Here we customize the install phase to\\n# use the relevant profile. If we want to build \\\"cpp-build\\\" with Github Action CI\\n# it's safe to remove the first line entirely.\\n    - name: Test Build Tools with Maven\\n      run: |\\n        mvn install -P github-actions -DskipTests=true  -Dmaven.javadoc.skip=true -B -V\\n        mvn -P github-actions test\\n    - name: Test Java API with Ant\\n      run: |\\n        ant clean -f java/build.xml\\n        ant jar -f java/build.xml\\n        ant junit -f java/build.xml\\n  js-files-ascii-check:\\n    runs-on: ubuntu-latest\\n    steps:\\n    - name: Harden Runner\\n      uses: step-security/harden-runner@8ca2b8b2ece13480cda6dacd3511b49857a23c09 # v2.5.1\\n      with:\\n        egress-policy: audit # TODO: change to 'egress-policy: block' after couple of runs\\n\\n    - uses: actions/checkout@ee0669bd1cc54295c223e0bb666b733df41de1c5 # v2.7.0\\n    - name: Install ascii-safe-cli\\n      run: npm install -g is-ascii-safe-cli\\n    - name: Check whether .js api files are ascii safe or not.\\n      run: find . -name '*.js' ! -name '*_test.js' | xargs is-ascii-safe\\n\",\n  \"rationale\": \"Add Maven dependency caching to the java-test job. The workflow uses Maven with multiple pom.xml files (parent and modules) and downloads dependencies on every run. Evidence from experiment batch-hiruni-pattern-bat-a89d5fd8d30bc8cb-r2 shows adding a Maven cache step to a similar workflow yielded 51% elapsed time savings (median elapsed seconds from 145 to 71). Pattern P-LIT-GHA-CACHE supports caching dependency downloads, and P-LIT-CONFIG-REUSE demonstrates configuration reuse benefits. The cache key uses hashFiles('**/pom.xml') to invalidate when any pom.xml changes, and restore-keys provides fallback. This preserves all build/test coverage and adds no privileged actions.\",\n  \"evidence_ids\": [\"experiment:batch-hiruni-pattern-bat-a89d5fd8d30bc8cb-r2\", \"pattern:P-LIT-GHA-CACHE\", \"pattern:P-LIT-CONFIG-REUSE\"]\n}",
+        "reasoning": "The user wants me to propose a CI optimization for the given workflow based on the evidence provided. I need to analyze the workflow and the evidence to see if there's a suitable optimization.\n\nFirst, let me understand the workflow:\n- It's a Java project with Maven and Ant builds\n- Two jobs: `java-test` and `js-files-ascii-check`\n- The `java-test` job runs Maven install and test, then Ant clean/jar/junit\n- The `js-files-ascii-check` job checks if JS files are ASCII safe\n\nLooking at the evidence, I see several patterns:\n1. P-LIT-GHA-CACHE - Cache dependency downloads (Maven packages)\n2. P-LIT-CONFIG-REUSE - Reuse work across compatible configurations (experiment shows 51% elapsed savings)\n3. P-LIT-DISTRIBUTED-CACHE - Share cached build dependencies\n4. P-LIT-FAIL-FAST - Cancel remaining matrix jobs after failure\n5. P-LIT-ENV-CACHE - Reuse validated build environments\n\nThe workflow uses Maven (multiple pom.xml files) and Ant. The evidence shows an experiment (batch-hiruni-pattern-bat-a89d5fd8d30bc8cb-r2) where adding Maven cache to a similar workflow resulted in 51% elapsed time savings. This is pattern P-LIT-CONFIG-REUSE but the actual change was adding a Maven cache step.\n\nAlso, there's evidence for P-LIT-GHA-CACHE (caching dependency downloads) and P-LIT-DISTRIBUTED-CACHE (pip cache example).\n\nThe workflow currently doesn't have any caching for Maven dependencies. The `java-test` job runs `mvn install` and `mvn test` which would download dependencies every time.\n\nLooking at the repository context, there are multiple pom.xml files:\n- java/pom.xml (parent)\n- java/libphonenumber/pom.xml\n- java/carrier/pom.xml\n- java/geocoder/pom.xml\n- java/internal/prefixmapper/pom.xml\n- java/demo/pom.xml\n\nThe workflow runs from the root and uses Maven with a profile \"github-actions\".\n\nThe evidence from experiment batch-hiruni-pattern-bat-a89d5fd8d30bc8cb-r2 shows adding a Maven cache step with:\n- path: ~/.m2/repository\n- key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}\n- restore-keys: ${{ runner.os }}-maven-\n\nThis is a perfect fit for this workflow since it uses Maven with multiple pom.xml files.\n\nAlso, the pattern P-LIT-GHA-CACHE supports caching dependency downloads.\n\nI should propose adding Maven dependency caching to the `java-test` job. This is a minimal change that preserves all build and test coverage.\n\nLet me check if there are any contraindications:\n- The evidence shows \"Mutable or untrusted cached content\" and \"An equivalent cache already exists\" as contraindications for P-LIT-GHA-CACHE\n- The workflow doesn't have an existing cache, so that's fine\n- Maven dependencies are generally immutable once downloaded (based on coordinates), so caching should be safe\n\nThe experiment evidence (batch-hiruni-pattern-bat-a89d5fd8d30bc8cb-r2) shows measured 51% elapsed savings on a similar Maven workflow.\n\nI'll propose adding the cache step before the Maven build steps in the `java-test` job.\n\nThe decision should be APPLY with the updated workflow YAML.\n\nLet me construct the updated workflow.",
+        "reasoning_details": [
+          {
+            "format": "unknown",
+            "index": 0,
+            "text": "The user wants me to propose a CI optimization for the given workflow based on the evidence provided. I need to analyze the workflow and the evidence to see if there's a suitable optimization.\n\nFirst, let me understand the workflow:\n- It's a Java project with Maven and Ant builds\n- Two jobs: `java-test` and `js-files-ascii-check`\n- The `java-test` job runs Maven install and test, then Ant clean/jar/junit\n- The `js-files-ascii-check` job checks if JS files are ASCII safe\n\nLooking at the evidence, I see several patterns:\n1. P-LIT-GHA-CACHE - Cache dependency downloads (Maven packages)\n2. P-LIT-CONFIG-REUSE - Reuse work across compatible configurations (experiment shows 51% elapsed savings)\n3. P-LIT-DISTRIBUTED-CACHE - Share cached build dependencies\n4. P-LIT-FAIL-FAST - Cancel remaining matrix jobs after failure\n5. P-LIT-ENV-CACHE - Reuse validated build environments\n\nThe workflow uses Maven (multiple pom.xml files) and Ant. The evidence shows an experiment (batch-hiruni-pattern-bat-a89d5fd8d30bc8cb-r2) where adding Maven cache to a similar workflow resulted in 51% elapsed time savings. This is pattern P-LIT-CONFIG-REUSE but the actual change was adding a Maven cache step.\n\nAlso, there's evidence for P-LIT-GHA-CACHE (caching dependency downloads) and P-LIT-DISTRIBUTED-CACHE (pip cache example).\n\nThe workflow currently doesn't have any caching for Maven dependencies. The `java-test` job runs `mvn install` and `mvn test` which would download dependencies every time.\n\nLooking at the repository context, there are multiple pom.xml files:\n- java/pom.xml (parent)\n- java/libphonenumber/pom.xml\n- java/carrier/pom.xml\n- java/geocoder/pom.xml\n- java/internal/prefixmapper/pom.xml\n- java/demo/pom.xml\n\nThe workflow runs from the root and uses Maven with a profile \"github-actions\".\n\nThe evidence from experiment batch-hiruni-pattern-bat-a89d5fd8d30bc8cb-r2 shows adding a Maven cache step with:\n- path: ~/.m2/repository\n- key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}\n- restore-keys: ${{ runner.os }}-maven-\n\nThis is a perfect fit for this workflow since it uses Maven with multiple pom.xml files.\n\nAlso, the pattern P-LIT-GHA-CACHE supports caching dependency downloads.\n\nI should propose adding Maven dependency caching to the `java-test` job. This is a minimal change that preserves all build and test coverage.\n\nLet me check if there are any contraindications:\n- The evidence shows \"Mutable or untrusted cached content\" and \"An equivalent cache already exists\" as contraindications for P-LIT-GHA-CACHE\n- The workflow doesn't have an existing cache, so that's fine\n- Maven dependencies are generally immutable once downloaded (based on coordinates), so caching should be safe\n\nThe experiment evidence (batch-hiruni-pattern-bat-a89d5fd8d30bc8cb-r2) shows measured 51% elapsed savings on a similar Maven workflow.\n\nI'll propose adding the cache step before the Maven build steps in the `java-test` job.\n\nThe decision should be APPLY with the updated workflow YAML.\n\nLet me construct the updated workflow.",
+            "type": "reasoning.text"
+          }
+        ],
+        "refusal": null,
+        "role": "assistant"
+      },
+      "native_finish_reason": "stop"
+    }
+  ],
+  "created": 1794838174,
+  "id": "gen-1794838174-mfR5pQifbuKdFSYgwPdl",
+  "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+  "object": "chat.completion",
+  "provider": "Nvidia",
+  "service_tier": null,
+  "system_fingerprint": null,
+  "usage": {
+    "completion_tokens": 1774,
+    "completion_tokens_details": {
+      "audio_tokens": 0,
+      "image_tokens": 0,
+      "reasoning_tokens": 758
+    },
+    "cost": 0,
+    "cost_details": {
+      "upstream_inference_completions_cost": 0,
+      "upstream_inference_cost": 0,
+      "upstream_inference_prompt_cost": 0
+    },
+    "is_byok": false,
+    "prompt_tokens": 29532,
+    "prompt_tokens_details": {
+      "audio_tokens": 0,
+      "cache_write_tokens": 0,
+      "cached_tokens": 0,
+      "video_tokens": 0
+    },
+    "total_tokens": 31306
+  }
+}

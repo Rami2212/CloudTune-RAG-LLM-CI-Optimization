@@ -1,0 +1,48 @@
+name: Check homepage build
+permissions:
+  contents: read
+  actions: write
+
+on:
+  pull_request:
+    paths:
+      - 'examples/**'
+      - 'docs/**'
+      - 'zeus/**'
+      - 'mkdocs.yml'
+      - 'docker/Dockerfile'
+      - '.github/workflows/check_homepage_build.yaml'
+
+# Jobs initiated by previous pushes get cancelled by a new push.
+concurrency:
+  group: ${{ github.ref }}-check-homepage-build
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: github.event.repository.fork == false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.10"
+          version: "latest"
+      - run: echo "cache_id=$(date --utc '+%V')" >> $GITHUB_ENV
+      - uses: actions/cache@v6
+        with:
+          key: mkdocs-material-${{ env.cache_id }}
+          path: .cache
+          restore-keys: |
+            mkdocs-material-
+      - name: Install Zeus and dependencies
+        run: uv sync --group docs --no-dev
+      - name: Build homepage
+        run: uv run mkdocs build --verbose --strict
+        env:
+          BUILD_SOCIAL_CARD: true

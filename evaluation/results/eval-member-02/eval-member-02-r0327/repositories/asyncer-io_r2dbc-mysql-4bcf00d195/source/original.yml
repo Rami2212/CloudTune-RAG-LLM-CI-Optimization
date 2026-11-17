@@ -1,0 +1,140 @@
+# Copyright 2023 asyncer.io proejcts
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: RELEASE
+
+on:
+  workflow_dispatch:
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set Up Java 8
+
+        uses: actions/setup-java@v5
+        with:
+          distribution: "temurin" # gh runner local caches lts temurins
+          java-version: "8"
+
+      - name: Setup Git Configs
+        run: |
+          git config --global user.email "asyncer-io-bot@users.noreply.github.com"
+          git config --global user.name "asyncer-io-bot"
+
+      - name: Install SSH Key
+        uses: shimataro/ssh-key-action@v2
+        with:
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          known_hosts: ${{ secrets.SSH_KNOWN_HOSTS }}
+
+      - name: Cache & Load Local Maven Repository
+        uses: actions/cache@v5
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-prepare-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-prepare-
+
+      - name: DryRun Release Prepare
+        run: |
+          ./mvnw -B -ntp -pl r2dbc-mysql release:prepare -DpreparationGoals=clean -DdryRun=true -DskipTests=true
+
+      - name: Upgrade Native Image Version
+        run: ./.github/scripts/upgrade_native_image_version.sh
+
+      - name: Run release prepare command
+        run: |
+          ./mvnw -B -ntp -pl r2dbc-mysql release:prepare -DpreparationGoals=clean -Dresume=false -DskipTests=true
+          ./mvnw -B -ntp clean
+
+      - name: Ensure Prepared
+        run: ./.github/scripts/ensure_prepared.sh
+
+      - name: Upload workspace
+        uses: actions/upload-artifact@v4
+        with:
+          name: prepare-workspace
+          path: ${{ github.workspace }}
+          include-hidden-files: true
+
+      - name: Rollback Release
+        working-directory: ./prepare-workspace/
+        if: ${{ failure() }}
+        run: ./.github/scripts/release_rollback.sh ${{ github.ref_name }}
+
+  stage-release:
+    runs-on: ubuntu-latest
+    needs: prepare
+    steps:
+      - name: Download workspace
+        uses: actions/download-artifact@v4
+        with:
+          name: prepare-workspace
+          path: ./prepare-workspace/
+
+      - name: fix permissions
+        run: |
+          chmod 755 ./prepare-workspace/mvnw
+          chmod 755 ./prepare-workspace/.github/scripts/release_rollback.sh
+
+      - name: Set up Java 8
+        uses: actions/setup-java@v5
+        with:
+          distribution: "temurin" # gh runner local caches lts temurins
+          java-version: "8"
+
+      - name: Setup git configs
+        run: |
+          git config --global user.email "asyncer-io-bot@users.noreply.github.com"
+          git config --global user.name "asyncer-io-bot"
+
+      - name: Install SSH key0
+        uses: shimataro/ssh-key-action@v2
+        with:
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          known_hosts: ${{ secrets.SSH_KNOWN_HOSTS }}
+
+      - name: Cache & Load Local Maven Repository
+        uses: actions/cache@v5
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-prepare-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-prepare-
+
+      - name: Set Up Maven Settings
+        uses: s4u/maven-settings-action@v4.0.0
+        with:
+          servers: |
+            [{
+              "id": "central",
+              "username": "${{ secrets.CENTRAL_USERNAME }}",
+              "password": "${{ secrets.CENTRAL_PASSWORD }}"
+            }]
+
+      - name: Prepare Internal Dependencies
+        working-directory: ./prepare-workspace/
+        run: ./mvnw -B -ntp -pl build-tools clean install -DskipTests -Dcheckstyle.skip
+
+      - name: Import GPG Key
+        run: cat <(echo -e "${{ secrets.GPG_PRIVATE_KEY }}") | gpg --batch --import
+
+      - name: Sign & Deploy to Central Portal
+        working-directory: ./prepare-workspace/
+        run: ./mvnw -B -ntp -pl r2dbc-mysql clean javadoc:jar package gpg:sign org.sonatype.central:central-publishing-maven-plugin:publish -DskipTests=true -Dcheckstyle.skip -Dgpg.passphrase="${{ secrets.GPG_PASSPHRASE }}" -Dgpg.keyname="${{ secrets.GPG_KEY_NAME }}"
+
+      - name: Rollback Release
+        working-directory: ./prepare-workspace/
+        if: ${{ failure() }}
+        run: ./.github/scripts/release_rollback.sh trunk

@@ -1,0 +1,54 @@
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "logprobs": null,
+      "message": {
+        "content": "{\n  \"decision\": \"APPLY\",\n  \"workflow_yaml\": \"name: Push rapidocr to pypi\\n\\non:\\n  push:\\n    tags:\\n      - \\\"v*\\\"\\n\\njobs:\\n  TestAndPublish:\\n    runs-on: ubuntu-latest\\n\\n    steps:\\n      - name: Pull latest code\\n        uses: actions/checkout@v4\\n        with:\\n          fetch-depth: 0\\n\\n      - name: Set up Python 3.10\\n        uses: actions/setup-python@v4\\n        with:\\n          python-version: \\\"3.10\\\"\\n          architecture: \\\"x64\\\"\\n\\n      - name: Display Python version\\n        run: python -c \\\"import sys; print(sys.version)\\\"\\n\\n      - name: Cache pip dependencies\\n        uses: actions/cache@v4\\n        with:\\n          path: ~/.cache/pip\\n          key: ${{ runner.os }}-pip-${{ hashFiles('python/requirements.txt', 'python/pyproject.toml') }}\\n          restore-keys: |\\n            ${{ runner.os }}-pip-\\n\\n      - name: Install all dependencies\\n        run: |\\n          cd python\\n          python -m pip install --upgrade pip\\n          python -m pip install -r requirements.txt\\n          python -m pip install pytest build setuptools wheel setuptools-scm openvino==2026.2.1 onnxruntime python-bidi khatt MNN\\n          python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu\\n          python -m pip install paddlepaddle==3.1.1 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/\\n\\n      - name: Unit testings\\n        run: |\\n          cd python\\n          pytest tests/test_*.py\\n\\n      - name: Verify release tag\\n        run: |\\n          test -n \\\"$GITHUB_REF_NAME\\\"\\n          git tag --points-at HEAD | grep -Fx \\\"$GITHUB_REF_NAME\\\"\\n          VERSION=\\\"${GITHUB_REF_NAME#v}\\\"\\n          echo \\\"SETUPTOOLS_SCM_PRETEND_VERSION_FOR_RAPIDOCR=$VERSION\\\" >> \\\"$GITHUB_ENV\\\"\\n          echo \\\"Building rapidocr version: $VERSION\\\"\\n\\n      - name: Prepare wheel assets\\n        run: |\\n          cd python\\n          python tools/prepare_wheel_assets.py\\n\\n      - name: Build wheel package\\n        run: |\\n          cd python\\n          python -m build --wheel\\n          mv dist ../\\n\\n      - name: Publish distribution to PyPI\\n        uses: pypa/gh-action-pypi-publish@v1.5.0\\n        with:\\n          password: ${{ secrets.RAPIDOCR }}\\n          packages_dir: dist/\",\n  \"rationale\": \"The workflow installs numerous Python dependencies (including heavy ML frameworks) on every run without caching. Evidence from experiment:batch-hiruni-pattern-bat-ae496965ffa682a2-r2 shows a ~9.2% elapsed time reduction by adding pip caching to a similar Python workflow. Pattern P-LIT-GHA-CACHE from the literature reports modest aggregate benefit (6% free, 3.4% paid VM time reduction) for caching dependency downloads. The repository has python/requirements.txt and python/pyproject.toml which serve as stable cache keys. Adding a cache step before dependency installation preserves all test coverage and build steps while reducing repeated downloads.\",\n  \"evidence_ids\": [\"experiment:batch-hiruni-pattern-bat-ae496965ffa682a2-r2\", \"pattern:P-LIT-GHA-CACHE\"]\n}",
+        "reasoning": "The user wants me to propose a CI optimization for the given workflow. Let me analyze the workflow and the evidence.\n\nThe workflow is for publishing to PyPI on tag pushes. It:\n1. Checks out code\n2. Sets up Python 3.10\n3. Installs many dependencies (including heavy ML frameworks like torch, paddlepaddle, openvino, etc.)\n4. Runs unit tests\n5. Verifies release tag\n6. Prepares wheel assets\n7. Builds wheel package\n8. Publishes to PyPI\n\nLooking at the evidence, I see several patterns. The most relevant ones for this workflow appear to be:\n\n1. **P-LIT-GHA-CACHE** - Cache dependency downloads (from the literature report)\n2. **P-LIT-DISTRIBUTED-CACHE** - Share cached build dependencies (from experiment evidence showing ~9% improvement)\n3. **P-LIT-ENV-CACHE** - Reuse validated build environments\n\nThe workflow installs a lot of dependencies every run. The `requirements.txt` and `pyproject.toml` are present, so we can cache pip dependencies based on these files.\n\nLooking at the experiment evidence (experiment:batch-hiruni-pattern-bat-ae496965ffa682a2-r2), it shows a ~9.2% elapsed time savings by adding pip caching to a similar Python workflow. The pattern P-LIT-DISTRIBUTED-CACHE is referenced there.\n\nAlso, the pattern P-LIT-GHA-CACHE from the literature report suggests caching dependency downloads with modest aggregate benefit (6% free, 3.4% paid VM time reduction).\n\nThe workflow currently has no caching. Adding a pip cache step before installing dependencies would be a minimal, safe change that preserves all test coverage and build steps.\n\nLet me check the preconditions:\n- P-LIT-GHA-CACHE: \"Repeated dependency fetching is measurable\" and \"Cache inputs include lockfile and environment\" - We have requirements.txt and pyproject.toml\n- P-LIT-DISTRIBUTED-CACHE: \"Trusted cache infrastructure\" - GitHub Actions cache is trusted infrastructure\n\nThe experiment evidence shows this exact pattern applied to a similar workflow with measured improvement.\n\nI should propose adding a pip cache step using actions/cache@v4, caching ~/.cache/pip with a key based on the hash of requirements.txt and pyproject.toml (or just pyproject.toml since it references requirements.txt).\n\nLet me create the updated workflow.",
+        "reasoning_details": [
+          {
+            "format": "unknown",
+            "index": 0,
+            "text": "The user wants me to propose a CI optimization for the given workflow. Let me analyze the workflow and the evidence.\n\nThe workflow is for publishing to PyPI on tag pushes. It:\n1. Checks out code\n2. Sets up Python 3.10\n3. Installs many dependencies (including heavy ML frameworks like torch, paddlepaddle, openvino, etc.)\n4. Runs unit tests\n5. Verifies release tag\n6. Prepares wheel assets\n7. Builds wheel package\n8. Publishes to PyPI\n\nLooking at the evidence, I see several patterns. The most relevant ones for this workflow appear to be:\n\n1. **P-LIT-GHA-CACHE** - Cache dependency downloads (from the literature report)\n2. **P-LIT-DISTRIBUTED-CACHE** - Share cached build dependencies (from experiment evidence showing ~9% improvement)\n3. **P-LIT-ENV-CACHE** - Reuse validated build environments\n\nThe workflow installs a lot of dependencies every run. The `requirements.txt` and `pyproject.toml` are present, so we can cache pip dependencies based on these files.\n\nLooking at the experiment evidence (experiment:batch-hiruni-pattern-bat-ae496965ffa682a2-r2), it shows a ~9.2% elapsed time savings by adding pip caching to a similar Python workflow. The pattern P-LIT-DISTRIBUTED-CACHE is referenced there.\n\nAlso, the pattern P-LIT-GHA-CACHE from the literature report suggests caching dependency downloads with modest aggregate benefit (6% free, 3.4% paid VM time reduction).\n\nThe workflow currently has no caching. Adding a pip cache step before installing dependencies would be a minimal, safe change that preserves all test coverage and build steps.\n\nLet me check the preconditions:\n- P-LIT-GHA-CACHE: \"Repeated dependency fetching is measurable\" and \"Cache inputs include lockfile and environment\" - We have requirements.txt and pyproject.toml\n- P-LIT-DISTRIBUTED-CACHE: \"Trusted cache infrastructure\" - GitHub Actions cache is trusted infrastructure\n\nThe experiment evidence shows this exact pattern applied to a similar workflow with measured improvement.\n\nI should propose adding a pip cache step using actions/cache@v4, caching ~/.cache/pip with a key based on the hash of requirements.txt and pyproject.toml (or just pyproject.toml since it references requirements.txt).\n\nLet me create the updated workflow.",
+            "type": "reasoning.text"
+          }
+        ],
+        "refusal": null,
+        "role": "assistant"
+      },
+      "native_finish_reason": "stop"
+    }
+  ],
+  "created": 1794828386,
+  "id": "gen-1794828386-U7t9Bzm7vPJKdl2HUsFX",
+  "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+  "object": "chat.completion",
+  "provider": "Nvidia",
+  "service_tier": null,
+  "system_fingerprint": null,
+  "usage": {
+    "completion_tokens": 1351,
+    "completion_tokens_details": {
+      "audio_tokens": 0,
+      "image_tokens": 0,
+      "reasoning_tokens": 525
+    },
+    "cost": 0,
+    "cost_details": {
+      "upstream_inference_completions_cost": 0,
+      "upstream_inference_cost": 0,
+      "upstream_inference_prompt_cost": 0
+    },
+    "is_byok": false,
+    "prompt_tokens": 27460,
+    "prompt_tokens_details": {
+      "audio_tokens": 0,
+      "cache_write_tokens": 0,
+      "cached_tokens": 0,
+      "video_tokens": 0
+    },
+    "total_tokens": 28811
+  }
+}

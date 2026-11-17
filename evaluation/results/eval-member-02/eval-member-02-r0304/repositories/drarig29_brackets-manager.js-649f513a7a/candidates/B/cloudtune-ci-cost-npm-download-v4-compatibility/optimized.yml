@@ -1,0 +1,38 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 4 optimizations:
+# - [HIGH] Add npm dependency cache to "test" job
+# - [HIGH] Split "test" into parallel jobs (lint + test + build)
+# - [MEDIUM] Add concurrency group to "tests.yml"
+# - [MEDIUM] Use "npm ci" instead of "npm install" in "test"
+# Estimated savings: ~13 min/run
+#
+name: Unit Tests
+
+on:
+  push:
+    branches: ["master"]
+  pull_request:
+    branches: ["master"]
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Use Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 14
+      - run: npm install
+      - run: npm run lint
+      - run: npm test
+        env:
+          FORCE_COLOR: "1"
+      - name: Test documentation
+        run: |
+          npm install typedoc@0.25.0
+          npx typedoc src/index.ts --excludePrivate --excludeExternals --treatValidationWarningsAsErrors

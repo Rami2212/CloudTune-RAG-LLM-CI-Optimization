@@ -1,0 +1,163 @@
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+name: Continuous integration
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - run: sudo apt-get install libclang-dev
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - uses: actions-rs/cargo@v1
+        with:
+          command: check
+          args: --workspace --all-targets
+
+  test:
+    name: Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          - macOS-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Install Clang (Ubuntu)
+        if: ${{ runner.os == 'Linux' }}
+        run: sudo apt-get install libclang-dev
+      - name: Workaround macOS Clang
+        if: ${{ runner.os == 'macOS' }}
+        run: | 
+          brew install llvm@15
+          brew link llvm@15
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - run: rustup target add wasm32-unknown-unknown
+
+      - name: Test no-default-features
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --workspace --no-default-features
+
+      - name: Test default features
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --workspace
+
+      - name: Test uint
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: -p uint --all-features
+
+      - name: Test fixed-hash no_std
+        run: cargo test -p fixed-hash --no-default-features --features='rustc-hex'
+
+      - name: Test fixed-hash all-features
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: -p fixed-hash --all-features
+
+      - name: Test primitive-types no_std
+        run: cargo test -p primitive-types --no-default-features --features='scale-info,num-traits,serde_no_std'
+
+      - name: Test primitive-types all-features
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: -p primitive-types --all-features
+
+      - name: Build ethereum-types no_std
+        run: cargo build -p ethereum-types --no-default-features --features='serialize,rlp' --target=wasm32-unknown-unknown
+
+      - name: Test ethereum-types all-features
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: -p ethereum-types --all-features
+
+      - name: Test ethbloom all-features
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: -p ethbloom --all-features
+
+      - name: Test bounded-collections no_std
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: -p bounded-collections --no-default-features
+
+      - name: Test bounded-collections no_std,serde
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: -p bounded-collections --no-default-features --features=serde
+
+      - name: Test bounded-collections all-features
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: -p bounded-collections --all-features
+
+  test_windows:
+    name: Test Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --workspace --exclude kvdb-rocksdb
+
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: nightly
+          override: true
+      - run: rustup component add rustfmt
+      - uses: actions-rs/cargo@v1
+        with:
+          command: fmt
+          args: --all -- --check

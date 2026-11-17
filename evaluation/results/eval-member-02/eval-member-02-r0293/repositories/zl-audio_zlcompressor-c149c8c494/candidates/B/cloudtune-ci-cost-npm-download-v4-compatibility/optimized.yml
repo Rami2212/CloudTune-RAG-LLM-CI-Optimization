@@ -1,0 +1,137 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [LOW] Use shallow clone in "build_and_test" job
+# Estimated savings: ~0 min/run
+#
+name: Sanitizer
+
+on:
+  workflow_dispatch:
+
+# Cancel older runs of this workflow on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  DISPLAY: :0
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+
+jobs:
+  build_and_test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS Address Sanitizer
+            os: macos-latest
+            pluginval-binary: ./pluginval/Builds/pluginval_artefacts/RelWithDebInfo/pluginval.app/Contents/MacOS/pluginval
+            sanitizer: address
+            formats: VST3;AU
+            simd: NEON
+            pluginval_disabled: Plugin state restoration
+          - name: macOS Thread Sanitizer
+            os: macos-latest
+            pluginval-binary: ./pluginval/Builds/pluginval_artefacts/RelWithDebInfo/pluginval.app/Contents/MacOS/pluginval
+            sanitizer: thread
+            formats: VST3;AU
+            simd: NEON
+            pluginval_disabled: Plugin state restoration
+          - name: Linux Address Sanitizer
+            os: ubuntu-latest
+            pluginval-binary: ./pluginval/Builds/pluginval_artefacts/RelWithDebInfo/pluginval
+            sanitizer: address
+            formats: VST3
+            simd: AVX2
+            pluginval_disabled: Plugin state restoration
+          - name: Linux Thread Sanitizer
+            os: ubuntu-latest
+            pluginval-binary: ./pluginval/Builds/pluginval_artefacts/RelWithDebInfo/pluginval
+            sanitizer: thread
+            formats: VST3
+            simd: AVX2
+            pluginval_disabled: Plugin state restoration,Background thread state
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Configure and Build
+        uses: ./.github/actions/build
+        with:
+          formats: ${{ matrix.formats }}
+          simd: ${{ matrix.simd }}
+          build-type: RelWithDebInfo
+          sanitizer: ${{ matrix.sanitizer }}
+          linux-extra-packages: ladspa-sdk
+
+      - name: Checkout pluginval code
+        uses: actions/checkout@v7
+        with:
+          path: "pluginval"
+          repository: 'ZL-Audio/pluginval'
+          submodules: recursive
+
+      - name: Configure and Build Pluginval (Linux & macOS)
+        if: runner.os != 'Windows'
+        uses: ./.github/actions/build
+        with:
+          source-dir: pluginval
+          build-dir: ${{ env.BUILD_DIR }}
+          build-type: ${{ env.BUILD_TYPE }}
+          formats: ${{ matrix.formats }}
+          simd: ${{ matrix.simd }}
+          sanitizer: ${{ matrix.sanitizer }}
+          cmake-extra-args: -DPLUGINVAL_VST3_VALIDATOR=OFF
+          setup-environment: 'false'
+          import-env: 'false'
+
+      - name: Setup Pluginval random seed
+        id: setup_seed
+        shell: bash
+        run: |
+          CURRENT_DATE_SEED=$(date +%y%m%d%H%M)
+          echo "Generated Seed: $CURRENT_DATE_SEED"
+          echo "RANDOM_SEED=$CURRENT_DATE_SEED" >> "$GITHUB_OUTPUT"
+
+      - name: Setup TSan Suppressions (Linux)
+        if: runner.os == 'Linux' && contains(matrix.name, 'Thread Sanitizer')
+        shell: bash
+        run: |
+          echo "mutex:juce::MessageManager::Lock" > tsan_suppressions.txt
+          echo "TSAN_OPTIONS=suppressions=tsan_suppressions.txt detect_deadlocks=0" >> $GITHUB_ENV
+
+      - name: Pluginval VST3 validations (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          ${{ matrix.pluginval-binary }} --verbose --validate "${{ env.VST3_PATH }}" --disabled-tests "${{ matrix.pluginval_disabled }}"
+        env:
+          STRICTNESS_LEVEL: 10
+          TIMEOUT_MS: 1440000
+          REPEAT: 3
+          RANDOM_SEED: "${{ steps.setup_seed.outputs.RANDOM_SEED }}"
+
+      - name: Pluginval VST3 validations (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          ${{ matrix.pluginval-binary }} --verbose --validate "${{ env.VST3_PATH }}" --disabled-tests "${{ matrix.pluginval_disabled }}"
+          sleep 5
+          ${{ matrix.pluginval-binary }} --verbose --validate "${{ env.VST3_PATH }}" --disabled-tests "${{ matrix.pluginval_disabled }}"
+          sleep 5
+          ${{ matrix.pluginval-binary }} --verbose --validate "${{ env.VST3_PATH }}" --disabled-tests "${{ matrix.pluginval_disabled }}"
+        env:
+          STRICTNESS_LEVEL: 10
+          TIMEOUT_MS: 1440000
+          REPEAT: 1
+          RANDOM_SEED: "${{ steps.setup_seed.outputs.RANDOM_SEED }}"

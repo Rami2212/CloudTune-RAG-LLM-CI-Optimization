@@ -1,0 +1,55 @@
+name: PyPI Download Stats
+
+on:
+  schedule:
+    - cron: "30 0 * * 0"
+  workflow_dispatch:
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch PyPI stats
+        id: stats
+        run: |
+          STATS=$(curl -s -X POST 'https://sql-clickhouse.clickhouse.com:8443/?user=demo' \
+            --data-binary "SELECT
+              sumIf(count, date >= today() - 7) AS last_week,
+              sum(count) AS total
+            FROM pypi.pypi_downloads_per_day
+            WHERE project = 'gac'
+            FORMAT JSONEachRow")
+
+          fmt() { LC_ALL=en_US.UTF-8 printf "%'d" "$1"; }
+
+          echo "last_week=$(fmt "$(echo "$STATS" | jq -r '.last_week')")" >> $GITHUB_OUTPUT
+          echo "total=$(fmt "$(echo "$STATS" | jq -r '.total')")" >> $GITHUB_OUTPUT
+
+      - name: Send Discord notification
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          curl -sS -X POST "$DISCORD_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "embeds": [{
+                "title": "📦 PyPI Download Stats — gac",
+                "url": "https://clickpy.clickhouse.com/dashboard/gac",
+                "color": 5793266,
+                "fields": [
+                  {
+                    "name": "Last 7 days",
+                    "value": "${{ steps.stats.outputs.last_week }}",
+                    "inline": true
+                  },
+                  {
+                    "name": "All-time total",
+                    "value": "${{ steps.stats.outputs.total }}",
+                    "inline": true
+                  }
+                ],
+                "footer": {
+                  "text": "clickpy.clickhouse.com"
+                }
+              }]
+            }'

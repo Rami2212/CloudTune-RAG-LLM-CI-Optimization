@@ -1,0 +1,54 @@
+name: docker build and deploy
+
+on:
+  push:
+    # Always except for irrelevant changes
+    paths-ignore:
+      - 'docs/**'
+      - '.github/**'
+      - '*.csv'
+  pull_request:
+    # Only for Dockerfile changes
+    paths:
+      - 'Dockerfile'
+  schedule:
+    # Weekly rebuild every Saturday at 21:00 UTC
+    - cron: '0 21 * * 6'
+
+jobs:
+  deploy-docker:
+    runs-on: ubuntu-latest
+    name: build and deploy
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up QEMU
+        timeout-minutes: 1
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        timeout-minutes: 1
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to Github Packages
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+        timeout-minutes: 5
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build/push
+        timeout-minutes: 30
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          tags: ghcr.io/johang/sd-card-images:latest

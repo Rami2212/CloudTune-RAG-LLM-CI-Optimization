@@ -1,0 +1,49 @@
+# This workflow records the pull request number for the "Apply Issue and PR Labels Post" workflow, which applies
+# labels to pull requests based on the file paths in a pull request or content in the body of a pull request.
+#
+# NOTE: This file is automatically synchronized from Mu DevOps. Update the original file there
+#       instead of the file in this repo.
+#
+# NOTE: This workflow runs on the pull_request event without secrets. The labels are applied by the
+#       label-issues-post.yml workflow.
+#
+# - Mu DevOps Repo: https://github.com/microsoft/mu_devops
+# - File Sync Settings: https://github.com/microsoft/mu_devops/blob/main/.sync/Files.yml
+#
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: BSD-2-Clause-Patent
+#
+
+name: Apply Issue and PR Labels
+
+on:
+  pull_request:
+    types:
+      - edited
+      - opened
+      - reopened
+      - synchronize
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    name: Collect PR Metadata
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Create PR Metadata
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          mkdir metadata
+          printf '{"pr_number": %s}\n' "${PR_NUMBER}" > metadata/pr-metadata.json
+
+      - name: Upload PR Metadata
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pr-labeler-metadata
+          path: metadata/pr-metadata.json
+          overwrite: true
+          retention-days: 5

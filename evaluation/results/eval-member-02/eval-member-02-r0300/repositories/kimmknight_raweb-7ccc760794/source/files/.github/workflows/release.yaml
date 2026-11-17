@@ -1,0 +1,443 @@
+name: Create draft release with prepared assets
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g. vYYYY.MM.DD.PATCH). Leave blank to auto-generate based on today's date."
+        required: false
+        type: string
+
+jobs:
+  build-guacd:
+    name: Build guacd WSL distribution
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build guacd WSL distribution
+        id: guacd
+        uses: ./.github/actions/build-guacd
+
+      - name: Upload guacd.wsl artifact
+        id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: guacd.wsl
+          path: ${{ steps.guacd.outputs.guacd_path }}
+
+  test-server:
+    name: Test server (backend)
+    runs-on: windows-latest
+
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+
+    env:
+      NUGET_PACKAGES: ${{ github.workspace }}/.nuget/packages
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v6
+        if: ${{ !env.ACT }}
+        with:
+          global-json-file: global.json
+          cache: false
+
+      - name: Restore .NET solution
+        run: dotnet restore RAWeb.Server.slnf --locked-mode
+
+      - name: Build .NET solution
+        run: dotnet build RAWeb.Server.slnf --no-restore --configuration Release
+
+      - name: Test .NET solution
+        if: ${{ !env.ACT }} # act does not run in a separate environment as an admin account
+        run: dotnet test RAWeb.Server.slnf --no-build --configuration Release -- --report-trx --coverage
+
+      - name: Upload HTML test report
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: TestReport
+          path: "**/*-report.html"
+
+  build_and_release:
+    name: Build and release
+    runs-on: windows-latest
+    needs: [build-guacd, test-server]
+    permissions:
+      contents: write
+      id-token: write # required for SignPath and for build provenance attestations
+      attestations: write # required to store build provenance attestations
+      actions: write # required to delete temporary artifacts
+
+    env:
+      NUGET_PACKAGES: ${{ github.workspace }}/.nuget/packages
+      SIGNPATH_ORGANIZATION_ID: b8f0ef72-143a-482d-b776-e08d26305b3c
+      SIGNPATH_PROJECT_SLUG: raweb
+      SIGNPATH_SIGNING_POLICY_SLUG: test-signing
+      SIGNPATH_ARTIFACT_CONFIGURATION_SLUG_RELEASE: raweb-release
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Generate release version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANUAL_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          manual_version="$MANUAL_VERSION"
+
+          if [ -n "$manual_version" ]; then
+            # ensure the manual version has a leading 'v'
+            if [[ "$manual_version" != v* ]]; then
+              manual_version="v${manual_version}"
+            fi
+
+            new_version="$manual_version"
+          else
+            today=$(date +'%Y.%m.%d')
+            default_version="v${today}.0"
+
+            # fetch the latest release tag name
+            latest_version=$(gh release list --limit 1 --json tagName --jq '.[0].tagName' || echo "")
+
+            # check if we successfully got a latest version and if its date matches today's date
+            if [ -n "$latest_version" ] && [[ "$latest_version" =~ ^v([0-9]{4}\.[0-9]{2}\.[0-9]{2})\.([0-9]+)$ ]]; then
+              latest_date="${BASH_REMATCH[1]}"
+              latest_increment="${BASH_REMATCH[2]}"
+
+              if [ "$latest_date" == "$today" ]; then
+                # date matches; increment the number
+                new_increment=$(($latest_increment + 1))
+                new_version="v${today}.${new_increment}"
+              else
+                # date does not match; use the default version with .0
+                new_version="$default_version"
+              fi
+            else
+              # No latest release found or format is unexpected, use the default version with .0
+              new_version="$default_version"
+            fi
+          fi
+
+          echo "Using version $new_version"
+          echo "version=$new_version" >> $GITHUB_OUTPUT
+
+      - name: Clean version string
+        id: clean_version
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+
+          # remove 'v' prefix
+          VERSION=${VERSION#v}
+
+          # split by '.' and remove leading zeros from each part
+          IFS='.' read -ra ADDR <<< "$VERSION"
+          CLEAN_VERSION=""
+          for i in "${ADDR[@]}"; do
+            # remove leading zeros unless it's a single zero
+            CLEAN_VERSION+="$(echo "$i" | sed 's/^0\([0-9]\)/\1/g')."
+          done
+          CLEAN_VERSION=${CLEAN_VERSION%.} # remove trailing dot
+
+          echo "clean_version=$CLEAN_VERSION" >> $GITHUB_OUTPUT
+          echo "Setting FileVersion to $CLEAN_VERSION"
+
+      - name: "Update .csproj FileVersion"
+        if: success()
+        shell: bash
+        run: |
+          CLEAN_VERSION="${{ steps.clean_version.outputs.clean_version }}"
+
+          CSPROJ_FILES=(
+            "dotnet/RAWeb.Server/RAWeb.Server.csproj"
+            "dotnet/RAWeb.Server.Utilities/RAWeb.Server.Utilities.csproj"
+            "dotnet/RAWeb.Server.Management/RAWeb.Server.Management.csproj"
+            "dotnet/RAWeb.Server.Management.ServiceHost/RAWeb.Server.Management.ServiceHost.csproj"
+          )
+
+          # loop through each file path
+          for CSPROJ_FILE in "${CSPROJ_FILES[@]}"; do            
+            echo "Updating FileVersion in $CSPROJ_FILE to $CLEAN_VERSION"
+            sed -i'' -E "s|(<FileVersion>)[0-9\.]+(</FileVersion>)|\1$CLEAN_VERSION\2|g" "$CSPROJ_FILE"
+            
+            # check if the sed command actually modified the file
+            if [ $? -ne 0 ]; then
+              echo "Warning: Failed to update or find <FileVersion> tag in $CSPROJ_FILE."
+            fi
+          done
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.11
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24.16.0"
+          cache: "pnpm"
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: cd frontend && pnpm install
+
+      - name: Build the frontend (no embedded docs)
+        run: cd frontend && pnpm run build
+        env:
+          RAWEB_EXCLUDE_DOCS: true
+          RAWEB_SERVER_TYPE: aspnetcore
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+          cache: false
+
+      - name: Restore .NET solution
+        run: dotnet restore RAWeb.Server.slnf --locked-mode
+
+      - name: Build .NET solution (no embedded docs)
+        shell: bash
+        run: |
+          dotnet publish RAWeb.Server.slnf \
+            --configuration Release --no-restore \
+            -p:InformationalVersion="${{ steps.version.outputs.version }}" \
+            -p:IncludeSourceRevisionInInformationalVersion=false
+
+      - name: Move repository setup.ps1 to dotnet/RAWeb.Server/dist so it is included in the release archive
+        shell: bash
+        run: |
+          mv setup.ps1 dotnet/RAWeb.Server/dist/setup.ps1
+
+      # modify setup.ps1 to replace $source_dir = "dotnet\RAWeb.Server" with $source_dir = ""
+      # since the setup.ps1 is now in the same folder as the files to install
+      - name: Modify setup.ps1 for altered location
+        shell: bash
+        run: |
+          find='$source_dir = "dotnet\\RAWeb.Server"'
+          replace='$source_dir = ""'
+          file='dotnet/RAWeb.Server/dist/setup.ps1'
+
+          sed -i "s|$find|$replace|g" "$file"
+
+      - name: Copy repository setup.json to dotnet/RAWeb.Server/dist so it is included in the release archive
+        shell: bash
+        run: |
+          cp setup.json dotnet/RAWeb.Server/dist/setup.json
+
+      # modify setup.json to replace "sourceRoot": ".\\dotnet\\RAWeb.Server\\dist" with "sourceRoot": "."
+      # since setup.json is now in the same folder as the files to install
+      - name: Modify setup.json for altered location
+        shell: bash
+        run: |
+          find='"sourceRoot": ".\\\\dotnet\\\\RAWeb.Server\\\\dist"'
+          replace='"sourceRoot": "."'
+          file='dotnet/RAWeb.Server/dist/setup.json'
+
+          sed -i "s|$find|$replace|g" "$file"
+
+      - name: Download guacd.wsl
+        uses: actions/download-artifact@v8
+        with:
+          name: guacd.wsl
+          path: dotnet/RAWeb.Server/dist
+
+      - name: Confirm guacd.wsl is present
+        shell: bash
+        run: |
+          if [ ! -f "dotnet/RAWeb.Server/dist/guacd.wsl" ]; then
+            echo "guacd.wsl not found in expected location: dotnet/RAWeb.Server/dist/guacd.wsl"
+            exit 1
+          fi
+
+      - name: Generate archive (no embedded docs)
+        uses: thedoctor0/zip-release@0.7.5
+        with:
+          type: "zip"
+          directory: dotnet/RAWeb.Server/dist/
+          filename: "../../../raweb_${{ steps.version.outputs.version }}__no_docs.zip"
+
+      - name: Build the frontend
+        run: cd frontend && pnpm run build
+        env:
+          RAWEB_SERVER_TYPE: aspnetcore
+
+      - name: Build .NET solution
+        shell: bash
+        run: |
+          dotnet publish RAWeb.Server.slnf \
+            --configuration Release --no-restore \
+            -p:InformationalVersion="${{ steps.version.outputs.version }}" \
+            -p:IncludeSourceRevisionInInformationalVersion=false
+
+      - name: Generate archive
+        uses: thedoctor0/zip-release@0.7.5
+        with:
+          type: "zip"
+          directory: dotnet/RAWeb.Server/dist/
+          filename: "../../../raweb_${{ steps.version.outputs.version }}.zip"
+
+      - name: Restore installer projects
+        run: dotnet restore RAWeb.Server.Installer.slnf --locked-mode
+
+      - name: Publish multi-version installer
+        run: dotnet publish dotnet/RAWeb.Server.Installer/RAWeb.Server.Installer.csproj --configuration Release --no-restore -p:ReleaseRepository="${{ github.repository }}"
+
+      - name: Publish installer pinned to this release
+        shell: bash
+        run: |
+          dotnet publish dotnet/RAWeb.Server.Installer/RAWeb.Server.Installer.csproj \
+            --configuration Release --no-restore \
+            -p:ReleaseRepository="${{ github.repository }}" \
+            -p:EmbeddedReleaseTag="${{ steps.version.outputs.version }}" \
+            -p:IncludeSourceRevisionInInformationalVersion=false
+
+      - name: Replace spaces with underscores and remove parentheses in installer executable names
+        shell: bash
+        run: |
+          for f in dotnet/RAWeb.Server.Installer/dist/*.exe; do
+            [ -f "$f" ] || continue
+            target="$(echo "$f" | tr ' ' '_' | tr -d '()')"
+            [ "$f" != "$target" ] && mv "$f" "$target"
+          done
+
+      - name: Read multi-version installer product version
+        id: multi-version
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem "dotnet/RAWeb.Server.Installer/dist/Multi-version*.exe" | Select-Object -First 1
+          "version=$($installer.VersionInfo.ProductVersion)" >> $env:GITHUB_OUTPUT
+
+      # the release archives and both installers are signed in one SignPath request
+      - name: Sign release assets
+        uses: ./.github/actions/sign-exe-signpath
+        with:
+          name: raweb-release
+          allow-any-file-type: "true"
+          parameters: |
+            version: "${{ steps.version.outputs.version }}"
+            multiVersionInstallerVersion: "${{ steps.multi-version.outputs.version }}"
+          files: |
+            raweb_${{ steps.version.outputs.version }}.zip
+            raweb_${{ steps.version.outputs.version }}__no_docs.zip
+            dotnet/RAWeb.Server.Installer/dist/Multi-version*.exe
+            dotnet/RAWeb.Server.Installer/dist/Installer*.exe
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ env.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ env.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ env.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ env.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG_RELEASE }}
+
+      - name: Attest build provenance of release assets
+        id: attest-provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            raweb_${{ steps.version.outputs.version }}.zip
+            raweb_${{ steps.version.outputs.version }}__no_docs.zip
+            dotnet/RAWeb.Server.Installer/dist/*.exe
+            dotnet/RAWeb.Server/dist/guacd.wsl
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0.24.3
+        with:
+          path: .
+          config: .github/syft.yaml
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Attest SBOM of release assets
+        id: attest-sbom
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            raweb_${{ steps.version.outputs.version }}.zip
+            raweb_${{ steps.version.outputs.version }}__no_docs.zip
+            dotnet/RAWeb.Server.Installer/dist/*.exe
+          sbom-path: sbom.spdx.json
+
+      - name: Create draft release
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: "raweb_${{ steps.version.outputs.version }}.zip,raweb_${{ steps.version.outputs.version }}__no_docs.zip,dotnet/RAWeb.Server.Installer/dist/*.exe" # comma-delimited list of artifact names (globs allowed)
+          tag: "${{ steps.version.outputs.version }}"
+          name: "Release ${{ steps.version.outputs.version }}"
+          draft: true
+          generateReleaseNotes: true
+          skipIfReleaseExists: true
+          body: |
+            ## Install this release
+
+            1. **Download and run the installer for this release.**
+
+                <a href="https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/Installer_for_RAWeb_${{ steps.version.outputs.version }}_x64.exe" rel="nofollow">
+                  <picture>
+                    <source media="(prefers-color-scheme: dark)" srcset="https://install.raweb.app/buttons/install-this-release-dark.svg">
+                    <source media="(prefers-color-scheme: light)" srcset="https://install.raweb.app/buttons/install-this-release-light.svg">
+                    <img src="https://install.raweb.app/buttons/install-this-release-light.svg" alt="Install this release" height="32">
+                  </picture>
+                </a>
+
+            2. **Follow the prompts.**
+
+            3. **Install web client prerequisites.**\
+               If you plan to use the web client connection method, follow the instructions in our [web client prerequisites documentation](https://raweb.app/docs/web-client/prerequisites) to install and configure the required software.
+
+            > [!NOTE]
+            > If Internet Information Services (IIS) or other required components are not already installed, the RAWeb installer will retrieve and install them.
+
+            <details>
+              <summary>Advanced installation</summary>
+
+              ### Non-interactive installation
+
+              To install without prompts, run the following in PowerShell:
+
+              ```
+              Invoke-WebRequest "https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/Installer_for_RAWeb_${{ steps.version.outputs.version }}_x64.exe" -OutFile "installer.exe"; Start-Process ".\installer.exe" -ArgumentList "--express","--overwrite" -Wait; Remove-Item "installer.exe"
+              ```
+
+              If RAWeb is already installed, **installing with this option will replace the existing installed files.** Resources, policies, and other data in `/App_Data` will be preserved.
+
+              ### Supported parameters
+
+              | Option                                              | Description                                                                                                                         |
+              | --------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+              | `--website <name>`, <br/>`-WebSite <name>`          | Specify the IIS web site that should serve RAWeb.                                                                                   |
+              | `--virtual-path <path>`, <br/>`-VirtualPath <path>` | Specify the virtual path within that IIS web site.                                                                                  |
+              | `--install-dir <path>`, <br/>`-InstallDir <path>`   | Specify where the software files will be stored. RAWeb's application data will be stored in this directory.                         |
+              | `--option <id>=<value>`                             | Specify one option declared in `setup.json`. Repeat for more than one.                                                              |
+              | `--express`, <br/>`-Express`, <br/>`-AcceptAll`     | Advance past a page automatically once it has a valid value.                                                                        |
+              | `--overwrite`, <br/>`-Overwrite`                    | Bypass warnings about replacing or losing existing data (`InstallPage`).                                                            |
+              | `--no-welcome`                                      | Skip the welcome page. The installer will automatically relaunch with administrator privileges.                                     |
+              | `--autoclose <always\|success\|never>`              | Close the window on its own once installation finishes (`InstallPage`). Defaults to `never`.                                        |
+              | `--no-gui`                                          | Run entirely in the console instead of showing the wizard window. You must specify all options that should not take default values. |
+
+            </details>
+
+            <details>
+              <summary>Verify this release</summary>
+
+              The files in this release have a [build provenance attestation](${{ steps.attest-provenance.outputs.attestation-url }}) and an [SBOM attestation](${{ steps.attest-sbom.outputs.attestation-url }}). To verify a downloaded file with the [GitHub CLI](https://cli.github.com/), run:
+
+              ```
+              gh attestation verify <file> --repo ${{ github.repository }}
+              ```
+
+            </details>
+
+            ---
+
+            Free code signing provided by [SignPath.io](https://about.signpath.io/). Certificate by [SignPath Foundation](https://signpath.org/). See our [code signing policy](https://raweb.app/docs/code-signing/policy) for details.

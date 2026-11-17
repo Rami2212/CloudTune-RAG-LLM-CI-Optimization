@@ -1,0 +1,223 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+# Cancel older runs of this workflow on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  DISPLAY: :0 # linux pluginval needs this
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+
+jobs:
+  build_and_test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux-x86-64
+            os: ubuntu-24.04
+            formats: VST3;LV2;Standalone
+            simd: SSE2
+          - name: Linux-x86-64-AVX2
+            os: ubuntu-24.04
+            formats: VST3;LV2;Standalone
+            simd: AVX2
+          - name: Linux-arm64
+            os: ubuntu-24.04-arm
+            formats: VST3;LV2;Standalone
+            simd: NEON
+          - name: macOS-x86-64
+            os: xcode-27
+            architecture: x86_64
+            formats: VST3;AU;Standalone
+            simd: SSE4
+          - name: macOS-arm64
+            os: xcode-27
+            architecture: arm64
+            formats: VST3;AU;Standalone
+            simd: NEON
+          - name: Windows-x86-64
+            os: windows-2025
+            wix_arch: x64
+            vcvars_script: vcvars64.bat
+            formats: VST3;LV2;Standalone
+            simd: SSE2
+          - name: Windows-x86-64-AVX2
+            os: windows-2025
+            wix_arch: x64
+            vcvars_script: vcvars64.bat
+            formats: VST3;LV2;Standalone
+            simd: AVX2
+          - name: Windows-arm64
+            os: windows-11-vs2026-arm
+            wix_arch: arm64
+            vcvars_script: vcvarsarm64.bat
+            formats: VST3;LV2;Standalone
+            simd: NEON
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Configure and Build
+        uses: ./.github/actions/build
+        with:
+          formats: ${{ matrix.formats }}
+          simd: ${{ matrix.simd }}
+          architecture: ${{ matrix.architecture }}
+          vcvars-script: ${{ matrix.vcvars_script }}
+
+      - name: Set additional env vars for next steps
+        shell: bash
+        run: |
+          echo "ARTIFACT_NAME=${{ env.PRODUCT_NAME }}-${{ env.VERSION }}-${{ matrix.name }}" >> $GITHUB_ENV
+
+      - name: Check VST3 dependencies and compatibility
+        shell: bash
+        run: |
+          python3 -u packaging/check_dependency.py
+
+      - name: Import Certificates (macOS)
+        uses: apple-actions/import-codesign-certs@v7 # only exists as a tag right now
+        if: ${{ (runner.os == 'macOS') && (env.p12-file-base64 != '') }}
+        with:
+          p12-file-base64: ${{ secrets.DEV_ID_APP_CERT }}
+          p12-password: ${{ secrets.DEV_ID_APP_PASSWORD }}
+        env:
+          p12-file-base64: ${{ secrets.DEV_ID_APP_CERT }}
+
+      - name: Codesign and Create Individual Packages (macOS)
+        if: ${{ runner.os == 'macOS' }}
+        run: |
+          python3 -u packaging/packager_macOS.py
+        env:
+          DEVELOPER_ID_APPLICATION: ${{ secrets.DEVELOPER_ID_APPLICATION }}
+          MACOS_ARCH: ${{ matrix.architecture }}
+
+      - name: Sign Final Package (macOS)
+        if: ${{ (runner.os == 'macOS') && (env.APPLE_INSTALLER_DEV != '') }}
+        run: productsign --sign "${{ secrets.APPLE_INSTALLER_DEV }}" "${{ env.ARTIFACT_NAME }}_unsigned.pkg" "${{ env.ARTIFACT_NAME }}.pkg"
+        env:
+          APPLE_INSTALLER_DEV: ${{ secrets.APPLE_INSTALLER_DEV }}
+
+      - name: Rename Final Package (macOS)
+        if: ${{ (runner.os == 'macOS') && (env.APPLE_INSTALLER_DEV == '') }}
+        run: mv "${{ env.ARTIFACT_NAME }}_unsigned.pkg" "${{ env.ARTIFACT_NAME }}.pkg"
+        env:
+          APPLE_INSTALLER_DEV: ${{ secrets.APPLE_INSTALLER_DEV }}
+
+      - name: Notarize and Staple PKG (macOS)
+        if: ${{ (runner.os == 'macOS') && (env.NOTARIZATION_USERNAME != '')}}
+        run: |
+          xcrun notarytool submit "${{ env.ARTIFACT_NAME }}.pkg" --apple-id ${{ secrets.NOTARIZATION_USERNAME }} --password ${{ secrets.NOTARIZATION_PASSWORD }} --team-id ${{ secrets.TEAM_ID }} --wait
+          xcrun stapler staple "${{ env.ARTIFACT_NAME }}.pkg"
+        env:
+          NOTARIZATION_USERNAME: ${{ secrets.NOTARIZATION_USERNAME }}
+
+      - name: Create DMG (macOS)
+        if: ${{ runner.os == 'macOS' }}
+        run: |
+          mkdir "${{ env.ARTIFACTS_PATH }}/dmgtmp"
+          mv "${{ env.ARTIFACT_NAME }}.pkg" "${{ env.ARTIFACTS_PATH }}/dmgtmp"
+          hdiutil create "${{ env.ARTIFACTS_PATH }}/tmp.dmg" -ov -volname "${{ env.ARTIFACT_NAME }}" -fs HFS+ -srcfolder "${{ env.ARTIFACTS_PATH }}/dmgtmp" -format UDRW
+          sync
+          sleep 5
+          hdiutil convert "${{ env.ARTIFACTS_PATH }}/tmp.dmg" -format UDZO -o "${{ env.ARTIFACT_NAME }}.dmg"
+
+      - name: Upload DMG (macOS)
+        if: ${{ runner.os == 'macOS' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.name }}
+          path: "${{ env.ARTIFACT_NAME }}.dmg"
+
+      - name: Install WiX v5 (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        shell: bash
+        run: dotnet tool install --global wix --version 5.0.2
+
+      - name: Add the WiX UI Extension (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        shell: bash
+        run: wix extension add WixToolset.UI.wixext/5.0.2
+
+      - name: Generate WiX (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        shell: bash
+        env:
+          WIX_ARCH: ${{ matrix.wix_arch }}
+        run: |
+          python3 -u packaging/packager_Windows_WiX.py
+          cat "packaging/installer.wxs"
+
+      - name: Generate Installer (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        shell: bash
+        run: |
+          wix build packaging/installer.wxs -ext WixToolset.UI.wixext -arch ${{ matrix.wix_arch }} -o "packaging/${{ env.ARTIFACT_NAME }}.msi"
+          mv "packaging/${{ env.ARTIFACT_NAME }}.msi" "${{ env.ARTIFACTS_PATH }}/"
+
+      - name: Upload MSI (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.name }}
+          path: "${{ env.ARTIFACTS_PATH }}/${{ env.ARTIFACT_NAME }}.msi"
+
+      - name: Generate Zip (Linux)
+        if: ${{ runner.os == 'Linux' }}
+        working-directory: ${{ env.ARTIFACTS_PATH }}
+        run: 7z a -tzip "${{ env.ARTIFACT_NAME }}.zip" "-xr!lib${{ env.PRODUCT_NAME }}_SharedCode.a" .
+
+      - name: Upload Zip (Linux)
+        if: ${{ runner.os == 'Linux' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.name }}
+          path: "${{ env.ARTIFACTS_PATH }}/${{ env.ARTIFACT_NAME }}.zip"
+
+  release:
+    if: contains(github.ref, 'tags/')
+    runs-on: ubuntu-latest
+    needs: build_and_test
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          fetch-tags: true
+          ref: ${{ github.ref }}
+
+      - name: Get Artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: installers/
+
+      - name: Generate Signed Build Provenance Attestations
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            installers/*/*.msi
+            installers/*/*.zip
+            installers/*/*.dmg
+
+      - name: Create Release
+        run: gh release create ${{ github.ref_name }} --prerelease installers/*/*.msi installers/*/*.zip installers/*/*.dmg
