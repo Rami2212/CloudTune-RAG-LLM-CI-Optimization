@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  common-check:
+    name: Check the common code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make common-check
+
+  common-test:
+    name: Test the common code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make common-test
+
+  api-check:
+    name: Check the generated APIs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          make gen-all-api
+          make cargo-api ARGS=check
+          make cargo-api ARGS='check --no-default-features'
+        env:
+          CI: true
+
+  api-test:
+    name: Test the generated APIs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          make gen-all-api
+          make cargo-api ARGS=test
+        env:
+          CI: true
+
+  api-document:
+    name: Document the generated APIs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          make gen-all-api
+          make cargo-api ARGS=doc
+          make docs-all
+        env:
+          CI: true
+          RUSTDOCFLAGS: -A warnings
+
+  cli-check:
+    name: Check the generated CLIs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          make gen-all-api
+          make gen-all-cli
+          make cargo-cli ARGS=check
+          make cargo-cli ARGS='check --no-default-features'
+        env:
+          CI: true

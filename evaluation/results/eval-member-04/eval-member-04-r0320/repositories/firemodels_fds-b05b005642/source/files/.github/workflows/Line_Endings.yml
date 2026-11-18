@@ -1,0 +1,48 @@
+# Firebot workflow
+
+name: Line_Endings
+
+# Controls when the workflow will run
+on:
+  # PR runs are called by pr-builds.yml after admission.
+  push:
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact commit approved by the PR security gate
+        required: true
+        type: string
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+permissions:
+  contents: read
+
+jobs:
+  # This workflow contains a single job called "build"
+  check-line-endings:
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+
+      - name: Check for CRLF line endings
+        run: |
+          { grep -IUlr --exclude={"*.pdf","*.png"} --exclude-dir=".git" $'\r' > tmp.txt || true; }
+          nlines=$(cat tmp.txt | wc -l)
+          if [ $nlines -gt 0 ]; then
+            echo "text files with dos line endings:"
+            cat tmp.txt
+            exit 1
+          fi
+
+
+

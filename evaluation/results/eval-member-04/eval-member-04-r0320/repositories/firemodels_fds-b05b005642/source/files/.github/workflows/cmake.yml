@@ -1,0 +1,410 @@
+name: cmake
+env:
+  UBUNTU_MIRRORS: |
+    http://azure.archive.ubuntu.com/ubuntu
+    http://archive.ubuntu.com/ubuntu
+    http://mirrors.edge.kernel.org/ubuntu
+    http://mirrors.mit.edu/ubuntu
+    http://mirror.math.princeton.edu/pub/ubuntu
+    http://ubuntu.osuosl.org/ubuntu
+  # update urls for oneapi packages according to
+  # https://github.com/oneapi-src/oneapi-ci/blob/master/.github/workflows/build_all.yml
+  WINDOWS_TOOLKIT_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/4144bec3-82ce-4672-bd71-5c93a79cd5e7/intel-oneapi-toolkit-2026.1.0.191_offline.exe
+  WINDOWS_TOOLKIT_COMPONENTS: intel.oneapi.win.ifort-compiler:intel.oneapi.win.mpi.devel:intel.oneapi.win.mkl.devel
+
+on:
+  push:
+    paths:
+    - .github/**
+    - Build/**
+    - Source/**
+    - CMakeLists.txt
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact commit approved by the PR security gate
+        required: true
+        type: string
+
+
+concurrency:
+  group: cmake-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+
+permissions:
+  contents: read
+
+jobs:
+  cmake-linux:
+    name: ${{ matrix.container }} ${{ matrix.compiler_mpi }} openmp=${{ matrix.openmp }} ${{ matrix.build_type }}
+    runs-on: [ubuntu-24.04]
+    container: ${{ matrix.container }}
+    strategy:
+      matrix:
+        container:
+          # - "fedora:40"
+          - "rockylinux:9"
+          - "ubuntu:24.04"
+        compiler_mpi:
+          - "intel_intelmpi"
+          # - "intel_openmpi"
+          - "gnu_openmpi"
+        openmp:
+          - "ON"
+          - "OFF"
+        build_type:
+          - "Debug"
+          - "Release"
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - name: Install prerequisites (dnf)
+      if: matrix.container != 'ubuntu:24.04'
+      run: dnf install -y --nobest --skip-broken git gcc make cmake sudo environment-modules
+    - name: Install prerequisites (apt)
+      if: matrix.container == 'ubuntu:24.04'
+      run: |
+        # Check Ubuntu's signed indexes before choosing a mirror.
+        # HTTP also works before ca-certificates is installed in the container.
+        root=()
+        if [ "$EUID" -ne 0 ]; then root=(sudo); fi
+        sources=/etc/apt/sources.list.d/ubuntu.sources
+        if [ ! -f "$sources" ]; then sources=/etc/apt/sources.list; fi
+        original_sources=$(cat "$sources")
+        mirror_ready=false
+        for mirror in $UBUNTU_MIRRORS; do
+          echo "Trying Ubuntu mirror: $mirror"
+          # Handle both direct Ubuntu URLs and the hosted runner's mirror-list URI.
+          printf '%s\n' "$original_sources" |
+            sed -E "s@(https?://([[:alnum:].-]*archive\.ubuntu\.com|security\.ubuntu\.com)/ubuntu/?|mirror\+file:/etc/apt/apt-mirrors\.txt)@$mirror/@g" |
+            "${root[@]}" tee "$sources" > /dev/null
+          if "${root[@]}" timeout --kill-after=5s 90s apt-get \
+            -o Dir::Etc::sourcelist="$sources" -o Dir::Etc::sourceparts="-" \
+            -o APT::Update::Error-Mode=any -o Acquire::Retries=0 \
+            -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update
+          then
+            echo "Using Ubuntu mirror: $mirror"
+            echo "Ubuntu mirror: $mirror" >> "$GITHUB_STEP_SUMMARY"
+            mirror_ready=true
+            break
+          fi
+          echo "::warning title=Ubuntu mirror unavailable::$mirror could not supply the package indexes; continuing to the next mirror."
+        done
+        if [ "$mirror_ready" != true ]; then
+          echo "::error title=Ubuntu dependency setup unavailable::None of the six mirrors supplied the package indexes. FDS was not built."
+          exit 1
+        fi
+        apt-get -y install -y git gcc make cmake sudo environment-modules
+
+    # # Setup OneAPI, icx is necessary for third-party libs
+    # - uses: marcfehling/setup-oneapi@v0
+    #   if: endsWith(matrix.compiler_mpi, '_intelmpi') !=  true
+    #   with:
+    #     components: |
+    #       ifx
+    #       icx
+    #       mkl
+
+    # Setup OneAPI, icx is necessary for third-party libs
+    - uses: marcfehling/setup-oneapi@v0
+      # if: endsWith(matrix.compiler_mpi, '_intelmpi')
+      with:
+        components: |
+          ifx
+          icx
+          impi
+          mkl
+
+    - name: install openmpi
+      if: endsWith(matrix.compiler_mpi, '_openmpi') && (startsWith(matrix.container, 'rockylinux') || startsWith(matrix.container, 'fedora'))
+      run: dnf install -y openmpi-devel
+
+    - name: install gcc-toolset
+      if: startsWith(matrix.compiler_mpi, 'gnu_') && startsWith(matrix.container, 'rockylinux')
+      run: dnf install -y gcc-toolset-14-gcc gcc-toolset-14-gcc-c++ gcc-toolset-14-gcc-gfortran
+
+    - name: install openmpi
+      if: endsWith(matrix.compiler_mpi, '_openmpi') && startsWith(matrix.container, 'ubuntu')
+      run: |
+        sudo apt-get -o APT::Update::Error-Mode=any -y update
+        sudo apt-get -y install libopenmpi-dev openmpi-bin
+
+    - uses: actions/checkout@v7.0.1
+      with:
+        ref: ${{ inputs.ref || github.sha }}
+        persist-credentials: false
+    - run: git config --global --add safe.directory /__w/fds/fds
+
+    - name: set linux-gnu compiler
+      if: startsWith(matrix.compiler_mpi, 'gnu_')
+      shell: bash
+      run: |
+        echo "CC=gcc" >> $GITHUB_ENV
+        echo "CXX=g++" >> $GITHUB_ENV
+        echo "FC=gfortran" >> $GITHUB_ENV
+
+    - name: set linux-gnu compiler
+      if: startsWith(matrix.compiler_mpi, 'intel_')
+      shell: bash
+      run: |
+        echo "CC=icx" >> $GITHUB_ENV
+        echo "CXX=icpx" >> $GITHUB_ENV
+        echo "FC=ifx" >> $GITHUB_ENV
+
+    - name: build fds
+      if: endsWith(matrix.compiler_mpi, '_intelmpi')
+      run: |
+        source /opt/intel/oneapi/setvars.sh
+        cmake -B builddir -S . -DCMAKE_BUILD_TYPE=${{matrix.build_type}} -DMKL_LINK=dynamic -DUSE_OPENMP=${{matrix.openmp}}
+        cmake --build builddir -j --target fds
+
+    - name: build fds
+      if: endsWith(matrix.compiler_mpi, '_openmpi')
+      run: |
+        # source /opt/intel/oneapi/setvars.sh
+        if [ "${{matrix.container}}" = "rockylinux:9" ]; then
+            source /opt/rh/gcc-toolset-14/enable
+            source /etc/profile.d/modules.sh
+            module load mpi/openmpi-x86_64
+        fi
+        cmake -B builddir -S . -DCMAKE_BUILD_TYPE=${{matrix.build_type}} -DMKL_LINK=dynamic -DUSE_OPENMP=${{matrix.openmp}}
+        cmake --build builddir -j --target fds
+
+    - name: Test
+      if: endsWith(matrix.compiler_mpi, '_intelmpi')
+      run: |
+        source /opt/intel/oneapi/setvars.sh
+        ctest --test-dir builddir -j --output-on-failure -V
+
+    - name: Test
+      if: endsWith(matrix.compiler_mpi, '_openmpi')
+      run: |
+        source /opt/intel/oneapi/setvars.sh
+        if [ "${{matrix.container}}" = "rockylinux:9" ]; then
+            source /opt/rh/gcc-toolset-14/enable
+            source /etc/profile.d/modules.sh
+            module load mpi/openmpi-x86_64
+        fi
+        ctest --test-dir builddir -j --output-on-failure -V
+
+  cmake-linux-nvhpc:
+    # build on ubuntu using the NVIDIA HPC SDK compilers (nvfortran, nvc, nvc++) and its bundled MPI (HPC-X, Open MPI based)
+    name: ubuntu-24.04 nvhpc_hpcx openmp=${{ matrix.openmp }} ${{ matrix.build_type }}
+    runs-on: [ubuntu-24.04]
+    env:
+      NVHPC_VERSION: "26.9"
+      # The runners have no GPU; skip the CUDA/UCC parts of the HPC-X initialization (see HPC SDK release notes)
+      OMPI_MCA_coll_ucc_enable: "0"
+      UCX_MODULES: "^cuda"
+    strategy:
+      fail-fast: false
+      matrix:
+        openmp:
+          - "ON"
+          - "OFF"
+        build_type:
+          - "Debug"
+          - "Release"
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - name: install nvidia hpc sdk
+      run: |
+        # Check Ubuntu's signed indexes before choosing a mirror.
+        # HTTP also works before ca-certificates is installed in the container.
+        root=()
+        if [ "$EUID" -ne 0 ]; then root=(sudo); fi
+        sources=/etc/apt/sources.list.d/ubuntu.sources
+        if [ ! -f "$sources" ]; then sources=/etc/apt/sources.list; fi
+        original_sources=$(cat "$sources")
+        mirror_ready=false
+        for mirror in $UBUNTU_MIRRORS; do
+          echo "Trying Ubuntu mirror: $mirror"
+          # Handle both direct Ubuntu URLs and the hosted runner's mirror-list URI.
+          printf '%s\n' "$original_sources" |
+            sed -E "s@(https?://([[:alnum:].-]*archive\.ubuntu\.com|security\.ubuntu\.com)/ubuntu/?|mirror\+file:/etc/apt/apt-mirrors\.txt)@$mirror/@g" |
+            "${root[@]}" tee "$sources" > /dev/null
+          if "${root[@]}" timeout --kill-after=5s 90s apt-get \
+            -o Dir::Etc::sourcelist="$sources" -o Dir::Etc::sourceparts="-" \
+            -o APT::Update::Error-Mode=any -o Acquire::Retries=0 \
+            -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update
+          then
+            echo "Using Ubuntu mirror: $mirror"
+            echo "Ubuntu mirror: $mirror" >> "$GITHUB_STEP_SUMMARY"
+            mirror_ready=true
+            break
+          fi
+          echo "::warning title=Ubuntu mirror unavailable::$mirror could not supply the package indexes; continuing to the next mirror."
+        done
+        if [ "$mirror_ready" != true ]; then
+          echo "::error title=Ubuntu dependency setup unavailable::None of the six mirrors supplied the package indexes. FDS was not built."
+          exit 1
+        fi
+        KR=/usr/share/keyrings/nvidia-hpcsdk-archive-keyring.gpg
+        curl -fsSL https://developer.download.nvidia.com/hpc-sdk/ubuntu/DEB-GPG-KEY-NVIDIA-HPC-SDK | sudo gpg --dearmor -o $KR
+        echo "deb [signed-by=$KR] https://developer.download.nvidia.com/hpc-sdk/ubuntu/amd64 /" | sudo tee /etc/apt/sources.list.d/nvhpc.list
+        sudo apt-get -o APT::Update::Error-Mode=any -y update
+        sudo apt-get -y install environment-modules nvhpc-${NVHPC_VERSION/./-}
+
+    - uses: actions/checkout@v7.0.1
+      with:
+        ref: ${{ inputs.ref || github.sha }}
+        persist-credentials: false
+
+    - name: build fds
+      run: |
+        source /usr/share/modules/init/bash
+        module use /opt/nvidia/hpc_sdk/modulefiles
+        module load nvhpc/${NVHPC_VERSION}
+        export CC=nvc CXX=nvc++ FC=nvfortran
+        nvfortran --version
+        which mpifort && mpifort --showme
+        cmake -B builddir -S . -DCMAKE_BUILD_TYPE=${{matrix.build_type}} -DUSE_OPENMP=${{matrix.openmp}}
+        cmake --build builddir -j --target fds
+
+    - name: Test
+      run: |
+        source /usr/share/modules/init/bash
+        module use /opt/nvidia/hpc_sdk/modulefiles
+        module load nvhpc/${NVHPC_VERSION}
+        ctest --test-dir builddir -j --output-on-failure -V
+
+  cmake-osx:
+    # Set the name of this build, variable depending on the OS
+    name: ${{ matrix.os }} ${{ matrix.compiler_mpi }} openmp=${{ matrix.openmp }} ${{ matrix.build_type }}
+    strategy:
+      fail-fast: false
+      # The matrix sets all the different combinations of builds, e.g. platforms
+      # and build configurations
+      matrix:
+        os:
+          - macos-26
+        compiler_mpi:
+          - "gnu_openmpi"
+        openmp:
+          - "ON"
+          - "OFF"
+        build_type:
+          - "Debug"
+          - "Release"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+
+      - name: install openmpi
+        run: |
+          brew install gcc libomp open-mpi
+          brew link --force libomp
+
+      - name: set macos gcc
+        if: startsWith(matrix.compiler_mpi, 'gnu_')
+        shell: bash
+        run: |
+          echo "CC=gcc" >> $GITHUB_ENV
+          echo "CXX=g++" >> $GITHUB_ENV
+          echo "FC=gfortran" >> $GITHUB_ENV
+          echo "OMPI_CC=gcc" >> $GITHUB_ENV
+          echo "OMPI_CXX=g++" >> $GITHUB_ENV
+          echo "OMPI_FC=gfortran" >> $GITHUB_ENV
+          brew install glew gd zlib json-c
+
+      - name: set macos intel
+        if: startsWith(matrix.compiler_mpi, 'intel_')
+        shell: bash
+        run: |
+          echo "CC=icx" >> $GITHUB_ENV
+          echo "CXX=icpx" >> $GITHUB_ENV
+          echo "FC=ifx" >> $GITHUB_ENV
+          echo "OMPI_CC=icx" >> $GITHUB_ENV
+          echo "OMPI_CXX=icpx" >> $GITHUB_ENV
+          echo "OMPI_FC=ifx" >> $GITHUB_ENV
+
+      - name: Build
+        if: startsWith(matrix.compiler_mpi, 'gnu_')
+        shell: bash
+        run: |
+          cmake -B builddir -DCMAKE_BUILD_TYPE=${{matrix.build_type}} -DUSE_OPENMP=${{matrix.openmp}}
+          cmake --build builddir -j1 --target fds
+
+      - name: Build
+        if: startsWith(matrix.compiler_mpi, 'intel_')
+        shell: bash
+        run: |
+          source /opt/intel/oneapi/setvars.sh
+          cmake -B builddir -DCMAKE_BUILD_TYPE=${{matrix.build_type}} -DUSE_OPENMP=${{matrix.openmp}}
+          cmake --build builddir -j1 --target fds
+
+      - name: Test
+        if: startsWith(matrix.compiler_mpi, 'gnu_')
+        run: ctest --test-dir builddir -j --output-on-failure -V
+
+      - name: Test
+        if: startsWith(matrix.compiler_mpi, 'intel_')
+        run: |
+          source /opt/intel/oneapi/setvars.sh
+          ctest --test-dir builddir -j --output-on-failure -V
+
+  cmake-windows:
+    # build on windows using ifort with intelmpi and mkl based on
+    # https://github.com/oneapi-src/oneapi-ci
+
+    name: windows ${{matrix.compiler}} intelmpi openmp=${{ matrix.openmp }} ${{ matrix.build_type }}
+    runs-on: [windows-latest]
+    strategy:
+      fail-fast: false
+      # The matrix sets all the different combinations of builds, e.g. platforms
+      # and build configurations
+      matrix:
+        build_type:
+          - "Debug"
+          - "Release"
+        openmp:
+          - "ON"
+          - "OFF"
+        compiler:
+          - "mpiifort"
+          - "mpiifx"
+    defaults:
+      run:
+        shell: cmd
+
+    steps:
+    - uses: actions/checkout@v7.0.1
+      with:
+        ref: ${{ inputs.ref || github.sha }}
+        persist-credentials: false
+
+      # install oneapi components from web installer based on
+      # oneapi-ci/scripts/install_windows.bat
+    - name: cache install oneapi
+      id: cache-install
+      uses: actions/cache@v6
+      with:
+        path: C:\Program Files (x86)\Intel\oneAPI\
+        key: install-${{ env.WINDOWS_TOOLKIT_URL }}-${{ env.WINDOWS_TOOLKIT_COMPONENTS }}
+    - name: install oneapi compiler, mpi, mkl
+      if: steps.cache-install.outputs.cache-hit != 'true'
+      run: |
+        curl.exe --output %TEMP%\webimage.exe --url %WINDOWS_TOOLKIT_URL% --retry 5 --retry-delay 5
+        start /b /wait %TEMP%\webimage.exe -s -x -f webimage_extracted --log extract.log
+        del %TEMP%\webimage.exe
+        webimage_extracted\bootstrapper.exe -s --action install --components=%WINDOWS_TOOLKIT_COMPONENTS% --eula=accept -p=NEED_VS2017_INTEGRATION=0 -p=NEED_VS2019_INTEGRATION=0 --log-dir=.
+        rd /s/q "webimage_extracted"
+
+    - name: build fds
+      run: |
+        call Build\Scripts\setup_intel_compilers.bat
+        cmake -B builddir -S . -G Ninja -DCMAKE_BUILD_TYPE=${{matrix.build_type}} -DUSE_SUNDIALS=OFF -DUSE_HYPRE=ON -DUSE_OPENMP=${{matrix.openmp}}
+        cmake --build builddir -j --target fds
+
+    - name: Test
+      run: |
+        call Build\Scripts\setup_intel_compilers.bat
+        ctest --test-dir builddir -j --output-on-failure -V

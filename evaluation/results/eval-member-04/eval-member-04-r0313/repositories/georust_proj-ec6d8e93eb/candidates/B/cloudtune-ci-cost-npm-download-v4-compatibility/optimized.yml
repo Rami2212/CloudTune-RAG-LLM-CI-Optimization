@@ -1,0 +1,369 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 13 optimizations:
+# - [HIGH] Add cargo dependency cache to "proj-ubuntu" job
+# - [HIGH] Add cargo dependency cache to "proj-macos" job
+# - [HIGH] Add cargo dependency cache to "proj-sys-ubuntu" job
+# - [HIGH] Add cargo dependency cache to "proj-sys-macos" job
+# - [HIGH] Add cargo dependency cache to "proj-windows-msvc-bundled" job
+# - [HIGH] Add cargo dependency cache to "proj-windows-msys2" job
+# - [HIGH] Switch "proj-macos" from macOS to ubuntu runner
+# - [HIGH] Switch "proj-sys-macos" from macOS to ubuntu runner
+# - [MEDIUM] Add concurrency group to "test.yml"
+# - [MEDIUM] Switch "proj-windows-msvc-bundled" from Windows to ubuntu runner
+# - [MEDIUM] Switch "proj-windows-msys2" from Windows to ubuntu runner
+# - [LOW] Explicitly set fail-fast for large matrix job "proj-ubuntu" (16 combinations)
+# - [LOW] Explicitly set fail-fast for large matrix job "proj-sys-ubuntu" (6 combinations)
+# Estimated savings: ~54 min/run
+#
+name: proj ci
+
+on:
+  push:
+    branches:
+      - main
+      - staging
+      - trying
+  pull_request:
+  merge_group:
+  schedule: [cron: "45 6 * * *"]
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  LIBPROJ_VERSION: 9.9.0
+  RUST_MSRV: "1.88"
+  RUST_LATEST: "1.99"
+
+jobs:
+  # work around GHA env strictness
+  compute:
+    runs-on: ubuntu-latest
+    outputs:
+      RUST_MSRV: ${{ env.RUST_MSRV }}
+      RUST_LATEST: ${{ env.RUST_LATEST }}
+      LIBPROJ_VERSION: ${{ env.LIBPROJ_VERSION }}
+    steps:
+      - name: Compute outputs
+        run: |
+          echo "RUST_MSRV=${{ env.RUST_MSRV }}" >> $GITHUB_OUTPUT
+          echo "RUST_LATEST=${{ env.RUST_LATEST }}" >> $GITHUB_OUTPUT
+          echo "LIBPROJ_VERSION=${{ env.LIBPROJ_VERSION }}" >> $GITHUB_OUTPUT
+  # The `ci-result` job doesn't actually test anything - it just aggregates the
+  # overall build status, otherwise the merge queue would need an entry
+  # for each individual job produced by the job-matrix.
+  #
+  # Ref: https://github.com/rust-lang/crater/blob/9ab6f9697c901c4a44025cf0a39b73ad5b37d198/.github/workflows/bors.yml#L125-L149
+  #
+  # ALL THE SUBSEQUENT JOBS NEED THEIR key ADDED TO THE `needs` SECTION OF THIS JOB!
+  ci-success:
+    name: ci result
+    runs-on: ubuntu-latest
+    if: ${{ success() }}
+    needs:
+      - proj-ubuntu
+      - proj-sys-ubuntu
+      - proj-macos
+      - proj-sys-macos
+      - proj-windows-msvc-bundled
+      - proj-windows-msvc-vcpkg
+      - proj-windows-msys2
+      - proj-sys-ubuntu-asan
+    steps:
+      - name: Mark the job as a success
+        run: exit 0
+
+  ci-failure:
+    name: ci result
+    runs-on: ubuntu-latest
+    if: ${{ failure() }}
+    needs:
+      - proj-ubuntu
+      - proj-sys-ubuntu
+      - proj-macos
+      - proj-sys-macos
+      - proj-windows-msvc-bundled
+      - proj-windows-msvc-vcpkg
+      - proj-windows-msys2
+      - proj-sys-ubuntu-asan
+    steps:
+      - name: Mark the job as a failure
+        run: exit 1
+
+  proj-ubuntu:
+    name: proj ubuntu
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    runs-on: ubuntu-latest
+    needs: compute
+    strategy:
+      fail-fast: false
+      matrix:
+        rust_version:
+          # Minimum supported rust (MSRV)
+          - ${{ needs.compute.outputs.RUST_MSRV }}
+          # Latest stable rust
+          - ${{ needs.compute.outputs.RUST_LATEST }}
+        features:
+          - ""
+          - "--features network"
+          - "--features bundled_proj"
+          - "--no-default-features"
+          - '--features "network bundled_proj"'
+          - '--features "network geo-types"'
+          - '--features "bundled_proj geo-types"'
+          - '--features "network bundled_proj geo-types"'
+    container:
+      image: ghcr.io/georust/proj-ci:proj-${{ needs.compute.outputs.LIBPROJ_VERSION }}-rust-${{ matrix.rust_version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - if: matrix.rust_version  == env.RUST_LATEST
+        run: |
+          cargo build ${{ matrix.features }}
+          cargo test ${{ matrix.features }}
+      - uses: taiki-e/install-action@cargo-hack
+        if: matrix.rust_version == env.RUST_MSRV
+      - uses: taiki-e/install-action@cargo-minimal-versions
+        if: matrix.rust_version == env.RUST_MSRV
+      - if: matrix.rust_version == env.RUST_MSRV
+        run: |
+          cargo minimal-versions build ${{ matrix.features }} --direct
+          cargo minimal-versions test ${{ matrix.features }} --direct
+
+  proj-macos:
+    name: proj macos
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", "--features network"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: cargo build ${{ matrix.features }}
+      - run: cargo test ${{ matrix.features }}
+
+  proj-sys-ubuntu:
+    name: proj-sys ubuntu
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    runs-on: ubuntu-latest
+    needs: compute
+    defaults:
+      run:
+        working-directory: proj-sys
+    container: ${{ matrix.container }}
+    strategy:
+      matrix:
+        include:
+          # Minimum supported rust (MSRV)
+          - container:
+              image: ghcr.io/georust/proj-ci:proj-${{ needs.compute.outputs.LIBPROJ_VERSION }}-rust-${{ needs.compute.outputs.RUST_MSRV }}
+              env:
+                _PROJ_SYS_TEST_EXPECT_BUILD_FROM_SRC: 0
+            features: ""
+          - container:
+              image: ghcr.io/georust/proj-ci:proj-${{ needs.compute.outputs.LIBPROJ_VERSION }}-rust-${{ needs.compute.outputs.RUST_MSRV }}
+              env:
+                _PROJ_SYS_TEST_EXPECT_BUILD_FROM_SRC: 1
+            features: "--features bundled_proj"
+          - container:
+              image: ghcr.io/georust/proj-ci-without-system-proj:proj-${{ needs.compute.outputs.LIBPROJ_VERSION }}-rust-${{ needs.compute.outputs.RUST_MSRV }}
+              env:
+                _PROJ_SYS_TEST_EXPECT_BUILD_FROM_SRC: 1
+            features: ""
+
+          # Latest stable rust
+          - container:
+              image: ghcr.io/georust/proj-ci:proj-${{ needs.compute.outputs.LIBPROJ_VERSION }}-rust-${{ needs.compute.outputs.RUST_LATEST }}
+              env:
+                _PROJ_SYS_TEST_EXPECT_BUILD_FROM_SRC: 0
+            features: ""
+          - container:
+              image: ghcr.io/georust/proj-ci:proj-${{ needs.compute.outputs.LIBPROJ_VERSION }}-rust-${{ needs.compute.outputs.RUST_LATEST }}
+              env:
+                _PROJ_SYS_TEST_EXPECT_BUILD_FROM_SRC: 1
+            features: "--features bundled_proj"
+          - container:
+              image: ghcr.io/georust/proj-ci-without-system-proj:proj-${{ needs.compute.outputs.LIBPROJ_VERSION }}-rust-${{ needs.compute.outputs.RUST_LATEST }}
+              env:
+                _PROJ_SYS_TEST_EXPECT_BUILD_FROM_SRC: 1
+            features: ""
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - if: matrix.rust_version  == env.RUST_LATEST
+        run: |
+          cargo build ${{ matrix.features }}
+          cargo test ${{ matrix.features }}
+      - uses: taiki-e/install-action@cargo-hack
+        if: matrix.rust_version == env.RUST_MSRV
+      - uses: taiki-e/install-action@cargo-minimal-versions
+        if: matrix.rust_version == env.RUST_MSRV
+      - if: matrix.rust_version == env.RUST_MSRV
+        run: |
+          cargo minimal-versions build ${{ matrix.features }} --direct
+          cargo minimal-versions test ${{ matrix.features }} --direct
+
+  proj-sys-macos:
+    name: proj-sys macos
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    runs-on: macos-latest
+    env:
+      _PROJ_SYS_TEST_EXPECT_BUILD_FROM_SRC: 0
+      HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: TRUE
+    defaults:
+      run:
+        working-directory: proj-sys
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # At some point around Feb. 2023, the GH macos CI runner no longer had
+      # pkg-config installed by default, so we need to install it manually.
+      #
+      # This PR (merged a couple days ago) adds pkg-config back to the macos
+      # build: https://github.com/actions/runner-images/pull/7125
+      #
+      # but it seems like it hasn't been deployed yet. At some point we should
+      # be able to delete this step if CI passes.
+      - run: brew update
+      - run: brew install pkg-config
+      - run: brew install proj
+      - run: cargo test
+
+  # Build PROJ and SQLite from source with MSVC.
+  proj-windows-msvc-bundled:
+    name: proj windows msvc bundled
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    runs-on: windows-latest
+    env:
+      _PROJ_SYS_TEST_EXPECT_BUILD_FROM_SRC: 1
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # The PROJ build uses the sqlite3 executable to generate proj.db.
+      - run: choco install sqlite --no-progress
+      - run: cargo test --workspace --features bundled_proj_sqlite
+
+  # Link a PROJ that vcpkg installs, found through pkg-config.
+  proj-windows-msvc-vcpkg:
+    name: proj windows msvc vcpkg
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    runs-on: windows-latest
+    env:
+      _PROJ_SYS_TEST_EXPECT_BUILD_FROM_SRC: 0
+      VCPKG_DEFAULT_TRIPLET: x64-windows
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Configure vcpkg binary cache
+        id: vcpkg
+        shell: bash
+        run: |
+          echo "rev=$(git -C "$VCPKG_INSTALLATION_ROOT" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/vcpkg-cache"
+          echo "VCPKG_DEFAULT_BINARY_CACHE=$RUNNER_TEMP/vcpkg-cache" >> "$GITHUB_ENV"
+      - uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/vcpkg-cache
+          key: vcpkg-${{ steps.vcpkg.outputs.rev }}-x64-windows-proj-tiff
+      - name: Install PROJ
+        shell: pwsh
+        run: '& "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install "proj[core,tiff]"'
+      - run: choco install pkgconfiglite --no-progress
+      - name: Configure environment
+        shell: pwsh
+        run: |
+          $root = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows"
+          "PKG_CONFIG=C:\ProgramData\chocolatey\bin\pkg-config.exe" >> $env:GITHUB_ENV
+          "PKG_CONFIG_PATH=$root\lib\pkgconfig" >> $env:GITHUB_ENV
+          "PROJ_DATA=$root\share\proj" >> $env:GITHUB_ENV
+          "$root\bin" >> $env:GITHUB_PATH
+      - run: cargo test --workspace
+      - run: cargo test --workspace --features network
+
+  proj-windows-msys2:
+    name: proj windows msys2
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # MSYS2 has PROJ 9.8.1, which is older than the minimum version, so
+        # these configurations also build PROJ from source. When MSYS2 has
+        # PROJ 9.9.0 or later, set expect_build_from_src to 0 for the first
+        # two configurations.
+        include:
+          - features: ""
+            expect_build_from_src: 1
+          - features: "--features network"
+            expect_build_from_src: 1
+          - features: "--features bundled_proj"
+            expect_build_from_src: 1
+          - features: "--features bundled_proj_sqlite"
+            expect_build_from_src: 1
+    env:
+      _PROJ_SYS_TEST_EXPECT_BUILD_FROM_SRC: ${{ matrix.expect_build_from_src }}
+      CMAKE_GENERATOR: Ninja
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          pacboy: >-
+            cmake:p
+            ninja:p
+            pkgconf:p
+            proj:p
+            rust:p
+            sqlite3:p
+            toolchain:p
+      - run: cargo test --workspace ${{ matrix.features }}
+
+  # Build PROJ from the bundled source to enable ASAN. In order to link against
+  # the ASAN-enabled library, "-Z sanitizer=address" flag needs to be passed to
+  # the Rust compiler. So, this job requires the nightly toolchain.
+  proj-sys-ubuntu-asan:
+    name: proj-sys ubuntu asan
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    runs-on: ubuntu-latest
+    needs: compute
+    container:
+      image: ghcr.io/georust/proj-ci-without-system-proj:proj-${{ needs.compute.outputs.LIBPROJ_VERSION }}-rust-${{ needs.compute.outputs.RUST_LATEST }}
+    env:
+      _PROJ_SYS_TEST_EXPECT_BUILD_FROM_SRC: 1
+      CC: clang
+      CXX: clang++
+      CFLAGS: "-O1 -g -fsanitize=address -fno-omit-frame-pointer"
+      CXXFLAGS: "-O1 -g -fsanitize=address -fno-omit-frame-pointer"
+      LDFLAGS: "-fsanitize=address"
+      RUSTFLAGS: "-Z sanitizer=address"
+      RUSTDOCFLAGS: "-Z sanitizer=address"
+      ASAN_OPTIONS: "detect_leaks=0"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo +nightly test --features bundled_proj --target x86_64-unknown-linux-gnu

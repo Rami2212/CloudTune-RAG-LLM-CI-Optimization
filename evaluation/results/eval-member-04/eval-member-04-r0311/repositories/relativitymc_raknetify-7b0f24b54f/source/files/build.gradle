@@ -1,0 +1,93 @@
+plugins {
+	id 'fabric-loom' version '1.13-SNAPSHOT' apply false
+	id 'com.gradleup.shadow' version '9.2.1' apply false
+	id 'dev.yumi.gradle.licenser' version '2.1.1' apply false
+	id 'com.modrinth.minotaur' version '2.+' apply false
+	id 'io.github.themrmilchmann.curseforge-publish' version '0.8.0' apply false
+}
+
+subprojects {
+	apply plugin: 'java'
+	apply plugin: 'java-library'
+	apply plugin: 'maven-publish'
+	apply plugin: 'dev.yumi.gradle.licenser'
+
+	java {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+	version = project.mod_version + "." + getVersionSuffix()
+
+	license {
+		rule(rootProject.file('HEADER.txt'))
+	}
+
+	repositories {
+		mavenCentral()
+		maven { url 'https://jitpack.io' }
+		maven { url 'https://repo.codemc.org/repository/maven-public' }
+		maven { url 'https://oss.sonatype.org/content/repositories/snapshots' }
+	}
+
+	// configure the maven publication
+	publishing {
+		publications {
+			mavenJava(MavenPublication) {
+				from components.java
+			}
+		}
+
+		// See https://docs.gradle.org/current/userguide/publishing_maven.html for information on how to set up publishing.
+		repositories {
+			// Add repositories to publish to here.
+			// Notice: This block does NOT have the same function as the block in the top level.
+			// The repositories here will be used for publishing your artifact, not for
+			// retrieving dependencies.
+		}
+	}
+
+	tasks.withType(AbstractArchiveTask) {
+		preserveFileTimestamps = false
+		reproducibleFileOrder = true
+	}
+
+	afterEvaluate {
+		if (it.plugins.hasPlugin("com.modrinth.minotaur")) {
+			modrinth {
+				token = System.getenv("MODRINTH_TOKEN") // This is the default. Remember to have the MODRINTH_TOKEN environment variable set or else this will fail, or set it to whatever you want - just make sure it stays private!
+				projectId = "raknetify" // This can be the project ID or the slug. Either will work!
+//				versionNumber = project.version + "+" + project.minecraft_version // You don't need to set this manually. Will fail if Modrinth has this version already
+//				versionName = project.version + " devbuild for " + project.minecraft_version
+				versionType = "alpha" // This is the default -- can also be `beta` or `alpha`
+//				uploadFile = remapShadowJar // With Loom, this MUST be set to `remapJar` instead of `jar`!
+				gameVersions = ["1.18", "1.18.1", "1.18.2", "1.19", "1.19.1", "1.19.2", "1.19.3", "1.19.4", "1.20", "1.20.1", "1.20.2", "1.20.3", "1.20.4", "1.20.5", "1.20.6", "1.21", "1.21.1", "1.21.2", "1.21.3", "1.21.4", "1.21.5", "1.21.6", "1.21.7", "1.21.8", "1.21.9", "1.21.10", "1.21.11"]
+//				loaders = ["fabric"]
+				changelog = com.ishland.buildscript.ParseGItHubActionChangelog.getChangelog()
+			}
+		}
+	}
+
+}
+
+afterEvaluate {
+	logger.lifecycle("Version String: ${project.mod_version + '.' + getVersionSuffix()}")
+	logger.lifecycle(com.ishland.buildscript.ParseGItHubActionChangelog.getChangelog())
+}
+
+String getVersionSuffix() {
+    def stdout = providers.exec {
+        commandLine 'git', 'describe', '--tags', '--dirty', '--broken'
+    }.standardOutput.asText.get()
+	stdout = stdout.toString().strip()
+	def suffix = ""
+	if (stdout.endsWith("-dirty")) {
+		stdout = stdout.substring(0, stdout.length() - "-dirty".length())
+		suffix = "-dirty"
+	}
+	if (stdout.indexOf('-') < 0) {
+		return "0" + suffix;
+	}
+	def split = stdout.split('-')
+	return split[split.length - 2] + suffix
+}

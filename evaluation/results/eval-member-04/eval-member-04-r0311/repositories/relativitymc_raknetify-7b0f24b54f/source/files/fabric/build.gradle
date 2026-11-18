@@ -1,0 +1,173 @@
+evaluationDependsOn(":")
+
+apply plugin: 'fabric-loom'
+apply plugin: 'com.gradleup.shadow'
+apply plugin: 'com.modrinth.minotaur'
+apply plugin: 'io.github.themrmilchmann.curseforge-publish'
+
+base {
+    archivesName = project.archives_base_name + "-fabric"
+}
+group = project.maven_group + ".fabric"
+
+configurations {
+	shadowInclude
+}
+
+dependencies {
+	// To change the versions see the gradle.properties file
+	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+	mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+	modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+
+	shadowInclude implementation(project(":common"))
+
+	// Fabric API. This is technically optional, but you probably want it anyway.
+//	modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+}
+
+processResources {
+	inputs.property "version", project.version
+
+	filesMatching("fabric.mod.json") {
+		expand "version": project.version
+	}
+}
+
+tasks.withType(JavaCompile).configureEach {
+	// Minecraft 1.18 (1.18-pre2) upwards uses Java 17.
+	it.options.release = 17
+}
+
+java {
+	// Loom will automatically attach sourcesJar to a RemapSourcesJar task and to the "build" task
+	// if it is present.
+	// If you remove this line, sources will not be generated.
+	withSourcesJar()
+}
+
+loom {
+	accessWidenerPath = file("src/main/resources/raknetify-fabric.accesswidener")
+	runs {
+		server {
+			vmArgs "-Draknetify.debug=true", "-Dio.netty.leakDetection.level=advanced"
+			ideConfigGenerated(true)
+		}
+		client {
+			vmArgs "-Draknetify.debug=true", "-Dio.netty.leakDetection.level=advanced"
+			ideConfigGenerated(true)
+		}
+	}
+    mixin {
+        useLegacyMixinAp = true
+    }
+}
+
+jar {
+	exclude "META-INF/LICENSE.txt"
+	exclude "META-INF/NOTICE.txt"
+	from "../LICENSE"
+}
+
+shadowJar {
+	dependencies {
+		exclude(dependency('it.unimi.dsi:fastutil'))
+	}
+	exclude "META-INF/LICENSE.txt"
+	exclude "META-INF/NOTICE.txt"
+	minimize()
+	archiveClassifier = "all-dev"
+	configurations = [ project.configurations.shadowInclude ]
+	from "../LICENSE"
+}
+
+//noinspection UnnecessaryQualifiedReference
+task("remapShadowJar", type: net.fabricmc.loom.task.RemapJarTask, dependsOn: shadowJar) {
+	input = shadowJar.archiveFile
+	archiveFileName = shadowJar.archiveFileName.get().replaceAll("-dev\\.jar\$", ".jar")
+	addNestedDependencies = true
+}
+
+assemble.dependsOn(remapShadowJar)
+
+afterEvaluate {
+	migrateMappings.configure {
+		outputDir = project.file("build/remappedSrc")
+		doLast {
+			copy {
+				from project.file("build/remappedSrc")
+				into project.file("src/main/java")
+			}
+		}
+	}
+}
+
+tasks.withType(AbstractArchiveTask) {
+	preserveFileTimestamps = false
+	reproducibleFileOrder = true
+}
+
+modrinth {
+	versionNumber = project.version
+	versionName = project.version + " devbuild"
+	uploadFile = remapShadowJar
+	loaders = ["fabric", "quilt"]
+}
+
+curseforge {
+    apiToken = System.getenv("CURSEFORGE_TOKEN")
+    publications {
+        register("main") {
+            projectId = "631457"
+
+            gameVersion("minecraft-1-18", "1-18")
+            gameVersion("minecraft-1-18", "1-18-1")
+            gameVersion("minecraft-1-18", "1-18-2")
+            gameVersion("minecraft-1-19", "1-19")
+            gameVersion("minecraft-1-19", "1-19-1")
+            gameVersion("minecraft-1-19", "1-19-2")
+            gameVersion("minecraft-1-19", "1-19-3")
+            gameVersion("minecraft-1-19", "1-19-4")
+            gameVersion("minecraft-1-20", "1-20")
+            gameVersion("minecraft-1-20", "1-20-1")
+            gameVersion("minecraft-1-20", "1-20-2")
+            gameVersion("minecraft-1-20", "1-20-3")
+            gameVersion("minecraft-1-20", "1-20-4")
+            gameVersion("minecraft-1-20", "1-20-5")
+            gameVersion("minecraft-1-20", "1-20-6")
+            gameVersion("minecraft-1-21", "1-21")
+            gameVersion("minecraft-1-21", "1-21-1")
+            gameVersion("minecraft-1-21", "1-21-2")
+            gameVersion("minecraft-1-21", "1-21-3")
+            gameVersion("minecraft-1-21", "1-21-4")
+            gameVersion("minecraft-1-21", "1-21-5")
+            gameVersion("minecraft-1-21", "1-21-6")
+            gameVersion("minecraft-1-21", "1-21-7")
+            gameVersion("minecraft-1-21", "1-21-8")
+            gameVersion("minecraft-1-21", "1-21-9")
+            gameVersion("minecraft-1-21", "1-21-10")
+            gameVersion("minecraft-1-21", "1-21-11")
+            gameVersion("modloader", "fabric")
+            gameVersion("java", "java-22")
+            gameVersion("java", "java-21")
+            gameVersion("java", "java-20")
+            gameVersion("java", "java-19")
+            gameVersion("java", "java-18")
+            gameVersion("java", "java-17")
+            gameVersion("environment", "server")
+            gameVersion("environment", "client")
+
+            artifacts.register("main") {
+                from(remapShadowJar)
+
+                displayName = project.version + " devbuild"
+                releaseType = io.github.themrmilchmann.gradle.publish.curseforge.ReleaseType.ALPHA
+
+                changelog {
+                    format = io.github.themrmilchmann.gradle.publish.curseforge.ChangelogFormat.MARKDOWN
+                    from(com.ishland.buildscript.ParseGItHubActionChangelog.getChangelog())
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,56 @@
+name: github-osx
+
+
+on:
+  push:
+    paths:
+    - .github/**
+    - Build/**
+    - Source/**
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact commit approved by the PR security gate
+        required: true
+        type: string
+
+
+concurrency:
+  group: osx-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+
+permissions:
+  contents: read
+
+
+jobs:
+  osx-gnu-openmpi:
+    # debug build on osx using gfortran with openmpi
+  
+    name: osx gnu openmpi
+    runs-on: [macos-26]
+    defaults:
+      run:
+        shell: bash
+        
+    steps:
+    - uses: actions/checkout@v7.0.1
+      with:
+        ref: ${{ inputs.ref || github.sha }}
+        persist-credentials: false
+    - name: install openmpi
+      run: |
+        brew install gcc open-mpi
+        echo "OMPI_FC=gfortran" >> $GITHUB_ENV
+
+    - name: build fds debug
+      run: |
+        cd ./Build/ompi_gnu_osx_db
+        sh ./make_fds.sh
+        ./fds_ompi_gnu_osx_db
+    - name: build fds release
+      run: |
+        cd ./Build/ompi_gnu_osx
+        sh ./make_fds.sh
+        ./fds_ompi_gnu_osx

@@ -1,0 +1,64 @@
+name: Build and Deploy Docs
+
+on:
+  push:
+    branches:
+      - main
+
+permissions: read-all
+
+jobs:
+  build-and-deploy:
+    name: Build and deploy docs to external repo
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup PNPM
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.21.1
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build docs
+        run: pnpm --filter dify-app-hub-docs build
+
+      - name: Verify build output exists
+        run: |
+          test -d packages/docs/doc_build || (echo "packages/docs/doc_build not found" && exit 1)
+          ls -la packages/docs/doc_build
+
+      - name: Deploy doc_build to external repository main branch
+        env:
+          TARGET_REPO: ${{ secrets.DOCS_TARGET_REPO }}
+          PAT_TOKEN: ${{ secrets.DOCS_PAT }}
+          USER_NAME: ${{ secrets.USER_NAME }}
+          USER_EMAIL: ${{ secrets.USER_EMAIL }}
+        run: |
+          set -e
+          if [ -z "$TARGET_REPO" ] || [ -z "$PAT_TOKEN" ]; then
+            echo "Missing secrets: DOCS_TARGET_REPO or DOCS_PAT" >&2
+            echo "Configure repository secrets: DOCS_TARGET_REPO (e.g. owner/repo) and DOCS_PAT (PAT with repo write access)." >&2
+            exit 1
+          fi
+
+          cd packages/docs/doc_build
+          git init
+          git config user.name "${USER_NAME}"
+          git config user.email "${USER_EMAIL}"
+          git add -A
+          git commit -m "docs: deploy from $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          git branch -M main
+          git remote add origin "https://x-access-token:${PAT_TOKEN}@github.com/${TARGET_REPO}.git"
+          git push -f origin main

@@ -1,0 +1,85 @@
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+
+evaluationDependsOn(":")
+
+apply plugin: 'com.gradleup.shadow'
+apply plugin: 'com.modrinth.minotaur'
+
+base {
+    archivesName = project.archives_base_name + "-bungee"
+}
+group = project.maven_group + ".bungee"
+
+repositories {
+    ivy {
+        url 'https://ci.md-5.net/job/'
+        patternLayout {
+//            artifact "[organization]/versions/[module]/builds/[revision]/downloads/[organization]-[module]-[revision](.[ext])"
+            // https://ci.md-5.net/job/BungeeCord/1636/artifact/bootstrap/target/BungeeCord.jar
+            artifact "[module]/[revision]/artifact/bootstrap/target/BungeeCord(.[ext])"
+        }
+        metadataSources {
+            it.artifact()
+        }
+    }
+}
+
+configurations {
+    shadowInclude
+}
+
+dependencies {
+    implementation 'bungee:BungeeCord:2000'
+//    implementation "net.md-5:bungeecord-proxy:1.+"
+//    compileOnly 'org.projectlombok:lombok:1.18.24' // for bungeecord sources
+
+    shadowInclude implementation(project(":common"))
+}
+
+processResources {
+    inputs.property "version", project.version
+
+    filesMatching("bungee.yml") {
+        expand "version": project.version
+    }
+}
+
+jar {
+    exclude "META-INF/LICENSE.txt"
+    exclude "META-INF/NOTICE.txt"
+    from "LICENSE"
+}
+
+shadowJar {
+//    dependencies {
+//        exclude(dependency('it.unimi.dsi:fastutil'))
+//    }
+    exclude "META-INF/LICENSE.txt"
+    exclude "META-INF/NOTICE.txt"
+    minimize()
+    archiveClassifier = "all"
+    configurations = [ project.configurations.shadowInclude ]
+    from "LICENSE"
+}
+
+assemble.dependsOn(shadowJar)
+
+tasks.withType(AbstractArchiveTask) {
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+}
+
+modrinth {
+    versionNumber = project.version + "+bungeecord"
+    versionName = project.version + " devbuild for BungeeCord"
+    uploadFile = shadowJar
+    loaders = ["bungeecord", "waterfall"]
+}
+
+task("prepareRunBungee", dependsOn: shadowJar) {
+    doFirst {
+        Files.createDirectories(rootProject.projectDir.toPath().resolve("run-bungee").resolve("plugins"))
+        Files.copy(shadowJar.archiveFile.getAsFile().get().toPath(), rootProject.projectDir.toPath().resolve("run-bungee").resolve("plugins").resolve("raknetify-bungee-devlaunch.jar"), StandardCopyOption.REPLACE_EXISTING)
+    }
+}
