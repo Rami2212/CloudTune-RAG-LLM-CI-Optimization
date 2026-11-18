@@ -1,0 +1,124 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [MEDIUM] Add concurrency group to "ci.yml"
+# Estimated savings: ~2 min/run
+#
+name: CI
+
+on:
+  push:
+    paths-ignore:
+      - 'guides/**'
+  pull_request:
+    paths-ignore:
+      - 'guides/**'
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  ci:
+    env:
+      MIX_ENV: test
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pair:
+              elixir: '1.15'
+              otp: '25.3'
+              mysql: '8.4'
+              postgres: '14.22-alpine'
+          - pair:
+              elixir: '1.20'
+              otp: '29.0'
+              mysql: '9.1'
+              postgres: '18.4-alpine'
+            lint: lint
+
+    runs-on: ubuntu-24.04
+
+    services:
+      postgres:
+        image: postgres:${{matrix.pair.postgres}}
+        env:
+          POSTGRES_DB: oban_test
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432/tcp
+      mysql:
+        image: mysql:${{matrix.pair.mysql}}
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+        options: >-
+          --health-cmd "mysqladmin ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 3306/tcp
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{matrix.pair.otp}}
+          elixir-version: ${{matrix.pair.elixir}}
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-${{matrix.pair.elixir}}-${{matrix.pair.otp}}-${{ hashFiles('**/mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-${{matrix.pair.elixir}}-${{matrix.pair.otp}}-
+
+      - name: Seed fake assets
+        run: mkdir -p priv/static && touch priv/static/app.css && touch priv/static/app.js
+
+      - name: Unlock optional dependencies
+        run: mix deps.unlock oban_pro
+
+      - name: Run mix deps.get
+        run: mix deps.get
+
+      - name: Run mix format
+        run: mix format --check-formatted
+        if: ${{ matrix.lint }}
+
+      - name: Run mix deps.unlock
+        run: mix deps.unlock --check-unused
+        if: ${{ matrix.lint }}
+
+      - name: Run mix deps.compile
+        run: mix deps.compile
+
+      - name: Run mix compile
+        run: mix compile --warnings-as-errors
+        if: ${{ matrix.lint }}
+
+      - name: Run credo
+        run: mix credo --strict
+        if: ${{ matrix.lint }}
+
+      - name: Run mix ecto.migrate
+        env:
+          MYSQL_URL: mysql://root@localhost:${{job.services.mysql.ports[3306]}}/oban_test
+          POSTGRES_URL: postgresql://postgres:postgres@localhost:${{job.services.postgres.ports[5432]}}/oban_test
+        run: mix test.setup
+
+      - name: Run mix test
+        env:
+          MYSQL_URL: mysql://root@localhost:${{job.services.mysql.ports[3306]}}/oban_test
+          POSTGRES_URL: postgresql://postgres:postgres@localhost:${{job.services.postgres.ports[5432]}}/oban_test
+        run: mix test

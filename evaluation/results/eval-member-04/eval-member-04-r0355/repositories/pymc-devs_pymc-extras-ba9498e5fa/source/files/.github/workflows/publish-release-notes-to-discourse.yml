@@ -1,0 +1,62 @@
+name: Publish Release Notes to Discourse
+
+permissions: {}
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag of an existing release to publish (e.g. v0.4.0)"
+        required: true
+        type: string
+
+jobs:
+  publish-to-discourse:
+    environment: discourse
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      # Fetch the release from the API in both trigger modes, so a manual
+      # dispatch produces exactly the same payload as a published release
+      - name: Get release info
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.event.release.tag_name }}
+        run: |
+          {
+            echo "tag=$TAG"
+            echo "url=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url --jq .url)"
+            echo "body<<RELEASE_BODY_EOF"
+            gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body
+            echo "RELEASE_BODY_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish release to Discourse
+        env:
+          DISCOURSE_API_KEY: ${{ secrets.DISCOURSE_API_KEY }}
+          DISCOURSE_USERNAME: "pymc-bot"
+          DISCOURSE_URL: "https://discourse.pymc.io"
+          DISCOURSE_CATEGORY: "News"
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_BODY: ${{ steps.release.outputs.body }}
+          RELEASE_URL: ${{ steps.release.outputs.url }}
+          REPO_NAME: ${{ github.repository }}
+        run: python ./scripts/publish_release_notes_to_discourse.py
