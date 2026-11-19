@@ -1,0 +1,48 @@
+name: CI (Mac)
+on:
+  workflow_call:
+jobs:
+  build:
+    name: Mac M1
+    runs-on: macos-latest
+    steps:
+    - name: Check out repository
+      uses: actions/checkout@v6
+    - name: Generate cache keys
+      run: |
+        echo "target=${{ runner.os }}-${{ runner.arch }}-target-${{ hashFiles('Cargo.lock') }}" >> $GITHUB_OUTPUT
+      id: cache-keys
+    - name: Restore target directory
+      uses: actions/cache/restore@v6
+      with:
+        path: target
+        key: ${{ steps.cache-keys.outputs.target }}
+    - name: Update Rust
+      run: rustup update stable
+    - name: Install Rust nightly
+      run: rustup toolchain install nightly
+    - name: Install additional Rust components
+      run: rustup component add rust-src --toolchain nightly
+    - name: Install additional Rust targets
+      run: rustup target add aarch64-unknown-none-softfloat
+    - name: Install additional tools
+      run: cargo install project
+    - name: Lint Rust sources
+      run: project lint
+    - name: Build
+      run: project build -r
+    - name: Run tests
+      run: cargo test
+    - name: Create Apple Disk Image
+      run: hdiutil create -volname Obliteration -srcfolder dist Obliteration.dmg
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v7
+      with:
+        name: obliteration-mac-m1
+        path: Obliteration.dmg
+    - name: Cache target directory
+      uses: actions/cache/save@v6
+      with:
+        path: target
+        key: ${{ steps.cache-keys.outputs.target }}-${{ github.run_id }}
+      if: startsWith(github.ref, 'refs/heads/')

@@ -1,0 +1,49 @@
+name: mhs-ci
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+jobs:
+  build-mhs-optparse-applicative:
+    runs-on: ubuntu-latest
+    steps:
+
+    - name: checkout mhs repo
+      uses: actions/checkout@v4
+      with:
+        repository: augustss/MicroHs
+        path: mhs
+    - name: make and install mhs
+      run: |
+        cd mhs
+        make install
+
+    # install dependencies
+    - name: compile and install packages
+      run: |
+        PATH="$HOME/.mcabal/bin:$PATH"
+        mcabal -q install ghc-compat
+        mcabal -q install transformers
+        mcabal -q install colour
+        mcabal -q install ansi-terminal-types
+        mcabal -q install ansi-terminal
+        mcabal -q install --git=https://github.com/augustss/prettyprinter.git --dir=prettyprinter prettyprinter
+        mcabal -q install --git=https://github.com/augustss/prettyprinter.git --dir=prettyprinter-ansi-terminal prettyprinter-ansi-terminal
+
+    # optparse-applicative
+    - name: checkout optparse-applicative repo
+      uses: actions/checkout@v4
+      with:
+        path: optparse-applicative
+    - name: compile and install optparse-applicative package
+      run: |
+        PATH="$HOME/.mcabal/bin:$PATH"
+        cd optparse-applicative
+        mcabal install
+
+    - name: cleanup
+      run: |
+        rm -rf $HOME/.mcabal

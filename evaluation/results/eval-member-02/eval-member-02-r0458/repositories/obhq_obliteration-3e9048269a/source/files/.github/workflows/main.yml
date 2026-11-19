@@ -1,0 +1,64 @@
+name: Development Build
+on:
+  push:
+    branches:
+    - main
+concurrency: dev-${{ github.ref }}
+jobs:
+  build-windows:
+    name: Build
+    uses: ./.github/workflows/ci-windows.yml
+  build-linux:
+    name: Build
+    uses: ./.github/workflows/ci-linux.yml
+  build-linux-aarch64:
+    name: Build
+    uses: ./.github/workflows/ci-linux-aarch64.yml
+  build-mac:
+    name: Build
+    uses: ./.github/workflows/ci-mac.yml
+  build-docs:
+    name: Build
+    uses: ./.github/workflows/ci-docs.yml
+  deploy-docs:
+    name: Deploy documentation
+    runs-on: ubuntu-24.04
+    needs: build-docs
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+    - name: Deploy to GitHub Pages
+      uses: actions/deploy-pages@v4
+      id: deployment
+  update-prs:
+    name: Update PRs
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Install System Packages
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y python3-github
+    - name: Update PRs
+      run: |
+        from datetime import datetime, timezone
+        from github import Auth, Github
+
+        now = datetime.now(timezone.utc)
+        gh = Github(auth=Auth.Token("${{ secrets.GITHUB_TOKEN }}"))
+        repo = gh.get_repo("${{ github.repository }}")
+
+        for pull in repo.get_pulls("open", "updated", "desc", "${{ github.ref_name }}"):
+          if (now - pull.updated_at).days > 30:
+            break
+          ready = False
+          for label in pull.labels:
+            if label.name == "S-ready":
+              ready = True
+          if ready:
+            print(f"Removing S-ready from {pull.title}")
+            pull.remove_from_labels("S-ready")
+      shell: python
