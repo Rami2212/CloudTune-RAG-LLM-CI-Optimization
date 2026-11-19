@@ -1,0 +1,54 @@
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "logprobs": null,
+      "message": {
+        "content": "{\n  \"decision\": \"APPLY\",\n  \"workflow_yaml\": \"name: pull request\\n\\non:\\n  pull_request:\\n    branches: [ master ]\\n\\njobs:\\n  build:\\n\\n    runs-on: ubuntu-latest\\n\\n    steps:\\n    - uses: actions/checkout@v4\\n    - name: Set up JDK 21\\n      uses: actions/setup-java@v4\\n      with:\\n        distribution: 'temurin'\\n        java-version: '21'\\n    - name: Cache Maven packages\\n      uses: actions/cache@v4\\n      with:\\n        path: ~/.m2/repository\\n        key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}\\n        restore-keys: |\\n          ${{ runner.os }}-maven-\\n    - name: build with maven\\n      run: mvn -B verify --file pom.xml\\n\",\n  \"rationale\": \"The workflow builds a multi-module Maven project (evidenced by multiple pom.xml files in repository_context) but does not cache Maven dependencies. Each run downloads dependencies into ~/.m2/repository, which is measurable repeated work. The P-LIT-GHA-CACHE pattern (literature report) and experimental evidence experiment:batch-hiruni-pattern-bat-a89d5fd8d30bc8cb-r2 (measured CI workflow on fork) both support caching Maven packages with a key based on pom.xml files. This change preserves all build and test coverage (mvn verify) and adds a minimal, safe cache step.\",\n  \"evidence_ids\": [\"pattern:P-LIT-GHA-CACHE\", \"experiment:batch-hiruni-pattern-bat-a89d5fd8d30bc8cb-r2\"]\n}",
+        "reasoning": "The user wants me to propose a CI optimization for the given workflow based on the evidence provided. Let me analyze the workflow and the evidence.\n\nThe workflow is a simple Maven build for a Java project:\n- Runs on pull requests to master branch\n- Single job \"build\" on ubuntu-latest\n- Steps: checkout, setup Java 21 (temurin), run `mvn -B verify --file pom.xml`\n\nLooking at the evidence, I see several patterns that could apply:\n\n1. **P-LIT-GHA-CACHE** - Cache dependency downloads (Maven packages)\n2. **P-LIT-CUSTOM-TIMEOUT** - Add a custom timeout\n3. **P-LIT-CANCEL-STALE** - Cancel superseded runs\n4. **P-LIT-FAIL-FAST** - But this is for matrix jobs, and there's no matrix here\n\nThe repository uses Maven (pom.xml files), so caching Maven dependencies (~/.m2/repository) would be applicable. There's experimental evidence for this in the first evidence item (experiment:batch-hiruni-pattern-bat-a89d5fd8d30bc8cb-r2) which shows caching Maven packages with actions/cache@v4.\n\nAlso, the pattern catalog includes P-LIT-GHA-CACHE which is about caching dependency downloads, with reported benefits.\n\nThe workflow currently has no caching, no timeout, and no concurrency control. Since it's a single job (no matrix), fail-fast doesn't apply.\n\nThe most applicable optimization would be adding Maven dependency caching. This is supported by:\n- Pattern P-LIT-GHA-CACHE (literature report)\n- Experimental evidence experiment:batch-hiruni-pattern-bat-a89d5fd8d30bc8cb-r2 (measured CI workflow on fork)\n\nLet me check the preconditions for P-LIT-GHA-CACHE:\n- \"Repeated dependency fetching is measurable\" - Yes, Maven downloads dependencies on each run\n- \"Cache inputs include lockfile and environment\" - Maven uses pom.xml files as lockfiles\n\nThe experimental evidence shows a similar Maven project adding cache for ~/.m2/repository with key based on hashFiles('**/pom.xml').\n\nI should also consider adding a custom timeout (P-LIT-CUSTOM-TIMEOUT) since the pattern shows benefits, but we don't have historical data on run times. However, the pattern says \"Representative successful-duration history exists\" as a precondition, which we don't have (ci_history shows \"no_completed_runs\").\n\nCancel stale runs (P-LIT-CANCEL-STALE) could be added via concurrency, but the workflow is on pull_request, so it would cancel previous runs on the same PR. This is generally safe for PR workflows.\n\nBut the most direct and evidence-supported optimization for this Maven project is adding dependency caching.\n\nLet me create the updated workflow with Maven caching added. I'll add the cache step after setup-java and before the build step.\n\nThe cache key should be based on the pom.xml files. Since it's a multi-module project, using **/pom.xml makes sense.\n\nI'll also add a timeout-minutes to the job as a good practice, but the evidence for custom timeout requires historical data which we don't have. However, the pattern P-LIT-CUSTOM-TIMEOUT has experimental evidence showing 26% elapsed savings. But the precondition \"Representative successful-duration history exists\" is not met. So I should not add timeout based on that pattern.\n\nFor cancel stale runs, the pattern P-LIT-CANCEL-STALE has preconditions: \"Runs represent the same workflow and branch or PR\" and \"A newer revision supersedes older checks\". This is true for PR workflows. The mechanism is \"stale_run_cancellation\" which can be implemented with concurrency. This is a workflow-level change, not a job-level change.\n\nBut the instruction says \"Preserve the intended build and test coverage, and avoid unrelated changes.\" Adding concurrency might be considered a behavior change (cancelling previous runs). However, it's a common practice for PR workflows.\n\nGiven the evidence, the strongest support is for Maven caching. Let me propose that.\n\nI'll use the experimental evidence ID: experiment:batch-hiruni-pattern-bat-a89d5fd8d30bc8cb-r2 and the pattern P-LIT-GHA-CACHE.\n\nNow, let me construct the updated workflow YAML.",
+        "reasoning_details": [
+          {
+            "format": "unknown",
+            "index": 0,
+            "text": "The user wants me to propose a CI optimization for the given workflow based on the evidence provided. Let me analyze the workflow and the evidence.\n\nThe workflow is a simple Maven build for a Java project:\n- Runs on pull requests to master branch\n- Single job \"build\" on ubuntu-latest\n- Steps: checkout, setup Java 21 (temurin), run `mvn -B verify --file pom.xml`\n\nLooking at the evidence, I see several patterns that could apply:\n\n1. **P-LIT-GHA-CACHE** - Cache dependency downloads (Maven packages)\n2. **P-LIT-CUSTOM-TIMEOUT** - Add a custom timeout\n3. **P-LIT-CANCEL-STALE** - Cancel superseded runs\n4. **P-LIT-FAIL-FAST** - But this is for matrix jobs, and there's no matrix here\n\nThe repository uses Maven (pom.xml files), so caching Maven dependencies (~/.m2/repository) would be applicable. There's experimental evidence for this in the first evidence item (experiment:batch-hiruni-pattern-bat-a89d5fd8d30bc8cb-r2) which shows caching Maven packages with actions/cache@v4.\n\nAlso, the pattern catalog includes P-LIT-GHA-CACHE which is about caching dependency downloads, with reported benefits.\n\nThe workflow currently has no caching, no timeout, and no concurrency control. Since it's a single job (no matrix), fail-fast doesn't apply.\n\nThe most applicable optimization would be adding Maven dependency caching. This is supported by:\n- Pattern P-LIT-GHA-CACHE (literature report)\n- Experimental evidence experiment:batch-hiruni-pattern-bat-a89d5fd8d30bc8cb-r2 (measured CI workflow on fork)\n\nLet me check the preconditions for P-LIT-GHA-CACHE:\n- \"Repeated dependency fetching is measurable\" - Yes, Maven downloads dependencies on each run\n- \"Cache inputs include lockfile and environment\" - Maven uses pom.xml files as lockfiles\n\nThe experimental evidence shows a similar Maven project adding cache for ~/.m2/repository with key based on hashFiles('**/pom.xml').\n\nI should also consider adding a custom timeout (P-LIT-CUSTOM-TIMEOUT) since the pattern shows benefits, but we don't have historical data on run times. However, the pattern says \"Representative successful-duration history exists\" as a precondition, which we don't have (ci_history shows \"no_completed_runs\").\n\nCancel stale runs (P-LIT-CANCEL-STALE) could be added via concurrency, but the workflow is on pull_request, so it would cancel previous runs on the same PR. This is generally safe for PR workflows.\n\nBut the most direct and evidence-supported optimization for this Maven project is adding dependency caching.\n\nLet me create the updated workflow with Maven caching added. I'll add the cache step after setup-java and before the build step.\n\nThe cache key should be based on the pom.xml files. Since it's a multi-module project, using **/pom.xml makes sense.\n\nI'll also add a timeout-minutes to the job as a good practice, but the evidence for custom timeout requires historical data which we don't have. However, the pattern P-LIT-CUSTOM-TIMEOUT has experimental evidence showing 26% elapsed savings. But the precondition \"Representative successful-duration history exists\" is not met. So I should not add timeout based on that pattern.\n\nFor cancel stale runs, the pattern P-LIT-CANCEL-STALE has preconditions: \"Runs represent the same workflow and branch or PR\" and \"A newer revision supersedes older checks\". This is true for PR workflows. The mechanism is \"stale_run_cancellation\" which can be implemented with concurrency. This is a workflow-level change, not a job-level change.\n\nBut the instruction says \"Preserve the intended build and test coverage, and avoid unrelated changes.\" Adding concurrency might be considered a behavior change (cancelling previous runs). However, it's a common practice for PR workflows.\n\nGiven the evidence, the strongest support is for Maven caching. Let me propose that.\n\nI'll use the experimental evidence ID: experiment:batch-hiruni-pattern-bat-a89d5fd8d30bc8cb-r2 and the pattern P-LIT-GHA-CACHE.\n\nNow, let me construct the updated workflow YAML.",
+            "type": "reasoning.text"
+          }
+        ],
+        "refusal": null,
+        "role": "assistant"
+      },
+      "native_finish_reason": "stop"
+    }
+  ],
+  "created": 1794902277,
+  "id": "gen-1794902277-x1p30ImaLwjQkz7hFlA9",
+  "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+  "object": "chat.completion",
+  "provider": "Nvidia",
+  "service_tier": null,
+  "system_fingerprint": null,
+  "usage": {
+    "completion_tokens": 1309,
+    "completion_tokens_details": {
+      "audio_tokens": 0,
+      "image_tokens": 0,
+      "reasoning_tokens": 930
+    },
+    "cost": 0,
+    "cost_details": {
+      "upstream_inference_completions_cost": 0,
+      "upstream_inference_cost": 0,
+      "upstream_inference_prompt_cost": 0
+    },
+    "is_byok": false,
+    "prompt_tokens": 28263,
+    "prompt_tokens_details": {
+      "audio_tokens": 0,
+      "cache_write_tokens": 0,
+      "cached_tokens": 0,
+      "video_tokens": 0
+    },
+    "total_tokens": 29572
+  }
+}

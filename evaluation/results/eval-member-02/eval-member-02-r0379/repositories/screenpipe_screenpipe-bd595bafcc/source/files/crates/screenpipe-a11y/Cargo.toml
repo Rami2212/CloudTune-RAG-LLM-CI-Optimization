@@ -1,0 +1,103 @@
+# screenpipe — AI that knows everything you've seen, said, or heard
+# https://screenpipe.com
+
+[package]
+name = "screenpipe-a11y"
+version = "0.1.0"
+edition = "2021"
+description = "Accessibility and UI event capture for screenpipe - keyboard, mouse, clipboard"
+license-file = { workspace = true }
+
+[features]
+default = []
+db = ["screenpipe-db"]
+
+[dependencies]
+screenpipe-db = { path = "../screenpipe-db", optional = true }
+screenpipe-core = { path = "../screenpipe-core" }
+screenpipe-config = { path = "../screenpipe-config" }
+# Core
+anyhow = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Concurrency
+crossbeam-channel = "0.5"
+parking_lot = { workspace = true }
+arc-swap = { workspace = true }
+
+# Regex for privacy patterns
+regex = { workspace = true }
+
+# Clipboard access (native NSPasteboard/Win32/X11 — no subprocess)
+arboard = "3"
+
+# Cross-platform user-config dir for electron_docs path resolution
+# (Obsidian / VS Code fork state files live under `dirs::config_dir()`
+# on every supported OS — `~/Library/Application Support` on macOS,
+# `%APPDATA%` on Windows, `~/.config` on Linux).
+dirs = { workspace = true }
+
+# VS Code fork document_path resolution reads `state.vscdb` (SQLite).
+# Keep rusqlite aligned with SQLx on libsqlite3-sys 0.37 so every binary links
+# one bundled, WAL-reset-safe SQLite on every supported OS.
+rusqlite = { version = "=0.39.0", features = ["bundled"] }
+url = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cidre = { git = "https://github.com/yury/cidre.git", rev = "8d0f7307d201d75328ed82ea0d4ca7bb0a649716", features = ["ax", "cg", "blocks", "ns", "app", "dispatch"] }
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSPasteboard"] }
+# Window-server frontmost-app query (CGWindowList) — the run-loop-free
+# source of truth the focused-app resolver cross-checks AX focus against.
+core-foundation = { workspace = true }
+core-graphics = { workspace = true }
+# In-process NSAppleScript for the Arc browser-URL fallback (tree/macos.rs).
+# Replaces the per-walk `osascript` subprocess spawn — see Fix 1 in
+# ~/Screenpipe-notes/"AX Walk Speed Fixes.md". Class-gated features keep this
+# to just NSAppleScript + its Apple Event descriptor result type.
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSDictionary", "NSAppleScript", "NSAppleEventDescriptor"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Native Windows APIs - no rdev dependency
+windows-core = "0.58"
+windows = { workspace = true, features = [
+    "implement",
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_SystemInformation",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_Accessibility",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Gdi",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# AT-SPI2 accessibility via D-Bus (pure Rust, no system deps for compilation)
+zbus = { workspace = true }
+# Input device events from /dev/input/event*
+evdev = "0.13"
+# fcntl for non-blocking I/O on evdev fds
+libc = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }
+# Linux debug examples are compiled by `cargo clippy --all-targets` on every
+# developer OS, so keep their D-Bus dependency available outside Linux too.
+zbus = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+libc = { workspace = true }

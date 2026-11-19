@@ -1,0 +1,192 @@
+# Reference:
+#   - https://github.com/actions/checkout
+#   - https://github.com/actions/download-artifact
+#   - https://github.com/actions/setup-python
+#   - https://github.com/actions/upload-artifact
+#   - https://github.com/codecov/codecov-action
+#   - https://github.com/prefix-dev/setup-pixi
+
+name: ci-tests
+
+on:
+  pull_request:
+
+  push:
+    branches:
+      - "main"
+      - "v*x"
+      - "!pixi-auto-update"
+      - "!pre-commit-ci-update-config"
+      - "!dependabot/*"
+    tags:
+      - "v*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash -l {0}
+
+permissions: {}
+
+# "xvfb-run" provides the display, from the xvfb and mesa the runner image
+# ships, so no step installs them; pyvista renders off screen within it
+env:
+  PYVISTA_OFF_SCREEN: true
+
+jobs:
+  tests:
+    name: "${{ matrix.session }} ${{ matrix.marker }} (${{ matrix.version }})"
+    runs-on: "${{ matrix.os }}"
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["ubuntu-22.04"]
+        version: ["py313", "py314"]
+        session: ["tests"]
+        marker: ["image", "not image"]
+        include:
+          - version: "py314"
+            coverage: "--cov-report= --cov=geovista"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: "environment configure"
+        env:
+          # Maximum cache period (in weeks) before forcing a cache refresh.
+          CACHE_WEEKS: 2
+        run: |
+          echo "CACHE_PERIOD=$(date +%Y).$(expr $(date +%U) / ${CACHE_WEEKS})" >> ${GITHUB_ENV}
+
+      - name: "setup pixi"
+        uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e
+        with:
+          environments: "test-${{ matrix.version }}"
+          frozen: true
+          activate-environment: true
+
+      - name: "cartopy cache"
+        uses: $/.github/workflows/composite/cartopy-cache
+        with:
+          cache_period: ${{ env.CACHE_PERIOD }}
+
+      - name: "geovista cache"
+        uses: $/.github/workflows/composite/geovista-cache
+        with:
+          cache_period: ${{ env.CACHE_PERIOD }}
+
+      - name: "${{ matrix.session }} ${{ matrix.marker }} (${{ matrix.version }})"
+        env:
+          PY_COLORS: "1"
+        run: |
+          xvfb-run -a geovista --report
+          xvfb-run -a pixi run --frozen pytest -m "${{ matrix.marker }}" --numprocesses logical --dist worksteal --failed_image_dir test_images_failed ${{ matrix.coverage }}
+
+      - name: "upload failed images"
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: ci-tests-failed-images-${{ github.job }}-${{ strategy.job-index }}
+          path: ${{ github.workspace }}/test_images_failed
+
+      - name: "prepare coverage"
+        if: ${{ matrix.coverage }}
+        env:
+          COVERAGE_FILE: ci-test-coverage${{ strategy.job-index }}
+        run: |
+          mv .coverage ${COVERAGE_FILE}
+
+      - if: ${{ matrix.coverage }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: coverage-artifacts-${{ github.job }}-${{ strategy.job-index }}
+          path: ${{ github.workspace }}/ci-test-coverage*
+
+
+  # the suite at the dependency floors, solved by the locked "floors"
+  # environment; a job of its own, outside the matrix, so that a red floor never
+  # stops the coverage report (floors spec §4.3)
+  floors:
+    name: "tests floors"
+    runs-on: "ubuntu-22.04"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: "environment configure"
+        env:
+          # Maximum cache period (in weeks) before forcing a cache refresh.
+          CACHE_WEEKS: 2
+        run: |
+          echo "CACHE_PERIOD=$(date +%Y).$(expr $(date +%U) / ${CACHE_WEEKS})" >> ${GITHUB_ENV}
+
+      - name: "setup pixi"
+        uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e
+        with:
+          environments: "floors"
+          frozen: true
+          activate-environment: true
+
+      - name: "cartopy cache"
+        uses: $/.github/workflows/composite/cartopy-cache
+        with:
+          cache_period: ${{ env.CACHE_PERIOD }}
+
+      - name: "geovista cache"
+        uses: $/.github/workflows/composite/geovista-cache
+        with:
+          cache_period: ${{ env.CACHE_PERIOD }}
+
+      - name: "tests floors"
+        env:
+          PY_COLORS: "1"
+        run: |
+          xvfb-run -a geovista --report
+          xvfb-run -a pixi run --frozen -e floors pytest -m "not image" --numprocesses logical --dist worksteal
+
+
+  coverage:
+    needs: [tests]
+    name: "upload coverage"
+    runs-on: "ubuntu-latest"
+
+    environment: development
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: "3.x"
+
+      - run: |
+          python -m pip install --upgrade pip
+          pip install coverage
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: coverage-artifacts-*
+          merge-multiple: true
+
+      - name: "create coverage report"
+        run: |
+          coverage combine ci-test-coverage*
+          coverage xml --omit=*/_version.py
+
+      - name: "upload coverage report"
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}

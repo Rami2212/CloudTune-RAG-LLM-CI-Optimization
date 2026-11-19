@@ -1,0 +1,218 @@
+name: CI
+
+# Foundation gates for the rewrite branch: the checks below must stay green so
+# the architecture, codegen, and safety-critical EEW math can't silently rot.
+on:
+  push:
+    branches: [rewrite, main]
+  pull_request:
+
+# One in-flight run per ref; a new push cancels the previous run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Naming any permission sets every one not listed to none, so the checkout's
+    # read is spelled out beside the OIDC token the Codecov upload signs with.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      # Full history: the commit gate walks the range this push or PR adds, and
+      # a shallow clone has no base to compare against.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          # Nothing here pushes, and every step after this one runs code the
+          # branch under test controls: the job token is not left in
+          # .git/config for it. The `git fetch`es below are anonymous, which a
+          # public repository allows.
+          persist-credentials: false
+
+      # The commit gate first, because it is the only failure that cannot be
+      # fixed by another commit. A message is immutable once pushed, so the
+      # repair is a rebase and a force-push — and the later that is discovered,
+      # the more there is to rebase.
+      - name: Commit message gate
+        env:
+          # Through the environment, like every other value here: a base ref is
+          # a branch name, and on a fork's pull request whoever opened it chose
+          # that name.
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            # The branch's own tip, not the checked-out merge commit: a pull
+            # request builds a synthetic merge of the branch into the base, and
+            # every commit this gate judges has to be one somebody wrote.
+            git fetch --quiet origin "$BASE_REF"
+            range="$(git rev-parse "origin/$BASE_REF")..$HEAD_SHA"
+          else
+            # A push event names what it replaced. On the first push to a new
+            # branch the before-sha is all zeroes, so fall back to the last
+            # commit alone.
+            case "$BEFORE" in
+            ''|0000000000000000000000000000000000000000) range="HEAD~1..HEAD" ;;
+            *) range="$BEFORE..HEAD" ;;
+            esac
+          fi
+          echo "checking $range"
+          bash tool/check/commits.sh "$range"
+
+      # Rebased, not merged, and not behind.
+      #
+      # Two reasons, and neither is taste. A merge commit is invisible to the
+      # gate above — `check_commits.sh` walks with `--no-merges`, because a
+      # merge message is generated rather than written — so anything that
+      # arrives through one is never judged. And a branch that is behind was
+      # tested against a main that no longer exists; the gates that passed
+      # describe a tree nobody will ever have.
+      - name: Branch is rebased on the base
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git fetch --quiet origin "$BASE_REF"
+          base="$(git rev-parse "origin/$BASE_REF")"
+
+          if merges="$(git rev-list --merges "$base..$HEAD_SHA")" &&
+            [ -n "$merges" ]; then
+            echo "::error::this branch merges $BASE_REF instead of rebasing onto it"
+            git --no-pager log --format='  %h %s' --merges "$base..$HEAD_SHA"
+            printf '\n  git rebase origin/%s\n  git push --force-with-lease\n' "$BASE_REF"
+            exit 1
+          fi
+
+          if ! git merge-base --is-ancestor "$base" "$HEAD_SHA"; then
+            echo "::error::this branch is behind $BASE_REF; rebase before merging"
+            printf '  %s is %s commit(s) ahead of this branch\n' \
+              "$BASE_REF" "$(git rev-list --count "$HEAD_SHA..$base")"
+            printf '\n  git fetch origin\n  git rebase origin/%s\n  git push --force-with-lease\n' "$BASE_REF"
+            exit 1
+          fi
+
+          echo "branch gate: rebased on $BASE_REF, no merge commits"
+
+      # The workflows themselves, because a broken one does not fail — it is
+      # *refused*: an expression error kills the run before a job exists. The
+      # script says more, and pins and checksums the actionlint it runs.
+      - name: Workflow gate
+        run: bash tool/check/workflows.sh
+
+      # And what they let somebody else do: a moved tag, a token left on disk,
+      # a job with more permission than it uses, a value pasted into a script.
+      # The script says more, and pins and checksums the zizmor it runs.
+      - name: Workflow security gate
+        run: bash tool/check/workflow_security.sh
+
+      # Architecture gate — pure grep, no toolchain, fails fast.
+      - name: Layering gate
+        run: bash tool/check/layering.sh
+
+      # Localization gate — bash + python3 (preinstalled), no toolchain either:
+      # ARB parity + no hardcoded UI strings. See CLAUDE.md → Localization.
+      - name: Localization gate
+        run: bash tool/check/l10n.sh
+
+      # Storage gate — settings via the typed SettingsStore; sqflite only in
+      # the store that owns each table.
+      - name: Storage gate
+        run: bash tool/check/storage.sh
+
+      # Wall-clock gate — every DateTime.now() in lib/ says why the device
+      # clock is the right one. See ARCHITECTURE.md → Calibrated time.
+      - name: Wall-clock gate
+        run: bash tool/check/wall_clock.sh
+
+      # Every channel sound must resolve, or the channel is rejected on device.
+      - name: Notification-sound gate
+        run: bash tool/check/notification_sounds.sh
+
+      # Lockfile must not embed a machine-local path (pubspec_overrides leak).
+      - name: pubspec.lock path gate
+        run: bash tool/check/pubspec_lock.sh
+
+      # Every workflow has a script under tool/; the docs and this file may not
+      # tell anyone to type the toolchain directly. A copied `flutter test` runs
+      # whatever SDK the shell cached, and running against the wrong SDK looks
+      # exactly like running against the right one.
+      - name: Tooling
+        run: bash tool/check/tooling.sh
+
+      # Flutter/Dart come from mise.toml, so CI uses the exact pinned version
+      # developers run locally — one source of truth. v4 = Node 24 runtime
+      # (Node 20 actions are forced onto 24 and emit deprecation warnings).
+      - name: Install toolchain (mise)
+        uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
+
+      - name: Install dependencies
+        run: bash tool/dev/deps.sh
+
+      # The same script a developer runs. CI naming its own commands is how CI
+      # and the local checklist drift apart, and the drift is only ever found
+      # by a red PR on a branch that was green.
+      - name: Format and analyze
+        run: bash tool/dev/analyze.sh
+
+      # Committed *.freezed.dart / *.g.dart must match a fresh build — a stale
+      # generated file (e.g. after editing a model without regenerating) fails
+      # here instead of shipping.
+      # What git knows about this build. Committed as a stub — see the header
+      # of the generated file — so CI has to write the real values itself.
+      # Without this the checkout compiles whatever symbols the stub happens to
+      # declare, and a new one added locally is invisible until a store build
+      # fails: the file is `skip-worktree`, so a developer's own copy has the
+      # symbol and their `flutter analyze` passes while CI's does not.
+      - name: Build info
+        run: bash tool/check/build_info.sh
+
+      - name: Widget township resources
+        run: bash tool/check/widget_township_resources.sh
+
+      - name: Codegen is up to date
+        run: |
+          bash tool/dev/codegen.sh
+          # build_info.g.dart is excluded because it *cannot* match: it holds
+          # the hash of the commit it is committed in.
+          git diff --exit-code -- . ':!lib/core/build_info.g.dart' || {
+            echo "::error::Working tree dirty after build_runner (stale codegen, or pubspec.lock rewritten — e.g. a path override leaked into the lockfile). Run: dart run build_runner build && flutter pub get (without pubspec_overrides.yaml) and commit."
+            git --no-pager diff --stat
+            git --no-pager diff
+            exit 1
+          }
+
+      # The ETag-cache tests run SQLite on the host via sqflite_common_ffi;
+      # ubuntu ships libsqlite3.so.0 but not the unversioned symlink its loader
+      # needs, so install the dev package.
+      - name: Install SQLite
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+
+      # The test suite, run once, with coverage. The coverage run *is* the test
+      # run — a failing test fails this step exactly as tool/dev/test.sh would —
+      # so the lcov below costs a few seconds of instrumentation rather than a
+      # second pass over the suite.
+      - name: Test (with coverage)
+        run: bash tool/dev/coverage.sh
+
+      # Codecov is where the badge in the README, its sunburst graph and the
+      # pull-request comment all come from; codecov.yml holds the settings.
+      #
+      # OIDC rather than a token: there is nothing to store and nothing to
+      # rotate. A pull request from a fork cannot mint one, so the upload is
+      # allowed to fail rather than fail the run — by this point the suite has
+      # passed, which is what the check is for. Uploads from forks need the
+      # tokenless opt-out for public repositories, in the Codecov org settings.
+      - name: Upload coverage to Codecov
+        if: ${{ !cancelled() && hashFiles('coverage/lcov.info') != '' }}
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          use_oidc: true
+          files: coverage/lcov.info
+          disable_search: true
+          fail_ci_if_error: false

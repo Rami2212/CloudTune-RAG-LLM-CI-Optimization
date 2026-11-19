@@ -1,0 +1,247 @@
+description = "ForkHandles Tuples library"
+
+// Increasing this requires a minor version increment.
+// Decreasing it is not backward compatible, and so requires a major version increment.
+ext.maxTupleSize = 8
+
+ext.packageName = "dev.forkhandles.tuples"
+ext.packageSubdir = packageName.replace(".", "/")
+ext.generatedSrcDir = new File("$buildDir/generated-src/main/kotlin")
+ext.generatedPackageDir = new File("$generatedSrcDir/$packageSubdir")
+
+def generateSourceFile(name, contents) {
+    new File("$generatedPackageDir/$name").withPrintWriter("UTF-8") { out ->
+        out.println("// GENERATED CODE: DO NOT EDIT")
+        out.println()
+        out.println("package $packageName")
+        out.println()
+        contents(out)
+    }
+}
+
+tasks.register("recreateGeneratedSrcDir") {
+    doLast {
+        delete generatedPackageDir
+        mkdir generatedPackageDir
+    }
+}
+
+static String params(int count, String prefix, String suffix = "") {
+    return params(1..count, prefix, suffix)
+}
+
+static String params(IntRange indices, String prefix, String suffix = "") {
+    return indices.collect { "$prefix$it$suffix" }.join(", ")
+}
+
+static String tupleType(int n, String suffix = "") {
+    return tupleType(1..n, suffix)
+}
+
+static String tupleType(IntRange indices, String suffix = "") {
+    return "Tuple${indices.size()}<${params(indices, "T", suffix)}>"
+}
+
+
+task generateTupleClasses {
+    dependsOn "recreateGeneratedSrcDir"
+
+    doLast {
+        generateSourceFile("tuples.kt") { out ->
+            for (n in 4..maxTupleSize) {
+                out.println("data class ${"Tuple$n<${params(n, "out T")}>"}(")
+                for (i in 1..n) {
+                    out.print("  val val$i : T$i")
+                    if (i < n) out.print(",")
+                    out.println()
+                }
+                out.println(")")
+                out.println()
+            }
+        }
+    }
+}
+
+task generateTupleFactoryFunctions {
+    dependsOn "recreateGeneratedSrcDir"
+
+    doLast {
+        generateSourceFile("create.kt") { out ->
+            for (n in 2..maxTupleSize) {
+                out.println("fun <${params(n, "T")}> tuple(")
+                for (i in 1..n) {
+                    out.print("  val$i : T$i")
+                    if (i < n) out.print(",")
+                    out.println()
+                }
+                out.println(") = Tuple$n(${params(n, "val")})")
+                out.println()
+            }
+        }
+    }
+}
+
+
+task generateToListFunctions {
+    dependsOn "recreateGeneratedSrcDir"
+
+    doLast {
+        generateSourceFile("to-list.kt") { out ->
+            for (n in 2..maxTupleSize) {
+                out.println("fun <T> Tuple$n<${(["T"] * n).join(", ")}>.toList(): List<T> =")
+                out.println("  listOf(${params(n, "val")})")
+                out.println()
+            }
+        }
+    }
+}
+
+task generateFromListFunctions {
+    dependsOn "recreateGeneratedSrcDir"
+
+    doLast {
+        //Tuple$n<${(["T"] * n).join(", ")}>
+        generateSourceFile("from-list.kt") { out ->
+            for (n in 2..maxTupleSize) {
+                out.println("fun <T> List<T>.toTuple$n(): Tuple$n<${(["T?"] * n).join(", ")}> =")
+                out.print("  tuple(")
+                for (i in 1..n) {
+                    if (i > 1) out.print(", ")
+                    out.print("getOrNull(${i - 1})")
+                }
+                out.println(")")
+                out.println()
+            }
+        }
+    }
+}
+
+task generatePlusFunctions {
+    dependsOn "recreateGeneratedSrcDir"
+
+    doLast {
+        def operandType = { IntRange i ->
+            if (i.size() == 1) {
+                return "T${i.first()}"
+            } else {
+                return tupleType(i)
+            }
+        }
+
+        generateSourceFile("plus.kt") { out ->
+            for (n in 3..maxTupleSize) {
+                for (i in 1..n - 1) {
+                    out.println("operator fun <${params(n, "T")}> ${operandType(1..i)}.plus(that: ${operandType(i + 1..n)}): ${tupleType(n)} =")
+                    out.print("  tuple(")
+
+                    for (x in 1..i) {
+                        if (x > 1) {
+                            out.print(", ")
+                        }
+                        out.print("this")
+                        if (i > 1) {
+                            out.print(".val$x")
+                        }
+                    }
+
+                    for (x in i + 1..n) {
+                        out.print(", that")
+                        if (i < n - 1) {
+                            out.print(".val${x - i}")
+                        }
+                    }
+
+                    out.println(")")
+                    out.println()
+                }
+            }
+        }
+    }
+}
+
+task generateNonNullFunctions {
+    dependsOn "recreateGeneratedSrcDir"
+
+    doLast {
+        generateSourceFile("non-null.kt") { out ->
+            for (n in 2..maxTupleSize) {
+                out.println("fun <${params(n, "T", ":Any")}> ${tupleType(n, "?")}.allNonNull(): ${tupleType(n)}? {")
+                out.println("    return tuple(")
+                for (i in 1..n) {
+                    if (i > 1) out.println(",")
+                    out.print("        val$i ?: return null")
+                }
+                out.println(")")
+                out.println("}")
+                out.println()
+            }
+        }
+    }
+}
+
+task generateAsNullableFunctions {
+    dependsOn "recreateGeneratedSrcDir"
+
+    doLast {
+        generateSourceFile("as-null.kt") { out ->
+            for (n in 2..maxTupleSize) {
+                out.println("fun <${params(n, "T")}> ${tupleType(n)}.asNullable(): ${tupleType(n, "?")} = this")
+                out.println()
+            }
+        }
+    }
+}
+
+task generateNullableDestructuringExtensions {
+    dependsOn "recreateGeneratedSrcDir"
+
+    doLast {
+        generateSourceFile("nullable-destructuring.kt") { out ->
+            for (n in 2..maxTupleSize) {
+                for (i in 1..n) {
+                    out.println("operator fun <${params(n, "T")}> ${tupleType(n)}?.component$i(): T$i? = this?.component$i()")
+                }
+                out.println()
+            }
+        }
+    }
+}
+
+
+task generateContainsFunctions {
+    dependsOn "recreateGeneratedSrcDir"
+
+    doLast {
+        generateSourceFile("contains.kt") { out ->
+            for (n in 2..maxTupleSize) {
+                out.println("operator fun <T> Tuple$n<${(["T"] * n).join(", ")}>.contains(element: T): Boolean =")
+                out.println("    " + (1..n).collect {i -> "(element == val$i)" }.join(" || "))
+                out.println()
+            }
+        }
+    }
+}
+
+
+task generateSrcMain {
+    dependsOn "generateTupleClasses"
+    dependsOn "generateTupleFactoryFunctions"
+    dependsOn "generateToListFunctions"
+    dependsOn "generateFromListFunctions"
+    dependsOn "generatePlusFunctions"
+    dependsOn "generateNonNullFunctions"
+    dependsOn "generateAsNullableFunctions"
+    dependsOn "generateNullableDestructuringExtensions"
+    dependsOn "generateContainsFunctions"
+}
+
+compileKotlin {
+    dependsOn "generateSrcMain"
+}
+
+sourceSets {
+    main.kotlin {
+        srcDir generatedSrcDir
+    }
+}
+

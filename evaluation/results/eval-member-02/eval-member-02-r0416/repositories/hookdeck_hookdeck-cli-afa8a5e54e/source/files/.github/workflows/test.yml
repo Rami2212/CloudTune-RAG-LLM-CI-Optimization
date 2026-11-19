@@ -1,0 +1,151 @@
+name: test
+
+on:
+  # No workflow_run trigger. It used to run this workflow again after the
+  # "Dependabot PR Check" workflow, to give build-linux the Docker Hub secrets
+  # that Dependabot's pull_request runs do not get. But a workflow_run run
+  # checks out the default branch, not the PR, so it never built the
+  # dependency bump. Checking out the PR there instead would build untrusted
+  # code with secrets. build-linux now runs on pull_request without secrets.
+  pull_request:
+    branches:
+      - main
+  # Run on merge to main so the merged result is tested, not just each PR branch
+  # in isolation. A PR based on stale main can merge into a combination that no
+  # PR run exercised; this catches that (compile/unit/build only — acceptance
+  # tests stay PR-gated because they hit live APIs and are slow/flaky).
+  push:
+    branches:
+      - main
+  # Allow manually triggering CI on a branch
+  workflow_dispatch: {}
+
+jobs:
+  unit-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.11
+      - name: Run unit tests
+        run: go test -short ./pkg/...
+      # `go test` runs a reduced vet suite (printf, bools, atomic and a few
+      # more) and only over the packages it tests. The full suite is what
+      # catches things like sigchanyzer, which found an unbuffered
+      # signal.Notify channel that had been dropping Ctrl-C on the login
+      # prompt. Run it over ./... so test/ and tools/ are covered too.
+      - name: Run go vet
+        run: go vet ./...
+
+  # Keeps the vulnerability scan clean rather than asserting it once. Nothing ran
+  # govulncheck before, which is how GO-2026-5932 (x/crypto/openpgp, reached only
+  # through go-github v28's package init) went unnoticed until it was the last
+  # remaining finding. See #331.
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.11
+      - name: Run govulncheck
+        # Pinned rather than @latest: a new govulncheck release could change
+        # behaviour or fail this job with no change to the repo. Bump
+        # deliberately. The vulnerability database is still fetched live, so
+        # newly disclosed issues are picked up without a version bump.
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          govulncheck ./...
+
+  build-mac:
+    runs-on: macos-latest
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.11
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v5
+        with:
+          version: v2.12.1
+          args: release --skip=publish --snapshot -f .goreleaser/mac.yml --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GORELEASER_GITHUB_TOKEN }}
+
+  # Runs on every pull request, including Dependabot and fork PRs, which get no
+  # secrets. A --snapshot build never pushes images ("snapshot build: will not
+  # push any images"), so Docker Hub credentials are only used to authenticate
+  # the pull of the public alpine base image. Log in when they are available and
+  # pull anonymously when they are not, rather than skipping the job: a skipped
+  # required check counts as passing.
+  build-linux:
+    runs-on: ubuntu-latest
+    env:
+      # https://goreleaser.com/customization/docker_manifest/
+      DOCKER_CLI_EXPERIMENTAL: "enabled"
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # A step's `if` cannot read `secrets` directly, so check for them here.
+      - name: Check for Docker Hub credentials
+        id: docker-creds
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+        run: |
+          if [ -n "$DOCKER_USERNAME" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Docker Hub credentials in this run (Dependabot or fork PR); pulling base images anonymously."
+          fi
+      - name: Docker Login
+        if: steps.docker-creds.outputs.available == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Set up Docker QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.11
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v5
+        with:
+          version: v2.12.1
+          args: release --skip=publish --snapshot -f .goreleaser/linux.yml --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GORELEASER_GITHUB_TOKEN }}
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.11
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v5
+        with:
+          version: v2.12.1
+          args: release --skip=publish --snapshot -f .goreleaser/windows.yml --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GORELEASER_GITHUB_TOKEN }}
