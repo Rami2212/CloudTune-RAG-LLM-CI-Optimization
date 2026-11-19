@@ -1,0 +1,75 @@
+name: clojure-test-suite
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      suite-ref:
+        description: 'Ref of phel-lang/clojure-test-suite to run (blank = pinned SHA on PR/push, main on the nightly schedule)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clojure-test-suite-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  run-clojure-test-suite:
+    name: Run clojure-test-suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout phel-lang
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          path: phel
+
+      - name: Checkout clojure-test-suite
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: phel-lang/clojure-test-suite
+          # PR/push runs gate against a pinned, reproducible suite commit; the
+          # nightly cron tracks `main` to surface upstream drift; dispatch can
+          # override either way.
+          ref: ${{ github.event.inputs.suite-ref || (github.event_name == 'schedule' && 'main' || 'f2e52ff08691480b0147d0b15405b08bb7789ebf') }}
+          path: clojure-test-suite
+
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # v2
+        with:
+          php-version: 8.5
+          coverage: none
+          tools: composer
+
+      - name: Get composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+
+      - name: Cache dependencies
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: ${{ runner.os }}-composer-suite-${{ hashFiles('clojure-test-suite/composer.json') }}
+          restore-keys: ${{ runner.os }}-composer-suite-
+
+      - name: Point suite at local Phel checkout
+        working-directory: clojure-test-suite
+        run: |
+          composer config repositories.phel-local path ../phel
+          composer config minimum-stability dev
+          composer config prefer-stable true
+          composer require --no-update phel-lang/phel-lang:@dev
+
+      - name: Install suite dependencies
+        working-directory: clojure-test-suite
+        run: composer update --no-interaction --no-ansi --no-progress
+
+      - name: Run clojure-test-suite
+        working-directory: clojure-test-suite
+        run: composer test

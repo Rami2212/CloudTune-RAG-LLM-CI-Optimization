@@ -1,0 +1,41 @@
+name: lint
+permissions:
+  contents: read
+on:
+  push:
+    tags:
+      - v*
+    branches:
+      - actions
+      - main
+  pull_request:
+  merge_group:
+jobs:
+  golangci:
+    name: golangci
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - module: .
+            go-version-file: go.mod
+          - module: pkg/sdk
+            go-version-file: pkg/sdk/go.mod
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ${{ matrix.go-version-file }}
+      - name: install golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
+        with:
+          version: v2.11.3
+          install-mode: binary
+          install-only: true
+      - name: check formatting
+        working-directory: ${{ matrix.module }}
+        run: golangci-lint fmt --diff
+      - name: run linters
+        working-directory: ${{ matrix.module }}
+        run: golangci-lint run --timeout=5m

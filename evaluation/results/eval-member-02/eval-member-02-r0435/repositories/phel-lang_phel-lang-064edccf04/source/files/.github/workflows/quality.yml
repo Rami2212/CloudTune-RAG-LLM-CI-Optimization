@@ -1,0 +1,74 @@
+# https://help.github.com/en/categories/automating-your-workflow-with-github-actions
+
+name: Quality
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  composer-validate:
+    name: Validate composer configuration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # v2
+        with:
+          php-version: 8.5
+          coverage: none
+          tools: composer
+
+      - name: Validate composer configuration
+        run: composer validate --strict --quiet --no-interaction --no-check-all --no-check-lock
+
+  coding-guidelines:
+    name: Coding Guidelines
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: ./.github/actions/setup-phel
+
+      - name: Run friendsofphp/php-cs-fixer
+        run: ./vendor/bin/php-cs-fixer fix --allow-risky=yes --dry-run --show-progress=dots --using-cache=no --verbose
+
+      - name: Run rector/rector
+        run: ./vendor/bin/rector process --dry-run --config=rector.php
+
+  phel-lint:
+    name: Lint the Phel standard library
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: ./.github/actions/setup-phel
+
+      # Phel's own stdlib must pass Phel's own linter. Exits non-zero only on
+      # `error`-severity rules, so today's remaining warnings do not gate the
+      # build while a regression to an error does.
+      - name: Run phel lint on src/phel
+        run: ./bin/phel lint --no-cache src/phel
+
+  # Coverage lives in its own nightly workflow (`.github/workflows/coverage.yml`).
+  # It took ~22 minutes while everything else here finishes inside 8, so on a
+  # pull request it was the only thing merges waited on.
+
+  type-checker:
+    name: Type Checker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: ./.github/actions/setup-phel
+
+      - name: Run Psalm on internal code
+        run: ./vendor/bin/psalm --config=psalm.xml --no-progress --shepherd --show-info=false --stats --php-version=8.5
+
+      - name: Run PHPStan (level 9) on internal code
+        run: ./vendor/bin/phpstan --memory-limit=516M --debug -vvv

@@ -1,0 +1,244 @@
+name: Prepare Release
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "master"
+      - "release/**"
+env:
+  XCODE_VERSION: "['26.1.1', '26.2', '26.3', '26.4.1', '26.5', '27.0']"
+  PLATFORM: "['ios', 'osx', 'watchos', 'tvos', 'catalyst', 'visionos']"
+  RELEASE_VERSION: '27'
+  DEVELOPER_DIR: /Applications/Xcode_27.app/Contents/Developer
+jobs:
+  prepare:
+      runs-on: ubuntu-latest
+      name: Prepare outputs
+      outputs:
+        XCODE_VERSIONS_MATRIX: ${{ env.XCODE_VERSION }}
+        PLATFORM_MATRIX: ${{ env.PLATFORM }}
+        VERSION: ${{ steps.get-version.outputs.VERSION }}
+      steps:
+        - name: Compute outputs
+          run: |
+            echo "XCODE_VERSIONS_MATRIX=${{ env.XCODE_VERSION }}" >> $GITHUB_OUTPUT
+            echo "PLATFORM_MATRIX=${{ env.PLATFORM }}" >> $GITHUB_OUTPUT
+        - uses: actions/checkout@v4
+        - name: Read SDK version
+          id: get-version
+          run: |
+            version="$(sed -n 's/^VERSION=\(.*\)$/\1/p' "${GITHUB_WORKSPACE}/dependencies.list")"
+            echo "VERSION=$version" >> $GITHUB_OUTPUT
+  build-docs:
+      runs-on: xcode-27
+      name: Package docs
+      needs: prepare
+      steps:
+        - uses: actions/checkout@v4
+        - uses: ruby/setup-ruby@v1
+          with:
+            bundler-cache: true
+        - name: Prepare docs for packaging
+          run: bundle exec sh -x build.sh release-package-docs
+        - name: Upload docs to artifacts library
+          uses: actions/upload-artifact@v4
+          with:
+            name: realm-docs
+            path: docs/realm-docs.zip
+  build-examples:
+      runs-on: xcode-27
+      name: Package examples
+      needs: prepare
+      steps:
+        - uses: actions/checkout@v4
+        - name: Prepare examples for packaging
+          run: sh -x build.sh release-package-examples
+        - name: Upload examples to artifacts library
+          uses: actions/upload-artifact@v4
+          with:
+            name: realm-examples
+            path: realm-examples.zip
+  build-product: # Creates framework for each platform, xcode version, target and configuration
+      name: Package framework
+      needs: prepare
+      strategy:
+        max-parallel: 20
+        fail-fast: false
+        matrix:
+          platform: ${{ fromJSON(needs.prepare.outputs.PLATFORM_MATRIX) }}
+          xcode-version: ${{ fromJSON(needs.prepare.outputs.XCODE_VERSIONS_MATRIX) }}
+          configuration: [swift, static]
+          include:
+            - xcode-version: 26.1.1
+              xcode-version-tag: 26.1
+              os: macos-26
+            - xcode-version: 26.2
+              xcode-version-tag: 26.2
+              os: macos-26
+            - xcode-version: 26.3
+              xcode-version-tag: 26.3
+              os: macos-26
+            - xcode-version: 26.4.1
+              xcode-version-tag: 26.4
+              os: macos-26
+            - xcode-version: 26.5
+              xcode-version-tag: 26.5
+              os: macos-26
+            - xcode-version: 27.0
+              xcode-version-tag: 27.0
+              os: xcode-27
+          exclude:
+            - platform: osx
+              configuration: static
+            - platform: tvos
+              configuration: static
+            - platform: watchos
+              configuration: static
+            - platform: visionos
+              configuration: static
+            - platform: catalyst
+              configuration: static
+      runs-on: ${{ matrix.os }}
+      env:
+        DEVELOPER_DIR: /Applications/Xcode_${{matrix.xcode-version}}.app/Contents/Developer
+      steps:
+        - uses: actions/checkout@v4
+        - name: Install specific platform
+          run: sh build.sh install-xcode-platform "${{matrix.platform}}"
+        - run: sh build.sh ${{matrix.platform}}-${{matrix.configuration}}
+        - run: tar cf build.tar build/*/${{matrix.platform}}
+        - name: Upload framework
+          uses: actions/upload-artifact@v4
+          with:
+            name: build-${{matrix.platform}}-${{matrix.xcode-version-tag}}-${{matrix.configuration}}
+            path: build.tar
+            compression-level: 1
+  package-release:
+      runs-on: xcode-27
+      name: Package release file
+      needs: [build-product, prepare]
+      steps:
+        - uses: actions/checkout@v4
+        - uses: actions/download-artifact@v4
+        - name: Create release
+          env:
+            SIGNING_IDENTITY: ${{ secrets.SIGNING_IDENTITY }}
+          run: sh -x build.sh release-package
+        - name: Upload release artifactss
+          uses: actions/upload-artifact@v4
+          with:
+            name: release-package
+            path: pkg/*.zip
+        - name: Upload release for testing
+          uses: actions/upload-artifact@v4
+          with:
+            name: test-release-package
+            path: pkg/realm-swift-${{ needs.prepare.outputs.VERSION }}.zip
+  test-package-examples:
+      runs-on: xcode-27
+      name: Test examples
+      needs: [package-release, prepare]
+      steps:
+        - uses: actions/checkout@v4
+        - name: Restore release
+          uses: actions/download-artifact@v4
+          with:
+            name: test-release-package
+        - name: Test examples
+          run: sh -x build.sh release-test-examples
+  test-ios-static:
+      runs-on: xcode-27
+      name: Run tests on iOS with configuration Static
+      needs: package-release
+      steps:
+        - uses: actions/checkout@v4
+        - name: Test ios static
+          run: sh -x build.sh test-ios-static
+  test-osx-static:
+      runs-on: xcode-27
+      name: Run tests on macOS
+      needs: package-release
+      steps:
+        - uses: actions/checkout@v4
+        - name: Test osx static
+          run: |
+            export REALM_DISABLE_METADATA_ENCRYPTION=1
+            sh -x build.sh test-osx
+  test-installation:
+      runs-on: xcode-27
+      name: Run installation test
+      needs: [package-release, prepare]
+      env:
+        REALM_TEST_BRANCH: "${{github.ref_name}}"
+      strategy:
+        matrix:
+          platform: ${{ fromJSON(needs.prepare.outputs.PLATFORM_MATRIX) }}
+          installation: [cocoapods, spm, carthage]
+          linkage: [dynamic, static]
+          exclude:
+            - platform: visionos
+            - platform: catalyst
+              installation: carthage
+            - installation: carthage
+              linkage: static
+          include:
+            - platform: ios
+              installation: xcframework
+              linkage: static
+      steps:
+        - uses: actions/checkout@v4
+        - uses: ruby/setup-ruby@v1
+          with:
+            bundler-cache: true
+        - name: Download visionOS
+          if: matrix.platform == 'visionos'
+          run: xcodebuild -downloadPlatform visionOS
+        - name: Restore release
+          uses: actions/download-artifact@v4
+          if: ${{ matrix.installation == 'xcframework' }}
+          with:
+            name: test-release-package
+        - name: Run installation test
+          run: |
+            find . -name '*.zip' -depth 1 -exec mv {} examples/installation \;
+            cd examples/installation
+            bundle exec ./build.rb ${{ matrix.platform }} ${{ matrix.installation }} ${{ matrix.linkage }}
+  test-installation-xcframework:
+      name: Run installation test for xcframework
+      needs: [package-release, prepare]
+      strategy:
+        matrix:
+          xcode-version: ${{ fromJSON(needs.prepare.outputs.XCODE_VERSIONS_MATRIX) }}
+          include:
+            - xcode-version: 26.1
+              os: macos-26
+            - xcode-version: 26.2
+              os: macos-26
+            - xcode-version: 26.3
+              os: macos-26
+            - xcode-version: 26.4
+              os: macos-26
+            - xcode-version: 26.5
+              os: macos-26
+            - xcode-version: 27.0
+              os: xcode-27
+      env:
+        PLATFORM: 'osx'
+        DEVELOPER_DIR: /Applications/Xcode_${{ matrix.xcode-version }}.app/Contents/Developer
+        REALM_TEST_BRANCH: "${{github.ref_name}}"
+      runs-on: ${{ matrix.os }}
+      steps:
+        - uses: actions/checkout@v4
+        - uses: ruby/setup-ruby@v1
+          with:
+            bundler-cache: true
+        - name: Restore release
+          uses: actions/download-artifact@v4
+          with:
+            name: test-release-package
+        - name: Run installation test
+          run: |
+            find . -name '*.zip' -depth 1 -exec mv {} examples/installation \;
+            cd examples/installation
+            bundle exec ./build.rb osx xcframework dynamic
+
