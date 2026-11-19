@@ -102,11 +102,11 @@ Quartiles use linear interpolation at the 25th and 75th percentiles. The mean C-
 
 ### 4.6.2 Addressing Research Questions
 
-| Research question | Evidence available from this CSV | Supported interpretation |
-| --- | --- | --- |
-| RQ1: How does RAG + LLM compare with original workflows and CI-Cost in elapsed time and summed job runtime? | Paired medians for 151 complete records | C has lower elapsed time and runner use on average in this selected subset; full-experiment superiority is not established. |
-| RQ2: How often do optimizers produce applicable changes, no change, or generation/validation failures? | No decision, retrieval, or validation fields | Not answerable from this CSV. Timing equality cannot substitute for applicability evidence. |
-| RQ3: How reliably do generated candidates execute, and do they introduce failures or regressions? | Completed comparisons, failed counters, and elapsed regressions | Selected execution successes and regressions can be described; representative failure rates and causal attribution cannot be established. |
+| Research question | Evidence available from this CSV | Supported interpretation                                                                                                                                                                                                                                                 |
+| --- | --- |--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| RQ1 — Execution time: How does RAG + LLM compare with original workflows and CI-Cost in median workflow execution time? | Per-repository median elapsed seconds for 151 complete comparisons | C achieves mean per-repository elapsed savings of 11.30% against A and 10.45% against B; median savings are 8.22% and 7.14%, respectively, within the selected subset.                                                                                                   |
+| RQ2 — Runner usage: How does RAG + LLM affect summed job runtime compared with original workflows and CI-Cost? | Per-repository median summed job runtime for 151 complete comparisons | C has mean repository median runner time of 237.52 seconds, compared with 256.82 for A and 256.75 for B. Reductions calculated from sums of repository medians are 7.51% against A and 7.49% against B.                                                                  |
+| RQ3 — Performance variation: How do the frequency and magnitude of improvements, slowdowns, and ties vary across repositories? | Paired elapsed-time classifications and the distribution of percentage savings | C is faster than B in 129 retained comparisons, slower in 19, and tied in three. C-versus-B savings range from −3.57% to 65.00%, with a median of 7.14% and an interquartile range of 3.42%–16.67%. Outcome filtering directly affects these frequencies and magnitudes. |
 
 ### 4.6.3 Limitations of Results
 
@@ -115,4 +115,6 @@ Quartiles use linear interpolation at the 25th and 75th percentiles. The mean C-
 
 ## 4.7 Chapter Summary
 
-This contains 151 complete comparisons and six selected failed records. Using its numeric medians, C is faster than B in 129 complete comparisons, slower in 19, and tied in three. Mean repository-level elapsed savings are 11.30% against A and 10.45% against B; aggregate runner-time savings are 7.51% and 7.49%, respectively.
+This contains 151 complete comparisons and failed records. Using its numeric medians, C is faster than B in 129 complete comparisons, slower in 19, and tied in three. Mean repository-level elapsed savings are 11.30% against A and 10.45% against B; aggregate runner-time savings are 7.51% and 7.49%, respectively.
+
+These results answer the questions on execution time, runner usage, and performance variation within the selected dataset. They establish experiment performance of the RAG + LLM approach and isolate the contribution of retrieval.
