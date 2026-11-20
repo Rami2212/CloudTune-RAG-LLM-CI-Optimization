@@ -1,0 +1,284 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+
+    Copyright (c) 2019-2026 "Neo4j,"
+    Neo4j Sweden AB [https://neo4j.com]
+
+    This file is part of Neo4j.
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        https://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+	<modelVersion>4.0.0</modelVersion>
+
+	<parent>
+		<groupId>org.neo4j</groupId>
+		<artifactId>neo4j-cypher-dsl-parent</artifactId>
+		<version>2025.3.7-SNAPSHOT</version>
+	</parent>
+
+	<artifactId>neo4j-cypher-dsl-parser</artifactId>
+
+	<name>Neo4j Cypher DSL (Parser)</name>
+	<description>Building on top of the Neo4j 4.4 JavaCC parsers it provides a way from Cypher to Cypher-DSL Ast.</description>
+
+	<properties>
+		<covered-ratio-complexity>0.68</covered-ratio-complexity>
+		<sonar.coverage.jacoco.xmlReportPaths>${basedir}/../${aggregate.report.dir}</sonar.coverage.jacoco.xmlReportPaths>
+	</properties>
+
+	<dependencyManagement>
+		<dependencies>
+			<dependency>
+				<groupId>org.neo4j</groupId>
+				<artifactId>neo4j-cypher-dsl-bom</artifactId>
+				<version>${project.version}</version>
+				<type>pom</type>
+				<scope>import</scope>
+			</dependency>
+		</dependencies>
+	</dependencyManagement>
+
+	<dependencies>
+
+		<dependency>
+			<groupId>org.neo4j</groupId>
+			<artifactId>neo4j-cypher-dsl</artifactId>
+		</dependency>
+
+		<dependency>
+			<groupId>org.neo4j</groupId>
+			<artifactId>neo4j-cypher-javacc-parser</artifactId>
+		</dependency>
+
+		<dependency>
+			<groupId>com.opencsv</groupId>
+			<artifactId>opencsv</artifactId>
+			<version>${opencsv.version}</version>
+			<scope>test</scope>
+		</dependency>
+
+		<dependency>
+			<groupId>org.asciidoctor</groupId>
+			<artifactId>asciidoctorj</artifactId>
+			<scope>test</scope>
+		</dependency>
+
+		<dependency>
+			<groupId>org.assertj</groupId>
+			<artifactId>assertj-core</artifactId>
+			<scope>test</scope>
+		</dependency>
+
+		<dependency>
+			<groupId>org.junit.jupiter</groupId>
+			<artifactId>junit-jupiter</artifactId>
+			<scope>test</scope>
+		</dependency>
+
+		<dependency>
+			<groupId>org.neo4j.test</groupId>
+			<artifactId>neo4j-harness</artifactId>
+			<version>${neo4j.version}</version>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.slf4j</groupId>
+			<artifactId>slf4j-simple</artifactId>
+			<scope>test</scope>
+		</dependency>
+	</dependencies>
+
+	<build>
+		<plugins>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-surefire-plugin</artifactId>
+				<configuration combine.self="append">
+					<useModulePath>false</useModulePath>
+				</configuration>
+			</plugin>
+			<plugin>
+				<!-- This forces the failsafe plugin not to use the byte-code manipulated classes in the full bundle (yep, I know, it kinda
+				defeats the purpose of "IT", thank you very much), otherwise JaCoCo won't be able to actually recognize that classes have
+				been tested. Sure I might be as well just rename the tests and treat them as unit, ok, but at some time another developer
+				will add an integration tests and things will joyfully not work, so better have it here.
+				Ah and yes, please don't change the order, otherwise the source plugin now thinks things have been attached twice.
+				What a madness. -->
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-failsafe-plugin</artifactId>
+				<configuration combine.self="append">
+					<classesDirectory>${project.build.outputDirectory}</classesDirectory>
+					<classpathDependencyExcludes>
+						<classpathDependencyExclude>org.neo4j:neo4j-cypher-dsl-parser</classpathDependencyExclude>
+					</classpathDependencyExcludes>
+					<useModulePath>false</useModulePath>
+				</configuration>
+			</plugin>
+			<!--
+			Don't change the order of maven-javadoc-plugin, maven-shade-plugin, moditect-maven-plugin:
+			- JavaDoc can't live with a module-info.java that requires automatic modules and mess up class- and module path
+			  (JavaCC Cypher parser and dependencies are only automatic ones)
+			- Even if we would have one, the shade plugin would nuke it without an option to say "yes, this is ok, we know what we are doing"
+			- Therefor, we must add it "manually" with moditect
+			- That must however happen after javadoc plugin did his work. The resulting javadoc could be better, because right now
+			  it is based on the non-modular source version, whereas a proper one would be perfectly possible if the plugin
+			  just would allow to specify class- and module-path manually and independent.
+			-->
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-javadoc-plugin</artifactId>
+				<executions>
+					<execution>
+						<id>attach-javadocs</id>
+						<goals>
+							<goal>jar</goal>
+						</goals>
+					</execution>
+				</executions>
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-shade-plugin</artifactId>
+				<executions>
+					<execution>
+						<goals>
+							<goal>shade</goal>
+						</goals>
+						<phase>package</phase>
+						<configuration>
+							<artifactSet>
+								<includes>
+									<include>org.neo4j:cypher-ast-factory</include>
+									<include>org.neo4j:neo4j-cypher-javacc-parser</include>
+									<include>org.neo4j:cypher-parser-common</include>
+								</includes>
+							</artifactSet>
+							<relocations>
+								<relocation>
+									<pattern>org.neo4j.cypher.internal</pattern>
+									<shadedPattern>org.neo4j.cypherdsl.parser.internal</shadedPattern>
+								</relocation>
+							</relocations>
+							<createSourcesJar>true</createSourcesJar>
+							<filters>
+								<filter>
+									<artifact>*:*</artifact>
+									<excludes>
+										<exclude>module-info.class</exclude>
+										<exclude>library.properties</exclude>
+										<exclude>LICENSE.txt</exclude>
+										<exclude>rootdoc.txt</exclude>
+									</excludes>
+								</filter>
+								<filter>
+									<artifact>org.neo4j:cypher-ast-factory</artifact>
+									<excludes>
+										<exclude>META-INF/**/*</exclude>
+									</excludes>
+								</filter>
+								<filter>
+									<artifact>org.neo4j:neo4j-cypher-javacc-parser</artifact>
+									<excludes>
+										<exclude>META-INF/**/*</exclude>
+									</excludes>
+								</filter>
+								<filter>
+									<artifact>org.neo4j:cypher-parser-common</artifact>
+									<excludes>
+										<exclude>META-INF/**/*</exclude>
+									</excludes>
+								</filter>
+							</filters>
+						</configuration>
+					</execution>
+				</executions>
+			</plugin>
+			<plugin>
+				<groupId>org.moditect</groupId>
+				<artifactId>moditect-maven-plugin</artifactId>
+				<executions>
+					<execution>
+						<id>add-module-infos</id>
+						<goals>
+							<goal>add-module-info</goal>
+						</goals>
+						<phase>package</phase>
+						<configuration>
+							<overwriteExistingFiles>true</overwriteExistingFiles>
+							<module>
+								<moduleInfoSource><![CDATA[module org.neo4j.cypherdsl.parser {
+
+										requires transitive org.apiguardian.api;
+										requires transitive org.neo4j.cypherdsl.core;
+
+										// Those are shaded
+										// requires org.neo4j.cypher.internal.parser;
+										// requires org.neo4j.cypher.internal.parser.javacc;
+										// requires org.neo4j.cypher.internal.ast.factory;
+
+										exports org.neo4j.cypherdsl.parser;
+									}]]></moduleInfoSource>
+							</module>
+						</configuration>
+					</execution>
+				</executions>
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-resources-plugin</artifactId>
+				<executions>
+					<execution>
+						<id>copy-resources</id>
+						<goals>
+							<goal>copy-resources</goal>
+						</goals>
+						<phase>generate-test-resources</phase>
+						<configuration>
+							<outputDirectory>${basedir}/target/test-classes</outputDirectory>
+							<resources>
+								<resource>
+									<directory>${project.basedir}</directory>
+									<includes>
+										<include>README.adoc</include>
+									</includes>
+								</resource>
+							</resources>
+						</configuration>
+					</execution>
+				</executions>
+			</plugin>
+			<plugin>
+				<groupId>com.github.siom79.japicmp</groupId>
+				<artifactId>japicmp-maven-plugin</artifactId>
+			</plugin>
+		</plugins>
+	</build>
+
+	<reporting>
+		<plugins>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-checkstyle-plugin</artifactId>
+				<reportSets>
+					<reportSet>
+						<reports>
+							<report>checkstyle</report>
+						</reports>
+					</reportSet>
+				</reportSets>
+			</plugin>
+		</plugins>
+	</reporting>
+</project>
