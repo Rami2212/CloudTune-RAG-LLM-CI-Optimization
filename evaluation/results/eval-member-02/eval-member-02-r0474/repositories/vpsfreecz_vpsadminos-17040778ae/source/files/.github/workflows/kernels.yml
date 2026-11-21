@@ -1,0 +1,102 @@
+name: Build all kernel versions
+
+on:
+  schedule:
+    - cron: '5 3 * * *'
+  # GITHUB_TOKEN input updates do not trigger push workflows.
+  workflow_run:
+    workflows:
+      - Update flake inputs
+    types:
+      - completed
+    branches:
+      - staging
+  push:
+    branches:
+     - staging
+    paths:
+      - .github/workflows/kernels.yml
+      - flake.nix
+      - flake.lock
+      - os/packages/linux/**
+  pull_request:
+    branches:
+     - staging
+    paths:
+      - .github/workflows/kernels.yml
+      - flake.nix
+      - flake.lock
+      - os/packages/linux/**
+
+jobs:
+  detect:
+    name: Detect available kernel versions
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
+       github.event.workflow_run.head_branch == 'staging')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      kernelVersions: ${{ steps.set.outputs.kernelVersions }}
+      sourceRev: ${{ steps.set.outputs.sourceRev }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+          # The updater's head_sha predates its input update commit.
+          ref: ${{ github.event_name == 'workflow_run' && 'refs/heads/staging' || github.sha }}
+
+      - uses: cachix/install-nix-action@v31.11.3
+
+      - id: set
+        shell: bash
+        run: |
+          kernelVersions=$(nix eval --json .#lib.kernelVersions)
+          echo "Detected available kernels: $kernelVersions"
+          echo "kernelVersions=$kernelVersions" >> "$GITHUB_OUTPUT"
+          echo "sourceRev=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Kernel ${{ matrix.kernel }}
+    needs: detect
+    runs-on: self-hosted
+    strategy:
+      matrix:
+        kernel: ${{ fromJson(needs.detect.outputs.kernelVersions) }}
+    timeout-minutes: 480
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.detect.outputs.sourceRev }}
+
+      - name: Determine branch name
+        id: vars
+        run: |
+          echo "branch=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}" >> $GITHUB_OUTPUT
+
+      - name: Build toplevel closure with kernel ${{ matrix.kernel }}
+        run: |
+          KERNEL_OUTPUT_VERSION="${{ matrix.kernel }}"
+          KERNEL_OUTPUT_VERSION="${KERNEL_OUTPUT_VERSION//[.-]/_}"
+          make OUTPUT="ci-toplevel-kernel-$KERNEL_OUTPUT_VERSION" toplevel
+          echo "BUILD_OUT=$(readlink -f os/result/toplevel)" >> $GITHUB_ENV
+
+      - name: Copy toplevel closure with kernel ${{ matrix.kernel }} to binary cache
+        env:
+          VPSADMINOS_CACHE_SSH_KEY: ${{ secrets.VPSADMINOS_CACHE_SSH_KEY }}
+        run: |
+          install -m 600 -D <(echo "$VPSADMINOS_CACHE_SSH_KEY") .ssh/cache_id
+          NIX_SSHOPTS="-i .ssh/cache_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" nix-copy-closure --to push@cache.int.vpsadminos.org "$BUILD_OUT"
+
+      - name: Add new profile generation for kernel ${{ matrix.kernel }}
+        env:
+          BRANCH: ${{ steps.vars.outputs.branch }}-kernel-${{ matrix.kernel }}
+        run: |
+          ssh -i .ssh/cache_id \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              push@cache.int.vpsadminos.org \
+              sudo push-ci-generation "$BRANCH" "$BUILD_OUT"
