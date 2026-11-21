@@ -1,0 +1,52 @@
+name: Pre-release (Linux archs)
+on:
+  push:
+    tags:
+      - 'v*-*'
+
+permissions:
+  contents: write
+
+jobs:
+  release-linux-archs:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        arch: ["armv7", "aarch64", "ppc64le"]
+      fail-fast: false
+    name: Build on ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v3
+        name: Checkout sources
+      - uses: uraimo/run-on-arch-action@v3
+        name: Generate artifacts on ${{ matrix.arch }}
+        id: run-tests-on-arch
+        with:
+          arch: ${{ matrix.arch }}
+          distro: ubuntu24.04
+          githubToken: ${{ github.token }}
+          dockerRunArgs: --volume "${GITHUB_WORKSPACE}/artifacts:/artifacts"
+          setup: |
+            mkdir -p ./artifacts
+
+            # Compute dev version
+            export PREV_VERSION=$(cat src/austin.h | sed -r -n "s/^#define VERSION[ ]+\"(.+)\"/\1/p")
+            export VERSION=${{ github.ref_name }}
+            sed -i "s/$PREV_VERSION/$VERSION/g" src/austin.h
+          run: ARCH=${{ matrix.arch }} bash scripts/build_arch.sh
+
+      - name: Show artifacts
+        run: |
+          ls -al ./artifacts
+
+      - name: Upload binaries to release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: artifacts/austin*.tar.xz
+          tag: ${{ github.ref }}
+          overwrite: true
+          prerelease: true
+          release_name: ${{ github.ref_name }}
+          body: See the changelog for details.
+          file_glob: true

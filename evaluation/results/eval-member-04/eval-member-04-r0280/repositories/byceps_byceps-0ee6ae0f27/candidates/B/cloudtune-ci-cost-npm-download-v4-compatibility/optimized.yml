@@ -1,0 +1,111 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [MEDIUM] Add concurrency group to "test.yml"
+# Estimated savings: ~2 min/run
+#
+name: Test
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - 'docs/**'
+      - '*.rst'
+  pull_request:
+    branches: [ main ]
+    paths-ignore:
+      - 'docs/**'
+      - '*.rst'
+  # Allow manual workflow triggering from the "Actions" tab.
+  workflow_dispatch:
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    environment: test
+
+    services:
+      postgres:
+        image: postgres@sha256:52e6ffd11fddd081ae63880b635b2a61c14008c17fc98cdc7ce5472265516dd0
+        env:
+          POSTGRES_PASSWORD: password
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          # Make accessible on localhost.
+          - 5432:5432
+
+      redis:
+        image: redis@sha256:1f073813b641755b70b0200da64131bbeeb4ec5b633ca67772229b49820caafa
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          # Make accessible on localhost.
+          - 6379:6379
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.13", "3.14"]
+
+    steps:
+    - name: Check out repository
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        persist-credentials: false
+
+    - name: Install uv and Python
+      uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      with:
+        enable-cache: auto
+        cache-dependency-glob: "uv.lock"
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install project
+      run: uv sync --frozen --only-group test
+
+    - name: Test with pytest and coverage
+      env:
+        POSTGRES_HOST: localhost
+        POSTGRES_USER: postgres
+        POSTGRES_PASSWORD: password
+        POSTGRES_DB: postgres
+        PYTEST_ADDOPTS: "--color=yes"
+      run: |
+        uv run coverage run --source=byceps -m pytest tests
+
+    - name: Generate XML output from test coverage
+      if: github.repository == 'byceps/byceps' && github.ref_name == 'main'
+      run: |
+        uv run coverage xml
+
+    - name: Upload coverage to Qlty
+      uses: qltysh/qlty-action/coverage@c9b09987143d1e4ac955f4803c7bea742102feb5 # v2.4.0
+      if: github.repository == 'byceps/byceps' && github.ref_name == 'main'
+      with:
+        oidc: true
+        files: coverage.xml
+
+    - name: Post result to Discord
+      # Run job even if build is cancelled.
+      if: always() && github.repository == 'byceps/byceps' && github.ref_name == 'main'
+      env:
+        PYTHON_VERSION: ${{ matrix.python-version }}
+        JOB_RESULT: ${{ job.status }}
+        DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      run: uv run ./.github/workflows/send-workflow-result-to-discord.py --result $JOB_RESULT --webhook-url $DISCORD_WEBHOOK_URL

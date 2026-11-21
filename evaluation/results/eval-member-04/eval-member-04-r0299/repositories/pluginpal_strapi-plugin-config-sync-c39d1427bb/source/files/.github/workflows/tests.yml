@@ -1,0 +1,79 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+      - develop
+      - beta
+
+jobs:
+  lint:
+    name: 'lint'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [22, 24, 26]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: 'yarn'
+      - name: Install dependencies
+        run: yarn --frozen-lockfile
+      - name: Run eslint
+        run: yarn run eslint
+  test:
+    name: 'test'
+    needs: [lint]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [22, 24, 26]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: 'yarn'
+      - name: Install dependencies plugin
+        run: yarn --frozen-lockfile --unsafe-perm
+      - name: Push the package to yalc
+        run: yarn build
+      - name: Add yalc package to the playground
+        run: yarn playground:yalc-add
+      - name: Install dependencies playground
+        run: cd playground && yarn install --unsafe-perm
+      - name: Build playground
+        run: yarn playground:build
+      # - name: Run unit tests
+      #   run: yarn test:unit
+      - name: Run integration tests
+        run: yarn run -s test:integration
+      - name: Run end-to-end tests
+        uses: cypress-io/github-action@v6
+        with:
+          start: yarn playground:start
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: cypress-screenshots
+          path: cypress/screenshots
+          if-no-files-found: ignore # 'warn' or 'error' are also available, defaults to `warn`
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: cypress-videos
+          path: cypress/videos
+          if-no-files-found: ignore # 'warn' or 'error' are also available, defaults to `warn`
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV }}
+          flags: unit
+          verbose: true
+          fail_ci_if_error: true

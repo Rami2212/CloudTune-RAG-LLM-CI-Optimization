@@ -1,0 +1,166 @@
+# SPDX-FileCopyrightText: 2022 Antonin Bas
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name: Test
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+# Cancel any preceding run on the pull request.
+concurrency:
+  group: test-bmv2-ubuntu-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  check-changes:
+    name: Check whether tests need to be run based on diff
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - uses: antrea-io/has-changes@v2
+      id: check_diff
+      with:
+        paths-ignore: docs/* *.md
+    outputs:
+      has_changes: ${{ steps.check_diff.outputs.has_changes }}
+
+  test:
+    needs: check-changes
+    if: ${{ needs.check-changes.outputs.has_changes == 'yes' }}
+    runs-on: ${{ matrix.os }}
+    name: test (${{ matrix.os }}, ${{ matrix.cc }})
+    env:
+      CCACHE_DIR: ~/.cache/ccache
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+        - os: ubuntu-22.04
+          cxx: g++
+          cc: gcc
+          gcov: gcov
+        - os: ubuntu-22.04
+          cxx: clang++
+          cc: clang
+          gcov: ""
+        - os: ubuntu-24.04
+          cxx: g++
+          cc: gcc
+          gcov: gcov
+        - os: ubuntu-24.04
+          cxx: clang++
+          cc: clang
+          gcov: ""
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        submodules: 'recursive'
+    - name: Setup native CI
+      uses: ./.github/actions/setup-native-ci
+      with:
+        cache-key: ccache-v2-${{ runner.arch }}-${{ matrix.os }}-${{ matrix.cc }}-${{ hashFiles('configure.ac', 'Makefile.am', '.github/workflows/test.yml', 'install_deps.sh') }}
+        install-lcov: true
+        install-clang: ${{ matrix.cc == 'clang' }}
+    - name: Run tests
+      env:
+        CC: ccache ${{ matrix.cc }}
+        CXX: ccache ${{ matrix.cxx }}
+        GCOV: ${{ matrix.gcov }}
+      run: |
+        ./autogen.sh
+        CONFIG_FLAGS="--with-pdfixed --with-pi --with-packet-trace --with-stress-tests --enable-debugger --enable-Werror"
+        if [ -n "$GCOV" ]; then
+          ./configure $CONFIG_FLAGS --enable-coverage
+        else
+          ./configure $CONFIG_FLAGS
+        fi
+        make -j$(nproc)
+        make check -j$(nproc)
+        ./ci/codecov.sh
+    - name: Show ccache stats
+      if: ${{ always() }}
+      run: ccache -s
+    - name: Check style
+      run: |
+        ./tools/check_style.sh
+
+  test-no-pi:
+    needs: check-changes
+    if: ${{ needs.check-changes.outputs.has_changes == 'yes' }}
+    runs-on: ${{ matrix.os }}
+    name: test-no-pi (${{ matrix.os }})
+    env:
+      CCACHE_DIR: ~/.cache/ccache
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        submodules: 'recursive'
+    - name: Setup native CI
+      uses: ./.github/actions/setup-native-ci
+      with:
+        cache-key: ccache-v2-${{ runner.arch }}-${{ matrix.os }}-no-pi-${{ hashFiles('configure.ac', 'Makefile.am', '.github/workflows/test.yml', 'install_deps.sh') }}
+    - name: Run tests
+      env:
+        CC: ccache gcc
+        CXX: ccache g++
+      run: |
+        ./autogen.sh
+        ./configure --enable-debugger --enable-Werror
+        make -j$(nproc)
+        make check -j$(nproc)
+    - name: Show ccache stats
+      if: ${{ always() }}
+      run: ccache -s
+
+  test-cmake:
+    needs: check-changes
+    if: ${{ needs.check-changes.outputs.has_changes == 'yes' }}
+    runs-on: ${{ matrix.os }}
+    name: test-cmake (${{ matrix.os }}, ${{ matrix.name }})
+    env:
+      CCACHE_DIR: ~/.cache/ccache
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            name: default
+            options: -DWITH_PDFIXED=ON -DWITH_PI=ON -DENABLE_PACKET_TRACE=ON -DWITH_STRESS_TESTS=ON -DENABLE_DEBUGGER=ON -DENABLE_WERROR=ON
+            run_install: true
+          - os: ubuntu-24.04
+            name: without-thrift
+            options: -DWITH_PDFIXED=OFF -DWITH_PI=ON -DENABLE_PACKET_TRACE=ON -DWITH_STRESS_TESTS=ON -DENABLE_DEBUGGER=ON -DENABLE_WERROR=ON -DWITH_THRIFT=OFF
+            run_install: false
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        submodules: 'recursive'
+    - name: Setup native CI
+      uses: ./.github/actions/setup-native-ci
+      with:
+        cache-key: ccache-v2-${{ runner.arch }}-${{ matrix.os }}-cmake-${{ matrix.name }}-${{ hashFiles('CMakeLists.txt', '.github/workflows/test.yml', 'install_deps.sh') }}
+    - name: Build BMv2
+      run: |
+        mkdir -p build
+        cd build
+        cmake ${{ matrix.options }} ..
+        make -j$(nproc)
+    - name: Run tests
+      run: cd build && ctest -j$(nproc) --output-on-failure
+    - name: Install
+      if: ${{ matrix.run_install }}
+      run: cd build && sudo cmake --build . --target install
+    - name: Show ccache stats
+      if: ${{ always() }}
+      run: ccache -s

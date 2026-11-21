@@ -1,0 +1,56 @@
+name: build nightlies
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+
+    env:
+      SVDTOOLS: svdtools
+
+    steps:
+      - name: Checkout master
+        uses: actions/checkout@v4
+        with:
+          path: stm32-rs
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Add fictive crate
+        run: |
+          cargo init
+
+      - name: Install tools
+        run: ./stm32-rs/scripts/tool_install.sh
+
+      - name: Deploy SSH key
+        run: |
+          mkdir ~/.ssh
+          echo "${{ secrets.NIGHTLIES_KEY }}" > ~/.ssh/id_rsa
+          chmod 700 ~/.ssh
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -t rsa github.com
+      - name: Build and publish
+        run: |
+          mkdir nightly
+          cd stm32-rs
+          COMMIT=$(git rev-parse HEAD)
+          make -j2 form
+          mv stm32{c,f,g,h,l,mp,n,u,wl,wb}* ../nightly
+          cp .github/workflows/README-nightlies.md ../nightly/README.md
+          cd ../nightly
+          git init
+          git add .
+          git config user.name "stm32-rs builder"
+          git config user.email "action@github.com"
+          git commit -m "stm32-rs master $COMMIT"
+          git remote add origin git@github.com:stm32-rs/stm32-rs-nightlies
+          git push --force origin master

@@ -1,0 +1,39 @@
+name: .NET Linux
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        submodules: recursive
+        fetch-depth: 0
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: 10.0.x
+
+    - name: Restore dependencies
+      run: dotnet restore GameRealisticMap-LinuxCI.sln
+
+    - name: Build
+      run: dotnet build --no-restore --configuration Release GameRealisticMap-LinuxCI.sln
+
+    - name: Test
+      run: dotnet test --no-build --verbosity normal --configuration Release GameRealisticMap-LinuxCI.sln
+      
+    - name: Build Linux Command Line
+      run: dotnet publish --no-self-contained -f net10.0 -r linux-x64 -c Release GameRealisticMap.Arma3.CommandLine/GameRealisticMap.Arma3.CommandLine.csproj -o Output
+      
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: Linux Command Line
+        path: Output/grma3

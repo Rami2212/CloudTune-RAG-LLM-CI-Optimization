@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  release:
+    types: [ created ]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  releases-matrix:
+    name: Release Go Binary
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macOS-latest ]
+        arch: [ amd64, arm64 ]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install Go
+        uses: actions/setup-go@v3
+        with:
+          go-version: 1.21.x
+          cache: true
+
+      - name: Test
+        run: go test -race -covermode atomic ./...
+
+      - name: Set GITHUB_ENV
+        run: |
+          stripped_tag="${{ github.event.release.tag_name }}"
+          echo "STRIPPED_TAG=${stripped_tag:1}" >> "$GITHUB_ENV"
+          if [ "${{ matrix.os }}" == "ubuntu-latest" ]; then
+            echo "GOOS=linux" >> $GITHUB_ENV
+          else
+            echo "GOOS=darwin" >> $GITHUB_ENV
+          fi
+
+      - name: Build
+        run: |
+          export GOARCH=${{ matrix.arch }}
+          export CGO_ENABLED=0
+          go build -o pandora_${STRIPPED_TAG}_${GOOS}_${{ matrix.arch }}
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: pandora_${{ env.STRIPPED_TAG }}_${{ env.GOOS }}_${{ matrix.arch }}

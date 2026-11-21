@@ -1,0 +1,57 @@
+on:
+    push:
+        branches:
+            - main
+    pull_request:
+        branches:
+            - main
+
+name: Linux build
+jobs:
+    py-check:
+        runs-on: ${{ matrix.config.os }}
+        name: ${{ matrix.config.os }} (${{ matrix.config.py }})
+        strategy:
+            fail-fast: false
+            matrix:
+                config:
+                    - { os: ubuntu-latest, py: "3.10" }
+                    - { os: ubuntu-latest, py: "3.11" }
+                    - { os: ubuntu-latest, py: "3.12" }
+
+        env:
+            SDKROOT: /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk
+        defaults:
+            run:
+                shell: bash -el {0}
+        steps:
+            - name: CHECKOUT CODE
+              uses: actions/checkout@v7
+            - name: Setup micromamba
+              uses: mamba-org/setup-micromamba@v3
+              with:
+                  environment-name: test-env
+                  create-args: >-
+                      python=${{ matrix.config.py }}
+                      gdal
+                      pyproj
+                      -c conda-forge
+                  cache-environment: true
+            - name: Test GDAL installation
+              run: |
+                  python -c "from osgeo import gdal"
+                  gdalinfo --version
+            - name: Install dependencies
+              run: |
+                  python -m pip install --upgrade pip
+                  pip install --user --no-cache-dir Cython
+                  pip install --user -r requirements.txt
+                  pip install --user -r requirements_dev.txt
+                  pip install --user .
+            - name: Test import
+              run: python -c "import samgeo; print('samgeo import successful')"
+            - name: Fast unit tests
+              run: python -m unittest tests.test_utmconv
+            # - name: PKG-TEST
+            #   run: |
+            #       python -m unittest discover tests/

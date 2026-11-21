@@ -1,0 +1,55 @@
+name: Swift
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    name: Android
+    strategy:
+      fail-fast: false
+      matrix:
+        # os: ['ubuntu-24.04', 'macos-15-intel']
+        os: ['ubuntu-24.04']
+        android-sdk: ['nightly-6.3']
+        android-api: ['28', '29', '31', '33']
+        android-ndk: ['r27d']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+      - uses: skiptools/actions/setup-skip@v1
+        with:
+          gradle-version: 'none'
+          install-swift-android-sdk: true
+          swift-android-sdk-version: ${{ matrix.android-sdk }}
+          swift-android-ndk-version: ${{ matrix.android-ndk }}
+
+      - name: "Build Swift Package for Android (aarch64)"
+        run: |
+          ANDROID_SDK_VERSION=${{ matrix.android-api }} skip android build --arch aarch64 --android-api-level ${{ matrix.android-api }}
+
+      - name: "Build Swift Package for Android (armv7)"
+        run: |
+          ANDROID_SDK_VERSION=${{ matrix.android-api }} skip android build --arch armv7 --android-api-level ${{ matrix.android-api }}
+
+      - name: "Build Swift Package for Android (x86_64)"
+        run: |
+          ANDROID_SDK_VERSION=${{ matrix.android-api }} skip android build --arch x86_64 --android-api-level ${{ matrix.android-api }}
+
+      - name: "Test Swift Package on Android"
+        # can only lookup the current JavaVirtualMachine on API >= 31
+        # https://github.com/swiftlang/swift-java/issues/419
+        if: ${{ matrix.android-api >= 31 }}
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.android-api }}
+          arch: x86_64
+          script: |
+            ANDROID_SDK_VERSION=${{ matrix.android-api }} skip android test --android-api-level ${{ matrix.android-api }} --apk --verbose

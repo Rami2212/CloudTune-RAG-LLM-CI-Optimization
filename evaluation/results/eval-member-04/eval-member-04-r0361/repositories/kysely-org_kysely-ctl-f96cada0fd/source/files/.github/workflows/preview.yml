@@ -1,0 +1,62 @@
+name: preview
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    paths:
+      - '**/*'
+      - '!.github/workflows/*.yml'
+      - '.github/workflows/preview.yml'
+      - '!.github/dependabot.yml'
+      - '!.vscode/**'
+      - '!docs/**'
+      - '!*.md'
+      - '!LICENSE'
+      - '!tests/**'
+      - '!vitest.config.ts'
+      - '!vitest.setup.ts'
+      - '!zizmor.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  cancel-in-progress: ${{ github.ref_name != 'main' }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+
+jobs:
+  release:
+    name: Release preview build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          cache: false # cache can be poisoned by malicious actors.
+
+      - name: Use Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: lts/*
+          package-manager-cache: false # cache can be poisoned by malicious actors.
+
+      - name: Install dependencies
+        run: pnpm i
+
+      - name: Build
+        run: pnpm build
+
+      - name: Release preview version
+        run: pnpx pkg-pr-new@0.0.71 publish --template './examples/node-esm'

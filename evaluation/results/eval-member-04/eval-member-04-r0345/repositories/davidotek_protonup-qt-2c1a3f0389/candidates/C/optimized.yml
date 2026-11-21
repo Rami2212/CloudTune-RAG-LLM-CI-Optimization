@@ -1,0 +1,55 @@
+name: Test using Pytest
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  tests:
+    name: "Run PyTest"
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        python-version: ["3.10"]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: "${{ matrix.python-version }}"
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v3
+
+    - name: Cache uv dependencies
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/uv
+        key: ${{ runner.os }}-uv-${{ matrix.python-version }}-${{ hashFiles('uv.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-uv-${{ matrix.python-version }}-
+
+    - name: Install dependencies
+      run: |
+        sudo apt install -y libegl1 libxkbcommon0
+        uv sync --group test
+
+    - name: Run pytest
+      run: uv run pytest -q
+      env:
+        QT_QPA_PLATFORM: "offscreen"
+
+  validate_metainfo:
+    name: "Run AppStream Metainfo Validation"
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install dependencies
+      run: sudo apt install -y appstream-util
+    - name: Validate Metainfo file
+      run: appstream-util validate-relax ./share/metainfo/net.davidotek.pupgui2.appdata.xml

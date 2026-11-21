@@ -1,0 +1,564 @@
+name: LinBox Prefix Pack (v8.4 前缀模板)
+
+# ============================================================
+# v8.4 前缀架构 · 预构建前缀模板包（prefix-pack.tar.zst）
+# ------------------------------------------------------------
+# 把 wine 槽位 + bionic rootfs 变成「开箱即用」的前缀模板。
+# 工具三件套（构建与打包分离，各司其职）：
+#   tools/prefix-pack/build_prefix.py      构建（无头 wineboot -u +
+#     环境组装 + 布局修复 + 产物验收；--mode full 失败即败，不静默降级）
+#   tools/prefix-pack/make_prefix_pack.py  打包（full / component 布局）
+#   tools/prefix-pack/verify_prefix.py     校验（三 mode 契约）
+#
+# v8.4 修复清单（2026-11-16 arm64ec CI 构建失败逐项修复）：
+#   ① 接口断裂 —— v8.3 重制 make_prefix_pack.py（--prefix 必填）后
+#      workflow 未同步（旧调用 --wine-dir/--rootfs/--mode/--timeout 报
+#      "the following arguments are required: --prefix" 直接 exit 2）；
+#      本版按三件套新契约重写调用链；
+#   ② arm64ec 加载链 —— 冒烟 "library libandroid-shmem.so not found"
+#      根因：wineboot/冒烟环境未把 rootfs usr/lib（libandroid-shmem.so
+#      等 bionic 扩展库所在）纳入 LD_LIBRARY_PATH。本版冒烟与构建均按
+#      设备端同源语义组装（rootfs usr/lib → wine lib → /system/lib64；
+#      x86_64 形态前置 wine 自带 lib/x86_64-bionic 闭包），冒烟改为
+#      **硬门禁**（加载链断裂时快速失败 + 诊断输出，不再烧 30 分钟
+#      wineboot 超时）；
+#   ③ 无头零 GUI —— wineboot 不跑 explorer 虚拟桌面、不连 X11
+#      （WINEDLLOVERRIDES=mscoree,gecko=d;winedbg=d 双禁防弹窗等待）；
+#   ④ binfmt 自检 —— qemu-user-static 安装后 guest 内部 exec
+#      （wineserver / wow64 重执行链）依赖 binfmt_misc 注册，装完
+#      即验，未注册自动补注册；
+#   ⑤ 诚实构建 —— 默认 --mode full（验收不过=失败），auto/skeleton
+#      降级仅显式选择；wineboot 全量日志（WINEDEBUG=err+all）落盘
+#      out/wineboot.log，失败时随 artifact 上传；
+#   ⑥ 双布局产物 —— full（秒开模板，--keep-stamp 保留时间戳：与
+#      同源 wine 槽位配对安装时设备端跳过增量 wineboot）+ component
+#      （drive_c.tar.xz / [directx.tar.xz] / *.reg.xz —— arm64ec 不带
+#      directx，设备端 PrefixAssetInflater 自动解压）。
+#
+# v8.5 修复清单（2026-11-17 arm64ec 冒烟 ntdll.so 双重路径根因）：
+#   ⑦ arm64ec 槽位污染 —— rootfs 自带内置 wine（hangover-11.16，
+#      usr/opt 根布局，bin/wine → ../lib/wine/aarch64-unix/wine 符号
+#      链接）。旧版 arm64ec 分支直接 `cp -a` 叠加：GNU cp 会**穿过
+#      符号链接**把新 wine 的 loader 写进 lib/wine/aarch64-unix/wine，
+#      bin/wine 仍是符号链接 → realpath 解析到 lib 侧 → proton-10.0
+#      形态 loader 按自身位置算 `../lib` 相对路径得双重路径
+#      lib/wine/lib/wine/aarch64-unix/ntdll.so → 冒烟报
+#      "dlopen failed: library ... not found"（x86_64 槽位=usr/opt/wine
+#      且并入前已 rm -rf，故不受害）。修复：arm64ec 并入前**整体
+#      清空 usr/opt 再重建**（槽位内容=发行包原文），并入后做槽位
+#      纯净性硬校验（bin/wine 形态必须与包内一致）；
+#   ⑧ WINEDLLPATH 保险 —— wine 10.0 loader 的 ntdll.so 搜索链里
+#      WINEDLLPATH/<arch>-unix/ntdll.so 是独立兑底路径；冒烟与
+#      wineboot 均注入 WINEDLLPATH=<槽位>/lib/wine，任何布局形态下
+#      loader 都能定位 ntdll（10.0 实文件形态 / 10.17+ 符号链接形态
+#      双兼容）；
+#
+# 设备端消费链（App v8+）：
+#   1. <wineDir>/prefix-pack.tar.zst      随 wine tar 一起装进槽位
+#      （*-with-wine.tar.gz / *-with-wine-rootfs.tar.gz 两条安装通道）；
+#   2. rootfs/opt/prefix/pack/*.tar.zst   生态包通道；
+#   3. 设备黄金模板                        wineboot 成功后自动快照；
+#   4. APK assets builtin/prefix/         内置兜底。
+# 详见 docs/prefix-architecture.md。
+# ============================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      wine_flavor:
+        description: 'Wine 形态（对应 build-wine-bionic 产物）'
+        required: false
+        default: 'both'
+        type: choice
+        options:
+          - x86_64
+          - arm64ec
+          - both
+      wine_tar_url:
+        description: 'wine 发行包直链（linbox-wine-*-bionic.tar.gz；留空自动取最新 Release）'
+        required: false
+        default: ''
+        type: string
+      rootfs_tar_url:
+        description: 'bionic rootfs 直链（linbox-rootfs-*.tar.gz，v8.4 前旧名 linbox-bionic-rootfs-* 亦命中；留空自动取最新 Release）'
+        required: false
+        default: ''
+        type: string
+      directx_url:
+        description: '可选：directx.tar.xz 直链（仅 x86_64 component 布局内嵌；留空则不带）'
+        required: false
+        default: ''
+        type: string
+      layout:
+        description: '产物布局（both=full+component 双包；full=秒开模板；component=两个 xz+注册表）'
+        required: false
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - full
+          - component
+      mode:
+        description: '构建模式（full=真跑 wineboot，验收不过即失败【推荐】；auto=失败降级 skeleton；skeleton=纯骨架）'
+        required: false
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - auto
+          - skeleton
+      make_release:
+        description: '构建成功后创建 GitHub Release'
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: prefix-pack-${{ github.ref }}-${{ github.event.inputs.wine_flavor }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-prefix-pack:
+    name: Prefix Pack (${{ matrix.flavor }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: ${{ github.event.inputs.wine_flavor == 'both' && fromJson('["x86_64","arm64ec"]') || fromJson(format('["{0}"]', github.event.inputs.wine_flavor)) }}
+    env:
+      # Android API29 官方模拟器镜像（真 bionic 运行时来源）
+      SYSIMG_ARM64: https://dl.google.com/android/repository/sys-img/android/arm64-v8a-29_r08.zip
+      SYSIMG_X86_64: https://dl.google.com/android/repository/sys-img/android/x86_64-29_r08-linux.zip
+      # 设备形态 rootfs 根（wine 编译期绝对路径前缀）
+      LINBOX_ROOTFS: /data/data/com.linbox/files/rootfs
+      WINEBOOT_TIMEOUT: '1800'
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      # ============ 1. 宿主依赖 + binfmt 自检 ============
+      - name: 安装宿主依赖（zstd / qemu-user-static / python）并自检 binfmt
+        run: |
+          set -eu
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends zstd qemu-user-static binfmt-support python3-pip unzip
+          python3 -m pip install --quiet zstandard ext4
+          echo "=== binfmt_misc（guest 内部 exec 的接续关键）==="
+          if [ -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
+            echo "  [OK] qemu-aarch64 binfmt 已注册"
+          else
+            sudo update-binfmts --enable qemu-aarch64 || true
+            if [ -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
+              echo "  [OK] 已补注册"
+            else
+              echo "::error::qemu-aarch64 binfmt_misc 未注册 —— wineserver/wow64 重执行链必断（qemu-user-static 安装异常）"
+              exit 1
+            fi
+          fi
+          qemu-aarch64-static --version | head -1
+
+      # ============ 2. 解析 wine / rootfs 包地址 ============
+      - name: 解析 wine / rootfs 包地址
+        run: |
+          set -eu
+          pick_latest() {
+            # Releases 资产按前缀取最新（分页扫描，最多 500 条）
+            local prefix="$1" hit=""
+            for page in 1 2 3 4 5; do
+              hit=$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100&page=${page}" \
+                --jq ".[].assets[].browser_download_url" 2>/dev/null \
+                | grep -E "^https://.*/${prefix}" | head -n 1)
+              [[ -n "$hit" ]] && { echo "$hit"; return 0; }
+            done
+            return 1
+          }
+          if [[ -z "${{ github.event.inputs.wine_tar_url }}" ]]; then
+            WINE_URL=$(pick_latest "linbox-wine-.*-${{ matrix.flavor }}-bionic\.tar\.gz" || true)
+            [[ -n "$WINE_URL" ]] || { echo "::error::未找到 linbox-wine-*-${{ matrix.flavor }}-bionic.tar.gz 的 Release 资产，请先跑 build-wine-bionic 或手填 wine_tar_url"; exit 1; }
+          else
+            WINE_URL="${{ github.event.inputs.wine_tar_url }}"
+          fi
+          if [[ -z "${{ github.event.inputs.rootfs_tar_url }}" ]]; then
+            # v8.4 起新资产名 linbox-rootfs-*；旧名 linbox-bionic-rootfs-* 兼容命中
+            ROOTFS_URL=$(pick_latest "linbox-rootfs-.*-aarch64\.tar\.gz" \
+                        || pick_latest "linbox-bionic-rootfs-.*-aarch64\.tar\.gz" || true)
+            [[ -n "$ROOTFS_URL" ]] || { echo "::error::未找到 linbox-rootfs-*-aarch64.tar.gz（或旧名 linbox-bionic-rootfs-*）的 Release 资产，请先跑 build-rootfs 或手填 rootfs_tar_url"; exit 1; }
+          else
+            ROOTFS_URL="${{ github.event.inputs.rootfs_tar_url }}"
+          fi
+          echo "WINE_URL=$WINE_URL" >> "$GITHUB_ENV"
+          echo "ROOTFS_URL=$ROOTFS_URL" >> "$GITHUB_ENV"
+          echo "wine  : $WINE_URL"
+          echo "rootfs: $ROOTFS_URL"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      # ============ 3. 下载 wine / rootfs（+ 可选 directx）============
+      - name: 下载 wine / rootfs
+        run: |
+          set -eu
+          mkdir -p /tmp/src
+          curl -fL --retry 3 -o /tmp/src/wine.tar.gz "$WINE_URL"
+          curl -fL --retry 3 -o /tmp/src/rootfs.tar.gz "$ROOTFS_URL"
+          if [[ -n "${{ github.event.inputs.directx_url }}" ]]; then
+            curl -fL --retry 3 -o /tmp/src/directx.tar.xz "${{ github.event.inputs.directx_url }}"
+            ls -lh /tmp/src/directx.tar.xz
+          fi
+          ls -lh /tmp/src/
+
+      # ============ 4. 解包 wine / rootfs 并定位槽位 ============
+      - name: 解包 wine / rootfs 并定位槽位
+        run: |
+          set -eu
+          FLAVOR="${{ matrix.flavor }}"
+          rm -rf /tmp/wine-full /tmp/rootfs-full
+          mkdir -p /tmp/wine-full /tmp/rootfs-full
+          tar -xzf /tmp/src/wine.tar.gz -C /tmp/wine-full
+          tar -xzf /tmp/src/rootfs.tar.gz -C /tmp/rootfs-full
+
+          # ---- wine 槽位定位：发行包为 data/data 全路径布局 ----
+          #   x86_64 形态 → usr/opt/wine（bin/wine 在此）
+          #   arm64ec 形态 → usr/opt（bin/wine 在此）
+          #   兼容兜底：顶层即槽位树（手工包）
+          W="data/data/com.linbox/files/rootfs/usr"
+          SLOT_REL=""
+          if   [ -x "/tmp/wine-full/$W/opt/wine/bin/wine" ]; then SLOT_REL="opt/wine"
+          elif [ -x "/tmp/wine-full/$W/opt/bin/wine"      ]; then SLOT_REL="opt"
+          elif [ -x "/tmp/wine-full/opt/wine/bin/wine" ] || [ -x "/tmp/wine-full/bin/wine" ]; then
+            echo "::error::wine 包为顶层槽位树布局（非官方发行布局）—— 请用 build-wine-bionic 产物"
+            exit 1
+          else
+            echo "::error::wine 包内未找到 bin/wine（布局异常）。包根内容："
+            find /tmp/wine-full -maxdepth 6 -type d | head -20
+            exit 1
+          fi
+          echo "wine 槽位相对路径：usr/$SLOT_REL"
+
+          # ---- ELF 架构交叉校验（防 flavor 与包不匹配）----
+          WINE_ELF=$(realpath "/tmp/wine-full/$W/$SLOT_REL/bin/wine")
+          EM=$(WINE_ELF="$WINE_ELF" python3 -c '
+          import os
+          with open(os.environ["WINE_ELF"], "rb") as f: h = f.read(20)
+          print(h[18] | (h[19] << 8))')
+          WANT_EM=183; [ "$FLAVOR" = "x86_64" ] && WANT_EM=62
+          if [ "$EM" != "$WANT_EM" ]; then
+            echo "::error::ELF 架构不匹配：flavor=$FLAVOR 期望 e_machine=$WANT_EM，实际=$EM（${WINE_ELF}）—— 请核对 wine_tar_url"
+            exit 1
+          fi
+          echo "ELF 校验通过（e_machine=$EM）"
+
+          # ---- rootfs 归位（data/data 全路径 → 真实设备路径）----
+          sudo mkdir -p /data/data/com.linbox/files
+          sudo cp -a /tmp/rootfs-full/data/data/com.linbox/files/rootfs /data/data/com.linbox/files/rootfs
+          # wineboot 要在 usr/tmp 下建 .wine-<uid> socket 目录 —— 全树归 runner
+          sudo chown -R "$(id -u):$(id -g)" /data/data/com.linbox
+          # wine 槽位并入（形态分流）
+          if [ "$SLOT_REL" = "opt/wine" ]; then
+            sudo rm -rf "$LINBOX_ROOTFS/usr/opt/wine"
+            sudo cp -a "/tmp/wine-full/$W/opt/wine" "$LINBOX_ROOTFS/usr/opt/wine"
+            WINE_DIR="$LINBOX_ROOTFS/usr/opt/wine"
+          else
+            # v8.5：arm64ec 槽位 = usr/opt 根 —— 但 rootfs 自带内置 wine
+            #（hangover，bin/wine→../lib/wine/aarch64-unix/wine 符号链接）。
+            # 直接 cp -a 会穿过符号链接把新 loader 写进 lib 侧、bin/wine
+            # 仍是旧符号链接 → proton-10.0 loader 的 ../lib 相对寻址得到
+            # 双重路径（2026-11-17 冒烟实锤）。必须先整体清空再重建，
+            # 保证槽位内容 = 发行包原文（与 x86_64 分支的 rm -rf 同语义）。
+            sudo rm -rf "$LINBOX_ROOTFS/usr/opt"
+            sudo mkdir -p "$LINBOX_ROOTFS/usr/opt"
+            sudo cp -a "/tmp/wine-full/$W/opt/." "$LINBOX_ROOTFS/usr/opt/"
+            WINE_DIR="$LINBOX_ROOTFS/usr/opt"
+          fi
+          # ---- 槽位纯净性硬校验（防叠加污染回归）----
+          # 并入后 bin/wine 的【形态】（符号链接 / 实文件）必须与发行包
+          # 内一致；不一致即说明叠加写穿或槽位残留（冒烟必炸，早死早超生）
+          PKG_WINE="/tmp/wine-full/$W/$SLOT_REL/bin/wine"
+          if [ -L "$PKG_WINE" ] && [ ! -L "$WINE_DIR/bin/wine" ]; then
+            echo "::error::槽位污染：包内 bin/wine 为符号链接而槽位内为实文件（叠加异常）"
+            exit 1
+          fi
+          if [ ! -L "$PKG_WINE" ] && [ -L "$WINE_DIR/bin/wine" ]; then
+            echo "::error::槽位污染：包内 bin/wine 为实文件而槽位内为符号链接（rootfs 内置 wine 残留未被清除）—— arm64ec 槽位必须先 rm -rf 再并入"
+            ls -la "$WINE_DIR/bin/wine"
+            exit 1
+          fi
+          echo "槽位纯净性校验通过：bin/wine 形态与发行包一致（$( [ -L "$WINE_DIR/bin/wine" ] && echo '符号链接→'$(readlink "$WINE_DIR/bin/wine") || echo '实文件' )）"
+          # 无头 wineboot：不建 .X11-unix（不连 X11），仅 tmp/home
+          sudo mkdir -p "$LINBOX_ROOTFS/usr/tmp" "$LINBOX_ROOTFS/home"
+          sudo chown -R "$(id -u):$(id -g)" "$LINBOX_ROOTFS/usr/tmp" "$LINBOX_ROOTFS/home"
+          # rootfs 关键依赖自检（arm64ec wine 的 DT_NEEDED 所在）
+          echo "=== rootfs usr/lib 关键库自检 ==="
+          for lib in libandroid-shmem libc++_shared; do
+            if ls "$LINBOX_ROOTFS/usr/lib/"${lib}.so* >/dev/null 2>&1; then
+              echo "  [OK] $lib"
+            else
+              echo "  [WARN] rootfs usr/lib 缺 $lib（wineboot 可能失败 —— rootfs 包与 wine 形态不匹配？）"
+            fi
+          done
+          # 临时解包目录消磁（/data 侧已是权威副本；磁盘紧张预防）
+          rm -rf /tmp/wine-full /tmp/rootfs-full
+          echo "WINE_DIR=$WINE_DIR" >> "$GITHUB_ENV"
+          echo "WINE_SLOT_NAME=$(basename "$WINE_URL" .tar.gz)" >> "$GITHUB_ENV"
+          echo "WINE_ARCH=$([ "$FLAVOR" = "arm64ec" ] && echo aarch64 || echo x86_64)" >> "$GITHUB_ENV"
+          echo "wineDir=$WINE_DIR（slot=$(basename "$WINE_URL" .tar.gz)）"
+          sudo ls "$WINE_DIR/bin/" | head
+          cat "$WINE_DIR/.linbox-wine-info" 2>/dev/null || true
+        env:
+          LINBOX_ROOTFS: /data/data/com.linbox/files/rootfs
+
+      # ============ 5. 真 bionic /system（Android 官方镜像，带缓存）============
+      - name: 缓存 Android 系统镜像 bionic 运行时
+        uses: actions/cache@v4
+        with:
+          path: ~/android-bionic
+          key: linbox-android-bionic-29-${{ matrix.flavor }}-v1
+
+      - name: 提取真 bionic 运行时（linker64 + bionic 库）
+        run: |
+          set -eu
+          if [ -x ~/android-bionic/system/bin/linker64 ]; then
+            echo "  [OK] 缓存命中：~/android-bionic/system/bin/linker64"
+            ls ~/android-bionic/system/lib64 | head -5
+          else
+            rm -rf ~/android-bionic
+            ZIP=/tmp/android-sysimg.zip
+            if [ "${{ matrix.flavor }}" = "arm64ec" ]; then
+              curl -fsSL --retry 3 -o "$ZIP" "$SYSIMG_ARM64"
+            else
+              curl -fsSL --retry 3 -o "$ZIP" "$SYSIMG_X86_64"
+            fi
+            # 落盘 system.img（GPT/动态分区解析 + ext4 提取）
+            unzip -q -o "$ZIP" '*/system.img' -d /tmp/sysimg
+            IMG=$(find /tmp/sysimg -name system.img | head -n1)
+            python3 tools/prefix-pack/extract_android_system.py \
+              --image "$IMG" --output ~/android-bionic
+            rm -rf /tmp/sysimg "$ZIP"
+          fi
+
+      - name: 伪装 Android /system 与 /apex（真 bionic）
+        run: |
+          set -eu
+          sudo mkdir -p /system /apex
+          sudo cp -a ~/android-bionic/system/. /system/
+          sudo cp -a ~/android-bionic/apex/. /apex/ 2>/dev/null || true
+          sudo chmod 755 /system/bin/linker64
+          echo "=== /system 自检 ==="
+          file /system/bin/linker64 | head -1
+          ls /system/lib64/ | grep -E '^(libc|libm|libdl|liblog|libz)\.so$'
+
+      # ============ 6. qemu 冒烟硬门禁（加载链断裂 = 快速失败）============
+      # v8.4：冒烟带上与 build_prefix.py 同源的 LD_LIBRARY_PATH
+      # （rootfs usr/lib 必须在列 —— libandroid-shmem.so 是 arm64ec wine
+      #  的 DT_NEEDED，v8.2 冒烟不设路径报 "not found" 即此根因）。
+      # v8.5：+WINEDLLPATH=<槽位>/lib/wine —— wine 10.0 loader 的
+      # ntdll.so 搜索链兑底（10.0 实文件 / 10.17+ 符号链接两种布局
+      # 双兼容）；门禁化理由：加载链断则 wineboot 必然 30 分钟超时白烧。
+      - name: qemu 冒烟硬门禁（wine --version 全链自证）
+        run: |
+          set -eu
+          WINE_ELF=$(realpath "$WINE_DIR/bin/wine")
+          if [ "${{ matrix.flavor }}" = "arm64ec" ]; then
+            LP="$WINE_DIR/lib/wine/aarch64-unix:$LINBOX_ROOTFS/usr/lib:/system/lib64"
+            RUN=(qemu-aarch64-static "$WINE_ELF")
+          else
+            LP="$WINE_DIR/lib/wine/x86_64-unix:$WINE_DIR/lib/x86_64-bionic:/system/lib64"
+            RUN=("$WINE_ELF")
+          fi
+          export LD_LIBRARY_PATH="$LP"
+          # v8.5：ntdll.so 定位兑底（10.0/10.17+ 双布局兼容）
+          if [ -d "$WINE_DIR/lib/wine" ]; then
+            export WINEDLLPATH="$WINE_DIR/lib/wine"
+          fi
+          echo "冒烟：LD_LIBRARY_PATH=$LP"
+          echo "冒烟：WINEDLLPATH=${WINEDLLPATH:-（未设）}"
+          set +e
+          OUT=$(timeout 120 "${RUN[@]}" --version 2>&1)
+          RC=$?
+          set -e
+          echo "$OUT" | head -5
+          if [ $RC -ne 0 ] || ! echo "$OUT" | grep -q "wine-"; then
+            echo "::error::wine 冒烟失败（rc=$RC）—— bionic/qemu/依赖库加载链断裂，wineboot 必然失败"
+            echo "  诊断："
+            echo "   - LD_LIBRARY_PATH=$LP"
+            echo "   - WINEDLLPATH=${WINEDLLPATH:-（未设）}"
+            ls -la "$WINE_DIR/bin/wine" || true
+            ls -d "$WINE_DIR"/lib/wine/*-unix 2>/dev/null || echo "   - [!] wine 无 *-unix 目录"
+            ls "$WINE_DIR/lib/wine/"*-unix/ntdll.so 2>/dev/null || echo "   - [!] *-unix 目录缺 ntdll.so（包布局异常）"
+            ls "$LINBOX_ROOTFS/usr/lib/" 2>/dev/null | grep -iE 'shmem|pulse|asound|X11' | head -5 \
+              || echo "   - [!] rootfs usr/lib 无 wine 依赖闭包（rootfs 包异常或过旧）"
+            ls /system/lib64/ | grep -E '^libc\.so$' || echo "   - [!] /system/lib64 缺 libc.so（镜像提取异常）"
+            exit 1
+          fi
+          echo "  [OK] 冒烟通过：$(echo "$OUT" | head -1)"
+        env:
+          LINBOX_ROOTFS: /data/data/com.linbox/files/rootfs
+
+      # ============ 7. 无头 wineboot 构建前缀 ============
+      - name: 构建前缀（build_prefix.py · 无头 wineboot -u）
+        timeout-minutes: 45
+        run: |
+          set -eu
+          mkdir -p out
+          python3 tools/prefix-pack/build_prefix.py \
+            --wine-dir "$WINE_DIR" \
+            --rootfs "$LINBOX_ROOTFS" \
+            --prefix-out out/prefix-template \
+            --log-file out/wineboot.log \
+            --mode "${{ github.event.inputs.mode }}" \
+            --timeout "$WINEBOOT_TIMEOUT"
+        env:
+          LINBOX_ROOTFS: /data/data/com.linbox/files/rootfs
+
+      # ============ 8. 打包（make_prefix_pack.py · 双布局）============
+      - name: 打包前缀模板包（full + component）
+        run: |
+          set -eu
+          LAYOUT="${{ github.event.inputs.layout }}"
+          ARGS_DIRECTX=""
+          if [ "${{ matrix.flavor }}" = "x86_64" ] \
+             && [ "${LAYOUT}" != "full" ] \
+             && [ -f /tmp/src/directx.tar.xz ]; then
+            ARGS_DIRECTX="--directx /tmp/src/directx.tar.xz"
+          fi
+          # arm64ec 不带 directx.tar.xz（x86 DirectX 预置件破坏 arm64ec
+          # 前缀的 DLL 加载序；设备端 PrefixAssetInflater 对 x86_64 包
+          # 内的 directx 也是自动跳过标记 —— 语义一致）
+          # ⑩ wine.inf 探测（arm64ec 槽位=usr/opt，x86_64 槽位=usr/opt/wine；
+          #     二者 share/wine/wine.inf 均相对槽位根）
+          WINE_INF=$(ls "$WINE_DIR/share/wine/wine.inf" 2>/dev/null \
+                    || find "$WINE_DIR" -name wine.inf -not -path '*/drive_c/*' 2>/dev/null | head -n1)
+          echo "WINE_INF=$WINE_INF" >> "$GITHUB_ENV"
+
+          if [ "${LAYOUT}" = "component" ]; then
+            # component 为主产物
+            python3 tools/prefix-pack/make_prefix_pack.py \
+              --prefix out/prefix-template \
+              --wine-slot "$WINE_SLOT_NAME" \
+              --arch "$WINE_ARCH" \
+              --wine-inf "$WINE_INF" \
+              --layout component $ARGS_DIRECTX \
+              --output out/prefix-pack.tar.zst
+          else
+            # full 为主产物（--keep-stamp：与同源 wine 配对安装时设备端
+            # PrefixMaintainer 判定戳一致，跳过增量 wineboot → 真秒开）
+            python3 tools/prefix-pack/make_prefix_pack.py \
+              --prefix out/prefix-template \
+              --wine-slot "$WINE_SLOT_NAME" \
+              --arch "$WINE_ARCH" \
+              --wine-inf "$WINE_INF" \
+              --layout full --keep-stamp \
+              --output out/prefix-pack.tar.zst
+            if [ "${LAYOUT}" = "both" ]; then
+              python3 tools/prefix-pack/make_prefix_pack.py \
+                --prefix out/prefix-template \
+                --wine-slot "$WINE_SLOT_NAME" \
+                --arch "$WINE_ARCH" \
+                --wine-inf "$WINE_INF" \
+                --layout component $ARGS_DIRECTX \
+                --output out/prefix-pack-component.tar.zst
+            fi
+          fi
+          ls -lh out/
+
+      # ============ 9. 校验 ============
+      - name: 校验前缀模板包（verify_prefix.py）
+        run: |
+          set -eu
+          for PK in out/prefix-pack.tar.zst out/prefix-pack-component.tar.zst; do
+            [ -f "$PK" ] || continue
+            echo "=== $PK ==="
+            python3 tools/prefix-pack/verify_prefix.py "$PK"
+            zstd -t "$PK" && echo "zstd 流校验 OK"
+          done
+
+      # ============ 10. 打包发行（三布局产物 + 校验和）============
+      - name: 打包发行（独立包 / 槽位树 / data/data 全路径）
+        run: |
+          set -eu
+          FLAVOR="${{ matrix.flavor }}"
+          PACKAGE_NAME="linbox-prefix-pack-${WINE_SLOT_NAME}"
+          echo "PACKAGE_NAME=$PACKAGE_NAME" >> "$GITHUB_ENV"
+
+          # ① 独立包（生态通道：解压到 rootfs/opt/prefix/pack/ 即被识别）
+          cp out/prefix-pack.tar.zst "${PACKAGE_NAME}.tar.zst"
+          EXTRA_ASSETS=""
+          if [ -f out/prefix-pack-component.tar.zst ]; then
+            cp out/prefix-pack-component.tar.zst "${PACKAGE_NAME}-component.tar.zst"
+            EXTRA_ASSETS="${PACKAGE_NAME}-component.tar.zst"
+          fi
+
+          # ② wine 槽位集成包（App 安装器通道：顶层即槽位树，
+          #    installFromTar --strip-components=1 语义；prefix-pack 落槽位根）
+          rm -rf /tmp/slot-integration && mkdir -p /tmp/slot-integration
+          cp -a "$WINE_DIR/." /tmp/slot-integration/
+          cp out/prefix-pack.tar.zst /tmp/slot-integration/prefix-pack.tar.zst
+          tar -czf "${PACKAGE_NAME}-with-wine.tar.gz" -C /tmp/slot-integration .
+
+          # ③ data/data 全路径集成包（CLI 通道：linbox-container install-wine
+          #    解到 / 即落位；arm64ec 形态槽位=usr/opt，x86_64 形态=usr/opt/wine）
+          rm -rf /tmp/rootfs-integration
+          mkdir -p "/tmp/rootfs-integration/data/data/com.linbox/files/rootfs/usr/$(dirname "$SLOT_REL_PATH")"
+          cp -a "$WINE_DIR/." "/tmp/rootfs-integration/data/data/com.linbox/files/rootfs/usr/$SLOT_REL_PATH/"
+          cp out/prefix-pack.tar.zst "/tmp/rootfs-integration/data/data/com.linbox/files/rootfs/usr/$SLOT_REL_PATH/prefix-pack.tar.zst"
+          tar -czf "${PACKAGE_NAME}-with-wine-rootfs.tar.gz" -C /tmp/rootfs-integration .
+
+          {
+            sha256sum "${PACKAGE_NAME}.tar.zst"
+            if [ -n "$EXTRA_ASSETS" ]; then sha256sum "$EXTRA_ASSETS"; fi
+            sha256sum "${PACKAGE_NAME}-with-wine.tar.gz"
+            sha256sum "${PACKAGE_NAME}-with-wine-rootfs.tar.gz"
+          } > "checksums-prefix-pack-${FLAVOR}.txt"
+          ls -lh "${PACKAGE_NAME}"* "checksums-prefix-pack-${FLAVOR}.txt"
+          cat "checksums-prefix-pack-${FLAVOR}.txt"
+        env:
+          # 步骤 4 已知：x86_64 形态 SLOT=opt/wine；arm64ec 形态 SLOT=opt
+          SLOT_REL_PATH: ${{ matrix.flavor == 'arm64ec' && 'opt' || 'opt/wine' }}
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE_NAME }}
+          path: |
+            ${{ env.PACKAGE_NAME }}.tar.zst
+            ${{ env.PACKAGE_NAME }}-component.tar.zst
+            ${{ env.PACKAGE_NAME }}-with-wine.tar.gz
+            ${{ env.PACKAGE_NAME }}-with-wine-rootfs.tar.gz
+            checksums-prefix-pack-${{ matrix.flavor }}.txt
+          if-no-files-found: error
+
+      # wineboot 全量日志（WINEDEBUG=err+all）：失败时现场诊断，
+      # 成功时也随包留存（体积小）
+      - name: 上传 wineboot 日志（诊断）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prefix-pack-wineboot-log-${{ matrix.flavor }}
+          path: out/wineboot.log
+          if-no-files-found: ignore
+
+      - name: 创建 Release
+        if: ${{ github.event.inputs.make_release == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: prefix-pack-${{ env.WINE_SLOT_NAME }}
+          name: LinBox Prefix Pack ${{ env.WINE_SLOT_NAME }} (${{ matrix.flavor }})
+          body: |
+            LinBox v8.4 前缀架构 · 预构建前缀模板包（${{ matrix.flavor }}）
+
+            - 构建模式: ${{ github.event.inputs.mode }}（full=无头 wineboot 完整 hive；auto=失败降级骨架；skeleton=纯骨架）
+            - 布局: ${{ github.event.inputs.layout }}（full=秒开模板【--keep-stamp】；component=drive_c.tar.xz + *.reg.xz【arm64ec 不带 directx】）
+            - bionic 运行时: Android API29 官方镜像提取（真 linker64 + bionic 库）；wineboot 环境与设备端 EnvSupport 同源（rootfs usr/lib → wine lib → /system/lib64）
+            - 消费方式（三布局）:
+              - `*.tar.zst` —— 独立模板包：放入 `rootfs/opt/prefix/pack/`（生态通道，任意 wine 槽位可用）
+              - `*-with-wine.tar.gz` —— 槽位树布局：App「Wine 管理 → 从本地安装」（prefix-pack 自动随槽位落位，成为该槽位一级模板来源）
+              - `*-with-wine-rootfs.tar.gz` — data/data 全路径：终端 `linbox-container install-wine <包>` 一键落位
+            - 设备端四级模板来源与供给链详见 `docs/prefix-architecture.md`
+          files: |
+            ${{ env.PACKAGE_NAME }}.tar.zst
+            ${{ env.PACKAGE_NAME }}-component.tar.zst
+            ${{ env.PACKAGE_NAME }}-with-wine.tar.gz
+            ${{ env.PACKAGE_NAME }}-with-wine-rootfs.tar.gz
+            checksums-prefix-pack-${{ matrix.flavor }}.txt

@@ -1,0 +1,185 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pymc-extras"
+authors = [
+  {name = "PyMC Developers", email = "pymc.devs@gmail.com"},
+]
+description =  "A home for new additions to PyMC, which may include unusual probability distribitions, advanced model fitting algorithms, or any code that may be inappropriate to include in the pymc repository, but may want to be made available to users."
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "License :: OSI Approved :: Apache Software License",
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering",
+  "Topic :: Scientific/Engineering :: Mathematics",
+  "Operating System :: OS Independent",
+]
+readme = "README.md"
+requires-python = ">=3.12"
+keywords = [
+  "probability",
+  "machine learning",
+  "statistics",
+  "mcmc",
+  "sampling",
+  "bayesian",
+]
+license = {file = "LICENSE"}
+dynamic = ["version"]  # specify the version in the __init__.py file
+dependencies = [
+  "pymc>=6.4.0,<6.5",
+  "pytensor>=3.3.8,<3.4",
+  "arviz>=1.2,<2.0",
+  "better-optimize>=0.5.1,<1.0",
+  "pandas>=2.2,<3.2",
+  "pydantic>=2.0.0,<3.0",
+  "preliz>=0.27.0,<0.29.0",
+  "pytensor-ml>=0.4.0,<0.5",
+]
+
+[project.optional-dependencies]
+complete = [
+  "dask[complete]",
+  "xhistogram",
+]
+dev = [
+  "pytest>=6.0,<10.0",
+  "dask[all]",
+  "blackjax>=0.12,<2.0",
+  "statsmodels",
+]
+docs = [
+  "nbsphinx>=0.4.2,<1.0",
+  "sphinx>=4.0,<10.0",
+  "pymc-sphinx-theme>=0.16,<1.0",
+]
+dask_histogram = [
+  "dask[complete]",
+  "xhistogram",
+]
+histogram = [
+  "xhistogram",
+]
+mlx_mclmc = [
+  "mlx>=0.32; platform_machine == 'arm64' and sys_platform == 'darwin'",
+]
+
+[project.urls]
+Documentation = "https://pymc-extras.readthedocs.io/"
+Repository = "https://github.com/pymc-devs/pymc-extras.git"
+Issues = "https://github.com/pymc-devs/pymc-extras/issues"
+
+[tool.hatch.version]
+source = 'vcs'
+
+[tool.hatch.build.hooks.vcs]
+version-file = "_version.py"
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+  '/.github',
+  '/notebooks',
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["pymc_extras"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+xfail_strict = true
+addopts = [
+  "-v",
+  "--doctest-modules",
+  "--ignore=pymc_extras/model_builder.py"
+]
+
+filterwarnings =[
+    "error",
+    # JAX issues an over-eager warning if os.fork() is called when the JAX module is loaded, even if JAX isn't being used
+    'ignore:os\.fork\(\) was called\.:RuntimeWarning',
+
+    # OpenMP library warning on windows CI
+    'ignore::RuntimeWarning:threadpoolctl',
+
+    # Numba warnings that are filtered by PyTensor but re-introduced by pytest
+    'ignore::numba.core.errors.NumbaPerformanceWarning',
+    'ignore:.*Cannot cache compiled function.*:numba.core.errors.NumbaWarning',
+
+    # PyMC use of cachetools raises this warning: https://github.com/pymc-devs/pymc/issues/8106
+    'ignore:decorating class methods with @cachedmethod is deprecated:DeprecationWarning',
+
+    # PyMC imports IfElse from the deprecated pytensor.ifelse module
+    "ignore:Importing .* from 'pytensor.ifelse' is deprecated:DeprecationWarning",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+  "pragma: nocover",
+  "raise NotImplementedError",
+  "if TYPE_CHECKING:",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.ruff.lint]
+select = ["D", "E", "F", "I", "UP", "W", "RUF"]
+ignore = [
+  "E501",
+  "RUF001", # String contains ambiguous character (such as Greek letters)
+  "RUF002", # Docstring contains ambiguous character (such as Greek letters)
+  "RUF012", # Mutable class attributes should be annotated with `typing.ClassVar`
+  "RUF059", # Unused unpacked variable -- naming unused tuple elements is idiomatic in PyMC code
+  "D100",
+  "D101",
+  "D102",
+  "D103",
+  "D104",
+  "D105",
+  "D107",
+  "D200",
+  "D202",
+  "D203",
+  "D204",
+  "D205",
+  "D209",
+  "D212",
+  "D213",
+  "D301",
+  "D400",
+  "D401",
+  "D403",
+  "D413",
+  "D415",
+  "D417",
+]
+
+[tool.ruff.lint.isort]
+lines-between-types = 1
+
+[tool.ruff.lint.per-file-ignores]
+'tests/*.py' = [
+  'F841', # Unused variable warning for test files -- common in pymc model declarations
+  'D106',  # Missing docstring for public method -- unittest test subclasses don't need docstrings
+  'E402'  # Import at top, not respected when pytest.importorskip is required
+]
+'tests/statespace/*.py' =  [
+  'F401', # Unused import warning for test files -- this check removes imports of fixtures
+  'F811'  # Redefine while unused -- this check fails on imported fixtures
+]
+'pymc_extras/__init__.py' = ['F401', 'F403']
+'notebooks/*.ipynb' = ['E402']  # Notebooks configure backends and suppress warnings before importing

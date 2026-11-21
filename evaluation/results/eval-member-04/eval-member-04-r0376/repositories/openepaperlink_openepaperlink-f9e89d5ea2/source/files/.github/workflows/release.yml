@@ -1,0 +1,182 @@
+name: Release binaries
+
+on:
+  push:
+    tags:
+      - '*'
+
+permissions:
+  contents: write
+
+jobs:
+  radio:
+    name: Radio firmware ${{ matrix.chip }}
+    runs-on: ubuntu-26.04
+    strategy:
+      matrix:
+        include:
+          - chip: C6
+            target: esp32c6
+          - chip: H2
+            target: esp32h2
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5.5
+          target: ${{ matrix.target }}
+          path: ARM_Tag_FW/OpenEPaperLink_esp32_${{ matrix.chip }}_AP/
+
+      - name: Collect binaries
+        run: |
+          chip=${{ matrix.chip }}
+          build=ARM_Tag_FW/OpenEPaperLink_esp32_${chip}_AP/build
+          mkdir out
+          cp $build/OpenEPaperLink_esp32_${chip}.bin out/
+          cp $build/bootloader/bootloader.bin out/bootloader_${chip}.bin
+          cp $build/partition_table/partition-table.bin out/partition-table_${chip}.bin
+          cp binaries/ESP32-${chip}/firmware_${chip}.json out/
+          # A board with its co-processor on the shared UART0 (the 4inch AP) asks for
+          # firmware_C6_Uart0.json, which names the 4inchAP-profile build of the same source.
+          # That profile isn't built here, so the manifest and its binary come from the repo.
+          if [ $chip = C6 ]; then
+            cp binaries/ESP32-C6/OpenEPaperLink_esp32_C6uart0.bin out/
+            cp binaries/ESP32-C6/firmware_C6_Uart0.json out/
+          fi
+          # The same goes for the ESP Thread Border Router board, which asks for firmware_H2_TBR.json.
+          # Its H2 has 2 MB flash, so that build has its own bootloader and partition table.
+          if [ $chip = H2 ]; then
+            cp binaries/ESP32-H2/OpenEPaperLink_esp32_H2tbr.bin out/
+            cp binaries/ESP32-H2/bootloader_H2tbr.bin out/
+            cp binaries/ESP32-H2/partition-table_H2tbr.bin out/
+            cp binaries/ESP32-H2/firmware_H2_TBR.json out/
+          fi
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: radio-${{ matrix.chip }}
+          path: out/*
+
+  ap:
+    name: AP firmware ${{ matrix.env }}
+    runs-on: ubuntu-26.04
+    strategy:
+      matrix:
+        # chip and flash mode/size default to an ESP32-S3 with 16 MB flash;
+        # the partition offsets for the merged image come from the partition table of the build
+        include:
+          - env: OpenEPaperLink_AP_and_Flasher
+          - env: ESP32_S3_16_8_YELLOW_AP
+          - env: ESP32_S3_C6_NANO_AP
+          - env: ESP32_S3_16_8_LILYGO_AP
+          - env: ESP32_S3_16_8_LILYGO_T3
+          - env: OpenEPaperLink_Nano_TLSR
+          - env: OpenEPaperLink_Nano_TLSR_C6
+          - env: OpenEPaperLink_Mini_AP_v4
+          - env: BLE_ONLY_AP
+          - env: ESP32_S3_16_8_4inch_AP
+          - env: ESP32_S3_SIMPLE_AP
+          - env: ESP32_S3_H2_THREAD_BR
+            size: 8MB
+          - env: OpenEPaperLink_PoE_AP
+            chip: esp32
+            mode: qio
+          - env: OpenEPaperLink_ESP32-PoE-ISO_AP
+            chip: esp32
+            mode: qio
+            size: 4MB
+            # this board gets its web files from the internet, its filesystem starts empty
+            empty_fs: true
+          - env: OpenEPaperLink_Mini_AP
+            chip: esp32s2
+            size: 4MB
+          - env: OpenEPaperLink_Nano_AP
+            chip: esp32s2
+            size: 4MB
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-pio
+
+      - name: Build firmware and filesystem
+        working-directory: ESP32_AP-Flasher
+        run: |
+          # quoted, so PlatformIO keeps a version like 3.00 a string instead of the float 3.0
+          export PLATFORMIO_BUILD_FLAGS="-D BUILD_VERSION='\"${{ github.ref_name }}\"' -D SHA=$GITHUB_SHA"
+          pio run --environment ${{ matrix.env }}
+          if [ "${{ matrix.empty_fs }}" = true ]; then mv data data.bak; mkdir data; fi
+          pio run --target buildfs --environment ${{ matrix.env }}
+          if [ -d data.bak ]; then rmdir data; mv data.bak data; fi
+
+      - name: Merge into a full image
+        run: |
+          build=ESP32_AP-Flasher/.pio/build/${{ matrix.env }}
+          chip=${{ matrix.chip || 'esp32s3' }}
+          # the ESP32 and ESP32-S2 ROMs look for the bootloader at 0x1000, the ESP32-S3 ROM at 0x0
+          boot=0x0
+          if [ $chip = esp32 ] || [ $chip = esp32s2 ]; then boot=0x1000; fi
+          # otadata (where boot_app0.bin goes), the first app and the filesystem partition
+          read otadata app fs < <(python3 - $build/partitions.bin <<'EOF'
+          import struct, sys
+          data = open(sys.argv[1], 'rb').read()
+          found = {}
+          for i in range(0, len(data), 32):
+              magic, ptype, subtype, offset = struct.unpack_from('<HBBI', data, i)
+              if magic != 0x50AA:
+                  break
+              found.setdefault((ptype, subtype), offset)
+          fs = found.get((1, 0x82), found.get((1, 0x83)))
+          print(hex(found[(1, 0x00)]), hex(found[(0, 0x10)]), hex(fs))
+          EOF
+          )
+          echo "bootloader $boot, otadata $otadata, app $app, filesystem $fs"
+          mkdir out
+          cp $build/firmware.bin out/${{ matrix.env }}.bin
+          esptool --chip $chip merge-bin -o out/${{ matrix.env }}_full.bin \
+            --flash-mode ${{ matrix.mode || 'dio' }} --flash-freq 80m --flash-size ${{ matrix.size || '16MB' }} \
+            $boot $build/bootloader.bin \
+            0x8000 $build/partitions.bin \
+            $otadata ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin \
+            $app $build/firmware.bin \
+            $fs $build/littlefs.bin
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ap-${{ matrix.env }}
+          path: out/*
+
+  release:
+    name: Publish release files
+    needs: [radio, ap]
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: espbinaries
+          merge-multiple: true
+
+      - name: Generate the release json files
+        run: |
+          mkdir jsonfiles
+          python3 genfilelist.py ${{ github.ref_name }} $GITHUB_REPOSITORY $GITHUB_SHA
+
+      - name: Add file lists to release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: jsonfiles/*
+          tag: ${{ github.ref }}
+          file_glob: true
+          overwrite: true
+
+      - name: Add binaries to release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: espbinaries/*
+          tag: ${{ github.ref }}
+          file_glob: true
+          overwrite: true

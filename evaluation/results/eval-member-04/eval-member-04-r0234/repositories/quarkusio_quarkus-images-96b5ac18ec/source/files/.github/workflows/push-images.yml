@@ -1,0 +1,64 @@
+name: Push Images to Quay
+on:
+  deployment:
+  schedule:
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+
+jobs:
+  build-images:
+    name: Build and Push images
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "base images"
+            modules: "quarkus-distroless-base-image,quarkus-micro-base-image"
+            args: ""
+          - name: "s2i binary images"
+            modules: "quarkus-binary-s2i"
+            args: ""
+          - name: "s2i native images"
+            modules: "quarkus-native-s2i"
+            args: ""
+          - name: "mandrel builder images (latest)"
+            modules: "quarkus-mandrel-builder-image"
+            args: ""
+          - name: "graalvm ce builder images (latest)"
+            modules: "quarkus-graalvm-builder-image"
+            args: ""
+    steps:
+      - name: Install Podman and qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install podman qemu-user-binfmt binfmt-support
+          sudo update-binfmts --enable qemu-aarch64
+          sudo systemctl restart systemd-binfmt
+      - name: Re-claim some disk space
+        run: |
+          sudo swapoff -a
+          sudo rm -rf /swapfile /usr/share/dotnet /usr/local/lib/android \
+          /usr/local/share/powershell /usr/share/swift /usr/local/.ghcup
+          sudo apt-get clean
+          podman system prune -a -f
+          sudo podman system prune -a -f
+          df -h
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - name: Log in to Quay.io
+        uses: redhat-actions/podman-login@50c2d9a331bb67c8fdab99b86455fad05e2e3252 # v2.0
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USER }}
+          password: ${{ secrets.QUAY_TOKEN }}
+      - name: Build images
+        run: mvn install --batch-mode --projects ${{ matrix.modules }} --also-make -DskipTests -Ppush ${{ matrix.args }}
+      - name: Print ${{ matrix.name}}
+        if: always()
+        run: |
+          df -h
+          podman images

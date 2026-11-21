@@ -1,0 +1,328 @@
+name: Release and Publish
+
+# Manual only: a tag push is published by npm-publish.yml (npm) and publish-github-packages.yml
+# (GitHub Packages). Running this on tags as well published every version three times.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., 3.12.6)'
+        required: true
+      publish_npm:
+        description: 'Publish to npm'
+        type: boolean
+        default: true
+      publish_github:
+        description: 'Publish to GitHub Packages'
+        type: boolean
+        default: true
+      publish_cloudsmith:
+        description: 'Publish to Cloudsmith'
+        type: boolean
+        default: true
+      publish_docker:
+        description: 'Publish Docker image'
+        type: boolean
+        default: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  prepare:
+    name: Prepare Release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION=${GITHUB_REF#refs/tags/v}
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=v$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+          echo "Tag: v$VERSION"
+      
+      - name: Update package.json version
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          npm version $VERSION --no-git-tag-version --allow-same-version
+          cat package.json | grep '"version"'
+
+  publish-npm:
+    name: Publish to npm
+    needs: prepare
+    if: github.event.inputs.publish_npm != 'false' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+      
+      - name: Install pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 9
+      
+      - name: Update version
+        run: |
+          npm version ${{ needs.prepare.outputs.version }} --no-git-tag-version --allow-same-version
+      
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      
+      - name: Build
+        run: pnpm run build
+      
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm publish --access public
+      
+      - name: Verify npm publication
+        run: |
+          echo "✅ Published to npm: @sparesparrow/mcp-prompts@${{ needs.prepare.outputs.version }}"
+
+  publish-github-packages:
+    name: Publish to GitHub Packages
+    needs: prepare
+    if: github.event.inputs.publish_github != 'false' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@sparesparrow'
+      
+      - name: Install pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 9
+      
+      - name: Update version
+        run: |
+          npm version ${{ needs.prepare.outputs.version }} --no-git-tag-version --allow-same-version
+      
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      
+      - name: Build
+        run: pnpm run build
+      
+      - name: Publish to GitHub Packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cp .npmrc.github .npmrc
+          npm publish --registry https://npm.pkg.github.com
+      
+      - name: Verify GitHub Packages publication
+        run: |
+          echo "✅ Published to GitHub Packages: @sparesparrow/mcp-prompts@${{ needs.prepare.outputs.version }}"
+
+  publish-cloudsmith:
+    name: Publish to Cloudsmith
+    needs: prepare
+    if: github.event.inputs.publish_cloudsmith != 'false' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      - name: Install pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 9
+      
+      - name: Install Cloudsmith CLI
+        run: |
+          pip install cloudsmith-cli
+      
+      - name: Update version
+        run: |
+          npm version ${{ needs.prepare.outputs.version }} --no-git-tag-version --allow-same-version
+      
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      
+      - name: Build
+        run: pnpm run build
+      
+      - name: Package for Cloudsmith
+        run: |
+          mkdir -p dist-package
+          cp -r dist/* dist-package/
+          cp package.json dist-package/
+          cp README.md dist-package/
+          cp LICENSE dist-package/
+          cp -r data dist-package/ 2>/dev/null || true
+          tar -czf mcp-prompts-${{ needs.prepare.outputs.version }}.tar.gz -C dist-package .
+      
+      - name: Authenticate with Cloudsmith
+        env:
+          CLOUDSMITH_API_KEY: ${{ secrets.CLOUDSMITH_API_KEY }}
+        run: |
+          cloudsmith whoami
+      
+      - name: Upload to Cloudsmith
+        env:
+          CLOUDSMITH_API_KEY: ${{ secrets.CLOUDSMITH_API_KEY }}
+        run: |
+          cloudsmith upload raw sparesparrow-conan/sparetools \
+            mcp-prompts-${{ needs.prepare.outputs.version }}.tar.gz \
+            --name "mcp-prompts" \
+            --version "${{ needs.prepare.outputs.version }}" \
+            --summary "MCP Prompts Server - Complete Package" \
+            --description "MCP Prompts server with all prompts and dependencies"
+      
+      - name: Verify Cloudsmith publication
+        run: |
+          echo "✅ Published to Cloudsmith: mcp-prompts@${{ needs.prepare.outputs.version }}"
+
+  publish-docker:
+    name: Publish Docker Image
+    needs: prepare
+    if: github.event.inputs.publish_docker != 'false' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      - name: Verify Docker publication
+        run: |
+          echo "✅ Published Docker image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.version }}"
+
+  create-release:
+    name: Create GitHub Release
+    needs: [prepare, publish-npm, publish-github-packages, publish-cloudsmith, publish-docker]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          TAG="${{ needs.prepare.outputs.tag }}"
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || echo "")
+          
+          if [ -z "$PREV_TAG" ]; then
+            CHANGELOG=$(git log --pretty=format:"- %s" HEAD)
+          else
+            CHANGELOG=$(git log --pretty=format:"- %s" ${PREV_TAG}..HEAD)
+          fi
+          
+          cat > /tmp/release_notes.md <<EOF
+          # MCP Prompts $TAG
+          
+          ## 📦 Published Packages
+          
+          - **npm**: \`@sparesparrow/mcp-prompts@${{ needs.prepare.outputs.version }}\`
+          - **GitHub Packages**: \`@sparesparrow/mcp-prompts@${{ needs.prepare.outputs.version }}\`
+          - **Cloudsmith**: \`mcp-prompts@${{ needs.prepare.outputs.version }}\`
+          - **Docker**: \`ghcr.io/${{ github.repository }}:${{ needs.prepare.outputs.version }}\`
+          
+          ## 📋 Changes
+          
+          $CHANGELOG
+          
+          ## 🚀 Installation
+          
+          ### npm
+          \`\`\`bash
+          npm install @sparesparrow/mcp-prompts@${{ needs.prepare.outputs.version }}
+          \`\`\`
+          
+          ### GitHub Packages
+          \`\`\`bash
+          npm install @sparesparrow/mcp-prompts@${{ needs.prepare.outputs.version }} --registry https://npm.pkg.github.com
+          \`\`\`
+          
+          ### Docker
+          \`\`\`bash
+          docker pull ghcr.io/${{ github.repository }}:${{ needs.prepare.outputs.version }}
+          \`\`\`
+          
+          ### Cloudsmith
+          Visit: https://cloudsmith.io/~sparesparrow-conan/repos/sparetools/packages/
+          EOF
+          
+          cat /tmp/release_notes.md
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: MCP Prompts ${{ needs.prepare.outputs.tag }}
+          body_path: /tmp/release_notes.md
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

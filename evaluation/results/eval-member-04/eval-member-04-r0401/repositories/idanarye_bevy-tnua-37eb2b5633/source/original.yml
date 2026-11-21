@@ -1,0 +1,244 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  checks: write
+
+env:
+  all_physics_backends: rapier2d,rapier3d,avian2d,avian3d
+  # all_physics_backends: avian2d,avian3d
+
+jobs:
+  ci:
+    name: CI
+    needs: [test, clippy, docs]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Done
+        run: exit 0
+  test:
+    name: Tests
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        rust: [1.99.1, nightly]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - name: Ready cache
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo chown -R $(whoami):$(id -ng) ~/.cargo/
+      - name: Install dependencies
+        run: sudo apt-get update; sudo apt-get install --no-install-recommends libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libudev-dev
+      - name: Cache cargo
+        uses: actions/cache@v6
+        id: cache
+        with:
+          path: ~/.cargo
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Test
+        run: cargo test --verbose --workspace --exclude tnua-demos-crate -- --nocapture
+      - name: Clean disk space before building the test with different features
+        run: cargo clean
+      - name: Test with state serialization enabled
+        run: cargo test --package bevy-tnua --verbose --features serialize -- --nocapture
+  fmt:
+   name: Rustfmt
+   runs-on: ubuntu-latest
+   steps:
+     - uses: actions/checkout@v7
+     - uses: dtolnay/rust-toolchain@master
+       with:
+         toolchain: 1.99.1
+         components: rustfmt
+     - name: Run fmt --all -- --check
+       run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+          components: clippy
+      - name: Install dependencies
+        run: sudo apt-get update; sudo apt-get install --no-install-recommends libudev-dev
+      - name: Cache cargo
+        uses: actions/cache@v6
+        id: cache
+        with:
+          path: ~/.cargo
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Run clippy
+        uses: actions-rs/clippy-check@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          args: --workspace --all-targets --features ${{ env.all_physics_backends }} --
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+      - name: Install dependencies
+        run: sudo apt-get update; sudo apt-get install --no-install-recommends libudev-dev
+      - name: Cache cargo
+        uses: actions/cache@v6
+        id: cache
+        with:
+          path: ~/.cargo
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Run doc tests
+        run: cargo test --doc --features ${{ env.all_physics_backends }}
+      - name: Get package names
+        id: get-package-names
+        run: |-
+          echo "PACKAGE_NAMES=$(
+            cargo metadata --no-deps --format-version=1 \
+            | jq '.packages[].name' -r \
+            | grep -v tnua-demos-crate \
+            | sort -u \
+            | xargs -L1 echo --package \
+            | paste -sd ' '
+          )" >> "$GITHUB_OUTPUT"
+      - name: Get features for docs
+        id: get-features-for-docs
+        run: |-
+          echo "FEATURES_FOR_DOCS=$(
+            cargo metadata --no-deps --format-version=1 \
+            | jq '.packages[].metadata.docs.rs.features | select(.) | .[]' -r \
+            | sort -u \
+            | xargs -r -L1 echo --features \
+            | paste -sd ' '
+          )" >> "$GITHUB_OUTPUT"
+      - name: Check docs
+        uses: actions-rs/cargo@v1
+        with:
+          command: doc
+          args: --no-deps ${{ steps.get-package-names.outputs.PACKAGE_NAMES }} ${{ steps.get-features-for-docs.outputs.FEATURES_FOR_DOCS }}
+  docs-and-demos-ghpages:
+    name: Update Docs and Demos in GitHub Pages
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jetli/wasm-bindgen-action@v0.1.0
+        with:
+          version: 'latest'
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          targets: wasm32-unknown-unknown
+          toolchain: 1.99.1
+      - name: Get package names
+        id: get-package-names
+        run: |-
+          echo "PACKAGE_NAMES=$(
+            cargo metadata --no-deps --format-version=1 \
+            | jq '.packages[].name | select(. != "tnua-demos-crate")' -r \
+            | grep -v tnua-demos-crate \
+            | sort -u \
+            | xargs -L1 echo --package \
+            | paste -sd ' '
+          )" >> "$GITHUB_OUTPUT"
+      - name: Get features for docs
+        id: get-features-for-docs
+        run: |-
+          echo "FEATURES_FOR_DOCS=$(
+            cargo metadata --no-deps --format-version=1 \
+            | jq '.packages[].metadata.docs.rs.features | select(.) | .[]' -r \
+            | sort -u \
+            | xargs -r -L1 echo --features \
+            | paste -sd ' '
+          )" >> "$GITHUB_OUTPUT"
+      - name: Build docs and demos
+        env:
+          GITHUB_REPO: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |-
+          set -ex
+          cargo doc --verbose ${{ steps.get-package-names.outputs.PACKAGE_NAMES }} ${{ steps.get-features-for-docs.outputs.FEATURES_FOR_DOCS }}
+          echo "<meta http-equiv=refresh content=0;url=bevy_tnua/index.html>" > target/doc/index.html
+
+          function build_for_backend () {
+              physics_backend=$1
+              if [[ ${{ env.all_physics_backends }} != *$physics_backend* ]]; then
+                  echo Skipping $physics_backend because it is not in the list
+                  return 0
+              fi
+              if [ -z ${2+x} ]; then
+                  demo_suffix=$physics_backend
+              else
+                  demo_suffix=$physics_backend-$2
+              fi
+              special_flags=${@:3}
+              RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo build \
+                  --package tnua-demos-crate \
+                  --bins \
+                  --release \
+                  $special_flags \
+                  --features ${physics_backend}2d \
+                  --features ${physics_backend}3d \
+                  --features bevy/webgl2 \
+                  --target wasm32-unknown-unknown
+              for demowasm in $(cd target/wasm32-unknown-unknown/release; ls *.wasm | grep -v -); do
+                  variant=${demowasm%.*}-$demo_suffix
+                  wasm-bindgen target/wasm32-unknown-unknown/release/$demowasm --out-dir target/doc/demos/ --out-name $variant --target web
+                  cat > target/doc/demos/$variant.html <<EOF
+          <html lang="en-us">
+              <head>
+                  <script type="module">
+                      import init from './$variant.js';
+                      var res = await init();
+                      res.start();
+                  </script>
+              </head>
+              <body>
+                  <script>
+                      document.body.addEventListener("contextmenu", (e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                      });
+                  </script>
+              </body>
+          </html>
+          EOF
+              done
+          }
+          build_for_backend rapier
+          build_for_backend avian
+          build_for_backend avian 64 --no-default-features --features f64 --features egui 
+          cp -R demos/assets/ target/doc/demos/
+      - name: Add read permissions
+        run: |-
+          chmod --recursive +r target/doc
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/doc
+  deploy-ghpages:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: docs-and-demos-ghpages
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
