@@ -1,0 +1,230 @@
+name: Publish Docker Images
+
+on:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  REGISTRY_GHCR: ghcr.io
+  REGISTRY_DOCKERHUB: docker.io
+  IMAGE_NAME: sparesparrow/mcp-prompts
+
+jobs:
+  build-and-push:
+    name: Build and Push Docker Images
+    runs-on: ubuntu-latest
+    # Only the production install runs under QEMU for arm64 (the build stage runs natively);
+    # fail instead of hanging if emulation crashes.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - name: default
+            file: Dockerfile
+            tags: latest
+          - name: mcp
+            file: Dockerfile.mcp
+            tags: mcp
+          - name: file
+            file: Dockerfile.file
+            tags: file
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY_GHCR }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to DockerHub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY_DOCKERHUB }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}
+            ${{ env.REGISTRY_DOCKERHUB }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=${{ matrix.variant.tags }}
+            type=raw,value=latest,enable={{is_default_branch}},suffix=-${{ matrix.variant.tags }}
+          flavor: |
+            latest=auto
+
+      - name: Get package version
+        id: package-version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Package version: $VERSION"
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./${{ matrix.variant.file }}
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}:${{ matrix.variant.tags }}
+            ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}:${{ steps.package-version.outputs.version }}-${{ matrix.variant.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.variant.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant.name }}
+          build-args: |
+            BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
+            VERSION=${{ steps.package-version.outputs.version }}
+            REVISION=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.revision'] }}
+
+      - name: Push to DockerHub
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./${{ matrix.variant.file }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.REGISTRY_DOCKERHUB }}/${{ env.IMAGE_NAME }}:${{ matrix.variant.tags }}
+            ${{ env.REGISTRY_DOCKERHUB }}/${{ env.IMAGE_NAME }}:${{ steps.package-version.outputs.version }}-${{ matrix.variant.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.variant.name }}
+          build-args: |
+            BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
+            VERSION=${{ steps.package-version.outputs.version }}
+            REVISION=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.revision'] }}
+        continue-on-error: true
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}:${{ matrix.variant.tags }}
+          format: 'sarif'
+          output: 'trivy-results-${{ matrix.variant.name }}.sarif'
+        continue-on-error: true
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results-${{ matrix.variant.name }}.sarif'
+          category: 'trivy-${{ matrix.variant.name }}'
+        continue-on-error: true
+
+  create-manifest:
+    name: Create Multi-Arch Manifest
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY_GHCR }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get package version
+        id: version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create and push manifest for latest
+        run: |
+          docker buildx imagetools create -t ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}:latest \
+            ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}-latest
+
+      - name: Inspect manifest
+        run: |
+          docker buildx imagetools inspect ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}:latest
+
+  test-images:
+    name: Test Docker Images
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name != 'pull_request'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # A failure here fails the job. The check used to end in "|| echo", and the images took no
+      # arguments, so it passed whatever the image did.
+      - name: The stdio images start, report the package version and know the profiles
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          for variant in mcp file; do
+            image=${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}:$variant
+            docker pull "$image"
+            test "$(docker run --rm "$image" --version)" = "$VERSION"
+            docker run --rm "$image" profiles --json | grep -q '"software-dev"'
+          done
+
+      - name: The HTTP image serves read-only and answers its probes
+        run: |
+          image=${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}:latest
+          docker pull "$image"
+          docker run -d --name http -p 127.0.0.1:3003:3003 "$image"
+          for i in $(seq 1 30); do curl -sf localhost:3003/health > /dev/null && break; sleep 1; done
+          curl -sf localhost:3003/ready | tee ready.json
+          grep -q '"readOnly":true' ready.json
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{"name":"n","content":"c"}' localhost:3003/v1/prompts)" = "405"
+          docker rm -f http
+
+  notify:
+    name: Notify on Success
+    runs-on: ubuntu-latest
+    needs: [build-and-push, create-manifest]
+    if: success()
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Success notification
+        run: |
+          echo "✅ Successfully built and pushed Docker images"
+          echo "📦 Version: ${{ steps.version.outputs.version }}"
+          echo "🐳 Images:"
+          echo "   - ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}:latest"
+          echo "   - ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}:mcp"
+          echo "   - ${{ env.REGISTRY_GHCR }}/${{ env.IMAGE_NAME }}:file"

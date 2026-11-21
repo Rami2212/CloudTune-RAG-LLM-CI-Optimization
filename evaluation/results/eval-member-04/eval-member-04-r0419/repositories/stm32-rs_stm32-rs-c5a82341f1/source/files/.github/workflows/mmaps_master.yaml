@@ -1,0 +1,48 @@
+name: build mmaps
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  build:
+    name: Build mmaps
+    runs-on: ubuntu-latest
+
+    env:
+      SVDTOOLS: svdtools
+
+    steps:
+      - name: Checkout stm32-rs
+        uses: actions/checkout@v4
+        with:
+          path: stm32-rs
+
+      - name: Checkout mmaps
+        uses: actions/checkout@v4
+        with:
+          repository: stm32-rs/stm32-rs-mmaps
+          ssh-key: ${{ secrets.MMAPS_KEY }}
+          path: stm32-rs-mmaps
+
+      - name: Add fictive crate
+        run: |
+          cargo init
+
+      - name: Install tools
+        run: |
+          ./stm32-rs/scripts/tool_install.sh svdtools
+
+      - name: Build and publish
+        run: |
+          cd stm32-rs
+          COMMIT=$(git rev-parse HEAD)
+          make -j2 mmaps
+          mv mmaps/* ../stm32-rs-mmaps/
+          cd ../stm32-rs-mmaps
+          git config user.name "stm32-rs builder"
+          git config user.email "action@github.com"
+          git add .
+          git commit --allow-empty -m "stm32-rs master $COMMIT"
+          git push origin master

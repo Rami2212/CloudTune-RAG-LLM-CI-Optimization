@@ -1,0 +1,88 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [MEDIUM] Add concurrency group to "ci.yaml"
+# - [LOW] Explicitly set fail-fast for large matrix job "check" (23 combinations)
+# Estimated savings: ~4 min/run
+#
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+  merge_group:
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        crate:
+          - stm32c0
+          - stm32f0
+          - stm32f1
+          - stm32f2
+          - stm32f3
+          - stm32f4
+          - stm32f7
+          - stm32h5
+          - stm32h7
+          - stm32l0
+          - stm32l1
+          - stm32l4
+          - stm32l5
+          - stm32g0
+          - stm32g4
+          - stm32mp1
+          - stm32n6
+          - stm32u0
+          - stm32u5
+          - stm32wl
+          - stm32wb
+          - stm32wb0
+          - stm32wba
+
+    env:
+      CRATES: ${{ matrix.crate }}
+      CARGO_INCREMENTAL: 0
+      SVDTOOLS: svdtools
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Install xmllint
+        run: |
+          sudo apt-get update
+          sudo apt-get install libxml2-utils
+
+      - name: Create working crate
+        run: make crates
+
+      - name: Install tools
+        run: |
+          ./scripts/tool_install.sh svdtools
+          ./scripts/tool_install.sh svd2rust
+
+      - name: Patch SVDs
+        run: make -j2 patch
+
+      - name: Check SVDs
+        run: make lint
+
+      - name: Build PACs
+        run: make -j2 svd2rust
+
+      - name: Check PACs
+        run: make -j2 check

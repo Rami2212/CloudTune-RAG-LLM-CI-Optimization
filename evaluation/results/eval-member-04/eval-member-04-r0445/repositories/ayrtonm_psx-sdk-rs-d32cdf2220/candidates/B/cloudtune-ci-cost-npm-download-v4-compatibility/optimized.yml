@@ -1,0 +1,74 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [HIGH] Add cargo dependency cache to "build" job
+# - [MEDIUM] Add concurrency group to "rust.yml"
+# Estimated savings: ~10 min/run
+#
+name: Rust
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+    - name: Provision build environment
+      run: |
+        rustup update nightly
+        rustup component add rust-src --toolchain nightly
+        # Install cargo-psx
+        pushd cargo-psx
+        cargo install --path .
+        popd
+        # Install the emulator, BFD linker and xvfb
+        sudo apt-get install -y       \
+            binutils-mipsel-linux-gnu \
+            mednafen                  \
+            xvfb
+    - name: Build the BIOS
+      run: |
+        # Build the BIOS and configure the emulator to use it
+        pushd examples/bios
+        cargo psx build --link bios.ld --lto
+        mkdir -p ~/.mednafen/firmware
+        cp target/mipsel-sony-psx/release/bios.exe \
+            ~/.mednafen/firmware/scph7001.bin
+        popd
+    - name: Run psx crate tests
+      run: |
+        pushd psx
+        # TODO: Simplify this. runner=echo is a dumb way to get the test exe.
+        # Ideally I'd just run cargo psx test with xvfb-run
+        TEST_EXE=$(CARGO_TARGET_MIPSEL_SONY_PSX_RUNNER=echo cargo psx test)
+        xvfb-run mednafen -psx.dbg_level 2 -psx.bios_jp scph7001.bin $TEST_EXE \
+            | tee bios_stdout &
+        sleep 30
+        grep "test result: ok. [0-9]* passed; 0 failed" bios_stdout
+        popd
+    - name: Build examples
+      run: |
+        pushd examples
+        for d in */; do
+            if [ $d != "bios/" ]; then
+                pushd $d
+                cargo psx build
+                popd
+            fi
+        done
+        popd
