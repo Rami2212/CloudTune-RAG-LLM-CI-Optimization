@@ -1,0 +1,51 @@
+name: php-cs-fixer
+
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+
+env:
+  COMPOSER_NO_SECURITY_BLOCKING: 1
+
+jobs:
+  php-cs-fixer:
+    name: php-cs-fixer
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          coverage: none
+        env:
+          COMPOSER_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+
+      - name: Cache composer dependencies
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          # Use composer.json for key, if composer.lock is not committed.
+          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.json') }}
+          # key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+          restore-keys: ${{ runner.os }}-composer-
+
+      - name: Run composer install
+        run: composer install --no-interaction --ansi -v
+
+      - name: Run php-cs-fixer with annotate-pull-request format
+        continue-on-error: true
+        run: composer php-cs-fixer:fix-dry-run-format-annotate-pull-request
+
+      - name: Run php-cs-fixer
+        run: composer php-cs-fixer:fix-dry-run
+
+      - name: ecs
+        run: composer ecs:check

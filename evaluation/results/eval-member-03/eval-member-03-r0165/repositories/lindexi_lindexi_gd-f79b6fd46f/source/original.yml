@@ -1,0 +1,27 @@
+﻿name: publish nuget
+
+on: 
+  push:
+    tags:
+    - '*'
+
+jobs:
+  build:
+
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v1
+
+    - name: Set tag to version
+      run: dnx DotNetCampus.TagToVersion -t ${{ github.ref }}
+
+    - name: Build with dotnet
+      run: |
+        dotnet build --configuration Release
+        dotnet pack --configuration Release --no-build
+
+    - name: Push generated package to GitHub registry
+      run: |
+        dotnet nuget push .\artifacts\package\release\*.nupkg -s https://api.nuget.org/v3/index.json -k ${{ secrets.NugetKey }}
+        dotnet nuget push .\artifacts\package\release\*.nupkg -s https://nuget.pkg.github.com/${{ github.repository_owner }} --api-key ${{ secrets.GITHUB_TOKEN }}

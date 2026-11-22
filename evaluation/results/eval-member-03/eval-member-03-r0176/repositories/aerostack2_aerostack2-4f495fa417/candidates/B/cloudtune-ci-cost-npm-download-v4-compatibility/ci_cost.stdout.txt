@@ -1,0 +1,87 @@
+[2mAnalyzing workflows in C:\Users\USER\AppData\Local\Temp\cloudtune-ci-cost-9nov2y2q\.github\workflows...[0m
+[2mFound 1 workflow file[0m
+
+[1m[36mci-cost[0m â€” GitHub Actions Cost Analyzer
+
+[2mAnalyzed 1 workflow Â· 1 job Â· 2 recommendations[0m
+
+[1mSEVERITY  RECOMMENDATION                                        ESTIMATED SAVINGS[0m
+[2mâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€[0m
+[31m[1mHIGH  [0m  Add pip dependency cache to "coverage" job            [32m~3 min per run[0m
+[31m[1mHIGH  [0m  Split "coverage" into parallel jobs (lint + test ...  [32m~6 min per run[0m
+
+[2mâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€[0m
+
+[1mRecommendations:[0m
+
+[1m1. [31m[HIGH][0m[1m Add pip dependency cache to "coverage" job[0m
+   [2mFile: coverage.yaml Â· Job: coverage[0m
+   Job "coverage" installs pip dependencies without caching. Add `actions/cache` before the install step to restore the pip cache across runs. This is one of the highest-impact optimizations for most CI workflows.
+
+   [36mFix:[0m
+   [2m# Add before your pip install step in job "coverage":[0m
+   [2m      - name: Cache pip packages[0m
+   [2m        uses: actions/cache@v4[0m
+   [2m        with:[0m
+   [2m          path: ~/.cache/pip[0m
+   [2m          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}[0m
+   [2m          restore-keys: |[0m
+   [2m            ${{ runner.os }}-pip-[0m
+
+[1m2. [31m[HIGH][0m[1m Split "coverage" into parallel jobs (lint + test + build)[0m
+   [2mFile: coverage.yaml Â· Job: coverage[0m
+   Job "coverage" runs lint, test, and/or build sequentially in a single job. Splitting them into separate parallel jobs can cut total runtime by 50â€“70% since they can run concurrently. Each job only needs to wait for the steps it depends on.
+
+   [36mFix:[0m
+   [2m# Split "coverage" into parallel jobs:[0m
+   [2mjobs:[0m
+   [2m  lint:[0m
+   [2m    runs-on: ubuntu-latest[0m
+   [2m    steps:[0m
+   [2m      - uses: actions/checkout@v4[0m
+   [2m      - uses: actions/setup-node@v4[0m
+   [2m        with:[0m
+   [2m          node-version: '20'[0m
+   [2m          cache: 'npm'[0m
+   [2m      - run: npm ci[0m
+   [2m      - run: npm run lint[0m
+   [2m      - run: npm run typecheck[0m
+   [2m[0m
+   [2m  test:[0m
+   [2m    runs-on: ubuntu-latest[0m
+   [2m    steps:[0m
+   [2m      - uses: actions/checkout@v4[0m
+   [2m      - uses: actions/setup-node@v4[0m
+   [2m        with:[0m
+   [2m          node-version: '20'[0m
+   [2m          cache: 'npm'[0m
+   [2m      - run: npm ci[0m
+   [2m      - run: npm test[0m
+   [2m[0m
+   [2m  build:[0m
+   [2m    runs-on: ubuntu-latest[0m
+   [2m    needs: [lint, test][0m
+   [2m    steps:[0m
+   [2m      - uses: actions/checkout@v4[0m
+   [2m      - uses: actions/setup-node@v4[0m
+   [2m        with:[0m
+   [2m          node-version: '20'[0m
+   [2m          cache: 'npm'[0m
+   [2m      - run: npm ci[0m
+   [2m      - run: npm run build[0m
+
+[2mâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€[0m
+
+[1mSummary[0m
+
+  Estimated monthly cost:   [33m~$12.80/month[0m
+  Time savings per run:     [32m~9 min/run[0m
+  Estimated monthly savings: [32m~$14.40/month[0m
+
+  Issues:  [31m2 HIGH[0m
+
+  [2mRun with [0m[36m--fix[0m[2m to generate optimized workflow files[0m
+
+[2mGenerating optimized workflow files in C:\Users\USER\AppData\Local\Temp\cloudtune-ci-cost-9nov2y2q\.github\workflows\optimized...[0m
+[32mGenerated 1 optimized workflow file:[0m
+  [36mC:\Users\USER\AppData\Local\Temp\cloudtune-ci-cost-9nov2y2q\.github\workflows\optimized\coverage.yaml[0m

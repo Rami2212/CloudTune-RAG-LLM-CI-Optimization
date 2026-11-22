@@ -1,0 +1,74 @@
+name: Android nightly build
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 2 * * *' # run at 2 AM UTC
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout master
+        uses: actions/checkout@v4
+        with:
+          ref: 'master'
+
+      - name: Replace applicationId and name (Master)
+        run: |
+          sed -i 's/applicationId = "xyz.zedler.patrick.grocy"/applicationId = "xyz.zedler.patrick.grocy.nightly"/' app/build.gradle
+          sed -i 's|<string name="app_name" translatable="false">Grocy</string>|<string name="app_name" translatable="false">Grocy Nightly</string>|g' app/src/main/res/values/strings.xml
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build Master Debug APK
+        run: ./gradlew assembleDebug
+
+      - name: Rename artifacts
+        run: |
+          mkdir -p deploy
+          cp app/build/outputs/apk/debug/app-debug.apk deploy/Grocy-Android-master-$(date +'%Y%m%d').apk
+          [ -f app/src/main/res/raw/changelog.txt ] && cp app/src/main/res/raw/changelog.txt deploy/Grocy-Android-master-$(date +'%Y%m%d')-changelog.txt
+
+      # --- Feature Branch ---
+
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: 'feature/mlkit_scanner'
+          clean: false
+
+      - name: Replace applicationId and name (MLKit)
+        run: |
+          sed -i 's/applicationId = "xyz.zedler.patrick.grocy"/applicationId = "xyz.zedler.patrick.grocy.nightly"/' app/build.gradle
+          sed -i 's/android:label="@string\/app_name"/android:label="Grocy Nightly"/' app/src/main/AndroidManifest.xml
+
+      - name: Build MLKit Debug APK
+        run: ./gradlew assembleDebug
+
+      - name: Rename MLKit artifacts
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk deploy/Grocy-Android-mlkit-$(date +'%Y%m%d').apk
+          [ -f app/src/main/res/raw/changelog.txt ] && cp app/src/main/res/raw/changelog.txt deploy/Grocy-Android-mlkit-$(date +'%Y%m%d')-changelog.txt
+
+      - name: Upload all artifacts
+        uses: pyTooling/Actions/releaser@r0
+        continue-on-error: true
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          rm: true
+          tag: nightly
+          files: |
+            deploy/*.apk
+            deploy/*.txt

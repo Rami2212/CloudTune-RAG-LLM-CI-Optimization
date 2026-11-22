@@ -1,0 +1,114 @@
+name: virtnbdbackup CI on ubuntu-22.04
+
+on: [push, pull_request]
+
+jobs:
+  test:
+
+    runs-on: ubuntu-22.04
+
+    steps:
+    - uses: actions/checkout@v7
+    - uses: abbbi/github-actions-tune@v1
+    - name: codespell
+      run: |
+        sudo apt-get update
+        sudo apt-get install codespell -y
+        codespell libvirtnbdbackup
+        codespell virtnbdbackup
+        codespell virtnbdrestore
+        codespell virtnbdmap
+        codespell virtnbd-nbdkit-plugin
+        codespell README.md
+        codespell Changelog
+    - name: Python code format test
+      run: |
+        sudo pip3 install black==25.1.0
+        black --check .
+        black --check virtnbdbackup
+        black --check virtnbdrestore
+        black --check virtnbdmap
+        black --check virtnbd-nbdkit-plugin
+    - name: Python lint test
+      run: |
+        sudo apt-get install python3-colorlog python3-paramiko python3-libvirt -y
+        sudo pip3 install pylint==3.3.4
+        pylint libvirtnbdbackup
+        pylint virtnbdbackup
+        pylint virtnbdrestore
+        pylint virtnbd-nbdkit-plugin
+    - name: Python typing tests
+      run: |
+        sudo pip3 install mypy
+        sudo pip3 install types-paramiko
+        mypy --ignore-missing libvirtnbdbackup
+        mypy --ignore-missing virtnbdbackup
+        mypy --ignore-missing virtnbdrestore
+        mypy --ignore-missing virtnbdmap
+    - name: Set up ssh access to localhost
+      run: |
+        sudo hostname -f
+        sudo hostname
+        sudo ssh-keygen -f /root/.ssh/id_rsa -N ""
+        sudo cat /root/.ssh/id_rsa.pub | sudo tee -a /root/.ssh/authorized_keys
+        sudo ssh-keyscan -H localhost | sudo tee -a /root/.ssh/known_hosts
+        sudo ssh -l root localhost true
+        sudo ssh-agent | sudo tee -a /root/agent
+        sudo -- bash -c 'source /root/agent; ssh-add'
+    - name: Set up libvirt
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          apparmor-profiles \
+          bridge-utils \
+          dnsmasq-base \
+          ebtables \
+          libarchive-tools \
+          libguestfs-tools \
+          libvirt-clients \
+          libvirt-daemon \
+          libvirt-daemon-system \
+          qemu-kvm \
+          qemu-utils \
+          python3-libnbd \
+          python3-tqdm \
+          python3-lz4 \
+          python3-libvirt \
+          python3-lxml \
+          python3-paramiko\
+          python3-scp \
+          python3-colorlog \
+          nbdkit \
+          nbdkit-plugin-python \
+          unzip \
+          libnbd-bin \
+        ;
+        # start daemon
+        echo 'security_driver = "none"' | sudo tee -a /etc/libvirt/qemu.conf
+        sudo aa-teardown
+        sudo rm -f /etc/apparmor.d/libvirt/libvirt*
+        sudo systemctl start libvirtd
+        sudo systemctl restart libvirtd
+        sudo modprobe nbd max_partitions=10
+    - name: Execute tests (vm1)
+      run: cd t && sudo -E make vm1.tests && cd -
+    - name: Execute tests (vm3)
+      run: cd t && sudo -E make vm3.tests && cd -
+    - name: Execute tests (vm4)
+      run: cd t && sudo -E make vm4.tests && cd -
+    - name: Perform installation
+      run: sudo python3 setup.py install
+    - name: Execute commands
+      run: virtnbdbackup -h && virtnbdrestore -h
+    - name: Create log archive
+      if: always()
+      run: |
+        sudo find /tmp/ -type d -name '.guestfs-*' | sudo xargs rm -rf
+        sudo tar -czvf /log.tar.gz /tmp/tmp.*
+        sudo chmod go+r /log.tar.gz
+    - name: Archive Test Results
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: test-results
+        path: /log.tar.gz

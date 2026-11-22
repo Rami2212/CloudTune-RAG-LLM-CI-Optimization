@@ -1,0 +1,33 @@
+name: npm Publish
+
+on:
+  release:
+    types: [created]
+
+jobs:
+  publish-npm:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+      - run: ./build_and_test.sh
+        shell: bash
+        env:
+          MISE_NODE_VERSION: 24
+      - name: Determine version from git tag
+        id: version
+        run: echo "tag=${GITHUB_REF#refs/*/}" >> "$GITHUB_OUTPUT"
+      - name: set version
+        run: |
+          ./updateVersion.sh ${{ steps.version.outputs.tag }}
+      - uses: stefanzweifel/git-auto-commit-action@v7
+        with:
+          commit_message: ${{ steps.version.outputs.tag }}
+          branch: master
+      - name: publish
+        run: |
+          ./build_and_test.sh
+          npm publish --access public

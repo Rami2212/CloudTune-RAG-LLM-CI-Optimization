@@ -1,0 +1,97 @@
+# This workflow will build a .NET project
+# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-net
+
+name: Nightly
+
+on:
+  push:
+    branches: [ "master" ]
+    paths-ignore:
+      - '**.md'
+
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    outputs:
+      sha_short: ${{ steps.vars.outputs.sha_short }}
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        submodules: recursive
+
+    - name: setup-msbuild
+      uses: microsoft/setup-msbuild@v3
+
+    - name: Setup NuGet
+      uses: NuGet/setup-nuget@v4
+
+    - name: Restore Packages
+      run: nuget restore ComicRack.sln
+
+    - name: Build solution
+      run: msbuild ComicRack\ComicRack.csproj -t:rebuild -property:Configuration=Release -property:Platform=AnyCPU
+
+    - name: Package Files
+      run: powershell Compress-Archive -Path 'ComicRack\bin\Release\net48\*' -DestinationPath 'ComicRackCE_nightly.zip' -Force
+
+    - name: Get short sha
+      id: vars
+      run: |
+        $sha_short = $(git rev-parse --short HEAD)
+        echo "sha_short=$sha_short" >> $env:GITHUB_OUTPUT
+        echo "Short SHA is $sha_short"
+
+    - name: Download VC++ Redistributable (x64)
+      run: |
+        mkdir ComicRack\bin\Release\net48\_CommonRedist
+        curl -L -o ComicRack\bin\Release\net48\_CommonRedist\vc_redist.x64.exe https://aka.ms/vs/17/release/vc_redist.x64.exe
+
+    - name: Compile installer
+      uses: Minionguyjpro/Inno-Setup-Action@v1.2.9
+      with:
+        path: Installer.iss
+        options: |
+          /O+
+          /DMyAppVersion=nightly-${{ steps.vars.outputs.sha_short }} 
+          /DMyAppSetupFile=ComicRackCESetup_nightly
+
+    - name: Update git tag
+      run: |
+        git tag -f nightly
+        git push -f origin nightly
+
+    - name: Update Nightly Release
+      uses: ncipollo/release-action@main
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        artifacts: "ComicRackCE_nightly.zip,ComicRackCESetup_nightly.exe"
+        tag: "nightly"
+        commit: ${{ github.ref_name }}
+        prerelease: false
+        allowUpdates: true
+        updateOnlyUnreleased: false
+        removeArtifacts: true
+    
+  publish:
+    runs-on: ubuntu-latest
+    if: github.repository == 'maforget/ComicRackCE'
+    needs: build  # Ensure this runs after the build job
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v7
+
+    - name: Publish Winget manifest
+      uses: vedantmgoyal9/winget-releaser@main
+      with:
+        identifier: maforget.ComicRackCE.Nightly
+        release-tag: nightly
+        version: nightly-${{ needs.build.outputs.sha_short }}  # Use the short 7-digit commit SHA for the version
+        max-versions-to-keep: 1
+        token: ${{ secrets.WINGET_TOKEN }}
+
