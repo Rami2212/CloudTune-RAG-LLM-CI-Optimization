@@ -1,0 +1,93 @@
+[package]
+authors = ["joep@ontola.io"]
+build = "src/build.rs"
+description = "Atomic Server - Tauri desktop"
+edition = "2021"
+license = "MIT"
+name = "atomic-server-tauri"
+# Ships as a Tauri bundle (.dmg/.AppImage/.exe), never as a crate. It also
+# depends on `atomic-server` and `atomic_lib` by path with no version, which
+# crates.io forbids — see the note on `publish` in ../wasm/Cargo.toml.
+publish = false
+repository = "https://github.com/atomicdata-dev/atomic-server"
+version = "0.41.0-beta.9"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+actix-rt = "2.6.0"
+# Cloud Vault IPC: base64 for the bytes crossing it, tokio for the
+# current-thread runtime the non-`Send` vault futures need. Shared rather
+# than desktop-only.
+base64 = "0.22"
+serde_json = "1.0"
+# `devtools` is not in this list on purpose: debug builds get the inspector
+# from tauri regardless, and a release bundle should not ship it. Opt in with
+# the `devtools` feature below when a release build needs one.
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-deep-link = "2"
+tauri-plugin-process = "2"
+# OS notifications for new messages and comments. Its init script replaces
+# `window.Notification` in the webview with one backed by the OS, so the
+# data-browser uses the same Notification API in the app as on the web.
+tauri-plugin-notification = "2"
+# Opening a URL in the system browser: the tray menu, and what an <a
+# target="_blank"> ultimately needs in a webview with nowhere to put a tab.
+# Deliberately the only plugin here that opens things — `tauri-plugin-shell`
+# also injects a click handler for `_blank` links, and because it listens on
+# `body` it wins the race against this one and calls `shell.open`, which is
+# denied by our ACL and fails with EACCES regardless.
+tauri-plugin-opener = "2"
+# Drives the running app over a WebSocket so an agent can open documents,
+# type, and read the DOM — used to test collaborative editing end to end
+# without a human at the keyboard. Registered only under `debug_assertions`
+# (see `lib.rs`), so it is compiled but inert in release builds.
+tauri-plugin-mcp-bridge = "0.13"
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+
+# Unix-only: the NFS "virtual drive" mount. `nfsserve` reaches for
+# `std::os::unix::fs::{MetadataExt, PermissionsExt}` in fs_util.rs, so it does
+# not compile for windows at all; windows ships without the virtual drive.
+#
+# lib.rs says the same thing as `cfg(unix)`.
+[target.'cfg(unix)'.dependencies]
+nfsserve = "0.10"
+hex = "0.4"
+blake3 = "1"
+fastcdc = "3"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[dependencies.atomic-server]
+# No HTTPS for desktop. Plugin/app endpoints depend on the shared Wasmtime
+# runtime, so embedded builds opt into that feature explicitly.
+default-features = false
+features = ["wasm-plugins"]
+path = "../server"
+
+[dependencies.atomic_lib]
+path = "../lib"
+features = ["db-redb", "iroh", "discovery"]
+
+[dependencies.serde]
+features = ["derive"]
+version = "1.0"
+
+[lib]
+name = "atomic_server_tauri"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "atomic-server-tauri"
+path = "src/main.rs"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+default = ["custom-protocol"]
+# Web inspector in a release build: `cargo tauri build --features devtools`.
+# Debug builds (`cargo tauri dev`) have it without this.
+devtools = ["tauri/devtools"]
+# Enables the loopback-only WebView diagnostic bridge in the local acceptance
+# package. Shipping release builds do not enable this feature.
+account-acceptance = []

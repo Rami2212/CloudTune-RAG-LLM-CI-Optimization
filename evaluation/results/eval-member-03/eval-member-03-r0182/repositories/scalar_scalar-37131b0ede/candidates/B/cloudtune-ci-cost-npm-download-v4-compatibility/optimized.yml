@@ -1,0 +1,106 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [HIGH] Add npm dependency cache to "update-cli-docs" job
+# Estimated savings: ~4 min/run
+#
+name: Update Scalar CLI Documentation
+
+on:
+  # Run every day at 15:00 UTC
+  schedule:
+    - cron: '0 15 * * *'
+  # Allow manual triggering
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  update-cli-docs:
+    name: Update CLI Documentation
+    permissions:
+      contents: write
+      pull-requests: write
+    if: ${{ github.repository_owner == 'scalar' }}
+    runs-on: blacksmith-2vcpu-ubuntu-2204
+    # Holds the release bot app credentials (without NPM_TOKEN) so the docs PR
+    # can be opened by the app rather than by GITHUB_TOKEN.
+    environment: release-bot
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6.0.3
+
+      # No shared caches: this job runs the published CLI, so it must not be
+      # able to write into the turbo or pnpm caches other workflows restore.
+      - name: Install pnpm
+        uses: pnpm/action-setup@v5.0.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6.4.0
+        with:
+          node-version-file: '.nvmrc'
+          package-manager-cache: false
+
+      - name: Install the docs generator
+        run: pnpm install --frozen-lockfile --filter @scalar-internal/build-scripts...
+
+      # `scalar context` prints the whole command tree as JSON, so the reference
+      # does not depend on the layout of the CLI README.
+      - name: Read the CLI command tree
+        run: npx --yes @scalar/cli@latest context > "$RUNNER_TEMP/cli-context.json"
+
+      - name: Generate CLI documentation
+        run: pnpm script generate-cli-docs --context "$RUNNER_TEMP/cli-context.json"
+
+      - name: Check for changes
+        id: check-changes
+        run: |
+          if [ -z "$(git status --porcelain -- documentation/guides/cli)" ]; then
+            echo "has-changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "has-changes=true" >> $GITHUB_OUTPUT
+          fi
+
+      # Mint a short-lived GitHub App token so the docs PR is opened by our app
+      # instead of GITHUB_TOKEN. Pull requests created with GITHUB_TOKEN do not
+      # trigger workflow events, so their CI checks stay pending forever; an app
+      # token lifts that restriction. The token is generated here, right before
+      # it is used, so the untrusted `npx @scalar/cli@latest` step above never
+      # runs while a live app token exists in the job.
+      - name: Generate GitHub App token
+        id: app-token
+        if: steps.check-changes.outputs.has-changes == 'true'
+        uses: actions/create-github-app-token@v3.2.0
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          # Scope the token to the minimum needed to open the docs PR.
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Create Pull Request
+        if: steps.check-changes.outputs.has-changes == 'true'
+        uses: peter-evans/create-pull-request@v8.1.0
+        with:
+          # The app token (not GITHUB_TOKEN) is what makes the PR trigger CI.
+          token: ${{ steps.app-token.outputs.token }}
+          # Restrict the PR to the generated markdown only. Even if an upstream
+          # step were compromised and touched other files, nothing but these
+          # paths can be staged into the PR.
+          add-paths: |
+            documentation/guides/cli/commands.md
+            documentation/guides/cli/commands/**
+          base: main
+          commit-message: 'docs(cli): update commands'
+          title: 'docs(cli): update commands'
+          body: |
+            > This PR was automatically created by a scheduled workflow.
+
+            This PR updates the CLI command reference from the latest version of @scalar/cli.
+
+            ```bash
+            npx @scalar/cli@latest context > cli-context.json
+            pnpm script generate-cli-docs --context cli-context.json
+            ```
+          branch: docs/update-cli-documentation
+          delete-branch: true

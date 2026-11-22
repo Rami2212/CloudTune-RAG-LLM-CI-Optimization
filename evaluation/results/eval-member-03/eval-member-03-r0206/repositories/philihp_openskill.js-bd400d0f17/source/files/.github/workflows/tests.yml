@@ -1,0 +1,74 @@
+name: tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+env:
+  CI: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+      - run: npm install
+      - run: npm run lint
+      - run: npm run typecheck
+
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version:
+          - 22.x # until 2027-04-30
+          - 24.x # until 2028-04-30
+          - 26.x # until 2029-04-30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+      # The suite runs against src/ via tsx, so dist is never involved. Skip the
+      # build (and the `prepare` script that triggers it) so this matrix stays a
+      # pure runtime check of each supported Node. The build is covered by the
+      # lint and coverage jobs.
+      - run: npm install --ignore-scripts
+      - run: npm test
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
+      # The tuning pages import the library from src/, so its dependencies
+      # must be installed at the repository root too.
+      - run: npm install --ignore-scripts
+      - run: npm ci
+        working-directory: docs
+      - run: npm run build
+        working-directory: docs
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+      - run: npm install
+      - run: npm run build --if-present
+      - run: npm run test:coverage
+      - name: Coveralls
+        uses: coverallsapp/github-action@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path-to-lcov: ./coverage/lcov.info

@@ -1,0 +1,129 @@
+name: Node CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 5
+
+    steps:
+      - name: Git checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Use Node.js 18.x
+        uses: actions/setup-node@v7
+        with:
+          node-version: 18.x
+      - name: Prepare Environment
+        run: |
+          yarn install
+          yarn build
+        env:
+          CI: true
+      - name: Run typecheck and linter
+        run: |
+          yarn lint
+        env:
+          CI: true
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [14.x, 16.x, 18.x, 20.x, 22.x, 24.x, 26.x]
+
+    steps:
+      - name: Git checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Prepare Environment
+        run: |
+          yarn install
+        env:
+          CI: true
+      - name: Run tests
+        run: |
+          yarn unit
+        env:
+          CI: true
+      - name: Send coverage
+        uses: codecov/codecov-action@v7
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        if: matrix.node-version == '18.x'
+      - name: Check docs generation
+        if: matrix.node-version == '18.x'
+        run: |
+          yarn docs:test
+        env:
+          CI: true
+
+  # validate-dependencies:
+  #   name: Validate production dependencies
+  #   runs-on: ubuntu-latest
+  #   continue-on-error: true
+  #   timeout-minutes: 15
+
+  #   steps:
+  #     - uses: actions/checkout@v7
+  #     - name: Use Node.js 18.x
+  #       uses: actions/setup-node@v7
+  #       with:
+  #         node-version: 18.x
+  #     - name: Prepare Environment
+  #       run: |
+  #         yarn install
+  #       env:
+  #         CI: true
+  #     - name: Validate production dependencies
+  #       run: |
+  #         if ! git log --format=oneline -n 1 | grep -q "\[ignore-audit\]"; then
+  #           yarn validate:dependencies
+  #         else
+  #           echo "Skipping audit"
+  #         fi
+  #       env:
+  #         CI: true
+
+  # validate-all-dependencies:
+  #   name: Validate all dependencies
+  #   runs-on: ubuntu-latest
+  #   continue-on-error: true
+  #   timeout-minutes: 15
+
+  #   steps:
+  #     - uses: actions/checkout@v7
+  #     - name: Use Node.js 18.x
+  #       uses: actions/setup-node@v7
+  #       with:
+  #         node-version: 18.x
+  #     - name: Prepare Environment
+  #       run: |
+  #         yarn install
+  #       env:
+  #         CI: true
+  #     - name: Validate production dependencies
+  #       run: |
+  #         yarn validate:dependencies
+  #       env:
+  #         CI: true
+  #     - name: Validate dev dependencies
+  #       run: |
+  #         yarn validate:dev-dependencies
+  #       env:
+  #         CI: true

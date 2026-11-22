@@ -1,0 +1,797 @@
+name: CI
+
+on:
+    push:
+        branches:
+            - main
+        paths:
+            - "**/*.rs"
+            - "**/Cargo.toml"
+            - "**/Cargo.lock"
+            - ".github/workflows/ci.yml"
+            - "!sdk/**"
+
+    pull_request:
+       types: [opened, synchronize, reopened, ready_for_review]
+       paths:
+           - "**/*.rs"
+           - "**/Cargo.toml"
+           - "**/Cargo.lock"
+           - ".github/workflows/ci.yml"
+           - "!sdk/**"
+
+    workflow_dispatch:
+
+    # pull_request_target:
+    #     branches:
+    #         - main
+    #     paths:
+    #         - "**/*.rs"
+    #         - "**/Cargo.toml"
+    #         - "**/Cargo.lock"
+    #         - ".github/workflows/ci.yml"
+    #         - "!sdk/**"
+
+concurrency:
+    group: ci-${{ github.head_ref || github.ref_name }}
+    cancel-in-progress: true
+
+env:
+    GOPROXY: https://proxy.golang.org,https://raw.githubusercontent.com/polytope-labs/gnark-ignition-verifier/goproxy,direct
+    CARGO_TERM_COLOR: always
+    FOUNDRY_PROFILE: default
+    BSC_URL: ${{ secrets.BSC_URL }}
+    OP_URL: ${{ secrets.OP_URL }}
+    SEPOLIA_URL: ${{ secrets.SEPOLIA_URL }}
+    SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+    POLYGON_RPC: ${{ secrets.POLYGON_RPC }}
+    # Live endpoints for the BEEFY consensus-proof simtest; override via repo secrets.
+    RELAY_WS_URL: ${{ secrets.RELAY_WS_URL || 'wss://paseo.dotters.network' }}
+    PARA_WS_URL: ${{ secrets.PARA_WS_URL || 'wss://gargantua.rpc.polytope.technology' }}
+    WASM_BINDGEN_TEST_TIMEOUT: 5400
+    GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+    MAINNET_FORK_URL: ${{ secrets.MAINNET_FORK_URL }}
+    TELEMETRY_SECRET_KEY: ${{ secrets.TELEMETRY_SECRET_KEY }}
+    STANDARD_TENDERMINT_URL: ${{secrets.STANDARD_TENDERMINT_URL}}
+    POLYGON_HEIMDALL: ${{secrets.POLYGON_HEIMDALL}}
+    POLYGON_HEIMDALL_REST: ${{secrets.POLYGON_HEIMDALL_REST}}
+    POLYGON_EXECUTION_RPC: ${{secrets.POLYGON_EXECUTION_RPC}}
+    SEI_RPC_URL: ${{secrets.SEI_RPC_URL}}
+    KAVA_RPC_URL: ${{secrets.KAVA_RPC_URL}}
+    PHAROS_ATLANTIC_RPC: ${{secrets.PHAROS_ATLANTIC_RPC}}
+
+jobs:
+    detect-changes:
+        name: Detect Changed Paths
+        runs-on: ubuntu-22.04
+        if: github.event.pull_request.draft != true
+        outputs:
+            pharos: ${{ steps.filter.outputs.pharos }}
+            sync-committee: ${{ steps.filter.outputs.sync-committee }}
+            tendermint: ${{ steps.filter.outputs.tendermint }}
+            bsc: ${{ steps.filter.outputs.bsc }}
+            wasm: ${{ steps.filter.outputs.wasm }}
+        steps:
+            - uses: actions/checkout@v3
+              with:
+                  ref: ${{ github.event.pull_request.head.sha || github.sha }}
+                  token: ${{ secrets.GH_TOKEN }}
+                  fetch-depth: 0
+
+            - uses: dorny/paths-filter@v3
+              id: filter
+              with:
+                  filters: |
+                      pharos:
+                        - 'modules/consensus/pharos/**'
+                        - 'modules/ismp/clients/pharos/**'
+                        - 'modules/ismp/state-machines/pharos/**'
+                        - 'tesseract/consensus/pharos/**'
+                        - 'tesseract/messaging/pharos-evm/**'
+                      sync-committee:
+                        - 'modules/consensus/sync-committee/**'
+                        - 'modules/ismp/clients/sync-committee/**'
+                        - 'tesseract/consensus/sync-committee/**'
+                      tendermint:
+                        - 'modules/consensus/tendermint/**'
+                        - 'modules/ismp/clients/tendermint/**'
+                        - 'tesseract/consensus/tendermint/**'
+                        - 'tesseract/messaging/evm-tendermint/**'
+                      bsc:
+                        - 'modules/consensus/bsc/**'
+                        - 'modules/ismp/clients/bsc/**'
+                        - 'tesseract/consensus/bsc/**'
+                      wasm:
+                        - 'modules/**'
+                        - 'evm/rust/**'
+                        - 'parachain/runtimes/**'
+                        - 'Cargo.toml'
+                        - 'Cargo.lock'
+                        - 'rust-toolchain.toml'
+                        - '.github/workflows/ci.yml'
+
+    check-wasm:
+        name: Check Wasm Crates
+        runs-on: arc-runner-set
+        needs: detect-changes
+        if: github.event.pull_request.draft != true && needs.detect-changes.outputs.wasm == 'true'
+        strategy:
+            matrix:
+                crate: [gargantua-runtime, nexus-runtime]
+
+        steps:
+            - name: Get User Permission
+              id: checkAccess
+              uses: actions-cool/check-user-permission@v2
+              with:
+                  require: write
+                  username: ${{ github.triggering_actor }}
+
+            - name: Check User Permission
+              if: steps.checkAccess.outputs.require-result == 'false'
+              run: |
+                  echo "${{ github.triggering_actor }} does not have permissions on this repo."
+                  echo "Current permission level is ${{ steps.checkAccess.outputs.user-permission }}"
+                  echo "Job originally triggered by ${{ github.actor }}"
+                  exit 1
+
+            - uses: actions/checkout@v3
+              with:
+                  ref: ${{  github.event.pull_request.head.sha }}
+                  token: ${{ secrets.GH_TOKEN }}
+                  submodules: recursive
+
+            - name: Install Dependencies
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y clang netcat wget curl libssl-dev llvm libclang-dev libudev-dev make libprotobuf-dev protobuf-compiler pkg-config
+                  echo "LIBCLANG_PATH=/usr/lib/llvm-14/lib" >> $GITHUB_ENV
+
+            - uses: pnpm/action-setup@v4
+              with:
+                  version: 10
+
+            - name: Set up Node
+              uses: actions/setup-node@v3
+              with:
+                  node-version: 22
+                  cache-dependency-path: "evm/pnpm-lock.yaml"
+                  cache: "pnpm"
+
+            - name: Install npm dependencies
+              working-directory: evm
+              run: |
+                  pnpm install
+
+            - name: Install toolchain
+              uses: dtolnay/rust-toolchain@nightly
+              with:
+                  toolchain: stable
+
+            - name: Add wasm toolchain
+              run: |
+                  rustup update nightly
+                  rustup target add wasm32-unknown-unknown --toolchain nightly
+                  rustup target add wasm32-unknown-unknown
+                  rustup component add rust-src
+
+            - uses: Swatinem/rust-cache@v2
+
+            - uses: webfactory/ssh-agent@v0.7.0
+              with:
+                  ssh-private-key: ${{ secrets.SSH_KEY }}
+
+            - name: check no-std
+              env:
+                  RUSTFLAGS: "--cfg substrate_runtime"
+              run: |
+                  cargo check -p ${{ matrix.crate }} --no-default-features --target=wasm32-unknown-unknown --locked
+
+    check-workspace:
+        name: Check Workspace
+        runs-on: arc-runner-set
+        if: github.event.pull_request.draft != true
+        steps:
+            - name: Get User Permission
+              id: checkAccess
+              uses: actions-cool/check-user-permission@v2
+              with:
+                  require: write
+                  username: ${{ github.triggering_actor }}
+
+            - name: Check User Permission
+              if: steps.checkAccess.outputs.require-result == 'false'
+              run: |
+                  echo "${{ github.triggering_actor }} does not have permissions on this repo."
+                  echo "Current permission level is ${{ steps.checkAccess.outputs.user-permission }}"
+                  echo "Job originally triggered by ${{ github.actor }}"
+                  exit 1
+
+            - uses: actions/checkout@v3
+              with:
+                  ref: ${{  github.event.pull_request.head.sha }}
+                  token: ${{ secrets.GH_TOKEN }}
+                  submodules: recursive
+
+            - name: Install toolchain
+              uses: dtolnay/rust-toolchain@nightly
+              with:
+                  toolchain: stable
+
+            - name: Add wasm toolchain
+              run: |
+                  rustup update nightly
+                  rustup target add wasm32-unknown-unknown --toolchain nightly
+                  rustup target add wasm32-unknown-unknown
+                  rustup component add rust-src
+
+            - name: Install Dependencies
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y clang netcat wget curl libssl-dev llvm libclang-dev libudev-dev make libprotobuf-dev protobuf-compiler pkg-config
+                  echo "LIBCLANG_PATH=/usr/lib/llvm-14/lib" >> $GITHUB_ENV
+                  curl -L https://sp1.succinct.xyz | bash
+                  ~/.sp1/bin/sp1up --token $GITHUB_TOKEN
+                  ~/.sp1/bin/cargo-prove prove --version
+
+            - uses: pnpm/action-setup@v4
+              with:
+                  version: 10
+
+            - name: Set up Node
+              uses: actions/setup-node@v3
+              with:
+                  node-version: 22
+                  cache-dependency-path: "evm/pnpm-lock.yaml"
+                  cache: "pnpm"
+
+            - name: Install npm dependencies
+              working-directory: evm
+              run: |
+                  pnpm install
+
+            - uses: webfactory/ssh-agent@v0.7.0
+              with:
+                  ssh-private-key: ${{ secrets.SSH_KEY }}
+
+            - uses: Swatinem/rust-cache@v2
+
+            - name: Install Go
+              uses: actions/setup-go@v5
+              with:
+                  go-version: "1.24"
+
+            - name: check workspace
+              run: |
+                  cargo check --all --benches --locked
+
+    unit-tests:
+        name: Unit Tests
+        runs-on: arc-runner-set
+        if: github.event.pull_request.draft != true
+        steps:
+            - name: Get User Permission
+              id: checkAccess
+              uses: actions-cool/check-user-permission@v2
+              with:
+                  require: write
+                  username: ${{ github.triggering_actor }}
+
+            - name: Check User Permission
+              if: steps.checkAccess.outputs.require-result == 'false'
+              run: |
+                  echo "${{ github.triggering_actor }} does not have permissions on this repo."
+                  echo "Current permission level is ${{ steps.checkAccess.outputs.user-permission }}"
+                  echo "Job originally triggered by ${{ github.actor }}"
+                  exit 1
+
+            - uses: actions/checkout@v3
+              with:
+                  ref: ${{  github.event.pull_request.head.sha }}
+                  token: ${{ secrets.GH_TOKEN }}
+                  submodules: recursive
+
+            - name: Install toolchain
+              uses: dtolnay/rust-toolchain@nightly
+              with:
+                  toolchain: stable
+
+            - name: Add wasm toolchain
+              run: |
+                  rustup update nightly
+                  rustup target add wasm32-unknown-unknown --toolchain nightly
+                  rustup target add wasm32-unknown-unknown
+                  rustup component add rust-src
+
+            - name: Install Dependencies
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y clang netcat wget curl libssl-dev llvm libclang-dev libudev-dev make libprotobuf-dev protobuf-compiler pkg-config
+                  echo "LIBCLANG_PATH=/usr/lib/llvm-14/lib" >> $GITHUB_ENV
+                  curl -L https://sp1.succinct.xyz | bash
+                  ~/.sp1/bin/sp1up --token $GITHUB_TOKEN
+                  ~/.sp1/bin/cargo-prove prove --version
+
+            - uses: pnpm/action-setup@v4
+              with:
+                  version: 10
+
+            - name: Set up Node
+              uses: actions/setup-node@v3
+              with:
+                  node-version: 22
+                  cache-dependency-path: "evm/pnpm-lock.yaml"
+                  cache: "pnpm"
+
+            - name: Install npm dependencies
+              working-directory: evm
+              run: |
+                  pnpm install
+
+            - name: Install Foundry
+              uses: foundry-rs/foundry-toolchain@v1
+              with:
+                  version: nightly
+
+            - name: Build Foundry artifacts
+              working-directory: evm
+              run: forge build
+
+            - uses: webfactory/ssh-agent@v0.7.0
+              with:
+                  ssh-private-key: ${{ secrets.SSH_KEY }}
+
+            - name: Install Go
+              uses: actions/setup-go@v5
+              with:
+                  go-version: "1.24"
+
+            - uses: Swatinem/rust-cache@v2
+
+            - name: Run unit tests
+              run: |
+                  cargo test --all-targets --locked
+
+    simnet-tests:
+        name: Simnet Tests
+        runs-on: arc-runner-set
+        if: github.event.pull_request.draft != true
+        steps:
+            - name: Get User Permission
+              id: checkAccess
+              uses: actions-cool/check-user-permission@v2
+              with:
+                  require: write
+                  username: ${{ github.triggering_actor }}
+
+            - name: Check User Permission
+              if: steps.checkAccess.outputs.require-result == 'false'
+              run: |
+                  echo "${{ github.triggering_actor }} does not have permissions on this repo."
+                  echo "Current permission level is ${{ steps.checkAccess.outputs.user-permission }}"
+                  echo "Job originally triggered by ${{ github.actor }}"
+                  exit 1
+
+            - uses: actions/checkout@v3
+              with:
+                  ref: ${{  github.event.pull_request.head.sha }}
+                  token: ${{ secrets.GH_TOKEN }}
+                  submodules: recursive
+
+            - name: Install toolchain
+              uses: dtolnay/rust-toolchain@nightly
+              with:
+                  toolchain: stable
+
+            - name: Add wasm toolchain
+              run: |
+                  rustup update nightly
+                  rustup target add wasm32-unknown-unknown --toolchain nightly
+                  rustup target add wasm32-unknown-unknown
+                  rustup component add rust-src
+
+            - name: Install Dependencies
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y clang netcat wget curl libssl-dev llvm libclang-dev libudev-dev make libprotobuf-dev protobuf-compiler pkg-config
+                  echo "LIBCLANG_PATH=/usr/lib/llvm-14/lib" >> $GITHUB_ENV
+
+            - uses: pnpm/action-setup@v4
+              with:
+                  version: 10
+
+            - name: Set up Node
+              uses: actions/setup-node@v3
+              with:
+                  node-version: 22
+                  cache-dependency-path: "evm/pnpm-lock.yaml"
+                  cache: "pnpm"
+
+            - name: Install npm dependencies
+              working-directory: evm
+              run: |
+                  pnpm install
+
+            - uses: webfactory/ssh-agent@v0.7.0
+              with:
+                  ssh-private-key: ${{ secrets.SSH_KEY }}
+
+            - uses: Swatinem/rust-cache@v2
+
+            - name: Install Go
+              uses: actions/setup-go@v5
+              with:
+                  go-version: "1.24"
+
+            - name: Run Simnet Tests
+              run: |
+                  cargo build -p hyperbridge --release
+                  ./target/release/hyperbridge simnode --chain=gargantua-4009 --name=alice --tmp  --state-pruning=archive --blocks-pruning=archive --rpc-port=9990 --port 40337 --log="mmr=trace" --rpc-cors=all --unsafe-rpc-external --rpc-methods=unsafe --pool-type=single-state &
+                  ./scripts/wait_for_tcp_port_opening.sh localhost 9990
+                  cargo test -p simtests -- --nocapture --ignored --test-threads=1 --skip test_runtime_upgrade_and_fee_migration --skip legacy_storage_items_state_drain_test
+
+            - name: Cleanup
+              if: always()
+              run: |
+                  pkill -f "hyperbridge simnode" || true
+                  fuser -k 9990/tcp || true
+
+    ethereum-tests:
+        name: Ethereum Sync Committee Tests
+        needs: detect-changes
+        runs-on: ubuntu-22.04
+        if: github.event.pull_request.draft != true && needs.detect-changes.outputs.sync-committee == 'true'
+        steps:
+            - name: Get User Permission
+              id: checkAccess
+              uses: actions-cool/check-user-permission@v2
+              with:
+                  require: write
+                  username: ${{ github.triggering_actor }}
+
+            - name: Check User Permission
+              if: steps.checkAccess.outputs.require-result == 'false'
+              run: |
+                  echo "${{ github.triggering_actor }} does not have permissions on this repo."
+                  echo "Current permission level is ${{ steps.checkAccess.outputs.user-permission }}"
+                  echo "Job originally triggered by ${{ github.actor }}"
+                  exit 1
+
+            - uses: actions/checkout@v3
+              with:
+                  ref: ${{  github.event.pull_request.head.sha }}
+                  token: ${{ secrets.GH_TOKEN }}
+                  submodules: recursive
+
+            - name: Install toolchain
+              uses: dtolnay/rust-toolchain@nightly
+              with:
+                  toolchain: stable
+
+            - name: Add wasm toolchain
+              run: |
+                  rustup update nightly
+                  rustup target add wasm32-unknown-unknown --toolchain nightly
+                  rustup target add wasm32-unknown-unknown
+                  rustup component add rust-src
+
+            - name: Install Dependencies
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y clang netcat wget curl libssl-dev llvm libclang-dev libudev-dev make libprotobuf-dev protobuf-compiler pkg-config
+                  echo "LIBCLANG_PATH=/usr/lib/llvm-14/lib" >> $GITHUB_ENV
+
+            - uses: pnpm/action-setup@v4
+              with:
+                  version: 10
+
+            - name: Set up Node
+              uses: actions/setup-node@v3
+              with:
+                  node-version: 22
+                  cache-dependency-path: "evm/pnpm-lock.yaml"
+                  cache: "pnpm"
+
+            - name: Install npm dependencies
+              working-directory: evm
+              run: |
+                  pnpm install
+
+            - uses: webfactory/ssh-agent@v0.7.0
+              with:
+                  ssh-private-key: ${{ secrets.SSH_KEY }}
+
+            - uses: Swatinem/rust-cache@v2
+
+            # Authenticate to Docker Hub so the many images Kurtosis/ethereum-package pull are
+            # not subject to the anonymous per-IP rate limit (shared across GitHub runners),
+            # which otherwise surfaces as image-pull timeouts during `kurtosis engine start`.
+            - name: Login to Docker Hub
+              uses: docker/login-action@v3
+              with:
+                  username: ${{ secrets.DOCKER_USERNAME }}
+                  password: ${{ secrets.DOCKER_ACCESS_TOKEN }}
+
+            - name: Install Kurtosis
+              run: |
+                  # The legacy Gemfury apt repo only serves old Kurtosis (<=1.15.x), which cannot
+                  # run current ethereum-package (it uses the newer GpuConfig Starlark API). Install
+                  # a pinned modern release directly from the official release artifacts instead.
+                  KURTOSIS_VERSION=1.20.0
+                  curl -fsSL -o /tmp/kurtosis-cli.deb \
+                    "https://github.com/kurtosis-tech/kurtosis-cli-release-artifacts/releases/download/${KURTOSIS_VERSION}/kurtosis-cli_${KURTOSIS_VERSION}_linux_amd64.deb"
+                  sudo dpkg -i /tmp/kurtosis-cli.deb
+                  kurtosis version
+
+            - name: Setup Eth POS Devnet
+              run: |
+                  # Pin ethereum-package to a known-good commit so the devnet (and its
+                  # genesis_validators_root, which KurtosisDevnet hardcodes) stays reproducible.
+                  # It needs a commit that understands gloas_fork_epoch.
+                  ETH_PKG=github.com/ethpandaops/ethereum-package@6dd3f2613d1f9d1a9274864083c692726146c9db
+
+                  # Image pulls can still time out transiently; retry a few times before failing.
+                  for i in 1 2 3; do
+                    kurtosis engine start && break
+                    [ "$i" = 3 ] && { echo "kurtosis engine start failed after 3 attempts"; exit 1; }
+                    echo "engine start attempt $i failed; retrying in 15s"; sleep 15
+                  done
+
+                  for i in 1 2 3; do
+                    kurtosis run "$ETH_PKG" --args-file ./sync-committee-devnet.yaml --enclave sync-committee-devnet && break
+                    [ "$i" = 3 ] && { echo "kurtosis run failed after 3 attempts"; exit 1; }
+                    echo "devnet run attempt $i failed; cleaning up and retrying in 15s"
+                    kurtosis enclave rm -f sync-committee-devnet || true
+                    sleep 15
+                  done
+
+                  ./scripts/wait_for_tcp_port_opening.sh localhost 53001
+
+            # Compile while the devnet produces its first epochs.
+            - name: Build Sync Committee Tests
+              run: |
+                  cargo test -p sync-committee-prover --no-run
+
+            # The gloas verifier tests start from the current finalized checkpoint, and the
+            # genesis one has no block to fetch, so wait for the first real finalization.
+            - name: Wait for Finality
+              run: |
+                  for i in $(seq 1 120); do
+                    epoch=$(curl -s localhost:53001/eth/v1/beacon/states/head/finality_checkpoints | jq -r '.data.finalized.epoch // 0')
+                    echo "finalized epoch ${epoch}"
+                    [ "${epoch:-0}" -ge 2 ] && exit 0
+                    sleep 10
+                  done
+                  echo "devnet did not finalize in 20 minutes"; exit 1
+
+            - name: Run Sync Committee Tests
+              run: |
+                  # The devnet is on Gloas from genesis, so the one test that needs a fork
+                  # mid chain is left for a local devnet.
+                  cargo test -p sync-committee-prover -- --nocapture --ignored \
+                    --skip verifier_follows_the_chain_across_the_gloas_fork
+
+            - name: Cleanup
+              if: always()
+              run: |
+                  kurtosis enclave rm -f sync-committee-devnet || true
+                  kurtosis engine stop || true
+
+    bsc-tests:
+        name: Binance Smart Chain Tests
+        needs: detect-changes
+        runs-on: ubuntu-22.04
+        if: github.event.pull_request.draft != true && needs.detect-changes.outputs.bsc == 'true'
+        steps:
+            - name: Get User Permission
+              id: checkAccess
+              uses: actions-cool/check-user-permission@v2
+              with:
+                  require: write
+                  username: ${{ github.triggering_actor }}
+
+            - name: Check User Permission
+              if: steps.checkAccess.outputs.require-result == 'false'
+              run: |
+                  echo "${{ github.triggering_actor }} does not have permissions on this repo."
+                  echo "Current permission level is ${{ steps.checkAccess.outputs.user-permission }}"
+                  echo "Job originally triggered by ${{ github.actor }}"
+                  exit 1
+
+            - uses: actions/checkout@v3
+              with:
+                  ref: ${{  github.event.pull_request.head.sha }}
+                  token: ${{ secrets.GH_TOKEN }}
+                  submodules: recursive
+
+            - name: Install toolchain
+              uses: dtolnay/rust-toolchain@nightly
+              with:
+                  toolchain: stable
+
+            - name: Add wasm toolchain
+              run: |
+                  rustup update nightly
+                  rustup target add wasm32-unknown-unknown --toolchain nightly
+                  rustup target add wasm32-unknown-unknown
+                  rustup component add rust-src
+
+            - name: Install Dependencies
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y clang netcat wget curl libssl-dev llvm libclang-dev libudev-dev make libprotobuf-dev protobuf-compiler pkg-config
+                  echo "LIBCLANG_PATH=/usr/lib/llvm-14/lib" >> $GITHUB_ENV
+
+            - uses: pnpm/action-setup@v4
+              with:
+                  version: 10
+
+            - name: Set up Node
+              uses: actions/setup-node@v3
+              with:
+                  node-version: 22
+                  cache-dependency-path: "evm/pnpm-lock.yaml"
+                  cache: "pnpm"
+
+            - name: Install npm dependencies
+              working-directory: evm
+              run: |
+                  pnpm install
+
+            - uses: webfactory/ssh-agent@v0.7.0
+              with:
+                  ssh-private-key: ${{ secrets.SSH_KEY }}
+
+            - uses: Swatinem/rust-cache@v2
+
+
+            - name: Run BSC Tests
+              run: |
+                  cargo test -p bsc-prover -- --nocapture --ignored
+
+    tendermint-tests:
+        name: Tendermint Tests
+        needs: detect-changes
+        runs-on: ubuntu-22.04
+        if: github.event.pull_request.draft != true && needs.detect-changes.outputs.tendermint == 'true'
+        steps:
+            - name: Get User Permission
+              id: checkAccess
+              uses: actions-cool/check-user-permission@v2
+              with:
+                  require: write
+                  username: ${{ github.triggering_actor }}
+
+            - name: Check User Permission
+              if: steps.checkAccess.outputs.require-result == 'false'
+              run: |
+                  echo "${{ github.triggering_actor }} does not have permissions on this repo."
+                  echo "Current permission level is ${{ steps.checkAccess.outputs.user-permission }}"
+                  echo "Job originally triggered by ${{ github.actor }}"
+                  exit 1
+
+            - uses: actions/checkout@v3
+              with:
+                  ref: ${{  github.event.pull_request.head.sha }}
+                  token: ${{ secrets.GH_TOKEN }}
+                  submodules: recursive
+
+            - name: Install toolchain
+              uses: dtolnay/rust-toolchain@nightly
+              with:
+                  toolchain: stable
+
+            - name: Add wasm toolchain
+              run: |
+                  rustup update nightly
+                  rustup target add wasm32-unknown-unknown --toolchain nightly
+                  rustup target add wasm32-unknown-unknown
+                  rustup component add rust-src
+
+            - name: Install Dependencies
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y clang netcat wget curl libssl-dev llvm libclang-dev libudev-dev make libprotobuf-dev protobuf-compiler pkg-config
+                  echo "LIBCLANG_PATH=/usr/lib/llvm-14/lib" >> $GITHUB_ENV
+
+            - uses: pnpm/action-setup@v4
+              with:
+                  version: 10
+
+            - name: Set up Node
+              uses: actions/setup-node@v3
+              with:
+                  node-version: 22
+                  cache-dependency-path: "evm/pnpm-lock.yaml"
+                  cache: "pnpm"
+
+            - name: Install npm dependencies
+              working-directory: evm
+              run: |
+                  pnpm install
+
+            - uses: webfactory/ssh-agent@v0.7.0
+              with:
+                  ssh-private-key: ${{ secrets.SSH_KEY }}
+
+            - uses: Swatinem/rust-cache@v2
+
+
+            - name: Run Tendermint Tests
+              run: |
+                  RUST_LOG=tendermint_prover=trace,tesseract=trace,tendermint_verifier=trace cargo test -p tendermint-prover -- --nocapture --ignored
+
+    pharos-tests:
+        name: Pharos Tests
+        needs: detect-changes
+        runs-on: ubuntu-22.04
+        if: github.event.pull_request.draft != true && needs.detect-changes.outputs.pharos == 'true'
+        steps:
+            - name: Get User Permission
+              id: checkAccess
+              uses: actions-cool/check-user-permission@v2
+              with:
+                  require: write
+                  username: ${{ github.triggering_actor }}
+
+            - name: Check User Permission
+              if: steps.checkAccess.outputs.require-result == 'false'
+              run: |
+                  echo "${{ github.triggering_actor }} does not have permissions on this repo."
+                  echo "Current permission level is ${{ steps.checkAccess.outputs.user-permission }}"
+                  echo "Job originally triggered by ${{ github.actor }}"
+                  exit 1
+
+            - uses: actions/checkout@v3
+              with:
+                  ref: ${{  github.event.pull_request.head.sha }}
+                  token: ${{ secrets.GH_TOKEN }}
+                  submodules: recursive
+
+            - name: Install toolchain
+              uses: dtolnay/rust-toolchain@nightly
+              with:
+                  toolchain: stable
+
+            - name: Add wasm toolchain
+              run: |
+                  rustup update nightly
+                  rustup target add wasm32-unknown-unknown --toolchain nightly
+                  rustup target add wasm32-unknown-unknown
+                  rustup component add rust-src
+
+            - name: Install Dependencies
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y clang netcat wget curl libssl-dev llvm libclang-dev libudev-dev make libprotobuf-dev protobuf-compiler pkg-config
+                  echo "LIBCLANG_PATH=/usr/lib/llvm-14/lib" >> $GITHUB_ENV
+
+            - uses: pnpm/action-setup@v4
+              with:
+                  version: 10
+
+            - name: Set up Node
+              uses: actions/setup-node@v3
+              with:
+                  node-version: 22
+                  cache-dependency-path: "evm/pnpm-lock.yaml"
+                  cache: "pnpm"
+
+            - name: Install npm dependencies
+              working-directory: evm
+              run: |
+                  pnpm install
+
+            - uses: webfactory/ssh-agent@v0.7.0
+              with:
+                  ssh-private-key: ${{ secrets.SSH_KEY }}
+
+            - uses: Swatinem/rust-cache@v2
+
+            - name: Run Pharos unit tests
+              run: |
+                  cargo test -p pharos-primitives -p pharos-verifier -- --nocapture
+
+            - name: Run Pharos integration tests
+              run: |
+                  PHAROS_ATLANTIC_RPC=${{ secrets.PHAROS_ATLANTIC_RPC }} cargo test -p pallet-ismp-testsuite "pharos" -- --nocapture --ignored
