@@ -1,0 +1,91 @@
+name: "CS"
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+      - "2.**"
+
+permissions:
+  contents: read
+
+jobs:
+  coding-standards:
+    name: "CS Fixer, PHPStan & TwigCS"
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: mysql://root:root@127.0.0.1:3306/wallabag?charset=utf8mb4
+
+    steps:
+      - name: "Checkout"
+        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" # v7.0.1
+
+      - name: "Install PHP"
+        uses: "shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962" # 2.40.0
+        with:
+          coverage: "none"
+          php-version: "8.2"
+          tools: cs2pr, pecl
+          extensions: pdo, pdo_mysql, pdo_sqlite, pdo_pgsql, curl, imagick, pgsql, gd, tidy
+          ini-values: "date.timezone=Europe/Paris"
+        env:
+          COMPOSER_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "Install Node"
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: ".nvmrc"
+          cache: 'yarn'
+
+      - name: "Setup MySQL"
+        run: |
+          sudo systemctl start mysql.service
+          sudo mysql -u root -proot -h 127.0.0.1 -e "CREATE DATABASE wallabag_test"
+
+      - name: "Install dependencies with Composer"
+        id: composer-install
+        uses: "ramsey/composer-install@65e4f84970763564f46a70b8a54b90d033b3bdda" # 4.0.0
+        with:
+          composer-options: "--optimize-autoloader --prefer-dist"
+
+      - name: "Install dependencies with Yarn"
+        id: yarn-install
+        run: yarn install
+
+      - name: "Run Composer validate"
+        if: always() && steps.composer-install.outcome == 'success'
+        run: "composer validate"
+
+      - name: "Run Composer dependency analyser"
+        if: always() && steps.composer-install.outcome == 'success'
+        run: "bin/composer-dependency-analyser"
+
+      - name: "Run PHP CS Fixer"
+        if: always() && steps.composer-install.outcome == 'success'
+        run: "bin/php-cs-fixer fix --verbose --dry-run --format=checkstyle | cs2pr"
+
+      - name: "Generate test cache for PHPStan"
+        id: test-cache
+        if: always() && steps.composer-install.outcome == 'success'
+        run: "php bin/console cache:clear --env=test"
+
+      - name: "Run PHPStan"
+        if: always() && steps.test-cache.outcome == 'success'
+        run: "php bin/phpstan analyse --no-progress --error-format=checkstyle | cs2pr"
+
+      - name: "Run TwigCS"
+        if: always() && steps.composer-install.outcome == 'success'
+        run: "php bin/twigcs --severity=error --display=blocking --reporter checkstyle app/ src/ | cs2pr"
+
+      - name: "Run ergebnis/composer-normalize"
+        if: always() && steps.composer-install.outcome == 'success'
+        run: "composer normalize --dry-run --no-check-lock"
+
+      - name: "Run Biome"
+        if: always() && steps.yarn-install.outcome == 'success'
+        run: "yarn lint:js"
+
+      - name: "Run Stylelint"
+        if: always() && steps.yarn-install.outcome == 'success'
+        run: "yarn lint:scss"

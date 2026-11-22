@@ -1,0 +1,89 @@
+name: website
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - .github/workflows/website.yml
+      - 'config/**'
+      - 'examples/**'
+      - 'packages/**'
+      - 'website/**'
+      - 'website/package.json'
+      - 'package.json'
+      - 'scripts/**'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - .github/workflows/website.yml
+      - 'config/**'
+      - 'examples/**'
+      - 'packages/**'
+      - 'website/**'
+      - 'website/package.json'
+      - 'package.json'
+      - 'scripts/**'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 #v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 #v4
+        with:
+          node-version: 24.x
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.27.x
+      - uses: pnpm/action-setup@v4
+
+      # website is a pnpm workspace member, so a single root `pnpm install`
+      # wires its deps and the workspace symlinks to typia / @typia/*.
+      - name: Install Dependencies
+        run: pnpm install
+
+      # The wasm playground build links against samchon/ttsc via a sibling
+      # go.work file (packages/typia/native/go.work). Match that checkout to the
+      # installed @ttsc/wasm package so its Go host and browser API cannot drift.
+      - name: Checkout ttsc sibling
+        run: node scripts/checkout-ttsc.cjs
+
+      # ttsc compiles the typia Go plugin on first use into
+      # node_modules/.cache/ttsc, keyed by content (plugin source + ttsc/tsgo
+      # versions). Restoring a stale cache is safe: a changed source misses the
+      # binary key but still reuses the incremental go-build objects. Restored
+      # after `pnpm install` so an install-time node_modules rebuild cannot
+      # discard it.
+      - name: Restore ttsc Plugin Cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules/.cache/ttsc
+          key: ttsc-cache-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'packages/typia/native/**') }}
+          restore-keys: ttsc-cache-${{ runner.os }}-
+
+      # Workspace dependencies supply both the runtime and Monaco type packs.
+      - name: Packages
+        run: pnpm run build
+
+      - name: Test Playground Compiler
+        working-directory: website
+        run: |
+          pnpm run test:compiler
+          go -C compiler test ./cmd/playground
+
+      - name: Build
+        working-directory: website
+        run: pnpm run build
+
+      # A pull request stops at the build above; only a master push publishes.
+      - name: Deploy
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          branch: gh-pages
+          folder: ./website/out
+          # keep gh-pages at one commit; full-history snapshots bloat the repository
+          single-commit: true
