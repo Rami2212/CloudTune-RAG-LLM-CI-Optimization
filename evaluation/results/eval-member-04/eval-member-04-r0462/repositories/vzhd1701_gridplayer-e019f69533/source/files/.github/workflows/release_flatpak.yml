@@ -1,0 +1,70 @@
+name: release_flatpak
+
+on:
+  workflow_dispatch:
+    inputs:
+      custom_commit:
+        description: 'Custom commit (at gridplayer-flatpak) to release as'
+        required: false
+        type: string
+      dry_run:
+        description: 'Only build the bundle from this checkout, kept as the run''s artifact: nothing pushed'
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: read
+
+env:
+  BUILD_PYTHON_VERSION: "3.14"
+
+jobs:
+  build_flatpak:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: extractions/setup-just@v4
+
+      - name: Set up Python ${{ env.BUILD_PYTHON_VERSION }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.BUILD_PYTHON_VERSION }}
+
+      - name: Install the latest version of uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+
+      - name: Install requirements
+        run: |
+          sudo apt-get install -y desktop-file-utils appstream-util flatpak
+          flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y flathub org.kde.Sdk//6.11
+
+      # the runtimes, the PyQt BaseApp and flatpak-builder are installed by
+      # the build script
+      - name: Build bundle
+        if: inputs.dry_run
+        run: |
+          just build-linux-flatpak
+
+      - name: Save bundle
+        if: inputs.dry_run
+        uses: actions/upload-artifact@v7
+        with:
+          name: flatpak_result
+          path: dist/*.flatpak
+          retention-days: 7
+
+      - name: Release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GIT_USER: vzhd1701
+          GIT_EMAIL: vzhd1701@gmail.com
+          GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
+          RELEASE_FOR_COMMIT: ${{ github.event.inputs.custom_commit }}
+          FLATPAK_GIT_REPO: vzhd1701/gridplayer-flatpak
+          FLATHUB_GIT_REPO: flathub/com.vzhd1701.gridplayer
+        run: |
+          just build-linux-flatpak-git

@@ -1,0 +1,60 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [HIGH] Add npm dependency cache to "test" job
+# - [MEDIUM] Add concurrency group to "ci.yml"
+# Estimated savings: ~6 min/run
+#
+name: CI
+'on':
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - docs/**
+      - '**.md'
+  pull_request:
+    branches:
+      - master
+    paths-ignore:
+      - docs/**
+      - '**.md'
+env:
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v5
+      - name: Setup node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install dependencies
+        run: pnpm install
+      - name: Install Playwright Chromium
+        run: pnpm playwright install chromium
+        working-directory: tests
+      - name: Test unit
+        run: pnpm test:unit
+      - name: Test e2e dev
+        run: pnpm test:dev
+        working-directory: tests
+      - name: Test e2e build
+        run: pnpm test:build
+        working-directory: tests
+      - name: Archive test results
+        if: failure()
+        run: tar -czf test-results.tar.gz tests/test-results
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          retention-days: 3
+          name: test-failure-${{ github.run_id }}
+          path: test-results.tar.gz

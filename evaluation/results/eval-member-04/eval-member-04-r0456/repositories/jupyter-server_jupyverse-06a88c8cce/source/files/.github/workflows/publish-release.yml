@@ -1,0 +1,45 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+.post[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+[a-b][0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+rc[0-9]+"
+
+jobs:
+  pypi-publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: release
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+      - name: Build packages
+        run: uv build --all-packages
+      - name: Upload packages
+        run: |
+          for filename in dist/*; do
+            uv publish "$filename" || continue
+          done
+
+  github-release:
+      name: Create GitHub release
+      needs: pypi-publish
+      runs-on: ubuntu-latest
+      permissions:
+        contents: write
+      steps:
+      - uses: actions/checkout@v6
+      - id: changelog
+        uses: agronholm/release-notes@v1
+        with:
+          path: CHANGELOG.md
+          version_pattern: ^\#\# ([0-9][^*]*)\n
+      - uses: ncipollo/release-action@v1
+        with:
+          body: ${{ steps.changelog.outputs.changelog }}

@@ -1,0 +1,38 @@
+name: release_pypi
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: read
+
+env:
+  BUILD_PYTHON_VERSION: "3.14"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python ${{ env.BUILD_PYTHON_VERSION }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.BUILD_PYTHON_VERSION }}
+
+      - name: Install the latest version of uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+
+      - name: Get Git commit timestamp
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "$GITHUB_ENV"
+
+      - name: Build project for distribution
+        run: uv build
+
+      - name: Publish to PyPI
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
+        run: uv publish
