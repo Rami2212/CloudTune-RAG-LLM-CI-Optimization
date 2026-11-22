@@ -1,0 +1,616 @@
+# A push to main that brings a changelog entry is a snapshot; every tag is a
+# release. A push whose snapshot note would be empty — no commit since the last
+# tag carrying an entry — publishes nothing, and android.yml and ios.yml build it
+# instead. Run by hand, a snapshot is published regardless.
+#
+# The three values a build carries come from `tool/release/version.sh` and nowhere
+# else — no human edits a version, and `pubspec.yaml`'s stays a placeholder for
+# local runs. See that script for why the label, the train and the ordinal are
+# three separate things.
+name: Release
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+# One release at a time. Two concurrent runs would publish two builds whose
+# ordinals were computed from different commits, and the loser would be the
+# newer one.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+# None unless a job asks. The repository's default token can write, and two of
+# the three jobs here only read: one of them is the job that holds the signing
+# keys and the store credentials, and runs every dependency the build pulls in.
+permissions: {}
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    # Read: the checkout, and the release list the ordinal guard compares
+    # against. A token that can only read is shown published releases and not
+    # drafts — which is the set the guard means by "published".
+    permissions:
+      contents: read
+    outputs:
+      label: ${{ steps.v.outputs.label }}
+      train: ${{ steps.v.outputs.train }}
+      # From the guard, not from `v`: a release tag on a commit the snapshot
+      # run already published is raised there. See that step.
+      code: ${{ steps.ordinal.outputs.code }}
+      date: ${{ steps.v.outputs.date }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+      publish: ${{ steps.changelog.outputs.publish }}
+    steps:
+      # Full history: the label counts this week's commits and the train reads
+      # the newest tag. A shallow clone has neither.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          # Nothing in this job pushes; `gh` reads its token from GH_TOKEN.
+          persist-credentials: false
+
+      - id: v
+        run: |
+          eval "$(tool/release/version.sh)"
+          echo "label=$DPIP_LABEL" >> "$GITHUB_OUTPUT"
+          echo "train=$DPIP_TRAIN" >> "$GITHUB_OUTPUT"
+          echo "code=$DPIP_CODE" >> "$GITHUB_OUTPUT"
+          echo "date=$DPIP_DATE" >> "$GITHUB_OUTPUT"
+          # A tag is a release; anything else is a snapshot.
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "::notice::$DPIP_LABEL — $DPIP_TRAIN ($DPIP_CODE, built $DPIP_DATE)"
+
+      # The ordinal is the one value that must never repeat or go backwards: a
+      # store that has accepted a code refuses every build at or below it,
+      # permanently, and deleting the build does not release the number.
+      # Checking here fails the run loudly instead of failing an upload later,
+      # when the artifacts have already been built.
+      #
+      # This only sees what *this* workflow published. A build uploaded by hand
+      # is invisible to it — which is how 408283049 reached TestFlight ahead of
+      # the scheme. The per-store floors in tool/release/version.sh are what cover
+      # those; raise one whenever something is shipped outside this workflow.
+      #
+      # Equal and lower are different failures, and only one of them is a bug.
+      #
+      # **Lower** means the ordinal went backwards — a rewritten history, which
+      # is what the check was written for. It still stops the run.
+      #
+      # **Equal** on a tag means this commit was already published as a
+      # snapshot. That is not an accident, it is the normal shape of a release:
+      # every push to main with a changelog entry publishes, so by the time
+      # anyone can tag a commit it has usually already spent its number, and both uploads below run for a snapshot
+      # exactly as they do for a release. `v26.1` only shipped because its
+      # commit never went out as a snapshot; on `v26.2` (`d2b4664b`, carrying
+      # both `26w35g` and `v26.2`) the tag run computed the snapshot's own
+      # 426000507 and died. There is no way to tag around it — a branch push
+      # and a tag push are two events on one commit, so a fresh commit collides
+      # the same way.
+      #
+      # So a tie on a tag takes the next number instead. What that gives up is
+      # the ordinal reading back as an exact commit count for release builds
+      # only; what it buys is a release path that exists. A tie on a *branch*
+      # is still a failure — nothing should publish the same commit twice as a
+      # snapshot.
+      - name: Ordinal must be higher than the last published one
+        id: ordinal
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Through the environment rather than interpolated into the script:
+          # the value is ours, but a shell comparison built by string
+          # substitution is the shape that goes wrong when the value is not.
+          CODE: ${{ steps.v.outputs.code }}
+        run: |
+          # The REST endpoint rather than `gh release list`: that command has no
+          # `body` field at all (it is only on `gh release view`), so the whole
+          # check errored out before it could compare anything. One request
+          # returns bodies for every release, newest first.
+          #
+          # `.body // ""` because a release created without notes has a null
+          # body, and jq's `capture` refuses to match against null — one such
+          # release anywhere in the list used to abort the run.
+          previous="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '[.[] | (.body // "") | capture("<!--\\s*dpip-build:\\s*(?<c>\\d+)") | .c | tonumber] | max // 0')"
+          echo "previous=$previous current=$CODE"
+          if [ "$CODE" -lt "$previous" ]; then
+            echo "::error::build ordinal $CODE is below the published $previous"
+            exit 1
+          fi
+          if [ "$CODE" -eq "$previous" ]; then
+            if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+              echo "::error::build ordinal $CODE repeats the published $previous"
+              exit 1
+            fi
+            CODE=$((previous + 1))
+            echo "::notice::this commit already published $previous as a snapshot; the release takes $CODE"
+          fi
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+
+      # Nothing a user would see: the snapshot's note would say so and nothing
+      # else, and the stores would get a build that changes nothing. A push to
+      # main only — a tag is a release, and run by hand, someone asked for one.
+      # The next push that does bring an entry publishes these commits too,
+      # since its note runs from the same tag.
+      - name: Anything to publish
+        id: changelog
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = branch ] && [ "$EVENT" = push ] &&
+            ! bash tool/release/notes.sh --any; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no commit since $(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo 'the first') carries a changelog entry — no snapshot; android.yml and ios.yml build this push"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: version
+    # `publish`, which needs this, is skipped with it.
+    if: needs.version.outputs.publish == 'true'
+    strategy:
+      # Independent: one store failing must not stop the other shipping.
+      fail-fast: false
+      matrix:
+        include:
+          - platform: android
+            runs-on: ubuntu-latest
+          - platform: ios
+            runs-on: macos-latest
+    runs-on: ${{ matrix.runs-on }}
+    # Read, for the checkout. The uploads authenticate with their own store
+    # credentials, not with this token.
+    permissions:
+      contents: read
+    steps:
+      # Full history: tool/release/build_info.sh counts commits and reads tags.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          # Nothing in this job pushes, and it is the job holding the signing
+          # keys and the store credentials: the job token is not left in
+          # .git/config beside them.
+          persist-credentials: false
+
+      # Three caches are restored below — Gradle, pub and Swift packages —
+      # into the job that signs and ships, and the workflow lint
+      # (tool/check/workflow_security.sh) flags each one, rightly: whoever can
+      # write a cache this job restores can put code into a store build.
+      #
+      # They are kept, and each is marked as accepted, because of who that is.
+      # A run on `main` or on a tag restores only what was saved on `main` or
+      # on that tag; a pull request's caches are scoped to the pull request
+      # and are never offered here. On `main`, every workflow runs `main`'s own
+      # code, with one exception: review.yml runs in `main`'s scope on behalf
+      # of a pull request. Its threat model keeps the pull request's code from
+      # executing there, but the reviewer it runs is a third party's, and a
+      # compromised release of it could write a cache. That is the risk being
+      # accepted, and the pins in review.yml are what bound it; take these
+      # caches out rather than loosen them.
+      #
+      # mise's own cache is not one of them. What it saves is an SDK that
+      # mise.toml reconstructs identically on the next run, not minutes of work
+      # that only a cache can give back — 20 s on Linux and 46 s on macOS in
+      # the run of 2026-10-25, against 65 s for the Swift packages alone. It is
+      # therefore the one to give up first, and v5.2.0's release notes say
+      # outright that a job which publishes a release should not restore a
+      # cache at all.
+      #
+      # Flutter/Dart come from mise.toml, the same pin ci.yml and every
+      # developer use. A published build is the one that most needs to be
+      # reproducible, so it must not be the one tracking whatever "stable"
+      # happens to mean on the day it runs.
+      - uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
+        with:
+          cache: false
+
+      - if: matrix.platform == 'android'
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: "temurin"
+          java-version: "25"
+          cache: "gradle" # zizmor: ignore[cache-poisoning] — accepted, see above
+
+      # Keyed on the lockfile, so it is reused until a dependency actually
+      # moves. Without it every release re-downloads the full package set —
+      # mise caches the SDK but knows nothing about pub.
+      #
+      # No restore-keys fallback: `~/.pub-cache/git` mirrors the exact fork
+      # commit the lockfile resolved, and a lockfile bump (e.g. a new MapLibre
+      # fork pin) must not reuse a mirror of the previous commit — pub then
+      # resolves the old fork's dependency set and "removes" packages the new
+      # lockfile still needs, corrupting .dart_tool/package_graph.json. A
+      # precise key costs one full download on a dependency change and is
+      # correct every time.
+      - name: Cache pub packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.pub-cache
+          key: ${{ runner.os }}-pub-${{ hashFiles('pubspec.lock') }}
+          lookup-only: false # zizmor: ignore[cache-poisoning] — accepted, see above
+
+      # The iOS build resolves its dependencies through Swift Package Manager
+      # (there is no Podfile). Uncached, every release re-clones and rebuilds
+      # every package before the app's own code is even compiled — on the
+      # runner that bills at ten times the Linux rate.
+      #
+      # Both clone directories, because the build below uses both: Flutter's
+      # step clones into build/ios/SourcePackages (it always passes
+      # -clonedSourcePackagesDirPath), and the xcodebuild archive after it,
+      # which does not, clones into DerivedData.
+      #
+      # The list is ios.yml's, line for line, and has to stay that way. A cache
+      # entry's version is a hash of these paths, so a different list is a
+      # different cache under the same key: every pull request missed the one
+      # main saved here and stored a fresh ~880 MB copy of its own.
+      - name: Cache Swift packages
+        if: matrix.platform == 'ios'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            build/ios/SourcePackages
+            ~/Library/Developer/Xcode/DerivedData/**/SourcePackages
+          key: ${{ runner.os }}-spm-${{ hashFiles('ios/Runner.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+          lookup-only: false # zizmor: ignore[cache-poisoning] — accepted, see above
+
+      # The committed copy is a stub; the real values come from git. CI also
+      # passes them with --dart-define below, so this is belt and braces — but
+      # it is what makes the file compile at all.
+      - run: bash tool/release/build_info.sh
+
+      - run: bash tool/dev/deps.sh
+
+      # Without these the release build silently falls back to the *debug*
+      # signing config (see `buildTypes.release` in android/app/build.gradle.kts),
+      # which is signed with the well-known keypair that ships in the Android
+      # SDK. Play refuses such a bundle outright, and a sideloaded APK signed
+      # with it can be "updated" by anyone — on a disaster app that is not a
+      # theoretical objection. The quoted heredoc keeps a `$` in a password from
+      # being eaten by the shell.
+      - name: Install the upload key
+        if: matrix.platform == 'android'
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > android/app/my-release-key.jks
+          cat > android/key.properties << 'EOF'
+          storePassword=${{ secrets.KEYSTORE_PASSWORD }}
+          keyPassword=${{ secrets.KEY_PASSWORD }}
+          keyAlias=${{ secrets.KEY_ALIAS }}
+          storeFile=my-release-key.jks
+          EOF
+
+      # xcodebuild takes a *path* to the key, not the key. `printf` rather than
+      # `echo` so nothing is appended to the PEM.
+      - name: Install the App Store Connect API key
+        if: matrix.platform == 'ios'
+        run: |
+          mkdir -p "$RUNNER_TEMP/private_keys"
+          printf '%s' "${{ secrets.APPSTORE_API_PRIVATE_KEY }}" \
+            > "$RUNNER_TEMP/private_keys/AuthKey_${{ secrets.APPSTORE_API_KEY_ID }}.p8"
+
+      # Without this the archive below creates a brand-new Apple Development
+      # certificate, every run. The runner's keychain is empty, the archive
+      # signs for development, Apple's cloud signing covers distribution only,
+      # and `-allowProvisioningUpdates` creates whatever it cannot find. Each
+      # one is dead on arrival — its private key never leaves the runner — and
+      # they pile up in the account until the team hits Apple's cap, at which
+      # point every iOS release fails at once until a human revokes by hand.
+      #
+      # tool/release/ios_keychain.sh has the full mechanism, including why
+      # dropping the flag is not the fix and why the certificate cannot simply
+      # be downloaded.
+      #
+      # No teardown step. The keychain lives under $RUNNER_TEMP on a VM GitHub
+      # destroys, which is the same reason `Remove the API key` further down is
+      # about the repository checkout rather than the machine.
+      - name: Install the iOS signing identity
+        if: matrix.platform == 'ios'
+        env:
+          # Through the environment rather than `${{ }}` inside the script
+          # body: a secret spliced into a shell by string substitution is one
+          # quote away from being read as shell.
+          APPLE_DEV_CERT_BASE64: ${{ secrets.APPLE_DEV_CERT_BASE64 }}
+          APPLE_DEV_CERT_PASSWORD: ${{ secrets.APPLE_DEV_CERT_PASSWORD }}
+        run: bash tool/release/ios_keychain.sh
+
+      # `--build-name` is what reaches `CFBundleShortVersionString`, so it is
+      # the *train*: Apple rejects anything that is not one to three integers
+      # (ERROR ITMS-90060), at upload, TestFlight included. Android takes its
+      # `versionName` from `DPIP_LABEL` instead — see android/app/build.gradle.kts
+      # — so the store page shows the name a human was given.
+      #
+      # `DPIP_LABEL` also rides in as a dart-define, which is what the app
+      # itself displays on every platform.
+      #
+      # `DPIP_PRERELEASE` is the only thing that lets a release-mode build send
+      # crash reports (lib/core/diagnostics/prerelease_diagnostics.dart): `true`
+      # for a snapshot, `false` for a tag. Without it a build counts as
+      # production, so leaving it out fails safe — and silences the testers.
+      #
+      # Android builds twice on purpose: the APK is what a person sideloads from
+      # the GitHub release, the AAB is the only thing Play accepts.
+      - name: Build
+        env:
+          # Only the label under a name the build reads: gradle takes its
+          # versionCode from Flutter's `--build-number` below, so there is one
+          # source for it rather than two that can disagree.
+          DPIP_LABEL: ${{ needs.version.outputs.label }}
+          # The rest under names nothing in the build reads, for the same
+          # reason. They are in the environment at all so the script expands
+          # them itself: a `${{ }}` in a `run:` is pasted into its text before
+          # bash parses it, which leaves every value one quote away from being
+          # read as code. These come from git and nobody types them, but the
+          # habit costs nothing, and it is the one every step here follows.
+          RELEASE_TRAIN: ${{ needs.version.outputs.train }}
+          RELEASE_CODE: ${{ needs.version.outputs.code }}
+          RELEASE_DATE: ${{ needs.version.outputs.date }}
+          RELEASE_PRERELEASE: ${{ needs.version.outputs.prerelease }}
+        run: |
+          # One number for both stores — see tool/release/version.sh for why they can
+          # be aligned. It is also what the release advertises and what the
+          # update check compares, so nothing anywhere has to translate.
+          COMMON="--build-name=$RELEASE_TRAIN \
+                  --build-number=$RELEASE_CODE \
+                  --dart-define=DPIP_LABEL=$DPIP_LABEL \
+                  --dart-define=DPIP_CODE=$RELEASE_CODE \
+                  --dart-define=DPIP_TRAIN=$RELEASE_TRAIN \
+                  --dart-define=DPIP_DATE=$RELEASE_DATE \
+                  --dart-define=DPIP_PRERELEASE=$RELEASE_PRERELEASE"
+          if [ "${{ matrix.platform }}" = "android" ]; then
+            bash tool/dev/build.sh android $COMMON
+            bash tool/dev/build.sh bundle $COMMON
+            mv build/app/outputs/flutter-apk/app-release.apk \
+               "DPIP-$DPIP_LABEL.apk"
+          else
+            # Two steps rather than `flutter build ipa`. Flutter passes
+            # `-allowProvisioningUpdates` but never the App Store Connect
+            # authentication flags, so on a runner with no signed-in Xcode
+            # account automatic signing has nothing to authenticate as. Driving
+            # xcodebuild directly is the only way to hand it the API key.
+            #
+            # The Flutter step still has to run first: it writes
+            # FLUTTER_BUILD_NUMBER into ios/Flutter/Generated.xcconfig, which is
+            # where Info.plist's CFBundleVersion comes from.
+            bash tool/dev/build.sh ios $COMMON
+            AUTH=(-allowProvisioningUpdates
+                  -authenticationKeyPath "$RUNNER_TEMP/private_keys/AuthKey_${{ secrets.APPSTORE_API_KEY_ID }}.p8"
+                  -authenticationKeyID "${{ secrets.APPSTORE_API_KEY_ID }}"
+                  -authenticationKeyIssuerID "${{ secrets.APPSTORE_ISSUER_ID }}")
+            ( cd ios && xcodebuild -workspace Runner.xcworkspace -scheme Runner \
+                -configuration Release -sdk iphoneos \
+                -archivePath "$RUNNER_TEMP/Runner.xcarchive" "${AUTH[@]}" archive )
+
+            # The Runner target's Crashlytics build phase uploads these symbols.
+            # Keep the exact archive output too, so a failed upload can be retried
+            # after the ephemeral runner has gone away.
+            dsym="$RUNNER_TEMP/Runner.xcarchive/dSYMs/Runner.app.dSYM"
+            binary="$RUNNER_TEMP/Runner.xcarchive/Products/Applications/Runner.app/Runner"
+            if [ ! -d "$dsym" ]; then
+              echo "::error::archive contains no Runner.app.dSYM"
+              exit 1
+            fi
+            binary_uuid="$(dwarfdump --uuid "$binary" | awk '{print $2}' | sort)"
+            dsym_uuid="$(dwarfdump --uuid "$dsym" | awk '{print $2}' | sort)"
+            if [ "$binary_uuid" != "$dsym_uuid" ]; then
+              echo "::error::Runner binary and dSYM UUIDs do not match"
+              echo "binary: $binary_uuid"
+              echo "dSYM: $dsym_uuid"
+              exit 1
+            fi
+            ditto -c -k --sequesterRsrc --keepParent \
+              "$RUNNER_TEMP/Runner.xcarchive/dSYMs" \
+              "DPIP-$DPIP_LABEL-$RELEASE_CODE-dSYMs.zip"
+
+            xcodebuild -exportArchive \
+              -archivePath "$RUNNER_TEMP/Runner.xcarchive" \
+              -exportOptionsPlist ios/ExportOptions.plist \
+              -exportPath "$RUNNER_TEMP/ipa" "${AUTH[@]}"
+            ipa="$(find "$RUNNER_TEMP/ipa" -maxdepth 1 -name '*.ipa' | head -1)"
+            if [ -z "$ipa" ]; then
+              echo "::error::export produced no .ipa"; ls -R "$RUNNER_TEMP/ipa" || true; exit 1
+            fi
+            mv "$ipa" "DPIP-$DPIP_LABEL.ipa"
+          fi
+
+      # Resolved at run time, not hardcoded: the directory carries the AGP task
+      # name (`.../release/mergeReleaseNativeLibs/out/lib`), which is an
+      # implementation detail that has been renamed between AGP versions. An
+      # empty output makes the upload skip symbols rather than fail the release
+      # — losing symbolication is recoverable, losing the build is not.
+      - name: Locate native debug symbols
+        id: symbols
+        if: matrix.platform == 'android'
+        run: |
+          dir="$(find build/app/intermediates/merged_native_libs/release \
+                   -type d -name lib -path '*/out/*' 2>/dev/null | head -1)"
+          [ -n "$dir" ] || echo "::warning::no native symbol directory found; uploading without symbols"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+      # Every Android build lands in internal testing. A tag still creates the
+      # signed release artifact and GitHub release, but promotion to production
+      # is deliberately performed in Play Console: rollout, review notes and
+      # timing remain a human decision, just as App Store submission does on
+      # iOS. CI therefore never opens or commits a production-track Edit that
+      # can race with an operator already working in the console.
+      - name: Upload to Play
+        if: matrix.platform == 'android'
+        uses: r0adkll/upload-google-play@e738b9dd8f2476ea806d921b64aacd24f34515a5 # v1.1.5
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.SERVICE_ACCOUNT_JSON }}
+          packageName: com.exptech.dpip
+          releaseFiles: build/app/outputs/bundle/release/app-release.aab
+          # `track` is deprecated in favour of the plural, which takes a list.
+          tracks: internal
+          status: completed
+          releaseName: ${{ needs.version.outputs.label }}
+          # Lets Play symbolicate native crashes (MapLibre, the mesh stack)
+          # instead of showing raw addresses.
+          debugSymbols: ${{ steps.symbols.outputs.dir }}
+
+      # There is one iOS destination and this is it, for a snapshot and a
+      # release alike: App Store Connect. A build lands there, TestFlight is
+      # simply the view of builds that have landed, and the *same* build is
+      # what an App Store version is later built from — there is no separate
+      # "upload to the App Store".
+      #
+      # So a tag changes nothing here. What it would change is everything
+      # *after*: creating an `appStoreVersion`, attaching this build to it and
+      # submitting it for review. That is deliberately not automated — the
+      # first submission needs screenshots, review notes and export-compliance
+      # answers, and automating a step nobody has yet performed by hand is how
+      # a release gets stuck in a state no one recognises.
+      - name: Upload to App Store Connect
+        if: matrix.platform == 'ios'
+        uses: apple-actions/upload-testflight-build@155ea93be9ee6d5186c71f660a612f5eddb14510 # v5.6.0
+        with:
+          app-path: DPIP-${{ needs.version.outputs.label }}.ipa
+          issuer-id: ${{ secrets.APPSTORE_ISSUER_ID }}
+          api-key-id: ${{ secrets.APPSTORE_API_KEY_ID }}
+          api-private-key: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+          # The upload finishes; the wait after it cannot. The action signs one
+          # App Store Connect JWT with a 600-second life (`n=600` in its bundled
+          # dist/index.js) and never re-signs it, while its own poll schedule
+          # sleeps 60 + 120 + 240 + 300 = 720 seconds before giving up. Any build
+          # that takes longer than the token lives reports
+          # `401 NOT_AUTHORIZED` — after the binary is already on TestFlight.
+          #
+          # Nothing here needs the wait: it exists so the action can write
+          # metadata afterwards, and this step sets neither `release-notes` nor
+          # `uses-non-exempt-encryption` — Info.plist already declares
+          # ITSAppUsesNonExemptEncryption. What is given up is being told when
+          # Apple rejects a binary during processing, which this step never told
+          # us anyway: it failed on the token whether processing passed or not.
+          wait-for-processing: 'false'
+
+      # An Admin credential for the whole App Store Connect account. The runner
+      # is ephemeral, but removing it costs one line.
+      - name: Remove the API key
+        if: always() && matrix.platform == 'ios'
+        run: rm -rf "$RUNNER_TEMP/private_keys"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dpip-${{ matrix.platform }}
+          path: DPIP-*.*
+          if-no-files-found: error
+
+  publish:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    # Write: it pushes the snapshot tag and creates the release.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          # Kept, and the one place it is: `Publish` pushes the snapshot tag
+          # with `git push`. This job uploads no artifact for it to leak into.
+          persist-credentials: true
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # The ordinal rides in the body as an HTML comment: GitHub renders it as
+      # nothing, so the note stays a note while the app still has something
+      # unambiguous to compare. See `buildCodeOf` in update_check.dart.
+      # Built from the commit messages themselves — see tool/release/notes.sh
+      # for why a release accumulates across the snapshots it followed while a
+      # snapshot is only a delta.
+      - name: Release notes
+        env:
+          # Actions does not put GITHUB_TOKEN in the environment; a step has to
+          # ask. Without it notes.sh resolves authors unauthenticated, at 60
+          # requests an hour shared across everything on that runner's IP — and
+          # a rate-limited release produced a note that credited nobody and said
+          # nothing about why.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Through the environment rather than pasted into the script, as in
+          # `Build`.
+          RELEASE_LABEL: ${{ needs.version.outputs.label }}
+          RELEASE_CODE: ${{ needs.version.outputs.code }}
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            bash tool/release/notes.sh \
+              "$RELEASE_LABEL" \
+              "$RELEASE_CODE" --release > NOTES.md
+          else
+            bash tool/release/notes.sh \
+              "$RELEASE_LABEL" \
+              "$RELEASE_CODE" > NOTES.md
+          fi
+          cat NOTES.md
+
+      - name: Publish
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_LABEL: ${{ needs.version.outputs.label }}
+          RELEASE_PRERELEASE: ${{ needs.version.outputs.prerelease }}
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            # The bare label. `v[0-9]*` is what makes a build a release, so a
+            # snapshot named `26w33a` is already in its own namespace — and it
+            # is the name tool/release/version.sh counts to work out the next letter.
+            # An earlier `snapshot/` prefix put the tags somewhere the counter
+            # did not look, so every run computed `a` and this step died on a
+            # tag that already existed.
+            tag="$RELEASE_LABEL"
+            git tag "$tag"
+            git push origin "$tag"
+          fi
+          gh release create "$tag" \
+            --title "$RELEASE_LABEL" \
+            --notes-file NOTES.md \
+            --prerelease="$RELEASE_PRERELEASE" \
+            artifacts/*
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      # Here rather than in a workflow of its own listening on `release`.
+      # GitHub refuses to start a workflow run from an event its own
+      # GITHUB_TOKEN caused, and the release above is created with exactly that
+      # token — an `on: release: [published]` workflow would sit silent forever
+      # and look like a Discord problem.
+      #
+      # `published` would also have been the only safe type to listen for:
+      # publishing a pre-release fires `published` *and* `prereleased`, so
+      # asking for both announces every snapshot twice.
+      - name: Announce on Discord
+        if: always() && steps.publish.outputs.tag != ''
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          # Not secrets: a custom emoji's id is visible to everyone who can see
+          # the server, and it is useless without the webhook that is. Here
+          # rather than as defaults in the script, so a fork announcing to its
+          # own server falls back to the unicode pair instead of referencing
+          # emoji it does not have.
+          DPIP_EMOJI_ANDROID: "<:android:1539201870935892028>"
+          DPIP_EMOJI_IOS: "<:ios:1539201897766981692>"
+          # Without it the release lookup runs unauthenticated, at 60 requests
+          # an hour shared across everything on this runner's IP.
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.publish.outputs.tag }}
+        run: |
+          if [ -z "${DISCORD_WEBHOOK:-}" ]; then
+            echo "::notice::DISCORD_WEBHOOK is not set — nothing announced"
+            exit 0
+          fi
+          # A warning, not a failure. The build is published and the artifacts
+          # are downloadable by the time this runs; turning the job red over an
+          # announcement would say the release did not happen.
+          python3 tool/release/discord.py "$RELEASE_TAG" ||
+            echo "::warning::Discord announcement failed — the release itself is fine"

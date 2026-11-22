@@ -1,0 +1,381 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 13 optimizations:
+# - [HIGH] Add gradle dependency cache to "build" job
+# - [HIGH] Add gradle dependency cache to "test" job
+# - [HIGH] Add gradle dependency cache to "test-dab" job
+# - [HIGH] Add gradle dependency cache to "run-examples" job
+# - [HIGH] Add gradle dependency cache to "test-tck" job
+# - [HIGH] Add gradle dependency cache to "tck-compatibility" job
+# - [MEDIUM] Add concurrency group to "build.yml"
+# - [MEDIUM] 6 jobs clone the repo — consider artifact sharing
+# - [LOW] Use shallow clone in "build" job
+# - [LOW] Use shallow clone in "test" job
+# - [LOW] Use shallow clone in "test-dab" job
+# - [LOW] Use shallow clone in "test-tck" job
+# - [LOW] Use shallow clone in "tck-compatibility" job
+# Estimated savings: ~33 min/run
+#
+# SPDX-License-Identifier: Apache-2.0
+name: PR Checks
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - release/*
+  pull_request:
+    branches:
+      - main
+      - develop
+      - release/*
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+env:
+  LC_ALL: C.UTF-8
+  GRADLE_CACHE_USERNAME: ${{ secrets.GRADLE_CACHE_USERNAME }}
+  GRADLE_CACHE_PASSWORD: ${{ secrets.GRADLE_CACHE_PASSWORD }}
+  CG_EXEC: ionice -c 2 -n 2 nice -n 19
+
+jobs:
+  build:
+    name: Build
+    runs-on: hiero-client-sdk-linux-medium
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: "0"
+
+      - name: Setup NodeJS
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 18
+
+      - name: Setup Java
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: "21.0.6"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          cache-read-only: false
+
+      - name: Build SDK & Javadoc
+        id: gradle-build
+        run: ./gradlew assemble
+
+  test:
+    name: Unit and Integration Tests
+    runs-on: hiero-client-sdk-linux-medium
+    needs:
+      - build
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # Shallow clones should be disabled for a better relevancy of analysis
+
+      - name: Setup NodeJS
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 18
+
+      - name: Setup Java
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: "21.0.6"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+
+      - name: Prepare Hiero Solo
+        id: solo
+        uses: hiero-ledger/hiero-solo-action@dd84e95ece32d42071c945214571099ffbed9cf2 # v0.27.0
+        with:
+          installMirrorNode: true
+          soloVersion: v0.91.0
+          mirrorNodeVersion: v0.153.0
+          hieroVersion: v0.73.0
+
+      - name: Build SDK
+        run: ./gradlew assemble
+
+      - name: Code Quality Checks
+        run: ./gradlew qualityCheck :examples:qualityCheck --continue
+
+      - name: Run Unit and Integration Tests
+        env:
+          OPERATOR_KEY: "302e020100300506032b65700422042091132178e72057a1d7528025956fe39b0b847f200ab59b2fdd367017f3087137"
+          OPERATOR_ID: "0.0.2"
+          HEDERA_NETWORK: "localhost"
+        run: |
+          ./gradlew \
+            -POPERATOR_ID=$OPERATOR_ID \
+            -POPERATOR_KEY=$OPERATOR_KEY \
+            -PHEDERA_NETWORK=$HEDERA_NETWORK \
+            -PskipNodeUpdateTest=true \
+            test \
+            testIntegration \
+            --rerun-tasks
+
+            ./gradlew \
+            -POPERATOR_ID=$OPERATOR_ID \
+            -POPERATOR_KEY=$OPERATOR_KEY \
+            -PHEDERA_NETWORK=$HEDERA_NETWORK \
+            -PskipNodeUpdateTest=true \
+            :aggregation:testCodeCoverageReport \
+            --rerun-tasks
+
+      - name: Upload coverage to Codecov
+        if: ${{ github.event_name == 'push' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]') }}
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: gradle/aggregation/build/reports/jacoco/testCodeCoverageReport/testCodeCoverageReport.xml
+
+  test-dab:
+    name: Test Dynamic Addressbook
+    runs-on: hiero-client-sdk-linux-medium
+    needs:
+      - build
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Setup NodeJS
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 18
+
+      - name: Setup Java
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: "21.0.6"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+
+      - name: Prepare Hiero Solo (DUAL MODE)
+        id: solo
+        uses: hiero-ledger/hiero-solo-action@dd84e95ece32d42071c945214571099ffbed9cf2 # v0.27.0
+        with:
+          installMirrorNode: true
+          soloVersion: v0.91.0
+          dualMode: true
+          hieroVersion: v0.73.0
+          mirrorNodeVersion: v0.153.0
+
+      - name: Build SDK
+        run: ./gradlew assemble
+
+      - name: Run tests
+        env:
+          OPERATOR_KEY: "302e020100300506032b65700422042091132178e72057a1d7528025956fe39b0b847f200ab59b2fdd367017f3087137"
+          OPERATOR_ID: "0.0.2"
+          HEDERA_NETWORK: "localhost"
+        run: |
+          ./gradlew \
+            -POPERATOR_ID=$OPERATOR_ID \
+            -POPERATOR_KEY=$OPERATOR_KEY \
+            -PHEDERA_NETWORK=$HEDERA_NETWORK \
+            testIntegration \
+            --tests "*NodeUpdateTransactionIntegrationTest" \
+            --rerun-tasks
+
+  run-examples:
+    name: Run Examples
+    runs-on: hiero-client-sdk-linux-medium
+    needs:
+      - build
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup NodeJS
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 18
+
+      - name: Setup Java
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: "21.0.6"
+
+      - name: Setup Android SDK
+        uses: step-security/setup-android@6be8e374894861aef6b01c150cf6a9822297e319 # v4.0.4
+        with:
+          packages: platform-tools
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+
+      - name: Prepare Hiero Solo
+        id: solo
+        uses: hiero-ledger/hiero-solo-action@dd84e95ece32d42071c945214571099ffbed9cf2 # v0.27.0
+        with:
+          installMirrorNode: true
+          soloVersion: v0.91.0
+          mirrorNodeVersion: v0.153.0
+          hieroVersion: v0.73.0
+
+      - name: Build SDK
+        run: ./gradlew assemble
+
+      - name: Build Android Example
+        run: ./gradlew -p example-android assemble
+
+      - name: Prepare .env for Examples
+        run: |
+          echo "OPERATOR_KEY=302e020100300506032b65700422042091132178e72057a1d7528025956fe39b0b847f200ab59b2fdd367017f3087137" > examples/.env
+          echo "OPERATOR_ID=0.0.2" >> examples/.env
+          echo "HEDERA_NETWORK=localhost" >> examples/.env
+
+      - name: Run Examples
+        run: ./gradlew :examples:runAllExamples
+
+  test-tck:
+    name: TCK Tests
+    runs-on: hiero-client-sdk-linux-medium
+    needs:
+      - build
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # Shallow clones should be disabled for a better relevancy of analysis
+
+      - name: Setup NodeJS
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 18
+
+      - name: Setup Java
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: "21.0.6"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+
+      - name: Build TCK
+        run: ./gradlew assemble
+
+      - name: Run TCK Unit Tests
+        run: ./gradlew :tck:test
+
+  tck-compatibility:
+    name: TCK Compatibility
+    runs-on: hiero-client-sdk-linux-medium
+    needs:
+      - build
+      - test
+      - test-tck
+    timeout-minutes: 45
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # Shallow clones should be disabled for a better relevancy of analysis
+
+      - name: Setup NodeJS
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 18
+
+      - name: Setup Java
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: "21.0.6"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+
+      - name: Build and Start TCK Server
+        id: tck-server
+        run: |
+          ./gradlew assemble
+          nohup ./gradlew tck:bootRun > "${RUNNER_TEMP}/tck-server.log" 2>&1 &
+          echo "pid=$!" >> "${GITHUB_OUTPUT}"
+
+      - name: Prepare Hiero Solo
+        id: solo
+        uses: hiero-ledger/hiero-solo-action@dd84e95ece32d42071c945214571099ffbed9cf2 # v0.27.0
+        with:
+          installMirrorNode: true
+          soloVersion: v0.91.0
+          hieroVersion: v0.73.0
+          mirrorNodeVersion: v0.153.0
+
+      - name: Run TCK Compatibility
+        uses: hiero-ledger/hiero-sdk-tck@c9e7169888d86be4793cde5932ce57d9450a9761 # v0.14.0
+        with:
+          json-rpc-server-url: http://127.0.0.1:8544
+          node-ip: 127.0.0.1:35211
+          mirror-node-rest-url: http://127.0.0.1:38081
+          artifact-name: tck-compatibility
+
+      - name: Upload TCK Server Log
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tck-server-log
+          path: ${{ runner.temp }}/tck-server.log
+          if-no-files-found: warn
+
+      - name: Stop TCK Server
+        if: ${{ always() }}
+        run: |
+          if kill "${{ steps.tck-server.outputs.pid }}" 2>/dev/null; then
+            echo "TCK server stopped"
+          else
+            echo "TCK server already stopped"
+          fi

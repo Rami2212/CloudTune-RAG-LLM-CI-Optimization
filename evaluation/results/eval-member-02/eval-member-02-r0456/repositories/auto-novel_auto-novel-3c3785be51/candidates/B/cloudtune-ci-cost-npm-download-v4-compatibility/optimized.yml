@@ -1,0 +1,65 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [HIGH] Split "build" into parallel jobs (lint + test + build)
+# Estimated savings: ~6 min/run
+#
+name: CI Web
+
+on:
+  workflow_call:
+  pull_request:
+    paths:
+      - .github/workflows/ci-web.yml
+      - .github/workflows/cd-web.yml
+      - .dockerignore
+      - deploy/web/**
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+      - vite.config.ts
+      - daemon/**
+      - web/**
+      - apps/admin/**
+      - packages/crawler/**
+      - packages/translator/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-web-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: CI Web
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      VP_GIT_HOOKS: '0'
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint workspace
+        run: pnpm exec vp lint
+
+      - name: Type-check and build
+        run: pnpm build
+
+      - name: Type-check applications
+        run: pnpm typecheck
+
+      - name: Unit tests (without live crawler requests)
+        run: pnpm test:unit

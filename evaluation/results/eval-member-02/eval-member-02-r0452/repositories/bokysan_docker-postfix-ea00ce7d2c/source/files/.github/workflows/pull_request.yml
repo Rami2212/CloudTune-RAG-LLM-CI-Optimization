@@ -1,0 +1,84 @@
+name: Validate pull request
+
+on:
+  pull_request:
+    branches: [ 'master' ]
+
+env:
+  ALPINE_IMAGE: alpine:latest
+  UBUNTU_IMAGE: ubuntu:noble
+  DEBIAN_IMAGE: debian:trixie-slim
+
+jobs:
+  Unit_Tests:
+    runs-on: ubuntu-latest
+    steps:
+      # Checkout
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - uses: ./.github/actions/unit-tests
+
+  Integration_Tests:
+    runs-on: ubuntu-latest
+    steps:
+      # Checkout
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - uses: ./.github/actions/integration-tests
+        with:
+          XOAUTH2_RELAYHOST_USERNAME: ${{ secrets.XOAUTH2_RELAYHOST_USERNAME }}
+          XOAUTH2_CLIENT_ID: ${{ secrets.XOAUTH2_CLIENT_ID }}
+          XOAUTH2_SECRET: ${{ secrets.XOAUTH2_SECRET }}
+          XOAUTH2_INITIAL_REFRESH_TOKEN: ${{ secrets.XOAUTH2_INITIAL_REFRESH_TOKEN }}
+
+  Helm_chart_Tests:
+    runs-on: ubuntu-latest
+    steps:
+      # Checkout
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - uses: ./.github/actions/helm-chart-tests
+
+  Build_Alpine:
+    runs-on: ubuntu-latest
+    needs:
+      - Unit_Tests
+      - Integration_Tests
+      - Helm_chart_Tests
+    steps:
+      # Checkout
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Buildkit setup
+      - uses: ./.github/actions/buildx-setup
+
+      - name: Cache Docker layers
+        uses: actions/cache@v6
+        with:
+          path: /tmp/.buildx-cache
+          #key: ${{ runner.os }}-buildx-${{ hashFiles('**/Dockerfile') }}
+          key: ${{ runner.os }}-alpine-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-alpine-
+
+      - name: Fix issue with building Alpine # See https://gitlab.alpinelinux.org/alpine/aports/-/issues/12406
+        run: |
+          if command -v update-binfmts; then update-binfmts --enable; fi
+
+      - name: Build Alpine
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          tags: |
+            boky/postfix:latest
+            boky/postfix:latest-alpine
+          platforms: "linux/amd64"
+          cache-from: type=local,src=/tmp/.buildx-cache/alpine
+
+          build-args: |
+            BASE_IMAGE=${{ env.ALPINE_IMAGE }}

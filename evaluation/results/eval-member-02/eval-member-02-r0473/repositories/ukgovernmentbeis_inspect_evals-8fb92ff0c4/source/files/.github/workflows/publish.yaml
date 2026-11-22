@@ -1,0 +1,75 @@
+name: Publish Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "yes" to confirm PyPI publication'
+        required: true
+        type: string
+
+# Serialise. cancel-in-progress: false so a publish run can never be
+# aborted mid-flight by another dispatch.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+# Workflow-level default. The publish job below explicitly upgrades to
+# id-token:write for trusted PyPI publishing.
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish to PyPI
+    # SECURITY: Do not publish from forks, and restrict publishing to release tags.
+    # release-on-merge.yml dispatches with --ref "v$VERSION" so the automated path
+    # is unaffected; a manual dispatch from main or any branch is rejected here.
+    # zizmor: dangerous-triggers (https://docs.zizmor.sh/audits/#dangerous-triggers)
+    if: >-
+      github.repository_id == '866415939' &&
+      startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # Required for OIDC/trusted publishing
+      contents: read  # Explicit minimum required by actions/checkout
+    environment:
+      name: pypi
+      url: https://pypi.org/p/inspect-evals
+
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+          disable-sudo: true
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # Get all tags for version detection
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          # SECURITY: A less-privileged workflow could seed a cache entry restored here into the PyPI artifact.
+          # zizmor: cache-poisoning (https://docs.zizmor.sh/audits/#cache-poisoning)
+          enable-cache: false
+
+      - name: Show current version
+        run: |
+          echo "Version: $(git describe --tags --always)"
+
+      - name: Build
+        run: |
+          uv build
+          ls -la dist/
+
+      - name: Publish to PyPI
+        if: inputs.confirm == 'yes'
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3

@@ -1,0 +1,62 @@
+name: Publish docker images
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  repl:
+    name: Docker quickstart repl
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+    - name: Resolve the version and tags
+      id: version
+      env:
+        TAG: ${{ github.ref_name }}
+      run: |
+        version="${TAG#v}"
+        tags="phellang/repl:${TAG}"
+        # A pre-release tag (v1.0.0-rc1) must not move `latest`.
+        if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          tags="${tags},phellang/repl:latest"
+        fi
+        echo "version=${version}" >> "$GITHUB_OUTPUT"
+        echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+
+    # The image installs the release from Packagist, which picks up a new tag
+    # within minutes of the push.
+    - name: Wait for Packagist to list the version
+      env:
+        TAG: ${{ github.ref_name }}
+      run: |
+        for attempt in $(seq 1 30); do
+          if curl -fsS https://repo.packagist.org/p2/phel-lang/phel-lang.json \
+            | jq -e --arg tag "$TAG" '.packages["phel-lang/phel-lang"][] | select(.version == $tag)' > /dev/null; then
+            exit 0
+          fi
+          sleep 20
+        done
+        echo "Packagist does not list phel-lang/phel-lang ${TAG}" >&2
+        exit 1
+
+    - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+    - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+    - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+      with:
+        username: ${{ secrets.DOCKER_USER }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+
+    - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+      with:
+        context: docker/repl
+        platforms: linux/amd64,linux/arm64
+        build-args: PHEL_VERSION=${{ steps.version.outputs.version }}
+        tags: ${{ steps.version.outputs.tags }}
+        push: true

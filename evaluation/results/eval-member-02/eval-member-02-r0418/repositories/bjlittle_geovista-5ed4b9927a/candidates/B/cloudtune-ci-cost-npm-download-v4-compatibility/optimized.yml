@@ -1,0 +1,166 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [LOW] Use shallow clone in "references" job
+# Estimated savings: ~0 min/run
+#
+# Reference:
+#   - https://github.com/actions/checkout
+#   - https://github.com/peter-evans/create-issue-from-file
+#   - https://github.com/prefix-dev/setup-pixi
+
+name: ci-spec-status
+
+on:
+  # no paths filter: the references job is a required check, and a required
+  # check that never reports holds a pull request for ever, so the job decides
+  # from what changed instead (ledger spec §3.7). A label re-runs it, as adding
+  # "signed-off" is what a sign-off waits on.
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+  schedule:
+    # every day @ 00h20
+    - cron: "20 0 * * *"
+
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # a later run waits for the one in progress, and replaces any run still
+  # waiting, which is dropped before its jobs start: a burst of label events,
+  # as when a pull request opens with labels, then leaves no cancelled check
+  # on it (#2915)
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash -l {0}
+
+permissions: {}
+
+jobs:
+  references:
+    # a status may cite the pull request that writes it, while still open
+    if: ${{ github.event_name == 'pull_request' }}
+    name: "status references"
+    runs-on: "ubuntu-latest"
+
+    env:
+      # the files whose change changes this check, as globs
+      WATCHED: |
+        .github/scripts/breadcrumb.py
+        .github/scripts/check_status_references.py
+        .github/workflows/ci-spec-status.yml
+        docs/src/_ext/geovista_citations.py
+        docs/src/developer/specs/**
+        tests/test_spec_conventions.py
+
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: "changed"
+        id: changed
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -o errexit
+          # NUL-delimited, as git quotes a non-ASCII name otherwise, and without
+          # renames, so a specification moved away is seen by the path it left
+          git diff --name-only -z --no-renames "${BASE_SHA}...${HEAD_SHA}" > changed.txt
+          python3 - >> "${GITHUB_OUTPUT}" <<'PY'
+          import fnmatch
+          import os
+          from pathlib import Path
+
+          watched = os.environ["WATCHED"].split()
+          changed = [p for p in Path("changed.txt").read_text().split("\0") if p]
+          hit = any(fnmatch.fnmatch(path, glob) for path in changed for glob in watched)
+          print(f"watched={'true' if hit else 'false'}")
+          PY
+
+      - name: "setup pixi"
+        if: ${{ steps.changed.outputs.watched == 'true' }}
+        uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e
+        with:
+          environments: "test"
+          frozen: true
+
+      - name: "check status references"
+        if: ${{ steps.changed.outputs.watched == 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          pixi run --frozen --environment test check-spec-status "${PR_NUMBER}"
+
+  drift:
+    # drift appears when other work lands, so look for it on main each night
+    if: ${{ github.event_name != 'pull_request' }}
+    name: "status drift"
+    runs-on: "ubuntu-latest"
+
+    permissions:
+      contents: read
+      issues: write  # required for peter-evans/create-issue-from-file
+      pull-requests: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: "setup pixi"
+        uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e
+        with:
+          environments: "test"
+          frozen: true
+
+      - name: "check status drift"
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          status=0
+          pixi run --frozen --environment test check-spec-status drift > status.txt 2>&1 || status=$?
+          cat status.txt
+          {
+            echo "The nightly check of the specification statuses found the work they"
+            echo "cite has moved on, or is not what they say. Run"
+            echo "\`pixi run -e test check-spec-status drift\` to reproduce it."
+            echo
+            echo '```'
+            grep -v -e "^Why this check exists" -e "#gv-developer-checks-" status.txt || true
+            echo '```'
+            echo
+            # the breadcrumb is left out of the fence, so its link can be followed
+            grep -A1 "^Why this check exists" status.txt || true
+          } > status.md
+          echo "exit_code=${status}" >> "${GITHUB_OUTPUT}"
+
+      # exit code 2 is GitHub being unreachable, which is not worth an issue
+      - name: "report failure"
+        if: ${{ steps.check.outputs.exit_code == '1' }}
+        uses: peter-evans/create-issue-from-file@fca9117c27cdc29c6c4db3b86c48e4115a786710
+        with:
+          title: "chore: specification status drift"
+          content-filepath: ./status.md
+          labels: |
+            bot
+            new: issue
+            type: documentation
+
+      - name: "exit action"
+        if: ${{ steps.check.outputs.exit_code != '0' }}
+        env:
+          EXIT_CODE: ${{ steps.check.outputs.exit_code }}
+        run: |
+          exit "${EXIT_CODE}"

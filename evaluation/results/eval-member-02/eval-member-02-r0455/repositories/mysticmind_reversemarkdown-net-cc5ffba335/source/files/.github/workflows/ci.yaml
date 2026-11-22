@@ -1,0 +1,74 @@
+name: Build
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 1
+
+jobs:
+  job:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact-name: Linux
+          - os: windows-latest
+            artifact-name: Win64
+          #- os: macos-latest
+          #  artifact-name: Darwin
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    steps:
+      - name: checkout repo
+        uses: actions/checkout@v5
+      - name: Install .NET SDKs (8/9/10)
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+      - name: Display dotnet info
+        run: dotnet --list-sdks
+      # Build everything in the solution: the library for every target framework (including
+      # netstandard2.0, so a downlevel break is caught here rather than at publish time), the
+      # benchmark, the AOT smoke app, and both documentation samples projects - the code shown in
+      # the docs comes from those via region snippets, so this is what keeps the docs from going
+      # stale. Building the solution rather than naming projects means a new project cannot be
+      # left out of CI by accident.
+      - name: Build solution (all target frameworks)
+        run: dotnet build src/ReverseMarkdown.sln -c Release
+      # Run the test suite across every test target framework (net8.0/net9.0/net10.0).
+      - name: Run tests
+        run: dotnet test src/ReverseMarkdown.Test/ReverseMarkdown.Test.csproj -c Release
+
+  # Prove the library stays trim/Native-AOT compatible: publish a small app with PublishAot,
+  # fail on any trim (IL2xxx) or AOT (IL3xxx) warning, then run the native binary.
+  aot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout repo
+        uses: actions/checkout@v5
+      - name: Install .NET SDK (10)
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+      - name: Install Native AOT prerequisites
+        run: sudo apt-get update && sudo apt-get install -y clang zlib1g-dev
+      - name: AOT publish (fail on trim/AOT warnings)
+        run: |
+          set -o pipefail
+          dotnet publish tools/ReverseMarkdown.AotSmoke/ReverseMarkdown.AotSmoke.csproj \
+            -c Release -r linux-x64 2>&1 | tee aot.log
+          if grep -Eq "warning IL[23][0-9]{3}" aot.log; then
+            echo "::error::Trim/AOT (IL2xxx/IL3xxx) warnings found - library is not AOT-clean."
+            exit 1
+          fi
+      - name: Run the Native AOT binary
+        run: ./tools/ReverseMarkdown.AotSmoke/bin/Release/net10.0/linux-x64/native/ReverseMarkdown.AotSmoke

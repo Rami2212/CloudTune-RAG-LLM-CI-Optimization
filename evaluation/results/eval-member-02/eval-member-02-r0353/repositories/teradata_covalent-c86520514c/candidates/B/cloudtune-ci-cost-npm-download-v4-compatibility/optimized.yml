@@ -1,0 +1,82 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 5 optimizations:
+# - [MEDIUM] Add concurrency group to "ci.yml"
+# - [LOW] Use shallow clone in "lint" job
+# - [LOW] Use shallow clone in "test" job
+# - [LOW] Use shallow clone in "e2e" job
+# - [LOW] Use shallow clone in "build" job
+# Estimated savings: ~2 min/run
+#
+name: Covalent CI
+
+on:
+  pull_request:
+    branches: [main, beta]
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Use Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run format:check -- --base=${{ github.event.pull_request.base.sha }}
+      - run: npx nx affected --target=scsslint --base=${{ github.event.pull_request.base.sha }}
+      - run: npx nx affected --target=lint --base=${{ github.event.pull_request.base.sha }}
+
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Use Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npx nx affected --target=test --base=${{ github.event.pull_request.base.sha }}
+
+  e2e:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Use Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: NODE_OPTIONS=--max_old_space_size=4096 npx nx affected --target=e2e --base=${{ github.event.pull_request.base.sha }}
+
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Use Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npx nx affected --target=build --base=${{ github.event.pull_request.base.sha }}
+      - run: npx nx affected --target=build-scss --base=${{ github.event.pull_request.base.sha }}

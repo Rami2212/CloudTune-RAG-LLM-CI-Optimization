@@ -1,0 +1,436 @@
+name: Docker tag image
+
+on:
+  push:
+    tags: [ 'v*.*.*' ]
+
+env:
+  ALPINE_IMAGE: alpine:latest
+  UBUNTU_IMAGE: ubuntu:noble
+  DEBIAN_IMAGE: debian:trixie-slim
+
+jobs:
+  Unit_Tests:
+    runs-on: ubuntu-latest
+    steps:
+      # Checkout
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - uses: ./.github/actions/unit-tests
+
+  Integration_Tests:
+    runs-on: ubuntu-latest
+    steps:
+      # Checkout
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - uses: ./.github/actions/integration-tests
+        with:
+          XOAUTH2_RELAYHOST_USERNAME: ${{ secrets.XOAUTH2_RELAYHOST_USERNAME }}
+          XOAUTH2_CLIENT_ID: ${{ secrets.XOAUTH2_CLIENT_ID }}
+          XOAUTH2_SECRET: ${{ secrets.XOAUTH2_SECRET }}
+          XOAUTH2_INITIAL_REFRESH_TOKEN: ${{ secrets.XOAUTH2_INITIAL_REFRESH_TOKEN }}
+
+  Helm_chart_Tests:
+    runs-on: ubuntu-latest
+    steps:
+      # Checkout
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - uses: ./.github/actions/helm-chart-tests
+
+  Build_PostfixExporter:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    needs:
+      - Helm_chart_Tests
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Buildkit setup
+      - uses: ./.github/actions/buildx-setup
+
+      - uses: ./.github/actions/build-postfix-exporter
+        with:
+          DOCKER_ACCESS_TOKEN: '${{ secrets.DOCKER_ACCESS_TOKEN }}'
+          tags: |
+            boky/postfix-exporter:latest
+            boky/postfix-exporter:${{ env.RELEASE_VERSION }}
+            boky/postfix-exporter:${{ env.RELEASE_VERSION_NO_v }}
+            ghcr.io/bokysan/postfix-exporter:latest
+            ghcr.io/bokysan/postfix-exporter:${{ env.RELEASE_VERSION }}
+            ghcr.io/bokysan/postfix-exporter:${{ env.RELEASE_VERSION_NO_v }}
+
+  Build_Alpine:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    needs:
+      - Unit_Tests
+      - Integration_Tests
+      - Helm_chart_Tests
+    steps:
+      # Checkout
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # Buildkit setup
+      - uses: ./.github/actions/buildx-setup
+
+      # Docker hub login
+      - uses: ./.github/actions/docker-hub-login
+        with:
+          DOCKER_ACCESS_TOKEN: '${{ secrets.DOCKER_ACCESS_TOKEN }}'
+
+      # GitHub container registry login
+      - uses: ./.github/actions/ghcr-login
+
+      - name: Cache Docker layers
+        uses: actions/cache@v6
+        with:
+          path: /tmp/.buildx-cache
+          #key: ${{ runner.os }}-buildx-${{ hashFiles('**/Dockerfile') }}
+          key: ${{ runner.os }}-alpine-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-alpine-
+
+      - name: Fix issue with building Alpine # See https://gitlab.alpinelinux.org/alpine/aports/-/issues/12406
+        run: |
+          if command -v update-binfmts; then update-binfmts --enable; fi
+
+      - name: Build and push Alpine
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: |
+            boky/postfix:latest-alpine
+            boky/postfix:${{ env.RELEASE_VERSION }}-alpine
+            boky/postfix:${{ env.RELEASE_VERSION_NO_v }}-alpine
+            ghcr.io/bokysan/postfix:latest-alpine
+            ghcr.io/bokysan/postfix:${{ env.RELEASE_VERSION }}-alpine
+            ghcr.io/bokysan/postfix:${{ env.RELEASE_VERSION_NO_v }}-alpine
+          labels: |
+            org.opencontainers.image.source=https://github.com/bokysan/docker-postfix
+          # linux/s390x: "rsyslog (no such package)"
+          # Latest Alpine does not have all packages for 386 any more :-(
+          platforms: "linux/arm/v6,linux/arm/v7,linux/ppc64le,linux/amd64,linux/arm64"
+          cache-from: type=local,src=/tmp/.buildx-cache/alpine,mode=max,compression=estargz
+          cache-to: type=local,dest=/tmp/.buildx-cache-new/alpine
+          build-args: |
+            BASE_IMAGE=${{ env.ALPINE_IMAGE }}
+
+      - name: Move cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+  Snyk_Scan_Alpine:
+    runs-on: ubuntu-latest
+    needs:
+      - Build_Alpine
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js (for Snyk)
+        uses: actions/setup-node@v7
+        with:
+          node-version: '18'
+
+      - name: Get version number from tag
+        uses: ./.github/actions/get-release-version
+
+      - name: Install Snyk CLI
+        run: npm install -g snyk
+
+      - name: Authenticate Snyk
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: snyk auth $SNYK_TOKEN
+
+      - name: Run Snyk container test
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: snyk container test --severity-threshold=high --file=./Dockerfile --docker boky/postfix:${{ env.RELEASE_VERSION }}-alpine # --build-arg BASE_IMAGE=${{ env.ALPINE_IMAGE }}
+
+  Build_Ubuntu:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    needs:
+      - Unit_Tests
+      - Integration_Tests
+      - Helm_chart_Tests
+    steps:
+      # Checkout
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # Buildkit setup
+      - uses: ./.github/actions/buildx-setup
+
+      # Docker hub login
+      - uses: ./.github/actions/docker-hub-login
+        with:
+          DOCKER_ACCESS_TOKEN: '${{ secrets.DOCKER_ACCESS_TOKEN }}'
+
+      # GitHub container registry login
+      - uses: ./.github/actions/ghcr-login
+
+      - name: Cache Docker layers
+        uses: actions/cache@v6
+        with:
+          path: /tmp/.buildx-cache
+          #key: ${{ runner.os }}-buildx-${{ hashFiles('**/Dockerfile') }}
+          key: ${{ runner.os }}-ubuntu-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-ubuntu-
+
+      - name: Build and push Ubuntu
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: |
+            boky/postfix:latest-ubuntu
+            boky/postfix:${{ env.RELEASE_VERSION }}-ubuntu
+            boky/postfix:${{ env.RELEASE_VERSION_NO_v }}-ubuntu
+            ghcr.io/bokysan/postfix:latest-ubuntu
+            ghcr.io/bokysan/postfix:${{ env.RELEASE_VERSION }}-ubuntu
+            ghcr.io/bokysan/postfix:${{ env.RELEASE_VERSION_NO_v }}-ubuntu
+          labels: |
+            org.opencontainers.image.source=https://github.com/bokysan/docker-postfix
+          platforms: "linux/arm/v7,linux/amd64,linux/arm64,linux/ppc64le,linux/s390x"
+          cache-from: type=local,src=/tmp/.buildx-cache/ubuntu,mode=max,compression=estargz
+          cache-to: type=local,dest=/tmp/.buildx-cache-new/ubuntu
+          build-args: |
+            BASE_IMAGE=${{ env.UBUNTU_IMAGE }}
+
+      - name: Move cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+  Snyk_Scan_Ubuntu:
+    runs-on: ubuntu-latest
+    needs:
+      - Build_Ubuntu
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js (for Snyk)
+        uses: actions/setup-node@v7
+        with:
+          node-version: '18'
+
+      - name: Get version number from tag
+        uses: ./.github/actions/get-release-version
+
+      - name: Install Snyk CLI
+        run: npm install -g snyk
+
+      - name: Authenticate Snyk
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: snyk auth $SNYK_TOKEN
+
+      - name: Run Snyk container test
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: snyk container test --severity-threshold=high --file=./Dockerfile --docker boky/postfix:${{ env.RELEASE_VERSION }}-ubuntu # --build-arg BASE_IMAGE=${{ env.UBUNTU_IMAGE }}
+
+
+  Build_Debian:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    needs:
+      - Unit_Tests
+      - Integration_Tests
+      - Helm_chart_Tests
+    steps:
+      # Checkout
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # Buildkit setup
+      - uses: ./.github/actions/buildx-setup
+
+      # Docker hub login
+      - uses: ./.github/actions/docker-hub-login
+        with:
+          DOCKER_ACCESS_TOKEN: '${{ secrets.DOCKER_ACCESS_TOKEN }}'
+
+      # GitHub container registry login
+      - uses: ./.github/actions/ghcr-login
+
+      - name: Cache Docker layers
+        uses: actions/cache@v6
+        with:
+          path: /tmp/.buildx-cache
+          #key: ${{ runner.os }}-buildx-${{ hashFiles('**/Dockerfile') }}
+          key: ${{ runner.os }}-debian-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-debian-
+
+      - name: Build and push Debian
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: |
+            boky/postfix:latest
+            boky/postfix:latest-debian
+            boky/postfix:${{ env.RELEASE_VERSION }}
+            boky/postfix:${{ env.RELEASE_VERSION_NO_v }}
+            boky/postfix:${{ env.RELEASE_VERSION }}-debian
+            boky/postfix:${{ env.RELEASE_VERSION_NO_v }}-debian
+            ghcr.io/bokysan/postfix:latest
+            ghcr.io/bokysan/postfix:latest-debian
+            ghcr.io/bokysan/postfix:${{ env.RELEASE_VERSION }}
+            ghcr.io/bokysan/postfix:${{ env.RELEASE_VERSION_NO_v }}
+            ghcr.io/bokysan/postfix:${{ env.RELEASE_VERSION }}-debian
+            ghcr.io/bokysan/postfix:${{ env.RELEASE_VERSION_NO_v }}-debian
+          labels: |
+            org.opencontainers.image.source=https://github.com/bokysan/docker-postfix
+          platforms: "linux/386,linux/arm/v7,linux/arm64/v8,linux/amd64,linux/arm64,linux/ppc64le,linux/s390x"
+          cache-from: type=local,src=/tmp/.buildx-cache/debian,mode=max,compression=estargz
+          cache-to: type=local,dest=/tmp/.buildx-cache-new/debian
+          build-args: |
+            BASE_IMAGE=${{ env.DEBIAN_IMAGE }}
+
+      - name: Move cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+  Snyk_Scan_Debian:
+    runs-on: ubuntu-latest
+    needs:
+      - Build_Debian
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js (for Snyk)
+        uses: actions/setup-node@v7
+        with:
+          node-version: '18'
+
+      - name: Get version number from tag
+        uses: ./.github/actions/get-release-version
+
+      - name: Install Snyk CLI
+        run: npm install -g snyk
+
+      - name: Authenticate Snyk
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: snyk auth $SNYK_TOKEN
+
+      - name: Run Snyk container test
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: snyk container test --exclude-base-image-vulns --severity-threshold=high --file=./Dockerfile --docker boky/postfix:${{ env.RELEASE_VERSION }}-debian # --build-arg BASE_IMAGE=${{ env.DEBIAN_IMAGE }}
+
+
+  Release:
+    permissions: write-all
+    runs-on: ubuntu-latest
+    needs:
+      - Unit_Tests
+      - Integration_Tests
+      - Helm_chart_Tests
+      - Snyk_Scan_Alpine
+      - Snyk_Scan_Ubuntu
+      - Snyk_Scan_Debian
+
+    steps:
+      # Checkout
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # Release version setup
+      - name: Get version number from tag
+        uses: ./.github/actions/get-release-version
+
+      - name: Checkout gh-pages
+        uses: actions/checkout@v7
+        with:
+          ref: "gh-pages"
+          path: "gh-pages"
+          fetch-depth: 1
+
+      - name: Copy `README.md` and `LICENCE` into the helm chart
+        id: readme_and_licence
+        shell: bash
+        run: cp README.md LICENSE helm/mail/
+
+      - name: Changelog
+        uses: Bullrich/generate-release-changelog@master
+        id: Changelog
+        env:
+          REPO: ${{ github.repository }}
+
+      # TODO: Include the changelog in Chart.yml as annotations.artifacthub.io/changes
+      # See more here: https://artifacthub.io/docs/topics/annotations/helm/#supported-annotations
+
+      # The chart version must be valid SemVer, i.e. without the "v" prefix
+      - name: Package helm chart
+        uses: WyriHaximus/github-action-helm3@v4
+        with:
+          exec: helm package --app-version "${RELEASE_VERSION_NO_v}" --version "${RELEASE_VERSION_NO_v}" --destination ./gh-pages helm/mail
+
+      - name: Push helm chart as OCI image to GitHub Container Registry
+        uses: WyriHaximus/github-action-helm3@v4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          exec: |
+            echo "${GITHUB_TOKEN}" | helm registry login ghcr.io --username "${{ github.actor }}" --password-stdin
+            helm push "./gh-pages/mail-${RELEASE_VERSION_NO_v}.tgz" "oci://ghcr.io/bokysan/charts"
+            helm registry logout ghcr.io
+
+      - name: Create helm chart index
+        uses: WyriHaximus/github-action-helm3@v4
+        with:
+          exec: cd gh-pages && rm -rf .git && helm repo index . --url https://bokysan.github.io/docker-postfix
+
+      - name: Upload gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./gh-pages
+          tag_name: gh-pages-${{ env.RELEASE_VERSION }}
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # This token is provided by Actions, you do not need to create your own token
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: Release ${{ github.ref }}
+          body: |
+            ${{ steps.Changelog.outputs.changelog }}
+          draft: false
+          prerelease: false

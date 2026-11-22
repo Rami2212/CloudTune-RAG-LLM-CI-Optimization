@@ -1,0 +1,42 @@
+name: API Breaking Change Detection
+
+on:
+  pull_request:
+    branches: ["master"]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  semver-check:
+    name: Semver Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the baseline revision has to be available
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check for breaking API changes
+        id: semver
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          package: cel
+          feature-group: all-features
+          baseline-rev: ${{ github.event.pull_request.base.sha }}
+        continue-on-error: true
+
+      - name: Record the result for the labelling workflow
+        env:
+          PR: ${{ github.event.pull_request.number }}
+          OUTCOME: ${{ steps.semver.outcome }}
+        run: |
+          mkdir result
+          echo "$PR" > result/pr
+          echo "$OUTCOME" > result/outcome
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: semver-result
+          path: result/

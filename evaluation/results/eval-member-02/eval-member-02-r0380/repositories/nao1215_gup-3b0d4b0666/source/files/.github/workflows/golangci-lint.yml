@@ -1,0 +1,70 @@
+name: golangci-lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  golangci-lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The linter's toolchain is bounded by the linter, not by gup's policy. A
+      # released golangci-lint binary embeds the go/types of the Go it was built
+      # with, and type-checking a NEWER standard library makes it panic with
+      # "file requires newer Go version go1.27 (application built with go1.26)"
+      # -- so pointing this job at the Go 1.27 release toolchain took the linter
+      # out entirely. It stays on the module minimum; the newer toolchains are
+      # covered by unit_test.yml, which compiles and runs the code rather than
+      # analyzing it.
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26"
+
+      - name: Run golangci-lint as an enforced gate
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.15.0
+
+  # A linter only sees the files that build for its GOOS. The job above is
+  # the required check and stays as it is; this one covers the other
+  # systems gup has code for, including the BSDs, which reach gup through
+  # cmd/bug_report_nobrowser.go and the !windows halves of cmd and
+  # internal/lockfile and were compiled by nothing until now.
+  # Cross-compiling costs seconds and the repository is public, so every
+  # leg runs on every change.
+  golangci-lint-cross:
+    name: golangci-lint (${{ matrix.goos }})
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [darwin, windows, freebsd, openbsd, netbsd]
+    runs-on: ubuntu-latest
+    env:
+      GOOS: ${{ matrix.goos }}
+    steps:
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26"
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.15.0

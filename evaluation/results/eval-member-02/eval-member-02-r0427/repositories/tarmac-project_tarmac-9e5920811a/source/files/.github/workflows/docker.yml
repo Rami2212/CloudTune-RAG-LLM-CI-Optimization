@@ -1,0 +1,60 @@
+name: docker
+permissions:
+  contents: read
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - v*
+  pull_request:
+  merge_group:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Get latest tag
+        run: |
+          git fetch --tags
+          echo "current_tag=$(echo ${GITHUB_REF#refs/tags/})" >> $GITHUB_ENV
+          echo "latest_tag=$(git describe --tags `git rev-list --tags --max-count=1`)" >> $GITHUB_ENV
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - name: Build only
+        id: docker_build_only
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          platforms: linux/amd64,linux/arm64
+          push: false
+          tags: madflojo/tarmac:${{ github.sha }}
+      - name: Login to DockerHub
+        id: docker_login
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build and push (main)
+        id: docker_build
+        if: github.ref == 'refs/heads/main'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name == 'push' && 'true' || 'false' }}
+          tags: madflojo/tarmac:unstable
+      - name: Build and push (tag)
+        id: docker_build_tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name == 'push' && 'true' || 'false' }}
+          # tag with the git tag v*
+          tags: |
+            madflojo/tarmac:${{ github.ref_name }}
+            ${{ env.latest_tag == env.current_tag && 'madflojo/tarmac:latest' }}

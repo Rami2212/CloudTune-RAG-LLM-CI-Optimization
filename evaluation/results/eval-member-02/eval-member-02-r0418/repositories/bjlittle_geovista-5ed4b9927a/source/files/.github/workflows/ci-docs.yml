@@ -1,0 +1,82 @@
+# Reference:
+#   - https://github.com/actions/checkout
+#   - https://github.com/prefix-dev/setup-pixi
+
+name: ci-docs
+
+on:
+  pull_request:
+
+  push:
+    branches:
+      - "main"
+      - "v*x"
+      - "!pixi-auto-update"
+      - "!pre-commit-ci-update-config"
+      - "!dependabot/*"
+    tags:
+      - "v*"
+
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+# "xvfb-run" provides the display, from the xvfb and mesa the runner image
+# ships, so no step installs them; pyvista renders off screen within it
+env:
+  PYVISTA_OFF_SCREEN: true
+
+jobs:
+  tests:
+    name: "${{ matrix.session }} (${{ matrix.version }})"
+    runs-on: "${{ matrix.os }}"
+
+    defaults:
+      run:
+        shell: bash -l {0}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["ubuntu-22.04"]
+        version: ["py314"]
+        session: ["doctest"]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: "environment configure"
+        env:
+          # Maximum cache period (in weeks) before forcing a cache refresh.
+          CACHE_WEEKS: 2
+        run: |
+          echo "CACHE_PERIOD=$(date +%Y).$(expr $(date +%U) / ${CACHE_WEEKS})" >> ${GITHUB_ENV}
+
+      - name: "setup pixi"
+        uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e
+        with:
+          environments: "docs-${{ matrix.version }}"
+          frozen: true
+          activate-environment: true
+
+      - name: "cartopy cache"
+        uses: $/.github/workflows/composite/cartopy-cache
+        with:
+          cache_period: ${{ env.CACHE_PERIOD }}
+
+      - name: "geovista cache"
+        uses: $/.github/workflows/composite/geovista-cache
+        with:
+          cache_period: ${{ env.CACHE_PERIOD }}
+
+      - name: "${{ matrix.session }} (${{ matrix.version }})"
+        run: |
+          xvfb-run -a geovista --report
+          xvfb-run -a pixi run --frozen make ${{ matrix.session }}

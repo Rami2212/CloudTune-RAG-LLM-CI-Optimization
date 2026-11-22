@@ -1,0 +1,67 @@
+# Workflow for checking dependency updates using Gradle Versions plugin
+
+name: Check Dependency Updates
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 7 1 * *'
+
+jobs:
+  check-versions:
+    name: Check for New Versions
+    runs-on: "ubuntu-latest"
+    timeout-minutes: 10
+    steps:
+      - name: check-out
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: trunk
+      - name: setup-java
+        uses: actions/setup-java@v6.0.1
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+      - name: create-branch
+        uses: peterjgrainger/action-create-branch@v4.0.0
+        with:
+          branch: dependency-update
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: gradle/actions/setup-gradle@v6.4.0
+      - name: Check for dependency updates
+        run: ./gradlew dependencyUpdates
+      - name: Generate dependency update report
+        run: |
+          if [ -f "build/dependencyUpdates/report.txt" ]; then
+            echo "## Dependency Updates Available" > dependency-report.md
+            echo "" >> dependency-report.md
+            echo '```' >> dependency-report.md
+            cat build/dependencyUpdates/report.txt >> dependency-report.md
+            echo '```' >> dependency-report.md
+          else
+            echo "No dependency update report generated" > dependency-report.md
+          fi
+      - name: Commit report
+        uses: EndBug/add-and-commit@v11
+        with:
+          author_name: GitHub Actions
+          author_email: noreply@github.com
+          message: "Add dependency update report"
+          new_branch: dependency-update
+          push: --force --set-upstream origin dependency-update
+      - name: Pull Request
+        uses: repo-sync/pull-request@v2
+        with:
+          source_branch: dependency-update
+          destination_branch: trunk
+          pr_title: "Dependency Update Report"
+          pr_body: |
+            Automated dependency update check using Gradle Versions plugin.
+            
+            Please review the dependency update report and manually update dependencies as needed.
+            
+            To update a specific dependency, modify the version in `gradle/libs.versions.toml`.
+          pr_draft: false
+          github_token: ${{ secrets.GITHUB_TOKEN }}

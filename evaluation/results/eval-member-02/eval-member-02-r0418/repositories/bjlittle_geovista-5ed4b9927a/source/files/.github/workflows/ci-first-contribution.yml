@@ -1,0 +1,79 @@
+# Reference:
+#   - https://github.com/plbstl/first-contribution
+
+name: ci-first-contribution
+
+on:
+  issues:
+    types: [opened]
+
+  # `pull_request_target`, and not `pull_request`, because GitHub withholds
+  # secrets from a `pull_request` run triggered by a fork -- where a first-time
+  # contributor is, by definition. `GEOVISTA_BOT_TOKEN` is empty there, so the
+  # greeting never reaches the people this workflow is for.
+  #
+  # The trigger is safe here because the job checks nothing out and runs no code
+  # from the pull-request: it reacts, comments and labels through the API alone.
+  pull_request_target:  # zizmor: ignore[dangerous-triggers]
+    types: [opened, closed]
+
+concurrency:
+  # Keyed by the thread, not by `github.ref`. An `issues` event carries the
+  # default branch, and a `pull_request_target` event carries the *base* branch
+  # -- unlike `pull_request`, which carries `refs/pull/<n>/merge` -- so with the
+  # trigger changed above, a ref-keyed group would hold every issue and every
+  # pull-request in the repository in one queue.
+  #
+  # Not cancelling, either: nothing here supersedes anything. Each event is one
+  # message to one person, so a cancelled run is a message silently not sent.
+  group: >-
+    ${{ github.workflow }}-${{ github.event.issue.number
+    || github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  welcome:
+    name: "welcome"
+    runs-on: ubuntu-latest
+
+    # No `permissions:` block, deliberately. The action authenticates as the bot
+    # through the `token` input below, so this job's own `GITHUB_TOKEN` is never
+    # used and is granted nothing -- the top-level `permissions: {}` stands.
+    environment: development
+
+    steps:
+      - uses: plbstl/first-contribution@2c36bdb58684587f60549a69aaa3ec00b9d5f4fe
+        with:
+          token: ${{ secrets.GEOVISTA_BOT_TOKEN }}
+
+          issue-reactions: eyes
+          pr-reactions: eyes
+          issue-labels: first-issue
+          pr-labels: first-pull-request
+
+          issue-opened-msg: |
+            Welcome @{fc-author}!
+
+            Congrats! Your first issue :tada:
+
+            Thanks for taking the time to feedback and tell us how to improve `geovista` :heart:
+
+            Check out our [Code of Conduct](https://github.com/bjlittle/geovista/blob/main/CODE_OF_CONDUCT.md) and [Contribution Guide](https://geovista.readthedocs.io/en/latest/developer/index.html) to learn more about contributing to the `geovista` community.
+
+          pr-opened-msg: |
+            Welcome @{fc-author}!
+
+            Awesome! Your first pull-request! :partying_face:
+
+            Thanks for taking the time to contribute to `geovista` :heart:
+
+            Check out our [Code of Conduct](https://github.com/bjlittle/geovista/blob/main/CODE_OF_CONDUCT.md) and [Contribution Guide](https://geovista.readthedocs.io/en/latest/developer/index.html) to learn more about contributing to the `geovista` community.
+
+          pr-merged-msg: |
+            Hey @{fc-author}!
+
+            Congrats on banking your first `geovista` pull-request! :sparkles:
+
+            Let the good times roll! 🤟

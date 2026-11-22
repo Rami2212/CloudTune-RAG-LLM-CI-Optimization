@@ -1,0 +1,114 @@
+# Reference:
+#   - https://github.com/actions/checkout
+#   - https://github.com/actions/upload-artifact
+#   - https://github.com/prefix-dev/setup-pixi
+
+name: ci-tests-lock
+
+on:
+  schedule:
+    # every day @ 00h03 except sunday (see ci-locks.yml)
+    - cron: "3 0 * * 1-6"
+
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash -l {0}
+
+permissions:
+  issues: write
+
+# "xvfb-run" provides the display, from the xvfb and mesa the runner image
+# ships, so no step installs them; pyvista renders off screen within it
+env:
+  PYVISTA_OFF_SCREEN: true
+
+jobs:
+  test-lock:
+    name: "test lock"
+    runs-on: "${{ matrix.os }}"
+
+    env:
+      PY_COLORS: "1"
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["ubuntu-22.04"]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: "environment configure"
+        env:
+          # Maximum cache period (in weeks) before forcing a cache refresh.
+          CACHE_WEEKS: 2
+        run: |
+          echo "CACHE_PERIOD=$(date +%Y).$(expr $(date +%U) / ${CACHE_WEEKS})" >> ${GITHUB_ENV}
+          echo "NAME=geovista" >> ${GITHUB_ENV}
+
+      - name: "setup pixi"
+        uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e
+        with:
+          cache-write: false
+          run-install: false
+
+      - name: "refresh pixi manifest"
+        run: |
+          pixi update --json | pixi exec pixi-diff-to-markdown > diff.md
+
+      - name: "upload artifacts"
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: ci-tests-lock-artifacts-${{ github.job }}-${{ strategy.job-index }}
+          path: |
+            ${{ github.workspace }}/diff.md
+            ${{ github.workspace }}/pixi.lock
+
+      - name: "cartopy cache"
+        uses: $/.github/workflows/composite/cartopy-cache
+        with:
+          cache_period: ${{ env.CACHE_PERIOD }}
+
+      - name: "geovista cache"
+        uses: $/.github/workflows/composite/geovista-cache
+        with:
+          cache_period: ${{ env.CACHE_PERIOD }}
+          pixi_environment: ${{ env.NAME }}
+
+      - name: "test lock"
+        env:
+          NAME: ${{ env.NAME }}
+        run: |
+          xvfb-run -a pixi run --frozen --environment ${NAME} geovista --report
+          xvfb-run -a pixi run --frozen --environment ${NAME} pytest --numprocesses logical --dist worksteal --failed_image_dir test_images_failed
+
+      - name: "report failure"
+        if: ${{ failure() }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NAME: ${{ env.NAME }}
+        run: |
+          TITLE="chore: pixi.lock test failure"
+          BODY=$(cat <<EOL
+          The tests for the latest resolved \`pixi.lock\` have failed for the \`${NAME}\` environment.
+
+          Please investigate GHA run-id [${{ github.run_id }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          EOL
+          )
+          gh issue create --title "${TITLE}" --body "${BODY}" --label "bot" --label "new: issue" --repo "${{ github.repository }}"
+
+      - name: "upload failed images"
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: ci-tests-lock-failed-images-${{ github.job }}-${{ strategy.job-index }}
+          path: ${{ github.workspace }}/test_images_failed

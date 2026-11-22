@@ -1,0 +1,84 @@
+# Reference:
+#   - https://github.com/actions/cache
+#   - https://github.com/actions/checkout
+#   - https://github.com/lycheeverse/lychee-action
+#   - https://github.com/peter-evans/create-issue-from-file
+
+name: ci-linkcheck
+
+on:
+  schedule:
+    # every day @ 00h05
+    - cron: "5 0 * * *"
+
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash -l {0}
+
+permissions: {}
+
+jobs:
+  linkcheck:
+    name: "linkcheck"
+    runs-on: "ubuntu-latest"
+
+    permissions:
+      issues: write  # required for peter-evans/create-issue-from-file
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: "lychee cache"
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .lycheecache
+          key: cache-lychee
+
+      - name: "linkcheck"
+        id: lychee
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8
+        with:
+          args: |
+            --accept '200, 429'
+            --cache
+            --exclude '^https://github\.com/bjlittle/geovista\.git'
+            --host-concurrency 2
+            --host-request-interval 1s
+            --no-progress
+            --retry-wait-time 3
+            --verbose
+            './changelog/*.rst'
+            './docs/src/**/*.md'
+            './docs/src/**/*.rst'
+            './docs/src/**/*.txt'
+            './src/**/*.py'
+          fail: false
+
+      - name: "report failure"
+        if: ${{ fromJSON(steps.lychee.outputs.exit_code) != 0 }}
+        uses: peter-evans/create-issue-from-file@fca9117c27cdc29c6c4db3b86c48e4115a786710
+        with:
+          title: "chore: linkcheck failure"
+          content-filepath: ./lychee/out.md
+          labels: |
+            bot
+            new: issue
+            type: documentation
+
+      - name: "exit action"
+        if: ${{ fromJSON(steps.lychee.outputs.exit_code) != 0 }}
+        # read from the environment, as an expression expanded into the shell is
+        # a template injection to zizmor (#2918)
+        env:
+          EXIT_CODE: ${{ steps.lychee.outputs.exit_code }}
+        run: |
+          exit "${EXIT_CODE}"

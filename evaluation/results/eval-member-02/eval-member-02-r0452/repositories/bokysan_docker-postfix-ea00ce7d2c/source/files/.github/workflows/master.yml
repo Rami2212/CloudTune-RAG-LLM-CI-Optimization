@@ -1,0 +1,368 @@
+name: Docker image
+
+on:
+  push:
+    branches: [ 'master' ]
+
+env:
+  ALPINE_IMAGE: alpine:latest
+  UBUNTU_IMAGE: ubuntu:noble
+  DEBIAN_IMAGE: debian:trixie-slim
+
+jobs:
+  Unit_Tests:
+    runs-on: ubuntu-latest
+    steps:
+      # Checkout
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - uses: ./.github/actions/unit-tests
+
+  Integration_Tests:
+    runs-on: ubuntu-latest
+    steps:
+      # Checkout
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - uses: ./.github/actions/integration-tests
+        with:
+          XOAUTH2_RELAYHOST_USERNAME: ${{ secrets.XOAUTH2_RELAYHOST_USERNAME }}
+          XOAUTH2_CLIENT_ID: ${{ secrets.XOAUTH2_CLIENT_ID }}
+          XOAUTH2_SECRET: ${{ secrets.XOAUTH2_SECRET }}
+          XOAUTH2_INITIAL_REFRESH_TOKEN: ${{ secrets.XOAUTH2_INITIAL_REFRESH_TOKEN }}
+
+  Helm_chart_Tests:
+    runs-on: ubuntu-latest
+    steps:
+      # Checkout
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - uses: ./.github/actions/helm-chart-tests
+
+  Build_PostfixExporter:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    needs:
+      - Helm_chart_Tests
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Buildkit setup
+      - uses: ./.github/actions/buildx-setup
+
+      - uses: ./.github/actions/build-postfix-exporter
+        with:
+          DOCKER_ACCESS_TOKEN: '${{ secrets.DOCKER_ACCESS_TOKEN }}'
+          tags: |
+            boky/postfix-exporter:edge
+            ghcr.io/bokysan/postfix-exporter:edge
+
+  Build_Alpine:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    needs:
+      - Unit_Tests
+      - Integration_Tests
+    steps:
+      # Checkout
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Buildkit setup
+      - uses: ./.github/actions/buildx-setup
+
+      # Docker hub login
+      - uses: ./.github/actions/docker-hub-login
+        with:
+          DOCKER_ACCESS_TOKEN: '${{ secrets.DOCKER_ACCESS_TOKEN }}'
+
+      # GitHub container registry login
+      - uses: ./.github/actions/ghcr-login
+
+      - name: Cache Docker layers
+        uses: actions/cache@v6
+        with:
+          path: /tmp/.buildx-cache
+          #key: ${{ runner.os }}-buildx-${{ hashFiles('**/Dockerfile') }}
+          key: ${{ runner.os }}-alpine-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-alpine-
+
+      - name: Fix issue with building Alpine # See https://gitlab.alpinelinux.org/alpine/aports/-/issues/12406
+        run: |
+          if command -v update-binfmts; then update-binfmts --enable; fi
+
+      - name: Build and push Alpine
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: |
+            boky/postfix:edge-alpine
+            ghcr.io/bokysan/postfix:edge-alpine
+          labels: |
+            org.opencontainers.image.source=https://github.com/bokysan/docker-postfix
+          # linux/s390x: "rsyslog (no such package)"
+          # Latest Alpine does not have all the packages for 386 anymore. :-(
+          # Notice: linux/ppc64le (temporarily) removed, as building the SASL library crashes with:
+          # [ 55%] Building CXX object src/CMakeFiles/sasl-xoauth2-static.dir/http.cc.o
+          # [ 61%] Building CXX object src/CMakeFiles/sasl-xoauth2-static.dir/log.cc.o
+          # [ 66%] Building CXX object src/CMakeFiles/sasl-xoauth2-static.dir/module.cc.o
+          # [ 72%] Building CXX object src/CMakeFiles/sasl-xoauth2-static.dir/token_store.cc.o
+          # c++: internal compiler error: Segmentation fault signal terminated program cc1plus
+          # Please submit a full bug report, with preprocessed source (by using -freport-bug).
+          # See <https://gitlab.alpinelinux.org/alpine/aports/-/issues> for instructions.
+          # make[2]: *** [src/CMakeFiles/sasl-xoauth2-static.dir/build.make:149: src/CMakeFiles/sasl-xoauth2-static.dir/token_store.cc.o] Error 4
+          # make[1]: *** [CMakeFiles/Makefile2:169: src/CMakeFiles/sasl-xoauth2-static.dir/all] Error 2
+          # make: *** [Makefile:166: all] Error 2
+          #
+          # linux/386: Compilation of sasl-xoauth2 plugin fails with:
+          #  In file included from /usr/include/python3.12/Python.h:44:
+          #  In function 'Py_XDECREF',
+          #      inlined from 'b_complete_struct_or_union_lock_held' at src/c/_cffi_backend.c:5662:9:
+          #  /usr/include/python3.12/object.h:797:8: warning: 'interned_fields' may be used uninitialized [-Wmaybe-uninitialized]
+          #    797 |     if (op != _Py_NULL) {
+          #        |        ^
+          #  src/c/_cffi_backend.c: In function 'b_complete_struct_or_union_lock_held':
+          #  src/c/_cffi_backend.c:5307:15: note: 'interned_fields' was declared here
+          #   5307 |     PyObject *interned_fields;
+          #        |               ^~~~~~~~~~~~~~~
+          #  cc: fatal error: Killed signal terminated program cc1
+          #  compilation terminated.
+          platforms: "linux/arm/v6,linux/arm/v7,linux/amd64,linux/arm64,linux/riscv64"
+          cache-from: type=local,src=/tmp/.buildx-cache/alpine,mode=max,compression=estargz
+          cache-to: type=local,dest=/tmp/.buildx-cache-new/alpine
+          build-args: |
+            BASE_IMAGE=${{ env.ALPINE_IMAGE }}
+
+      - name: Move cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+  Snyk_Scan_Alpine:
+    runs-on: ubuntu-latest
+    needs:
+      - Build_Alpine
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js (for Snyk)
+        uses: actions/setup-node@v7
+        with:
+          node-version: '18'
+
+      - name: Install Snyk CLI
+        run: npm install -g snyk
+
+      - name: Authenticate Snyk
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: snyk auth $SNYK_TOKEN
+
+      - name: Run Snyk container test
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: snyk container test --severity-threshold=high --file=./Dockerfile --docker boky/postfix:edge-alpine # --build-arg BASE_IMAGE=${{ env.ALPINE_IMAGE }}
+
+  Build_Ubuntu:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    needs:
+      - Unit_Tests
+      - Integration_Tests
+    steps:
+      # Checkout
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Buildkit setup
+      - uses: ./.github/actions/buildx-setup
+
+      # Docker hub login
+      - uses: ./.github/actions/docker-hub-login
+        with:
+          DOCKER_ACCESS_TOKEN: '${{ secrets.DOCKER_ACCESS_TOKEN }}'
+
+      # GitHub container registry login
+      - uses: ./.github/actions/ghcr-login
+
+      - name: Cache Docker layers
+        uses: actions/cache@v6
+        with:
+          path: /tmp/.buildx-cache
+          #key: ${{ runner.os }}-buildx-${{ hashFiles('**/Dockerfile') }}
+          key: ${{ runner.os }}-ubuntu-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-ubuntu-
+
+      - name: Build and push Ubuntu
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: |
+            boky/postfix:edge-ubuntu
+            ghcr.io/bokysan/postfix:edge-ubuntu
+          labels: |
+            org.opencontainers.image.source=https://github.com/bokysan/docker-postfix
+          # Notice: linux/ppc64le (temporarily) removed, as building the SASL library crashes with:
+          # [ 55%] Building CXX object src/CMakeFiles/sasl-xoauth2-static.dir/http.cc.o
+          # [ 61%] Building CXX object src/CMakeFiles/sasl-xoauth2-static.dir/log.cc.o
+          # [ 66%] Building CXX object src/CMakeFiles/sasl-xoauth2-static.dir/module.cc.o
+          # [ 72%] Building CXX object src/CMakeFiles/sasl-xoauth2-static.dir/token_store.cc.o
+          # c++: internal compiler error: Segmentation fault signal terminated program cc1plus
+          # Please submit a full bug report, with preprocessed source (by using -freport-bug).
+          # See <https://gitlab.alpinelinux.org/alpine/aports/-/issues> for instructions.
+          # make[2]: *** [src/CMakeFiles/sasl-xoauth2-static.dir/build.make:149: src/CMakeFiles/sasl-xoauth2-static.dir/token_store.cc.o] Error 4
+          # make[1]: *** [CMakeFiles/Makefile2:169: src/CMakeFiles/sasl-xoauth2-static.dir/all] Error 2
+          # make: *** [Makefile:166: all] Error 2
+          platforms: "linux/arm/v7,linux/amd64,linux/arm64,linux/s390x"
+          cache-from: type=local,src=/tmp/.buildx-cache/ubuntu,mode=max,compression=estargz
+          cache-to: type=local,dest=/tmp/.buildx-cache-new/ubuntu
+          build-args: |
+            BASE_IMAGE=${{ env.UBUNTU_IMAGE }}
+
+      - name: Move cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+  Snyk_Scan_Ubuntu:
+    runs-on: ubuntu-latest
+    needs:
+      - Build_Ubuntu
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js (for Snyk)
+        uses: actions/setup-node@v7
+        with:
+          node-version: '18'
+
+      - name: Install Snyk CLI
+        run: npm install -g snyk
+
+      - name: Authenticate Snyk
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: snyk auth $SNYK_TOKEN
+
+      - name: Run Snyk container test
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: snyk container test --severity-threshold=high --file=./Dockerfile --docker boky/postfix:edge-ubuntu # --build-arg BASE_IMAGE=${{ env.UBUNTU_IMAGE }}
+
+  Build_Debian:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    needs:
+      - Unit_Tests
+      - Integration_Tests
+    steps:
+      # Checkout
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Buildkit setup
+      - uses: ./.github/actions/buildx-setup
+
+      # Docker hub login
+      - uses: ./.github/actions/docker-hub-login
+        with:
+          DOCKER_ACCESS_TOKEN: '${{ secrets.DOCKER_ACCESS_TOKEN }}'
+
+      # GitHub container registry login
+      - uses: ./.github/actions/ghcr-login
+
+      - name: Cache Docker layers
+        uses: actions/cache@v6
+        with:
+          path: /tmp/.buildx-cache
+          #key: ${{ runner.os }}-buildx-${{ hashFiles('**/Dockerfile') }}
+          key: ${{ runner.os }}-debian-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-debian-
+
+      - name: Build and push Debian
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: |
+            boky/postfix:edge
+            boky/postfix:edge-debian
+            ghcr.io/bokysan/postfix:edge
+            ghcr.io/bokysan/postfix:edge-debian
+          labels: |
+            org.opencontainers.image.source=https://github.com/bokysan/docker-postfix
+          # Notice: linux/ppc64le (temporarily) removed, as building the SASL library crashes with:
+          # [ 55%] Building CXX object src/CMakeFiles/sasl-xoauth2-static.dir/http.cc.o
+          # [ 61%] Building CXX object src/CMakeFiles/sasl-xoauth2-static.dir/log.cc.o
+          # [ 66%] Building CXX object src/CMakeFiles/sasl-xoauth2-static.dir/module.cc.o
+          # [ 72%] Building CXX object src/CMakeFiles/sasl-xoauth2-static.dir/token_store.cc.o
+          # c++: internal compiler error: Segmentation fault signal terminated program cc1plus
+          # Please submit a full bug report, with preprocessed source (by using -freport-bug).
+          # See <https://gitlab.alpinelinux.org/alpine/aports/-/issues> for instructions.
+          # make[2]: *** [src/CMakeFiles/sasl-xoauth2-static.dir/build.make:149: src/CMakeFiles/sasl-xoauth2-static.dir/token_store.cc.o] Error 4
+          # make[1]: *** [CMakeFiles/Makefile2:169: src/CMakeFiles/sasl-xoauth2-static.dir/all] Error 2
+          # make: *** [Makefile:166: all] Error 2
+          # linux/riscv64: Compilation of sasl-xoauth2 plugin fails with:
+          # Caused by:
+          #   process didn't exit successfully: `/root/.rustup/toolchains/stable-riscv64gc-unknown-linux-gnu/bin/rustc --crate-name pyo3_macros_backend --edition=2021 /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-macros-backend-0.26.0/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --warn=rust_2018_idioms '--warn=clippy::useless_transmute' '--warn=clippy::used_underscore_binding' --warn=unused_lifetimes --warn=unsafe_op_in_unsafe_fn '--warn=clippy::unnecessary_wraps' '--warn=clippy::todo' --warn=rust_2021_prelude_collisions '--warn=clippy::manual_ok_or' '--warn=clippy::manual_assert' '--warn=clippy::let_unit_value' --warn=invalid_doc_attributes '--warn=clippy::flat_map_option' '--warn=clippy::filter_map_next' '--warn=clippy::explicit_iter_loop' '--warn=clippy::explicit_into_iter_loop' --warn=elided_lifetimes_in_paths '--warn=clippy::dbg_macro' '--warn=clippy::checked_conversions' '--warn=rustdoc::broken_intra_doc_links' '--warn=rustdoc::bare_urls' -C debug-assertions=off -C overflow-checks=on --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("experimental-async", "experimental-inspect"))' -C metadata=5ad1618a3a089a81 -C extra-filename=-aa4fb17327cb5816 --out-dir /tmp/pip-install-bpvyezx3/cryptography_9e845f0e69e14411a204415c1ca278ca/target/release/deps -C strip=debuginfo -L dependency=/tmp/pip-install-bpvyezx3/cryptography_9e845f0e69e14411a204415c1ca278ca/target/release/deps --extern heck=/tmp/pip-install-bpvyezx3/cryptography_9e845f0e69e14411a204415c1ca278ca/target/release/deps/libheck-5cca0442036450f7.rmeta --extern proc_macro2=/tmp/pip-install-bpvyezx3/cryptography_9e845f0e69e14411a204415c1ca278ca/target/release/deps/libproc_macro2-ffc58256f48932db.rmeta --extern pyo3_build_config=/tmp/pip-install-bpvyezx3/cryptography_9e845f0e69e14411a204415c1ca278ca/target/release/deps/libpyo3_build_config-d3f83ee37c8ff91c.rmeta --extern quote=/tmp/pip-install-bpvyezx3/cryptography_9e845f0e69e14411a204415c1ca278ca/target/release/deps/libquote-9b8b7e8ba5ea1a40.rmeta --extern syn=/tmp/pip-install-bpvyezx3/cryptography_9e845f0e69e14411a204415c1ca278ca/target/release/deps/libsyn-e60f727f545c7410.rmeta --cap-lints allow --cfg c_str_lit --cfg diagnostic_namespace --cfg io_error_more --cfg mut_ref_in_const_fn --cfg fn_ptr_eq --cfg from_bytes_with_nul_error --check-cfg 'cfg(Py_LIMITED_API)' --check-cfg 'cfg(Py_GIL_DISABLED)' --check-cfg 'cfg(PyPy)' --check-cfg 'cfg(GraalPy)' --check-cfg 'cfg(py_sys_config, values("Py_DEBUG", "Py_REF_DEBUG", "Py_TRACE_REFS", "COUNT_ALLOCS"))' --check-cfg 'cfg(pyo3_disable_reference_pool)' --check-cfg 'cfg(pyo3_leak_on_drop_without_reference_pool)' --check-cfg 'cfg(Py_3_7)' --check-cfg 'cfg(Py_3_8)' --check-cfg 'cfg(Py_3_9)' --check-cfg 'cfg(Py_3_10)' --check-cfg 'cfg(Py_3_11)' --check-cfg 'cfg(Py_3_12)' --check-cfg 'cfg(Py_3_13)' --check-cfg 'cfg(Py_3_14)' --check-cfg 'cfg(Py_3_15)' --check-cfg 'cfg(c_str_lit)' --check-cfg 'cfg(diagnostic_namespace)' --check-cfg 'cfg(io_error_more)' --check-cfg 'cfg(mut_ref_in_const_fn)' --check-cfg 'cfg(fn_ptr_eq)' --check-cfg 'cfg(from_bytes_with_nul_error)'` (signal: 9, SIGKILL: kill)
+          # warning: build failed, waiting for other jobs to finish...
+          # 💥 maturin failed
+          #   Caused by: Failed to build a native library through cargo
+          #   Caused by: Cargo build finished with "exit status: 101": `env -u CARGO PYO3_BUILD_EXTENSION_MODULE="1" PYO3_ENVIRONMENT_SIGNATURE="cpython-3.13-64bit" PYO3_PYTHON="/sasl/bin/python3" PYTHON_SYS_EXECUTABLE="/sasl/bin/python3" "cargo" "rustc" "--profile" "release" "--message-format" "json-render-diagnostics" "--locked" "--manifest-path" "/tmp/pip-install-bpvyezx3/cryptography_9e845f0e69e14411a204415c1ca278ca/src/rust/Cargo.toml" "--lib"`
+          # Error: command ['maturin', 'pep517', 'build-wheel', '-i', '/sasl/bin/python3', '--compatibility', 'off'] returned non-zero exit status 1
+          # [end of output]
+          platforms: "linux/386,linux/arm/v7,linux/arm64/v8,linux/amd64,linux/arm64,linux/s390x"
+          cache-from: type=local,src=/tmp/.buildx-cache/debian,mode=max,compression=estargz
+          cache-to: type=local,dest=/tmp/.buildx-cache-new/debian
+          build-args: |
+            BASE_IMAGE=${{ env.DEBIAN_IMAGE }}
+
+      - name: Move cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+  Snyk_Scan_Debian:
+    runs-on: ubuntu-latest
+    needs:
+      - Build_Debian
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js (for Snyk)
+        uses: actions/setup-node@v7
+        with:
+          node-version: '18'
+
+      - name: Install Snyk CLI
+        run: npm install -g snyk
+
+      - name: Authenticate Snyk
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: snyk auth $SNYK_TOKEN
+
+      - name: Run Snyk container test
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: snyk container test --exclude-base-image-vulns --severity-threshold=high --file=./Dockerfile --docker boky/postfix:edge-debian # --build-arg BASE_IMAGE=${{ env.DEBIAN_IMAGE }}

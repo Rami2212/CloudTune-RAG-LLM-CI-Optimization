@@ -1,0 +1,53 @@
+name: build binaries
+
+on:
+  pull_request:
+    branches:
+      - master
+      - "*_release"
+    paths:
+      - '**/*.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '**/*.mk'
+  push:
+    branches:
+      - master
+      - "*_release"
+    paths:
+      - '**/*.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '**/*.mk'
+
+env:
+  GO_VERSION: "1.25"
+
+jobs:
+  build-binaries:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Go 1.x
+        uses: actions/setup-go@v3
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: generate bindata
+        run: make dashboard-bindata-gen dashboard-doc-gen
+
+      - name: go mod vendor
+        run: go mod vendor
+
+      - name: go build ob-operator
+        run: make build
+      
+      - name: go build oceanbase-dashboard
+        run: make dashboard
+        
+      - name: go build oceanbase-cli
+        run: make okctl
+        

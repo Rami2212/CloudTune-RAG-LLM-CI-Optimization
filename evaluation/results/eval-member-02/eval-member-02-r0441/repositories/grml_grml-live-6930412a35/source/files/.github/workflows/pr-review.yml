@@ -1,0 +1,100 @@
+# PR Review workflows.
+
+name: pr-review
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  ruff-format-check:
+    name: ruff format check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: '3.11'
+      - name: Install ruff
+        run: pip install ruff
+      - name: "build-driver: Check ruff formatting"
+        run: ruff format --line-length 120 --check build-driver/*.py
+      - name: "grml_live: Check ruff formatting"
+        run: cd usr/lib/grml-live && ruff format --line-length 120 --check .
+      - name: "grml_live: Check ruff lint"
+        run: cd usr/lib/grml-live && ruff check .
+
+  autoconfig-tests:
+    name: autoconfig tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: run_tests
+        run: |
+          # Install lsb-functions, etc.
+          git clone --depth 1 https://github.com/grml/grml-etc-core
+          sudo cp -rv grml-etc-core/etc/ /
+
+          cd tests/autoconfig && ./run_tests.sh
+
+  shellcheck:
+    name: shellcheck all scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: shellcheck
+        run: |
+          echo "Running shellcheck on all shell scripts..."
+          FOUND_ISSUES=0
+
+          # Function to run shellcheck and capture results
+          run_shellcheck() {
+            local file="$1"
+            echo "=== Checking $file ==="
+
+            # Run shellcheck from the file's directory to ensure relative paths work
+            local dir=$(dirname "$file")
+            local basename=$(basename "$file")
+
+            if ! (cd "$dir" && shellcheck -x "$basename"); then
+              echo "❌ $file has issues"
+              FOUND_ISSUES=1
+            else
+              echo "✅ $file passed"
+            fi
+          }
+
+          # Check main scripts
+          for script in \
+            build-driver/build \
+            config/files/GRMLBASE/usr/share/grml-autoconfig/autoconfig.functions \
+            config/files/GRMLBASE/usr/share/grml-autoconfig/grml-autoconfig \
+            debian/update-grml-live-version \
+            grml-live \
+            remaster/grml-live-remaster \
+            scripts/migrate-to-minifai; do
+              run_shellcheck "$script"
+          done
+
+          # Check other shell scripts
+          while read -r script; do
+            if head -1 "$script" | grep -q '^#!.*sh'; then
+              run_shellcheck "$script"
+            fi
+          done < <(find . -path ./.git -prune -o -type f -print)
+
+          if [ "$FOUND_ISSUES" = "0" ]; then
+            echo "Shellcheck analysis complete!"
+          else
+            echo "Shellcheck analysis complete, but found issues."
+            exit 1
+          fi

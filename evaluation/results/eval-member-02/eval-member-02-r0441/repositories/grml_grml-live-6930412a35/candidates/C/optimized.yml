@@ -1,0 +1,99 @@
+name: test-build
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+  schedule:
+    - cron: "30 3 * * 2"
+
+concurrency:
+  group: "${{ github.ref }}"
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-debian:
+    strategy:
+      # Keep other matrix jobs running, even if one fails.
+      fail-fast: false
+      matrix:
+        host_release:
+          - unstable
+          - forky
+          - trixie
+
+    # We want a working shell, qemu, python and docker. Specific version should not matter (much).
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - run: ./test/gha-build-deb.sh
+        name: "Build .deb for ${{matrix.host_release}}"
+        env:
+          HOST_RELEASE: ${{matrix.host_release}}
+
+      - name: Archive built .deb
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
+        with:
+          name: deb-${{matrix.host_release}}
+          if-no-files-found: error
+          path: |
+            *.deb
+
+  build-iso:
+    strategy:
+      fail-fast: false
+      matrix:
+        extra_classes:
+          - ""
+          - "GRML_GHACI_CLOUD"
+        arch:
+          - amd64
+          - arm64
+
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - run: ./test/gha-build-iso.sh initial
+        name: "Build ISO on ${{matrix.arch}}${{matrix.extra_classes && format(' with {0}', matrix.extra_classes) || ''}}"
+        env:
+          EXTRA_CLASSES: ${{matrix.extra_classes}}
+          ARCH: ${{matrix.arch}}
+          GITHUB_PR_NUMBER: ${{github.event.pull_request.number}}
+
+      - name: Archive built ISO
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
+        with:
+          name: grml-live-build-result-initial-${{github.event.pull_request.number && format('pr{0}', github.event.pull_request.number) || 'unknown'}}-${{matrix.arch}}${{matrix.extra_classes && format('-{0}', matrix.extra_classes) || ''}}
+          if-no-files-found: error
+          retention-days: 15
+          path: |
+            results-initial/*
+
+      - run: ./test/gha-build-iso.sh build-only-twice
+        name: "Repack ISO twice ${{matrix.arch}}${{matrix.extra_classes && format(' with {0}', matrix.extra_classes) || ''}}"
+        env:
+          EXTRA_CLASSES: ${{matrix.extra_classes}}
+          ARCH: ${{matrix.arch}}
+          GITHUB_PR_NUMBER: ${{github.event.pull_request.number}}
+
+      - name: Archive repacked ISO
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
+        with:
+          name: grml-live-build-result-repack-${{github.event.pull_request.number && format('pr{0}', github.event.pull_request.number) || 'unknown'}}-${{matrix.arch}}${{matrix.extra_classes && format('-{0}', matrix.extra_classes) || ''}}
+          if-no-files-found: error
+          retention-days: 15
+          path: |
+            results-build-only-second/*

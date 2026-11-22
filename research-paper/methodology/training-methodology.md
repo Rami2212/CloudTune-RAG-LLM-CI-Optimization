@@ -2,13 +2,11 @@
 
 ## Scope
 
-This document covers the work up to creation of the retrieval dataset. It ends before text embedding or vector indexing. “Training” refers to preparing searchable, source-linked knowledge; it does not fine-tune a language model.
+This document covers the work up to creation of the retrieval dataset. It ends before text embedding or vector indexing. “Training” refers to preparing searchable, source-linked knowledge.
 
 ## Work completed
 
-The literature extraction contains 25 CI optimization pattern records drawn from five papers. Each record captures the optimization mechanism, method, applicability conditions, limitations, reported findings and metrics, and a source locator. The records are currently marked as drafts in the knowledge registry.
-
-The data preparation process validates record structure, unique identifiers, source metadata, and evidence locators. Integrity checking also verifies source hashes, page bounds, and registry counts. The dataset builder turns the records into stable, searchable documents, preserves their citations, and writes a line-based retrieval dataset, a structured dataset, and a manifest with document counts and SHA-256 digests. The current corpus digest is `94c3ae909d96246be4286c6743ea76a0418c5ddbfcdec2ae6d402eb46e7d0f68`.
+The literature extraction contains 16 CI optimization pattern records drawn from five papers. Each record captures the optimization mechanism, method, applicability conditions, limitations, reported findings and metrics, and a source locator. The records are currently marked as drafts in the knowledge registry.
 
 ## CI time optimization coverage
 
@@ -46,7 +44,6 @@ flowchart LR
 4. [Accelerating Continuous Integration by Caching Environments and Inferring Dependencies (2022)](https://rebels.cs.uwaterloo.ca/papers/tse2020_gallaba.pdf)
 5. [Build Optimization: A Systematic Literature Review (2025)](https://arxiv.org/pdf/2501.11940)
 
-The extracted records retain section, table, or page locators for the claims they use. The systematic review is secondary evidence; its findings remain identified as such.
 
 ## GitHub preparation and handoff
 
