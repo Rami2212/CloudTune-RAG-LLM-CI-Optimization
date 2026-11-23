@@ -1,0 +1,65 @@
+name: Clang-Format Check
+
+# This workflow verifies that all tracked C/C++ files in the repository
+# are formatted according to the .clang-format rules.
+#
+# It uses:
+#   - the exact clang-format release pinned by the shell script
+#   - native .clang-format-ignore handling and one batch invocation
+#   - the shell script `./scripts/_280_format_c_code.sh` to orchestrate everything
+#
+# The workflow runs:
+#   - on every push to any branch
+#   - on every pull request
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+jobs:
+  clang-format-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      #########################################################################
+      # 1) Check out the repository so we have access to:
+      #    - source files
+      #    - .clang-format
+      #    - .clang-format-ignore
+      #    - scripts/_280_format_c_code.sh
+      #########################################################################
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          # Full git history is not strictly required for formatting,
+          # but some tools or future changes might rely on it.
+          fetch-depth: 0
+
+      #########################################################################
+      # 2) Install the repository's canonical clang-format release.
+      #
+      # clang-format output changes between releases. An unversioned apt package
+      # therefore makes local formatting and CI checks disagree when the hosted
+      # runner changes its Ubuntu image. The PyPI package supplies the exact
+      # native formatter binary in an isolated environment.
+      #########################################################################
+      - name: Install clang-format
+        run: |
+          ./scripts/_280_format_c_code.sh setup
+
+      #########################################################################
+      # 3) Run clang-format in CHECK mode via the shell script.
+      #
+      # The script:
+      #   - collects tracked C/C++ files (git ls-files)
+      #   - lets clang-format apply .clang-format-ignore natively
+      #   - runs clang-format in CHECK mode (no in-place changes)
+      #   - prints native file/line diagnostics and a GitHub Actions error
+      #   - fails the job (exit 1) if any file is misformatted
+      #########################################################################
+      - name: Run clang-format in check mode
+        run: |
+          chmod +x ./scripts/_280_format_c_code.sh
+          ./scripts/_280_format_c_code.sh check

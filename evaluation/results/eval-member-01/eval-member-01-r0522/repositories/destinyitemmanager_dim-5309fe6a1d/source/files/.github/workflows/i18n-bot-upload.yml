@@ -1,0 +1,41 @@
+# This workflow runs whenever locale/en.json is updated on the master branch
+# It updates crowdin with new translation strings
+name: i18n upload bot
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "src/locale/en.json"
+    branches: [master]
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout DIM
+        uses: actions/checkout@v7
+
+      - name: Sort en.json
+        run: dimJSON="$(jq -S . src/locale/en.json)" && echo "${dimJSON}" > src/locale/en.json
+
+      - name: Upload updated en.json to crowdin
+        uses: crowdin/github-action@v3.6.0
+        with:
+          upload_sources: true
+          upload_translations: false
+          project_id: ${{ secrets.CROWDIN_PROJECT_ID }}
+          token: ${{ secrets.CROWDIN_PERSONAL_TOKEN }}
+        env:
+          CROWDIN_PROJECT_ID: ${{ secrets.CROWDIN_PROJECT_ID }}
+          CROWDIN_PERSONAL_TOKEN: ${{ secrets.CROWDIN_PERSONAL_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check for changes
+        uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          base: HEAD
+          filters: |
+            changed:
+              - 'src/locale/en.json'

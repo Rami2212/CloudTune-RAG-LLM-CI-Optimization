@@ -1,0 +1,63 @@
+name: Publish website
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      # Github workflow file to get the artifacts for to generate the website matrix
+      # For example, "nightly-release.yml".
+      # Note: This parameter does not denote the absolute path in this repositories
+      # tree, but is the base name of it, which internally identifies the results of a CI run.
+      workflow_file:
+        required: true
+        type: string
+      www_out:
+        type: string
+        default: /tmp/www
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RUST_LOG: "info"
+  
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+  
+      - name: Generate HTML
+        run: |
+          mkdir -p ${{inputs.www_out}}
+          cd ci-tools/test-matrix
+
+          cargo +1.93 run --release -- \
+            --token ${GITHUB_TOKEN} \
+            --workflow ${{inputs.workflow_file}} \
+            --out ${{inputs.www_out}}
+      
+      - name: Generate GitHub Pages artifacts
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{inputs.www_out}}
+
+  deploy:
+    runs-on: ubuntu-22.04
+
+    needs: build
+
+    permissions:
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+      
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

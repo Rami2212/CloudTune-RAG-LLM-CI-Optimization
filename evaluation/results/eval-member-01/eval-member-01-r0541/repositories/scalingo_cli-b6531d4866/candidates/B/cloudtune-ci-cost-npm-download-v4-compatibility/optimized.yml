@@ -1,0 +1,84 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 4 optimizations:
+# - [MEDIUM] Add concurrency group to "publish.yml"
+# - [MEDIUM] Switch "releases-windows" from Windows to ubuntu runner
+# - [LOW] Use shallow clone in "releases" job
+# - [LOW] Use shallow clone in "releases-windows" job
+# Estimated savings: ~2 min/run
+#
+name: Test and Release Go CLI
+
+on:
+  pull_request:
+  push:
+    branches: [main, master, prod]
+    tags: ["*"]
+
+# The list of permissions is explained on the GitHub doc:
+# https://docs.github.com/en/actions/using-jobs/assigning-permissions-to-jobs
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  # Write permissions is needed to create a new release
+  contents: write
+  # allow read access to pull request. Use with `only-new-issues` option.
+  pull-requests: read
+
+jobs:
+  linter:
+    name: Linter on a PR
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: Scalingo/actions/go-linter@main
+
+  tests:
+    name: Unit Tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: Scalingo/actions/go-tests@main
+
+  releases:
+    needs: [tests]
+    name: GoReleaser Build on All OS but Windows
+    if: ${{ github.ref_type == 'tag' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # required by GoReleaser (https://goreleaser.com/ci/actions/#fetch-all-history)
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: "go.mod"
+          check-latest: true
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CGO_ENABLED: 0
+
+  releases-windows:
+    needs: [tests]
+    name: GoReleaser Build on Windows
+    if: ${{ github.ref_type == 'tag' }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # required by GoReleaser (https://goreleaser.com/ci/actions/#fetch-all-history)
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: "go.mod"
+          check-latest: true
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        with:
+          version: "~> v2"
+          args: release --config .goreleaser-windows.yaml --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,260 @@
+name: Test
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v7.0.1
+    - uses: actions/setup-node@v7.1.0
+    - uses: actions/cache@v6.1.0
+      with:
+        path: ~/.npm
+        key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+        restore-keys: |
+          ${{ runner.os }}-node-
+    - name: Install
+      run: npm ci
+    - name: Build
+      run: npm run build
+    # Tar the bundle so the executable bit on the relocated wrapper survives.
+    # actions/upload-artifact does not preserve unix file permissions.
+    - name: Archive dist
+      run: tar -cf dist.tar dist
+    - name: Upload dist
+      uses: actions/upload-artifact@v7.0.2
+      with:
+        name: dist
+        path: dist.tar
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7.0.1
+    - uses: actions/setup-node@v7.1.0
+    - uses: actions/cache@v6.1.0
+      with:
+
+        path: ~/.npm
+        key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+        restore-keys: |
+          ${{ runner.os }}-node-
+    - run: npm ci
+    - run: npm run lint
+
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v7.0.1
+    - uses: actions/setup-node@v7.1.0
+    - uses: actions/cache@v6.1.0
+      with:
+        path: ~/.npm
+        key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+        restore-keys: |
+          ${{ runner.os }}-node-
+    - name: Install
+      run: npm ci
+    - name: Test
+      run: npm test
+      env:
+        INPUT_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  integration:
+    name: Integration test
+    needs: build
+
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v7.0.1
+    - uses: $/.github/actions/dist
+    - name: Use Action
+      uses: ./
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+    - name: Validate
+      run: tflint -v
+
+  integration-versions:
+    name: 'Integration test: version (tflint_version: ${{ matrix.tflint_version }})'
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        tflint_version: ['v0.24.1', latest]
+
+    steps:
+    - uses: actions/checkout@v7.0.1
+    - uses: $/.github/actions/dist
+    - name: Use Action
+      id: setup-tflint
+      uses: ./
+      with:
+        tflint_version: ${{ matrix.tflint_version }}
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+    - name: Validate
+      if: matrix.tflint_version != 'latest'
+      run: |-
+        version='${{ matrix.tflint_version }}'
+        tflint -v | grep ${version:1}
+    - name: Validate
+      if: matrix.tflint_version == 'latest'
+      run: tflint -v
+    - name: Verify version output
+      run: |
+        if [[ "${{ matrix.tflint_version }}" == "latest" ]]; then
+          expected=$(gh api repos/terraform-linters/tflint/releases/latest --jq '.tag_name' | sed 's/^v//')
+        else
+          version='${{ matrix.tflint_version }}'
+          expected=${version:1}
+        fi
+        if [[ "${{ steps.setup-tflint.outputs.tflint-version }}" != "$expected" ]]; then
+          echo "Expected version output '$expected', got '${{ steps.setup-tflint.outputs.tflint-version }}'"
+          exit 1
+        fi
+      env:
+        GH_TOKEN: ${{ github.token }}
+
+  integration-checksum:
+    runs-on: ubuntu-latest
+    name: 'Integration test: checksum'
+    needs: build
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: $/.github/actions/dist
+      - name: Use Action
+        uses: ./
+        with:
+          tflint_version: 'v0.53.0'
+          # https://github.com/terraform-linters/tflint/releases/tag/v0.53.0
+          # checksums.txt
+          # tflint_linux_amd64
+          checksums: bb0a3a6043ea1bcd221fc95d49bac831bb511eb31946ca6a4050983e9e584578
+      - run: tflint -v
+
+  integration-version-file:
+    runs-on: ubuntu-latest
+    name: 'Integration test: version file'
+    needs: build
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: $/.github/actions/dist
+      - name: Write version file
+        run: |
+          cat > .tool-versions <<'EOF'
+          terraform 1.9.0
+          tflint 0.52.0
+          EOF
+      - name: Use Action
+        id: setup-tflint
+        uses: ./
+        with:
+          tflint_version_file: .tool-versions
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Validate
+        run: tflint -v | grep 0.52.0
+      - name: Verify version output
+        run: |
+          if [[ "${{ steps.setup-tflint.outputs.tflint-version }}" != "0.52.0" ]]; then
+            echo "Expected version output '0.52.0', got '${{ steps.setup-tflint.outputs.tflint-version }}'"
+            exit 1
+          fi
+
+  integration-matchers:
+    name: 'Integration test: matchers (tflint_version: ${{ matrix.tflint_version }})'
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        tflint_version: ['v0.26.0', latest]
+
+    steps:
+    - uses: actions/checkout@v7.0.1
+    - uses: $/.github/actions/dist
+    - name: Use Action
+      uses: ./
+      with:
+        tflint_version: ${{ matrix.tflint_version }}
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+    - name: Run
+      run: tflint -f compact --force
+
+  integration-wrapper:
+    name: 'Integration test: wrapper (tflint_version: ${{ matrix.tflint_version }})'
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        tflint_version: [ 'v0.26.0', latest ]
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: $/.github/actions/dist
+      - name: Use Action
+        id: setup-tflint
+        uses: ./
+        with:
+          tflint_version: ${{ matrix.tflint_version }}
+          tflint_wrapper: true
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run
+        id: tflint
+        run: tflint -f compact --force
+      - name: Verify Exit Code Output
+        run: |
+          if [[ ${{ steps.tflint.outputs.exitcode }} -ne 0 ]]; then
+            echo "TFLint Exit Code not captured."
+            exit 1
+          else
+            echo "TFLint Exit Code captured."
+          fi
+      - name: Verify Version Output
+        run: |
+          if [[ -z "${{ steps.setup-tflint.outputs.tflint-version }}" ]]; then
+            echo "TFLint version output not captured."
+            exit 1
+          else
+            echo "TFLint version captured: ${{ steps.setup-tflint.outputs.tflint-version }}"
+          fi
+
+  integration-cache:
+    name: 'Integration test: cache'
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: $/.github/actions/dist
+      - name: Use Action
+        uses: ./
+        with:
+          cache: true
+          tflint_config_path: .github/workflows/fixtures/.tflint.hcl
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Init TFLint
+        run: tflint --init --config .github/workflows/fixtures/.tflint.hcl
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify plugin installed
+        run: test -d ~/.tflint.d/plugins

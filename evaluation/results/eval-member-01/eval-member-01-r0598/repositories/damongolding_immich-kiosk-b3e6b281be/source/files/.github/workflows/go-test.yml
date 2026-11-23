@@ -1,0 +1,38 @@
+name: Test
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: "go.mod"
+
+      - name: Get dependencies
+        run: go mod download
+
+      - name: Install templ and generate
+        run: |
+          go mod download
+          go tool templ generate
+
+      - name: Run tests
+        shell: bash
+        env:
+          CI: true
+        run: |
+          set -o pipefail
+          go test -v ./... 2>&1 | tee test-results.log
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v7
+        with:
+          name: go-test-results
+          path: test-results.log

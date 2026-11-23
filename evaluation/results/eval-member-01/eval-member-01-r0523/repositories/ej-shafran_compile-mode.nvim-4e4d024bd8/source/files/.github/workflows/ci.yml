@@ -1,0 +1,139 @@
+name: Continuous Integration
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types:
+      - opened
+      - synchronize
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests
+
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+        nvim_version:
+          - 0.10.0
+          - 0.10.1
+          - 0.10.4
+          - 0.11.5
+        exclude:
+          # There's an issue building Vim syntax files from source for this version on macOS, specifically...
+          - os: macos-latest
+            nvim_version: 0.10.0
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+        with:
+          path: compile-mode.nvim
+
+      - name: Setup `baleia.nvim`
+        uses: actions/checkout@v6
+        with:
+          repository: m00qek/baleia.nvim
+          path: baleia.nvim
+          ref: v1.3.0
+
+      - name: Setup `plenary.nvim`
+        uses: actions/checkout@v6
+        with:
+          repository: nvim-lua/plenary.nvim
+          path: plenary.nvim
+
+      # workaround for https://github.com/actions/runner-images/issues/10984
+      - name: Fix Homebrew Issue
+        run: |
+          brew uninstall --ignore-dependencies --force pkg-config@0.29.2
+        if: matrix.os == 'macos-latest'
+
+      - name: Install Neovim
+        uses: ej-shafran/setup-neovim-action@v1
+        with:
+          tag: v${{ matrix.nvim_version }}
+        if: matrix.os != 'windows-latest'
+
+      - name: Install Neovim (Windows)
+        run: |
+          choco install neovim --version=${{ matrix.nvim_version }}
+          echo 'C:\tools\neovim\nvim-win64\bin' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        if: matrix.os == 'windows-latest'
+
+      - name: Run Tests
+        run: |
+          cd compile-mode.nvim
+          make setup-ci
+          make test
+        env:
+          ACTIONS_STEP_DEBUG: ${{ secrets.ACTIONS_STEP_DEBUG }}
+
+  typecheck:
+    name: Typecheck
+
+    strategy:
+      matrix:
+        nvim_version:
+          - 0.10.0
+          - 0.10.1
+          - 0.10.4
+          - 0.11.5
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+        with:
+          path: compile-mode.nvim
+
+      - name: Setup `plenary.nvim`
+        uses: actions/checkout@v6
+        with:
+          repository: nvim-lua/plenary.nvim
+          path: "${{ github.workspace }}/plenary.nvim"
+
+      - name: Setup Neovim Runtime
+        uses: actions/checkout@v6
+        with:
+          ref: "v${{ matrix.nvim_version }}"
+          repository: neovim/neovim
+          path: "${{ github.workspace }}/neovim"
+
+      - name: Typecheck
+        uses: mrcjkb/lua-typecheck-action@v1
+        env:
+          VIMRUNTIME: "${{ github.workspace }}/neovim/runtime"
+          PLENARY_PATH: "${{ github.workspace }}/plenary.nvim"
+        with:
+          directories: |
+            compile-mode.nvim
+          configpath: compile-mode.nvim/.luarc-ci.json
+
+  fmt-check:
+    name: Check Formatting
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+
+      - name: Stylua
+        uses: JohnnyMorganz/stylua-action@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          version: 2.0.2
+          args: --check lua

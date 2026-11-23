@@ -1,0 +1,45 @@
+name: Unit Tests
+on:
+  pull_request:
+  push:
+    tags:
+      - v*
+    branches:
+      - main
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 1.24
+
+      - name: Get dependencies
+        run: |
+          go mod download
+          go install gotest.tools/gotestsum@latest
+
+      - name: Generate coverage report
+        run: |
+          gotestsum --format dots -- \
+            -coverprofile=coverage.txt \
+            -covermode=atomic \
+            ./...
+
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage.txt
+          flags: unittests
+
+      - name: Report test coverage to DeepSource
+        uses: deepsourcelabs/test-coverage-action@master
+        with:
+          key: go
+          coverage-file: ./coverage.txt
+          dsn: ${{ secrets.DEEPSOURCE_DSN }}

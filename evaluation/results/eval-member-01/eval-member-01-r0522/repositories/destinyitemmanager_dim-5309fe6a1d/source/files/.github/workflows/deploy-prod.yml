@@ -1,0 +1,76 @@
+name: Deploy Prod
+
+on:
+  workflow_dispatch:
+    inputs:
+      patch:
+        description: 'Should this be a patch release?'
+        type: boolean
+        required: true
+        default: true
+  schedule:
+    # Deploy at 5pm Sunday PST, which is 1am Monday UTC
+    # * is a special character in YAML so you have to quote this string
+    - cron: '0 1 * * 1'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: release
+      url: https://app.dim.gg
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2 # So sentry can get the previous commit
+          # Use the dim-release-bot token rather than the default
+          token: ${{ secrets.GH_TOKEN }}
+
+      - uses: ./.github/actions/setup-pnpm
+
+      - name: Install SSH key
+        uses: benoitchantre/setup-ssh-authentication-action@1.0.1
+        with:
+          private-key: ${{ secrets.SSH_KEY }}
+          private-key-name: dim.rsa
+          known-hosts: ${{ secrets.REMOTE_HOST }}
+
+      - name: Build and deploy
+        run: ./build/deploy-prod.sh
+        env:
+          PATCH: ${{ github.event.inputs.patch }}
+          NODE_OPTIONS: "--max_old_space_size=8192"
+          WEB_API_KEY: ${{ secrets.BUNGIE_API_KEY }}
+          WEB_OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
+          WEB_OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_SECRET }}
+          DIM_API_KEY: ${{ secrets.DIM_API_KEY }}
+          REMOTE_USER: ${{ secrets.REMOTE_USER }}
+          REMOTE_HOST: ${{ secrets.REMOTE_HOST }}
+          REMOTE_PATH: app.destinyitemmanager.com
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          # Use the dim-release-bot token rather than the default
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+
+      - name: Purge CloudFlare cache
+        run: ./build/purge-cloudflare.sh
+        env:
+          CLOUDFLARE_KEY: ${{ secrets.CLOUDFLARE_KEY }}
+          CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
+          APP_DOMAIN: app.destinyitemmanager.com
+
+      - name: Get package version
+        id: package-version
+        shell: bash
+        run: |
+          echo "current-version=$(node -p 'const pkg = require("./web-console/package.json"); pkg.version')" >> $GITHUB_OUTPUT
+
+      - name: Create Sentry release
+        uses: getsentry/action-release@v3
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: destiny-item-manager
+          SENTRY_PROJECT: dim
+        with:
+          environment: release
+          release: ${{ steps.package-version.outputs.current-version }}
+          ignore_missing: true

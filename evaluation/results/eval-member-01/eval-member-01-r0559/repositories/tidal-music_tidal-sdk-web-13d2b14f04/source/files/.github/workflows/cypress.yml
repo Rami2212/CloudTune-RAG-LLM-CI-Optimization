@@ -1,0 +1,76 @@
+name: Cypress Tests
+
+# Paths: Cypress is only used in player pkg, so only run this workflow
+# when something in player changes, or in true-time since that's a hard dep.defaults:
+# (Auth is provided via credentials provider and not directly used)
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - packages/true-time/**
+      - packages/player/**
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - packages/true-time/**
+      - packages/player/**
+  merge_group:
+    types: [checks_requested]
+    paths:
+      - packages/true-time/**
+      - packages/player/**
+
+concurrency:
+  group: cypress-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cypress-run:
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Restore Cypress binary cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/Cypress
+          key: ${{ runner.os }}-cypress-${{ hashFiles('pnpm-lock.yaml') }}
+      - uses: ./.github/actions/setup
+      - name: Ensure Cypress binary is installed
+        working-directory: packages/player
+        run: pnpm exec cypress install
+      - name: Map dev.tidal.com to localhost
+        # Player dev server runs at https://dev.tidal.com:5173; see README.
+        run: echo "127.0.0.1 dev.tidal.com" | sudo tee -a /etc/hosts
+      - name: Prepare test user for player tests
+        id: json
+        env:
+          TEST_USER: ${{ secrets.PLAYER_TEST_USER }}
+          PLAYER_REFRESH_TOKEN: ${{ secrets.PLAYER_REFRESH_TOKEN }}
+        run: |
+          printf '%s' "$TEST_USER" | base64 -d > test-user.json
+          json=$(cat test-user.json)
+          fixed_json="${json/\[TOKEN\]/$PLAYER_REFRESH_TOKEN}"
+          encoded_json=$(printf '%s' "$fixed_json" | base64 | tr -d '\n')
+          echo "encoded=\"$encoded_json\"" >> $GITHUB_OUTPUT
+      - name: Cypress run
+        uses: cypress-io/github-action@4ce68f262a3888d22cf3175d62010a145ba737ee # v7.4.8
+        env:
+          CYPRESS_TEST_USER: ${{ steps.json.outputs.encoded }}
+        with:
+          install: false
+          browser: chrome
+          start: pnpm --dir packages/player/ dev
+          # A URL is pinged by the action with got 16, which sets
+          # rejectUnauthorized and ignores NODE_TLS_REJECT_UNAUTHORIZED, so
+          # the mkcert dev server never looks ready. A non-URL is executed
+          # as a command. curl -k accepts that cert; Chromium does the same
+          # via --ignore-certificate-errors in cypress.config.js.
+          wait-on: 'curl --retry 90 --retry-delay 1 --retry-all-errors --retry-connrefused -fsSko /dev/null https://dev.tidal.com:5173/demo/test-case-1.html'
+          command: pnpm --dir packages/player/ internal:cypress:run
+      - name: Save Cypress binary cache
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/Cypress
+          key: ${{ runner.os }}-cypress-${{ hashFiles('pnpm-lock.yaml') }}

@@ -1,0 +1,42 @@
+name: SuttaCentral CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  SuttaCentral-CI:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Install Docker
+        uses: docker/setup-docker-action@v4
+
+      - name: Build
+        run: |
+          make prepare-tests
+          # docker wait sc-frontend
+
+      # split debug logging into separate steps so that it is in its own sections and easier to read and parse
+      - name: Debug log - compose logs
+        run: |
+          docker compose logs
+      - name: Debug log - docker ps
+        run: |
+          docker ps
+
+      - name: Lint
+        run: |
+          make lint
+
+      - name: Test
+        run: make test-server-ci

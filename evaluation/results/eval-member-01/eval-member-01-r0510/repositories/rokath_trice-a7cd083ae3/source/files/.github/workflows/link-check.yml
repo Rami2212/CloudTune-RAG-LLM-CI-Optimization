@@ -1,0 +1,67 @@
+name: Link Check
+
+on:
+  push:
+    branches: ["main"]           # Run link checks on every push to main
+  pull_request:                  # PRs check local files and anchors without remote requests
+  workflow_dispatch:             # Allow manual runs from the GitHub UI
+
+jobs:
+  link-check:
+    runs-on: ubuntu-latest       # Use the latest Ubuntu runner
+
+    permissions:
+      contents: read             # Required so lychee can read repository files
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        # This makes the full repository (including all Markdown files)
+        # available in the GitHub Actions workspace.
+
+      - name: Read shared link checker version
+        id: versions
+        run: |
+          source scripts/test-tools.env
+          echo "lychee=$TRICE_TOOL_LYCHEE_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Run lychee link checker on all Markdown files
+        id: lychee
+        uses: lycheeverse/lychee-action@v2
+        with:
+          lycheeVersion: v${{ steps.versions.outputs.lychee }}
+          # args are passed directly to the lychee CLI.
+          # Here we:
+          #   - enable verbose logging
+          #   - disable the interactive progress bar (better CI logs)
+          #   - set a timeout per request
+          #   - limit the inputs to all Markdown files in the repo tree
+          #
+          # Notes:
+          #   - './**/*.md' is a glob that matches all Markdown files
+          #     in the repository, recursively.
+          #   - You can later add more patterns (e.g. './**/*.html') if needed.
+          args: >
+            --config lychee.toml
+            --include-fragments
+            --no-progress
+            ${{ github.event_name == 'pull_request' && '--offline' || '' }}
+            --remap "https://github.com/rokath/trice/blob/main/_test/testdata/triceCheck.c file://${{ github.workspace }}/_test/testdata/triceCheck.c"
+            .
+          #
+          # fail:
+          #   - If true, the workflow will fail when lychee finds broken links.
+          #   - This is typically what you want for CI gating.
+          fail: true
+
+        env:
+          # GITHUB_TOKEN is used by lychee to authenticate against the GitHub API
+          # when checking links that point to GitHub (better rate limits, fewer 429 errors).
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Optional: Add a future step to post-process the lychee output,
+      # create issues, or upload artifacts if desired.
+      #
+      # Example (for later):
+      # - name: Inspect lychee raw output
+      #   run: cat ./lychee/out.md || echo "No output file generated."

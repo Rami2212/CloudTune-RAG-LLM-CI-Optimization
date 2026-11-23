@@ -1,0 +1,209 @@
+name: Unit Tests
+
+on:
+  push:
+    branches:
+      - 2.x
+  pull_request: ~
+
+permissions:
+  contents: read
+
+env:
+  SYMFONY_DEPRECATIONS_HELPER: weak
+
+jobs:
+  unit-test:
+    name: Unit ( PHP ${{ matrix.php }} )
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.1', '8.2', '8.3', '8.4', '8.5']
+
+    steps:
+      - name: Checkout
+        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" # v7.0.1
+
+      - name: Setup PHP
+        uses: "shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962" # v2.40.0
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: intl, opcache, mysql, pdo_mysql
+          coverage: none
+
+      - name: Install dependencies
+        uses: "ramsey/composer-install@65e4f84970763564f46a70b8a54b90d033b3bdda" # v4.0.0
+
+      - name: Run unit tests
+        run: vendor/bin/phpunit
+
+  bc:
+    name: BC with 1.x
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" # v7.0.1
+
+      - name: Setup PHP
+        uses: "shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240" # v2.37.2
+        with:
+          php-version: '8.1'
+          extensions: intl, soap
+          coverage: none
+
+      - name: Install dependencies
+        uses: "ramsey/composer-install@65e4f84970763564f46a70b8a54b90d033b3bdda" # v4.0.0
+
+      # A failure here is a break with 1.x, not a test to update. See src/Payum/Core/Tests/Bc/README.md.
+      - name: Run the BC suite
+        run: vendor/bin/phpunit --testsuite bc
+
+  lowest:
+    name: Unit ( PHP ${{ matrix.php }} + Lowest )
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.1', '8.2', '8.3', '8.4', '8.5']
+
+    steps:
+      - name: Checkout
+        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" # v7.0.1
+
+      - name: Setup PHP
+        uses: "shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962" # v2.40.0
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: intl, opcache, mysql, pdo_mysql
+          coverage: none
+
+      - name: Install dependencies
+        uses: "ramsey/composer-install@65e4f84970763564f46a70b8a54b90d033b3bdda" # v4.0.0
+        with:
+          dependency-versions: "lowest"
+
+      - name: Run unit tests
+        run: vendor/bin/phpunit
+
+  doctrine-migrations:
+    name: Doctrine migrations ( ${{ matrix.database }} + ${{ matrix.dependencies }} )
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        database: ['postgres', 'mysql', 'mariadb']
+        dependencies: ['highest', 'lowest']
+        include:
+          - database: postgres
+            image: 'postgres:17'
+            port: 5432
+            url: 'pdo_pgsql://payum:payum@127.0.0.1:5432/payum'
+            health: 'pg_isready -U payum'
+          - database: mysql
+            image: 'mysql:8.4'
+            port: 3306
+            url: 'pdo_mysql://root:payum@127.0.0.1:3306/payum'
+            health: 'mysqladmin ping -ppayum'
+          - database: mariadb
+            image: 'mariadb:11'
+            port: 3306
+            url: 'pdo_mysql://root:payum@127.0.0.1:3306/payum'
+            health: 'healthcheck.sh --connect --innodb_initialized'
+
+    services:
+      database:
+        image: ${{ matrix.image }}
+        env:
+          POSTGRES_USER: payum
+          POSTGRES_PASSWORD: payum
+          POSTGRES_DB: payum
+          MYSQL_ROOT_PASSWORD: payum
+          MYSQL_DATABASE: payum
+          MARIADB_ROOT_PASSWORD: payum
+          MARIADB_DATABASE: payum
+        ports:
+          - ${{ matrix.port }}:${{ matrix.port }}
+        options: >-
+          --health-cmd "${{ matrix.health }}"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - name: Checkout
+        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" # v7.0.1
+
+      - name: Setup PHP
+        uses: "shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962" # v2.40.0
+        with:
+          php-version: '8.4'
+          extensions: intl, pdo_mysql, pdo_pgsql
+          coverage: none
+
+      - name: Install dependencies
+        uses: "ramsey/composer-install@65e4f84970763564f46a70b8a54b90d033b3bdda" # v4.0.0
+        with:
+          dependency-versions: ${{ matrix.dependencies }}
+
+      - name: Run the migration tests
+        run: vendor/bin/phpunit src/Payum/Core/Tests/Functional/Bridge/Doctrine/Migrations
+        env:
+          PAYUM_DOCTRINE_TEST_URL: ${{ matrix.url }}
+
+  mongodb:
+    name: Unit ( PHP ${{ matrix.php }} + MongoDB ${{ matrix.mongodb }} + ext-mongodb ${{ matrix.driver }}.x )
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.1', '8.2', '8.3', '8.4', '8.5']
+        mongodb: ['8.0']
+        driver: ['2']
+        include:
+          # Server compatibility is a property of ext-mongodb / doctrine-odm rather
+          # than of the PHP version, so older servers only need one PHP version.
+          - php: '8.1'
+            mongodb: '6.0'
+            driver: '2'
+          - php: '8.1'
+            mongodb: '7.0'
+            driver: '2'
+          # ext-mongodb 1.x is still widely deployed, and Composer resolves it to a
+          # different mongodb/mongodb major, so keep one job on the latest 1.x.
+          - php: '8.1'
+            mongodb: '8.0'
+            driver: '1'
+
+    steps:
+      - name: Checkout
+        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" # v7.0.1
+
+      - name: Setup PHP
+        uses: "shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962" # v2.40.0
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: intl, opcache, mysql, pdo_mysql, mongodb-${{ matrix.driver }}
+          coverage: none
+
+      # mongod 8.0 refuses to start on Linux 6.19 to 7.0.13 kernels, which some runners have
+      # (SERVER-121912). Handing rseq back to glibc keeps it out of the way.
+      - name: Start MongoDB
+        uses: "supercharge/mongodb-github-action@89d1ecb837145f486898e235478a7e267f68c44e" # main, for mongodb-extra-env
+        with:
+          mongodb-version: ${{ matrix.mongodb }}
+          mongodb-extra-env: GLIBC_TUNABLES=glibc.pthread.rseq=1
+
+      - name: Install dependencies
+        uses: "ramsey/composer-install@65e4f84970763564f46a70b8a54b90d033b3bdda" # v4.0.0
+
+      - name: Install Doctrine Mongodb ODM
+        run: composer require doctrine/mongodb-odm --with-all-dependencies
+
+      - name: Run unit tests
+        run: vendor/bin/phpunit

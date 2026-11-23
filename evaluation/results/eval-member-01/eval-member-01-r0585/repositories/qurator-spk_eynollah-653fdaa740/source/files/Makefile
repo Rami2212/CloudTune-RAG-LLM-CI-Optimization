@@ -1,0 +1,135 @@
+PYTHON ?= python3
+PIP ?= pip3
+EXTRAS ?=
+
+DOCKER_BASE_IMAGE ?= docker.io/ocrd/core-cuda-onnx:v3.13.2
+DOCKER_TAG ?= ocrd/eynollah
+DOCKER ?= docker
+WGET = wget -O
+
+# SEG_MODEL := https://github.com/qurator-spk/eynollah/releases/download/v0.3.0/models_eynollah.tar.gz
+# SEG_MODEL := https://github.com/qurator-spk/eynollah/releases/download/v0.3.1/models_eynollah.tar.gz
+# SEG_MODEL := https://zenodo.org/records/17194824/files/models_layout_v0_5_0.tar.gz?download=1
+# EYNOLLAH_MODELS_URL := https://zenodo.org/records/21362927/files/models_inference_all_v0_9_0.zip
+EYNOLLAH_MODELS_URL := https://zenodo.org/records/21381102/files/models_inference_all_v0_9_1.zip
+EYNOLLAH_MODELS_ZIP = $(notdir $(EYNOLLAH_MODELS_URL))
+EYNOLLAH_MODELS_DIR = $(EYNOLLAH_MODELS_ZIP:%.zip=%)
+
+PYTEST_ARGS ?= -vv --isolate
+
+# BEGIN-EVAL makefile-parser --make-help Makefile
+
+help:
+	@echo ""
+	@echo "  Targets"
+	@echo ""
+	@echo "    docker       Build Docker image"
+	@echo "    build        Build Python source and binary distribution"
+	@echo "    install      Install package with pip"
+	@echo "    install-dev  Install editable with pip"
+	@echo "    deps-test    Install test dependencies with pip"
+	@echo "    models       Download and extract models to $(CURDIR):"
+	@echo "                 $(EYNOLLAH_MODELS_DIR)"
+	@echo "    smoke-test   Run simple CLI check"
+	@echo "    ocrd-test    Run OCR-D CLI check"
+	@echo "    test         Run unit tests"
+	@echo ""
+	@echo "  Variables"
+	@echo "    EXTRAS       comma-separated list of features (like 'OCR,plotting') for 'install' [$(EXTRAS)]"
+	@echo "    DOCKER_TAG   Docker image tag for 'docker' [$(DOCKER_TAG)]"
+	@echo "    PYTEST_ARGS  pytest args for 'test' (Set to '-s' to see log output during test execution, '-vv' to see individual tests. [$(PYTEST_ARGS)]"
+	@echo "    ALL_MODELS   URL of archive of all models [$(ALL_MODELS)]"
+	@echo ""
+
+# END-EVAL
+
+# Download and extract models to $(PWD)/models_eynollah
+models: $(EYNOLLAH_MODELS_DIR)
+
+# do not download these files if we already have the directories
+.INTERMEDIATE: $(EYNOLLAH_MODELS_ZIP)
+
+$(EYNOLLAH_MODELS_ZIP):
+	$(WGET) $@ $(EYNOLLAH_MODELS_URL)
+
+$(EYNOLLAH_MODELS_DIR): $(EYNOLLAH_MODELS_ZIP)
+	unzip $<
+
+build:
+	$(PIP) install build
+	$(PYTHON) -m build .
+
+# Install with pip
+install:
+	$(PIP) install .$(and $(EXTRAS),[$(EXTRAS)])
+
+# Install editable with pip
+install-dev:
+	$(PIP) install -e .$(and $(EXTRAS),[$(EXTRAS)])
+
+deps-test:
+	$(PIP) install -r requirements-test.txt
+
+smoke-test: TMPDIR != mktemp -d
+smoke-test: tests/resources/2files/kant_aufklaerung_1784_0020.tif
+	# layout analysis:
+	eynollah -m $(CURDIR) layout -i $< -o $(TMPDIR) 
+	fgrep -q http://schema.primaresearch.org/PAGE/gts/pagecontent/2019-07-15 $(TMPDIR)/$(basename $(<F)).xml
+	fgrep -c -e TextRegion -e ImageRegion -e SeparatorRegion $(TMPDIR)/$(basename $(<F)).xml
+	# layout, directory mode (skip one, add one):
+	eynollah -m $(CURDIR) layout -di $(<D) -o $(TMPDIR) 
+	test -s $(TMPDIR)/euler_rechenkunst01_1738_0025.xml
+	# mbreorder, directory mode (overwrite):
+	eynollah -m $(CURDIR) reorder -mb -di $(<D) -o $(TMPDIR) 
+	fgrep -q http://schema.primaresearch.org/PAGE/gts/pagecontent/2019-07-15 $(TMPDIR)/$(basename $(<F)).xml
+	fgrep -c -e RegionRefIndexed $(TMPDIR)/$(basename $(<F)).xml
+	# binarize:
+	eynollah -m $(CURDIR) binarization  -i $< -o $(TMPDIR)/$(<F)
+	test -s $(TMPDIR)/$(<F)
+	@set -x; test "$$(identify -format '%w %h' $<)" = "$$(identify -format '%w %h' $(TMPDIR)/$(<F))"
+	# enhance:
+	eynollah -m $(CURDIR) enhancement  -sos -i $< -o $(TMPDIR) -O
+	test -s $(TMPDIR)/$(<F)
+	@set -x; test "$$(identify -format '%w %h' $<)" = "$$(identify -format '%w %h' $(TMPDIR)/$(<F))"
+	$(RM) -r $(TMPDIR)
+
+ocrd-test: export OCRD_MISSING_OUTPUT := ABORT
+ocrd-test: TMPDIR != mktemp -d
+ocrd-test: tests/resources/2files/kant_aufklaerung_1784_0020.tif
+	cp $< $(TMPDIR)
+	ocrd workspace -d $(TMPDIR) init
+	ocrd workspace -d $(TMPDIR) add -G OCR-D-IMG -g PHYS_0020 -i OCR-D-IMG_0020 $(<F)
+	ocrd-eynollah-segment -w $(TMPDIR) -I OCR-D-IMG -O OCR-D-SEG -P models $(CURDIR)
+	result=$$(ocrd workspace -d $(TMPDIR) find -G OCR-D-SEG); \
+	fgrep -q http://schema.primaresearch.org/PAGE/gts/pagecontent/2019-07-15 $(TMPDIR)/$$result && \
+	fgrep -c -e TextRegion -e ImageRegion -e SeparatorRegion $(TMPDIR)/$$result
+	ocrd-eynollah-binarize -w $(TMPDIR) -I OCR-D-IMG -O OCR-D-BIN -P model $(CURDIR)
+	ocrd-eynollah-binarize -w $(TMPDIR) -I OCR-D-SEG -O OCR-D-SEG-BIN -P model $(CURDIR)  -P operation_level region
+	$(RM) -r $(TMPDIR)
+
+# Run unit tests
+test: export EYNOLLAH_MODELS_DIR := $(CURDIR)
+test:
+	$(PYTHON) -m pytest tests --durations=0 --continue-on-collection-errors $(PYTEST_ARGS)
+
+coverage:
+	coverage erase
+	$(MAKE) test PYTHON="coverage run"
+	coverage report -m
+
+# Concatenate docker image names with either the git tag describing current commit or 'latest' and
+# merge list with "-t"
+empty :=
+space := $(empty) $(empty)
+GIT_TAG := $(strip $(shell git describe --tags | grep -x "v[0-9]\+\.[0-9]\+\.[0-9]\+"))
+DOCKER_TAGS = $(subst $(space),$(space)-t$(space),$(DOCKER_TAG:%=$(if $(GIT_TAG),%:$(GIT_TAG),%:latest)))
+
+# Build docker image
+docker:
+	$(DOCKER) build \
+	--build-arg DOCKER_BASE_IMAGE=$(DOCKER_BASE_IMAGE) \
+	--build-arg VCS_REF=$$(git rev-parse --short HEAD) \
+	--build-arg BUILD_DATE=$$(date -u +"%Y-%m-%dT%H:%M:%SZ") \
+	-t $(DOCKER_TAGS) .
+
+.PHONY: models build install install-dev test smoke-test ocrd-test coverage docker help

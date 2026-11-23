@@ -1,0 +1,53 @@
+name: Publish
+on:
+  push:
+    branches:
+      - main
+    tags-ignore:
+      - "**"
+    paths-ignore:
+      - "**/*.gitignore"
+      - .editorconfig
+      - apps/**
+      - examples/**
+      - decisions/**
+jobs:
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup node@26
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+          package-manager-cache: false
+      - name: Setup pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Build packages
+        run: node --run build
+      - name: Publish
+        run: |
+          if git log -1 --pretty=%B | grep "^release: [0-9]\+\.[0-9]\+\.[0-9]\+$";
+          then
+            pnpm --filter "./packages/*" --filter "./plugins/*" publish --provenance --access public
+          elif git log -1 --pretty=%B | grep "^release: [0-9]\+\.[0-9]\+\.[0-9]\+-rc\.[0-9]\+$";
+          then
+            pnpm --filter "./packages/*" --filter "./plugins/*" publish --provenance --access public --tag rc --no-git-checks
+          elif git log -1 --pretty=%B | grep "^release: [0-9]\+\.[0-9]\+\.[0-9]\+-beta\.[0-9]\+$";
+          then
+            pnpm --filter "./packages/*" --filter "./plugins/*" publish --provenance --access public --tag beta --no-git-checks
+          elif git log -1 --pretty=%B | grep "^release: [0-9]\+\.[0-9]\+\.[0-9]\+-next\.[0-9]\+$";
+          then
+            pnpm --filter "./packages/*" --filter "./plugins/*" publish --provenance --access public --tag next --no-git-checks
+          else
+            echo "Not a release, skipping publish"
+          fi

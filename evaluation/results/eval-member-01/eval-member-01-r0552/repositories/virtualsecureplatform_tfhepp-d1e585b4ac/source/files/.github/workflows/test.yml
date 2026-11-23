@@ -1,0 +1,194 @@
+name: Test
+
+on:
+  push:
+
+jobs:
+  scheme-tests:
+    name: ${{ matrix.parameter_label || 'block-binary' }}-${{ matrix.scheme }}-${{ matrix.compiler }}-26.04
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        scheme: [tfhe, bfv, clpx, ckks]
+        compiler: [gcc, clang]
+        # Non-TFHE schemes are tested with clang only to reduce the CI load.
+        exclude:
+          - scheme: bfv
+            compiler: gcc
+          - scheme: clpx
+            compiler: gcc
+          - scheme: ckks
+            compiler: gcc
+        include:
+          - scheme: tfhe
+            build_targets: test_common test_tfhe
+            test_dirs: common tfhe
+          - scheme: bfv
+            build_targets: test_bfv
+            test_dirs: bfv
+          - scheme: clpx
+            build_targets: test_clpx
+            test_dirs: clpx
+          - scheme: ckks
+            build_targets: test_ckks
+            test_dirs: ckks
+          # CLPX currently requires the 128-bit lvl1/lvl2 topology.  Keep
+          # this explicit while the default block-binary configuration covers
+          # TFHE, BFV, and CKKS.
+          - scheme: clpx
+            compiler: clang
+            parameter_label: 128bit
+            parameter_flags: -DUSE_BLOCK_BINARY=OFF
+          - compiler: gcc
+            compiler_flags: -DCMAKE_CXX_COMPILER=g++ -DCMAKE_C_COMPILER=gcc
+          # clang-22 is the newest clang in the Ubuntu 26.04 repositories;
+          # the plain "clang" metapackage still points at clang 21.
+          - compiler: clang
+            compiler_flags: -DCMAKE_CXX_COMPILER=clang++-22 -DCMAKE_C_COMPILER=clang-22
+          # Keep block-binary CKKS coverage above, and exercise the integer
+          # switching test separately with its required k=1 level topology.
+          - scheme: ckks-integer
+            compiler: clang
+            parameter_label: 128bit
+            parameter_flags: -DUSE_BLOCK_BINARY=OFF
+            compiler_flags: -DCMAKE_CXX_COMPILER=clang++-22 -DCMAKE_C_COMPILER=clang-22
+            build_targets: ckks_integer_multiplication
+            test_dirs: ckks
+    steps:
+      - name: Install libraries
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            git build-essential g++ libomp-dev libboost-dev cmake ninja-build
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y \
+              clang-22 llvm-22 lld-22
+          fi
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      # Configure, build, and run in a single step: -march=native and the
+      # AVX-512 detection happen at configure time, so the binaries must be
+      # built and executed on the same machine.
+      - name: Build and run scheme tests
+        run: |
+          cmake . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_TEST=ON \
+            -DCMAKE_CXX_FLAGS_RELEASE="-O3" \
+            -DCMAKE_C_FLAGS_RELEASE="-O3" \
+            ${{ matrix.compiler_flags }} \
+            ${{ matrix.parameter_flags }}
+          cmake --build build --target ${{ matrix.build_targets }}
+          cd build
+          # CKKS CI intentionally runs only the normal lightweight test
+          # executables. Do not pass lvl6 keygen/run/all flags here; those
+          # generate full bootstrap artifacts and exceed the storage budget.
+          test/test.sh ${{ matrix.test_dirs }}
+
+  tfhe-concrete:
+    name: tfhe-concrete-gcc-26.04
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:26.04
+    steps:
+      - name: Install libraries
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            git build-essential g++ libomp-dev libboost-dev cmake ninja-build
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Build and test TFHE concrete parameters
+        run: |
+          cmake . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_TEST=ON \
+            -DUSE_BLOCK_BINARY=OFF \
+            -DUSE_CONCRETE=ON
+          cmake --build build --target test_tfhe
+          cd build
+          test/test.sh tfhe
+
+  tfhe-128bit:
+    name: tfhe-128bit-gcc-26.04
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:26.04
+    steps:
+      - name: Install libraries
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            git build-essential g++ libomp-dev libboost-dev cmake ninja-build
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Build and test TFHE 128-bit parameters
+        run: |
+          cmake . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_TEST=ON \
+            -DUSE_BLOCK_BINARY=OFF
+          cmake --build build --target test_tfhe
+          cd build
+          test/test.sh tfhe
+
+  tfhe-raintt:
+    name: tfhe-raintt-gcc-26.04
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:26.04
+    steps:
+      - name: Install libraries
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            git build-essential g++ libomp-dev libboost-dev cmake ninja-build
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Build and test RAINTT
+        run: |
+          cmake . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_TEST=ON \
+            -DUSE_COMPRESS=ON
+          cmake --build build --target raintt trlwerainttenc gatebootstrappingtlwe2tlweraintt
+          build/test/common/raintt
+          build/test/tfhe/trlwerainttenc
+          build/test/tfhe/gatebootstrappingtlwe2tlweraintt
+
+  tutorial:
+    name: tutorial-128bit-gcc-26.04
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:26.04
+    steps:
+      - name: Install libraries
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            git build-essential g++ libomp-dev libboost-dev cmake ninja-build
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Build and run tutorial
+        run: |
+          cmake . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_TUTORIAL=ON \
+            -DUSE_BLOCK_BINARY=OFF
+          cmake --build build
+          echo "12345" | ./build/tutorial/client
+          echo "54321" | ./build/tutorial/cloud
+          ./build/tutorial/verify

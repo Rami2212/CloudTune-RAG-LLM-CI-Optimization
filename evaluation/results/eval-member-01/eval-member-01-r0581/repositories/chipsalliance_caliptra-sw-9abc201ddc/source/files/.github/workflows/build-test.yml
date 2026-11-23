@@ -1,0 +1,240 @@
+# docs: https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions
+
+name: Build and Test
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  merge_group:
+
+  workflow_call:
+  workflow_dispatch:
+    inputs:
+      hw-revision:
+        description: 'Target hardware revision'
+        type: choice
+        default: all
+        options:
+          - all
+          - latest
+          - "2.1"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: 0
+  SCCACHE_VERSION: 0.10.0
+  SCCACHE_GHA_CACHE_TO: sccache-caliptra-sw
+  SCCACHE_GHA_CACHE_FROM: sccache-caliptra-sw
+  SCCACHE_GHA_ENABLED: "on"
+  # CPTRA_COVERAGE_PATH: /tmp
+
+  # Compiler warnings should fail to compile
+  EXTRA_CARGO_CONFIG: "target.'cfg(all())'.rustflags = [\"-Dwarnings\"]"
+
+jobs:
+  # Determine which RTL revisions the jobs run for. By default run for all revisions.
+  # Or run only for the selected revision if this workflow is invoked manually.
+  setup:
+    runs-on: ubuntu-24.04
+    outputs:
+      revisions: ${{ steps.revisions.outputs.revisions }}
+    steps:
+      - name: Select HW revisions
+        id: revisions
+        env:
+          HW_REVISION: ${{ inputs.hw-revision }}
+        run: |
+          if [ -z "$HW_REVISION" ] || [ "$HW_REVISION" = "all" ]; then
+            echo 'revisions=["latest","2.1"]' >> "$GITHUB_OUTPUT"
+          else
+            echo "revisions=[\"$HW_REVISION\"]" >> "$GITHUB_OUTPUT"
+          fi
+
+  lint:
+    needs: setup
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        revision: ${{ fromJSON(needs.setup.outputs.revisions) }}
+    env:
+      CALIPTRA_HW_REV: ${{ matrix.revision }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v5
+
+      - name: Test commit name
+        run: |
+          echo "Build-Test: release_ref=$(git rev-parse HEAD)"
+
+      - name: Run precheckin checks
+        run: cargo xtask precheckin
+
+  build:
+    needs: [setup, lint]
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        revision: ${{ fromJSON(needs.setup.outputs.revisions) }}
+    env:
+      CALIPTRA_HW_REV: ${{ matrix.revision }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v5
+
+      - name: Test commit name
+        run: |
+          echo "Build-Test: release_ref=$(git rev-parse HEAD)"
+
+      - name: Build
+        run: |
+          cargo --config "$EXTRA_CARGO_CONFIG" build --locked
+          cargo xtask build all
+
+      - name: Build with OpenSSL
+        run: |
+          for proj in caliptra-auth-manifest-app caliptra-builder caliptra-image-crypto caliptra-image-app; do
+            cargo build -p $proj --locked --no-default-features --features openssl
+          done
+
+      - name: Build with RustCrypto
+        run: |
+          for proj in caliptra-auth-manifest-app caliptra-builder caliptra-image-crypto caliptra-image-app; do
+            cargo build -p $proj --locked --no-default-features --features rustcrypto
+          done
+
+      - name: Pull Caliptra subsystem RTL submodule
+        run: git submodule update --init hw/latest/caliptra-ss
+
+      - name: Build hw-model with fpga_realtime, fpga_subsystem, itrng, coverage
+        run: |
+          for feature in fpga_realtime fpga_subsystem itrng coverage; do
+            echo "Building with $feature"
+            cargo build --locked --features $feature
+          done
+
+      - name: Check x509 templates are up to date
+        run: |
+          cargo run -p caliptra-x509-gen --locked
+          git diff --exit-code -- x509/build/ x509/src/ || (
+            echo "x509 templates are out of date. Please regenerate with:"
+            echo "  cargo run -p caliptra-x509-gen"
+            exit 1
+          )
+
+      # As fuzzing targets are not part of the workspace, perform their tests explicitly.
+      - name: Build test fuzzing targets
+        # Intermittently fails and is too slow
+        if: false
+        run: |
+          rustup toolchain install nightly-2023-04-15
+          cargo +nightly-2023-04-15 install cargo-fuzz cargo-afl
+          for target in dpe/dpe/fuzz/ drivers/fuzz/ image/verify/fuzz/ x509/fuzz/; do
+            pushd $target; \
+            cargo fmt --check; \
+            # TODO: Depends on https://github.com/chipsalliance/caliptra-sw/issues/681
+            #cargo clippy; \
+            cargo +nightly-2023-04-15 fuzz build --features libfuzzer-sys; \
+            cargo +nightly-2023-04-15 afl build --features afl; \
+            popd; \
+          done
+          for target in drivers/fuzz/ image/verify/fuzz/; do
+            pushd $target; \
+            cargo +nightly-2023-04-15 fuzz build --features libfuzzer-sys,struct-aware; \
+            cargo +nightly-2023-04-15 afl build --features afl,struct-aware; \
+            popd; \
+          done
+
+  test_unit:
+    needs: [setup, lint]
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        revision: ${{ fromJSON(needs.setup.outputs.revisions) }}
+    env:
+      CALIPTRA_HW_REV: ${{ matrix.revision }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v5
+
+      - name: Run tests
+        run: |
+          CPTRA_COVERAGE_PATH=/tmp cargo --config "$EXTRA_CARGO_CONFIG" test --locked
+          CPTRA_COVERAGE_PATH=/tmp cargo --config "$EXTRA_CARGO_CONFIG" run --manifest-path ./coverage/Cargo.toml
+          CPTRA_COVERAGE_PATH=/tmp cargo --config "$EXTRA_CARGO_CONFIG" test -p caliptra-runtime --features ocp-lock test_ocp_lock --locked
+
+  test_compliance:
+    needs: lint
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v5
+
+      - name: Run emulator conformance tests
+        run: |
+          sudo apt-get update -qy && sudo apt-get install gcc-riscv64-unknown-elf binutils-riscv64-unknown-elf
+          (cd /tmp/ && git clone --depth 1 --branch old-framework-2.x https://github.com/riscv-non-isa/riscv-arch-test)
+          cargo --config "$EXTRA_CARGO_CONFIG" run --locked -p compliance-test -- --test_root_path /tmp/riscv-arch-test
+
+  test_rom:
+    needs: [setup, lint]
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        revision: ${{ fromJSON(needs.setup.outputs.revisions) }}
+    env:
+      CALIPTRA_HW_REV: ${{ matrix.revision }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v5
+
+      - name: Build ROM artifacts
+        run: cargo xtask build all
+
+      - name: ROM Makefile
+        run: |
+          (cd rom/dev && DEVICE_LIFECYCLE=unprovisioned make run)
+          (cd rom/dev && DEVICE_LIFECYCLE=manufacturing make run)
+          (cd rom/dev && DEVICE_LIFECYCLE=production make run)
+          (cd rom/dev && DEVICE_LIFECYCLE=unprovisioned make run-active)
+          (cd rom/dev && DEVICE_LIFECYCLE=manufacturing make run-active)
+          (cd rom/dev && DEVICE_LIFECYCLE=production make run-active)
+
+  test_integration:
+    needs: [setup, lint]
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        revision: ${{ fromJSON(needs.setup.outputs.revisions) }}
+    env:
+      CALIPTRA_HW_REV: ${{ matrix.revision }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install required packages
+        run: |
+          sudo apt-get update -qy && sudo apt-get install golang-1.21-go
+
+      - name: Caliptra HW-Model C Binding Smoke Test
+        run: |
+          (cd hw-model/c-binding/examples && make run)
+
+      - name: Caliptra C API Hwmodel Integration Test
+        run: |
+          (cd libcaliptra/examples/hwmodel && make && ./hwmodel)
+
+      - name: DPE Verification Tests
+        run: |
+          (cd test/dpe_verification && make run)
+
+  all_checks_passed:
+    needs: [build, test_unit, test_compliance, test_rom, test_integration]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: All checks passed
+        run: echo "All checks passed"

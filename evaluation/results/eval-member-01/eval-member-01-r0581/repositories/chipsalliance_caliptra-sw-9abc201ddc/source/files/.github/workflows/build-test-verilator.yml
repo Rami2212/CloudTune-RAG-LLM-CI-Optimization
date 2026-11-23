@@ -1,0 +1,120 @@
+# docs: https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions
+
+name: Verilator Hardware Model
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  merge_group:
+
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build_and_test:
+    name: Verilator Build and Test
+    runs-on: [e2-standard-8]
+    timeout-minutes: 120
+
+    env:
+      CARGO_INCREMENTAL: 0
+      NEXTEST_VERSION: 0.9.100
+      VERILATOR_VERSION: v5.006
+      # Change this to bust all caches
+      CACHE_BUSTER: 1
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qy
+          sudo apt-get install -qy flex bison libfl2 libfl-dev help2man
+
+      - name: Restore verilator installation
+        uses: actions/cache/restore@v4
+        id: verilator_restore
+        with:
+          path: /opt/verilator
+          key: verilator-${{ env.VERILATOR_VERSION }}-${{ env.CACHE_BUSTER }}
+
+      - name: Install verilator
+        if: steps.verilator_restore.outputs.cache-hit != 'true'
+        run: |
+          cd /tmp/
+          git clone -b "${VERILATOR_VERSION}" https://github.com/verilator/verilator
+          cd verilator
+          autoconf
+          ./configure --prefix=/opt/verilator
+          make -j"$(nproc)"
+          sudo make install
+
+      - name: Save verilator installation
+        uses: actions/cache/save@v4
+        if: steps.verilator_restore.outputs.cache-hit != 'true'
+        with:
+          path: /opt/verilator
+          key: verilator-${{ env.VERILATOR_VERSION }}-${{ env.CACHE_BUSTER }}
+
+      - name: Setup verilator path
+        run: |
+          echo /opt/verilator/bin >> $GITHUB_PATH
+          echo PKG_CONFIG_PATH=/opt/verilator/share/pkgconfig >> $GITHUB_ENV
+
+      - name: Restore cargo registry cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ hashFiles('Cargo.lock') }}-${{ env.CACHE_BUSTER }}
+          restore-keys: |
+            cargo-registry-
+
+      - name: Restore Rust build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/release/.fingerprint
+            target/release/build
+            target/release/deps
+            target/release/incremental
+          key: cargo-build-verilator-${{ env.VERILATOR_VERSION }}-${{ hashFiles('Cargo.lock') }}-${{ env.CACHE_BUSTER }}
+          restore-keys: |
+            cargo-build-verilator-${{ env.VERILATOR_VERSION }}-
+
+      - name: Install cargo-nextest
+        run: |
+          cargo install cargo-nextest --version ${NEXTEST_VERSION} --locked --no-default-features --features=default-no-update
+
+      - name: Build firmware ELFs
+        run: |
+          mkdir -p /tmp/caliptra-test-firmware
+          cargo run -p caliptra-builder -- --all_elfs /tmp/caliptra-test-firmware
+
+      - name: Run driver tests in Verilator
+        env:
+          # Limit Verilator C++ parallelism.
+          CALIPTRA_VERILATOR_JOBS: "4"
+        run: |
+          export LD_LIBRARY_PATH=$(rustc --print sysroot)/lib
+          export CALIPTRA_PREBUILT_FW_DIR=/tmp/caliptra-test-firmware
+          # Verilator simulations are very slow (~20+ min each) and each sim uses
+          # ~1-2 GB of RAM, so only run a few tests. Full Verilator coverage is
+          # run by the nightly-verilator workflow on a much larger GCP runner.
+          cargo nextest run \
+            -p caliptra-drivers \
+            --release \
+            --features=verilator,itrng \
+            --profile=verilator \
+            --test-threads=1 \
+            -E 'test(=test_error_reporter)
+              | test(=test_ecc384_sign_validation_failure)'

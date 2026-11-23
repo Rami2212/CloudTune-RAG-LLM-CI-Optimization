@@ -1,0 +1,63 @@
+# This workflow runs every Saturday @ 1900 UTC (NOON PST)
+name: i18n download bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 19 * * 6"
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout DIM
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.head_ref }}
+          token: ${{ secrets.I18N_PAT }}
+
+      - uses: ./.github/actions/setup-pnpm
+
+      - name: Download updated i18n files
+        uses: crowdin/github-action@v3.6.0
+        with:
+          upload_sources: false
+          upload_translations: false
+          download_translations: true
+          create_pull_request: false
+          push_translations: false
+          project_id: ${{ secrets.CROWDIN_PROJECT_ID }}
+          token: ${{ secrets.CROWDIN_PERSONAL_TOKEN }}
+        env:
+          CROWDIN_PROJECT_ID: ${{ secrets.CROWDIN_PROJECT_ID }}
+          CROWDIN_PERSONAL_TOKEN: ${{ secrets.CROWDIN_PERSONAL_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sort locale JSON files
+        run: |
+          allLocales=("en" "de" "es" "esMX" "fr" "it" "ja" "ko" "pl" "ptBR" "ru" "zhCHS" "zhCHT")
+          for lang in ${allLocales[@]}; do
+            jq -S . src/locale/$lang.json > src/locale/sorted_$lang.json && mv src/locale/sorted_$lang.json src/locale/$lang.json
+          done
+
+      - name: Build browsercheck utils
+        run: pnpm bcu
+
+      - name: Check for changes
+        uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          base: HEAD
+          filters: |
+            changed:
+              - '**'
+
+      - name: Commit files
+        if: steps.filter.outputs.changed == 'true'
+        uses: stefanzweifel/git-auto-commit-action@v7
+        with:
+          commit_message: "i18n: Update translations from Crowdin"
+          commit_user_name: DIM i18n Bot
+          commit_user_email: destinyitemmanager@gmail.com
+          commit_author: DIM i18n Bot <destinyitemmanager@gmail.com>

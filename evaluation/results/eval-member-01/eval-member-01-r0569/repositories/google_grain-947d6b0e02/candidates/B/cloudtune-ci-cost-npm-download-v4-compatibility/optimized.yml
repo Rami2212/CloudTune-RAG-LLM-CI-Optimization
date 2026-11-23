@@ -1,0 +1,185 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [HIGH] Add pip dependency cache to "build-and-test" job
+# - [LOW] Explicitly set fail-fast for large matrix job "build-and-test" (64 combinations)
+# Estimated savings: ~5 min/run
+#
+# This workflow builds Grain wheels and uploads them as artifacts.
+
+name: Build & Publish Template
+
+on:
+  workflow_call:
+    inputs:
+      pypi_project_url:
+        required: true
+        type: string
+      run_tests_with_bazel:
+        required: true
+        type: boolean
+      is_nightly:
+        required: true
+        type: boolean
+      is_ci_tests:
+        required: true
+        type: boolean
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: "Python ${{ matrix.python-version }} on ${{ matrix.os }}"
+    runs-on: "${{ matrix.os }}"
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+        os: [ubuntu-22.04, ubuntu-22.04-arm, macos-15, windows-2022]
+        is-ci-tests:
+          - ${{ inputs.is_ci_tests }}
+        exclude:
+          - is-ci-tests: true
+        include:
+          - python-version: "3.11"
+            os: ubuntu-22.04
+          - python-version: "3.12"
+            os: macos-15
+          - python-version: "3.13"
+            os: windows-2022
+          - python-version: "3.14"
+            os: ubuntu-22.04-arm
+
+    env:
+      USE_BAZEL_VERSION: "7.2.1"
+    steps:
+      - name: Set up Bazel
+        uses: bazel-contrib/setup-bazel@4fd964a13a440a8aeb0be47350db2fc640f19ca8 # 0.15.0
+      - name: Check Bazel installation
+        run: |
+          which bazel
+          bazel version
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install rsync for Windows
+        if: runner.os == 'Windows'
+        run: choco install --no-progress rsync
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Create directory and set TEMP_DIR
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        run: |
+          mkdir -p /tmp/grain
+          cp -r . /tmp/grain
+          echo "TEMP_DIR=/tmp/grain" >> $GITHUB_ENV
+          echo "WHL_DIR=/tmp/grain" >> $GITHUB_ENV
+      - name: Set TEMP_DIR
+        if: runner.os == 'Windows'
+        run: |
+          echo "TEMP_DIR=${PWD}" >> $GITHUB_ENV
+          echo "WHL_DIR=." >> $GITHUB_ENV
+      - name: Build package
+        run: |
+          set -xe
+          export PYTHON_VERSION=${{ matrix.python-version }}
+          export PYTHON_MAJOR_VERSION=$(echo $PYTHON_VERSION | cut -d. -f1)
+          export PYTHON_MINOR_VERSION=$(echo $PYTHON_VERSION | cut -d. -f2)
+          export BAZEL_VERSION="${USE_BAZEL_VERSION}"
+          export OUTPUT_DIR="${TEMP_DIR}"
+          export SOURCE_DIR="${TEMP_DIR}"
+          export RUN_TESTS_WITH_BAZEL=${{ inputs.run_tests_with_bazel }}
+          export IS_NIGHTLY=${{ inputs.is_nightly }}
+          . "${SOURCE_DIR}"'/grain/oss/runner_common.sh'
+          build_and_test_grain
+      - name: Smoke test built wheel
+        if: ${{ (inputs.is_ci_tests == 'false' || inputs.is_ci_tests == false) && (inputs.run_tests_with_bazel == 'true' || inputs.run_tests_with_bazel == true) }}
+        env:
+          IS_NIGHTLY: ${{ inputs.is_nightly }}
+        run: |
+          set -xe
+          SMOKE_DIR="${RUNNER_TEMP}/grain_wheel_smoke_test"
+          rm -rf "${SMOKE_DIR}"
+          mkdir -p "${SMOKE_DIR}"
+          python -m venv "${SMOKE_DIR}/venv"
+          if [ -x "${SMOKE_DIR}/venv/bin/python" ]; then
+            VENV_PYTHON="${SMOKE_DIR}/venv/bin/python"
+          else
+            VENV_PYTHON="${SMOKE_DIR}/venv/Scripts/python.exe"
+          fi
+          "${VENV_PYTHON}" -m pip install "${WHL_DIR}"/all_dist/grain*.whl
+          cd "${SMOKE_DIR}"
+          "${VENV_PYTHON}" - <<'EOF'
+          import importlib.metadata
+          import os
+          import pathlib
+          import grain
+          from grain.proto import execution_summary_pb2
+
+          wheel_path = pathlib.Path(grain.__file__).resolve()
+          assert any(p.lower() == "site-packages" for p in wheel_path.parts), (
+              f"Expected grain imported from site-packages, got {wheel_path}"
+          )
+
+          expected_dist = (
+              "grain-nightly"
+              if os.environ.get("IS_NIGHTLY", "").lower() == "true"
+              else "grain"
+          )
+          dist = importlib.metadata.distribution(expected_dist)
+          if expected_dist == "grain-nightly":
+            assert ".dev" in dist.version, (
+                f"Expected .dev version for grain-nightly, got {dist.version}"
+            )
+
+          assert execution_summary_pb2.ExecutionSummary() is not None
+          shuffled = grain.experimental.index_shuffle(
+              index=0, max_index=9, seed=42, rounds=4
+          )
+          assert 0 <= shuffled <= 9
+
+          ds = (
+              grain.MapDataset.range(10)
+              .shuffle(seed=42)
+              .map(lambda x: x + 1)
+              .to_iter_dataset()
+          )
+          assert sorted(list(ds)) == list(range(1, 11))
+          EOF
+      - name: Upload Grain artifacts
+        if: ${{ inputs.is_ci_tests == 'false' || inputs.is_ci_tests == false }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: built-grain-wheels-${{ matrix.os }}-${{ matrix.python-version }}
+          path: "${{ env.WHL_DIR }}/all_dist/*.whl"
+
+  publish-wheel:
+    runs-on: ubuntu-22.04
+    if: ${{ inputs.is_ci_tests == 'false' || inputs.is_ci_tests == false }}
+    needs: build-and-test
+    permissions:
+      id-token: write
+    environment:
+      name: pypi
+      url: ${{ inputs.pypi_project_url }}
+    steps:
+      - name: Download Grain artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: built-grain-wheels-*
+          path: dist/
+          merge-multiple: true
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          attestations: false
+          skip-existing: ${{ inputs.is_nightly }}
+          verbose: true

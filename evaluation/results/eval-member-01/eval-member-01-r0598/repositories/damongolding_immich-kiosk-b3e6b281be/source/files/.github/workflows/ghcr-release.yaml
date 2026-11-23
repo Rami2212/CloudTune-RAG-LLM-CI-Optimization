@@ -1,0 +1,126 @@
+name: GHCR Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      is_prerelease: ${{ steps.check_prerelease.outputs.is_prerelease }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Extract version from tag
+        id: extract_version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          VERSION=${VERSION#v}
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Check if pre-release
+        id: check_prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          IS_PRERELEASE=$(gh api "/repos/${GITHUB_REPOSITORY}/releases/tags/$TAG_NAME" --jq .prerelease)
+          echo "is_prerelease=$IS_PRERELEASE" >> $GITHUB_OUTPUT
+          echo "IS_PRERELEASE=$IS_PRERELEASE" >> $GITHUB_ENV
+
+      - name: Build and push Docker image
+        run: |
+          IMAGE_NAME=ghcr.io/${{ github.repository_owner }}/immich-kiosk
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          # Set version tag based on pre-release status
+          if [ "${{ env.IS_PRERELEASE }}" = "true" ]; then
+            VERSION_TAG="${{ env.VERSION }}-prerelease"
+            TAGS="-t $IMAGE_NAME:$VERSION_TAG"
+          else
+            VERSION_TAG="${{ env.VERSION }}"
+            TAGS="-t $IMAGE_NAME:$VERSION_TAG -t $IMAGE_NAME:latest"
+          fi
+
+          docker buildx build --build-arg VERSION=${{ env.VERSION }} \
+          --platform linux/amd64,linux/arm64 \
+          --push \
+          --label "org.opencontainers.image.created=$TIMESTAMP" \
+          --label "org.opencontainers.image.revision=${{ github.sha }}" \
+          --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+          --label "org.opencontainers.image.version=$VERSION_TAG" \
+          --label "org.opencontainers.image.authors=${{ github.repository_owner }}" \
+          $TAGS .
+
+      - name: Construct release URL
+        run: |
+          REPO_OWNER=$(echo ${{ github.repository }} | cut -d '/' -f 1)
+          REPO_NAME=$(echo ${{ github.repository }} | cut -d '/' -f 2)
+          RELEASE_URL="https://github.com/$REPO_OWNER/$REPO_NAME/releases/tag/v${{ env.VERSION }}"
+          echo "RELEASE_URL=$RELEASE_URL" >> $GITHUB_ENV
+
+      - name: Collect H2 headings from the release notes
+        id: collect_h2
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          BODY=$(gh api "/repos/${GITHUB_REPOSITORY}/releases/tags/$TAG_NAME" --jq .body)
+
+          if [ "$BODY" = "null" ] || [ -z "$BODY" ]; then
+            echo "No release found for tag $TAG_NAME" >&2
+            exit 1
+          fi
+
+          HEADERS=$(printf '%s\n' "$BODY" \
+            | sed -n '/^## /p' \
+            | sed "/^## What's Changed/,\$d" \
+            | sed 's/^## \s*//; s/^/- /')
+
+          {
+            echo 'HEADERS<<EOF'
+            echo "$HEADERS"
+            echo EOF
+          } >> "$GITHUB_ENV"
+
+      - name: Discord Notification
+        if: env.IS_PRERELEASE == 'false'
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        uses: Ilshidur/action-discord@master
+        with:
+          args: |
+            **Immich Kiosk ${{ env.VERSION }} released!**
+
+            What's changed:
+            ${{ env.HEADERS }}
+
+            ${{ env.RELEASE_URL }}
+
+  trigger:
+    needs: build
+    runs-on: ubuntu-latest
+    if: needs.build.outputs.is_prerelease == 'false'
+    steps:
+      - uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            await github.rest.repos.createDispatchEvent({
+              owner: 'damongolding',
+              repo: 'immich-kiosk-unraid',
+              event_type: 'generate-xml',
+            });

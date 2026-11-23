@@ -1,0 +1,104 @@
+# .github/workflows/coverage.yml
+#
+# Purpose:
+# - Run Go tests with coverage on every Pull Request (PR)
+# - Upload the coverage report to Coveralls
+# - Also run the same workflow once per month (useful as a periodic “canary”)
+#
+# Notes:
+# - GitHub scheduled workflows run in UTC and only run from the default branch workflow file.
+# - If you add this file on a non-default branch, the schedule will not start until merged.
+
+name: Go Coverage (PR + Monthly)
+
+on:
+  push:
+    branches:
+      - main
+
+  # Run for all PRs targeting any branch
+  pull_request:
+
+  # Run once a month: at 03:00 UTC on the 1st day of every month
+  # Adjust to your preference; cron is always interpreted in UTC.
+  schedule:
+    - cron: "0 3 1 * *"
+
+  # Optional: allow manual runs from the Actions tab (handy for testing changes)
+  workflow_dispatch:
+
+# Minimal permissions. Coveralls can post PR comments; that requires pull-requests: write.
+# contents: read is sufficient for checkout.
+permissions:
+  contents: read
+  pull-requests: write
+
+# Concurrency prevents duplicated runs from stacking up when you push multiple commits quickly to a PR.
+concurrency:
+  group: coverage-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    # Leave setup and artifact upload time beyond the Go package budget.
+    timeout-minutes: 150
+
+    steps:
+      # 1) Check out repository code
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # 2) Install the latest stable Go release for the tests.
+      # actions/setup-go exists in newer majors; using the major tag keeps you on supported updates.
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          check-latest: true
+          cache: true
+
+      # 3) Run tests and generate a coverage profile (Go native format)
+      # Store runtime artifacts under ./temp/log to keep the workspace root clean.
+      - name: Run tests with coverage
+        run: |
+          set -euo pipefail
+          mkdir -p ./temp/log
+          # Cached test profiles can retain old line positions for other packages
+          # in -coverpkg=./.... Keep the build cache, but rerun coverage tests.
+          go test -v -count=1 -timeout=2h ./... -covermode=atomic -coverprofile=./temp/log/coverage.out -coverpkg=./...
+
+      # 4) Print a human-readable summary into the workflow logs
+      # This uses Go’s built-in cover tool.
+      - name: Coverage summary (log)
+        run: |
+          set -euo pipefail
+          go tool cover -func=./temp/log/coverage.out
+
+      # 5) Upload coverage.out as an artifact for later inspection/download
+      # Keep coverage.out available for later inspection.
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-out
+          path: ./temp/log/coverage.out
+          if-no-files-found: error
+
+      # 6) Send coverage to Coveralls
+      #
+      # coverallsapp/github-action supports multiple input styles; 'file' + 'format' is the modern pattern.
+      # It can also add a PR comment on pull_request events.
+      #
+      # Authentication:
+      # - For public repos with GitHub integration, GITHUB_TOKEN is often enough.
+      # - If your Coveralls setup requires a repo token, set COVERALLS_REPO_TOKEN as a GitHub Actions secret
+      #   and pass it via env (see section B below).
+      - name: Publish to Coveralls
+        uses: coverallsapp/github-action@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          file: ./temp/log/coverage.out
+          format: golang
+        # If you need a repo token, uncomment the env block:
+        env:
+          COVERALLS_REPO_TOKEN: ${{ secrets.COVERALLS_REPO_TOKEN }}

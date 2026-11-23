@@ -1,0 +1,86 @@
+TARGET        = duplicut
+SHELL         = /bin/sh
+
+# debug level
+level         = 1
+
+CFLAGS        = -std=gnu99 -Iinclude -Wall -Wextra \
+                -Wdisabled-optimization -Winline \
+                -Wdouble-promotion -Wunknown-pragmas \
+                -Wno-implicit-fallthrough \
+                -Wno-error=implicit-function-declaration \
+                -mtune=native -ffast-math
+LDFLAGS       = -lm -pthread
+RELEASEFLAGS  = -O2 -D NDEBUG
+DEBUGFLAGS    = -O0 -D DEBUG=$(level) -g2
+COVERAGEFLAGS = -O0 -D NDEBUG -g2 --coverage -fprofile-update=atomic
+
+SOURCES       = main.c thpool.c file.c chunk.c line.c dedupe.c \
+                optparse.c config.c engine.c error.c memstate.c meminfo.c \
+                bytesize.c hmap.c mmap.c partition.c status.c progressbar.c cprintferr.c \
+
+COMMON        = include/const.h include/debug.h
+OBJECTS       = $(patsubst %.c, objects/%.o, $(SOURCES))
+
+PREFIX        = $(DESTDIR)/usr/local
+BINDIR        = $(PREFIX)/bin
+
+STRIP_CMD    ?= strip
+
+
+all: $(TARGET)
+release: $(TARGET)
+re: $(TARGET)
+
+debug: CFLAGS += $(DEBUGFLAGS)
+debug: distclean $(OBJECTS) $(COMMON)
+	-ctags src/* include/*
+	$(CC) $(FLAGS) $(CFLAGS) -o $(TARGET) $(OBJECTS) $(LDFLAGS)
+
+coverage: CFLAGS += $(COVERAGEFLAGS)
+coverage: distclean $(OBJECTS) $(COMMON)
+	$(CC) $(FLAGS) $(CFLAGS) -o $(TARGET) $(OBJECTS) $(LDFLAGS)
+
+$(TARGET): CFLAGS += $(RELEASEFLAGS)
+$(TARGET): distclean $(OBJECTS) $(COMMON)
+	$(CC) $(FLAGS) $(CFLAGS) -o $(TARGET) $(OBJECTS) $(LDFLAGS)
+	$(STRIP_CMD) --strip-all $(TARGET) || $(STRIP_CMD) -Sx $(TARGET) # osx fallback
+
+profile: CFLAGS += -pg
+profile: distclean $(TARGET)
+
+profile-generate: CFLAGS += $(RELEASEFLAGS) -fprofile-generate -fprofile-update=atomic
+profile-generate: distclean $(OBJECTS) $(COMMON)
+	$(CC) $(FLAGS) $(CFLAGS) -o $(TARGET) $(OBJECTS) $(LDFLAGS)
+
+rm-objects:
+	rm objects/*.o
+
+profile-use: CFLAGS += $(RELEASEFLAGS) -fprofile-use
+profile-use: rm-objects $(OBJECTS) $(COMMON)
+	$(CC) $(FLAGS) $(CFLAGS) -o $(TARGET) $(OBJECTS) $(LDFLAGS)
+
+objects/%.o: src/%.c
+	mkdir -p `dirname $@`
+	$(CC) $(FLAGS) $(CFLAGS) -c $< -o $@
+
+install: release
+	install -D $(TARGET) $(BINDIR)/$(TARGET)
+
+uninstall:
+	rm $(BINDIR)/$(TARGET)
+
+test:
+	python3 -m pytest
+
+clean:
+	-rm -rf objects/
+	-rm -f gmon.out
+	-rm -f tags
+
+distclean: clean
+	-rm -f $(TARGET)
+
+
+.PHONY: all release profile clean distclean \
+        install uninstall test

@@ -1,0 +1,105 @@
+name: Continuous Integration
+
+on:
+  push:
+    paths-ignore:
+      - 'sources/**'
+      - '*.md'
+  pull_request:
+    paths-ignore:
+      - 'sources/**'
+      - '*.md'
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Clone Repository
+        uses: actions/checkout@v7
+
+      - name: Remove System .NET
+        run: sudo apt-get remove -y dotnet*
+
+      - name: Install .NET 10
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-v1-${{ hashFiles('**/*.csproj', '**/*.slnx', '**/packages.lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-v1-
+
+      - name: Check Code
+        run: |
+          make check
+
+      - name: Retrieve Changed Files
+        if: github.event_name == 'pull_request'
+        id: changes
+        run: |
+          git fetch origin main --depth=1
+          git diff --name-only --diff-filter=AM origin/main ${{ github.sha }} > changed_files.txt
+          grep -E 'mods/hv/bits/.*\.png' changed_files.txt > sprites_changed_files.txt || true
+          echo "sprites=$(cat sprites_changed_files.txt | tr '\n' ' ')" >> $GITHUB_OUTPUT
+
+      - name: Check Sprites
+        if: github.event_name == 'pull_request'
+        env:
+            ALL_CHANGED_SPRITES: ${{ steps.changes.outputs.sprites }}
+        run: |
+          make check-sprites SPRITE_FILES="${ALL_CHANGED_SPRITES}"
+          sudo apt-get install pngcheck
+          make check-pngs
+
+      - name: Check Sounds
+        run: |
+          sudo apt-get install oggz-tools
+          make check-ogg
+
+      - name: Check Mod
+        run: |
+          sudo apt-get install lua5.1
+          make check-scripts -j2
+          make TREAT_WARNINGS_AS_ERRORS=true test
+
+  windows:
+    name: Windows
+    runs-on: windows-2022
+
+    steps:
+      - name: Clone Repository
+        uses: actions/checkout@v7
+
+      - name: Install .NET 10
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-v1-${{ hashFiles('**/*.csproj', '**/*.slnx', '**/packages.lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-v1-
+
+      - name: Check Code
+        shell: powershell
+        run: |
+          .\make.ps1 check
+
+      - name: Check Mods
+        run: |
+          choco install lua --version 5.1.5.52 --no-progress
+          $ENV:Path = $ENV:Path + ";C:\\Program Files (x86)\\Lua\\5.1\\"
+          .\make.ps1 check-scripts
+          .\make.ps1 test

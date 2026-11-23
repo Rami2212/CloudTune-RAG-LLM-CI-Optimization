@@ -1,0 +1,40 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 4 optimizations:
+# - [HIGH] Add npm dependency cache to "test" job
+# - [HIGH] Split "test" into parallel jobs (lint + test + build)
+# - [MEDIUM] Add concurrency group to "ci.yml"
+# - [LOW] Explicitly set fail-fast for large matrix job "test" (9 combinations)
+# Estimated savings: ~14 min/run
+#
+name: Node.js CI
+
+on:
+    push:
+      branches: [ main ]
+    pull_request:
+      branches: [ main ]
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x, 21.x]
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+    - uses: actions/checkout@v3
+    - uses: actions/setup-node@v3
+      with:
+        node-version: ${{ matrix.node-version }}
+    - run: npm i
+    - run: npm run lint
+    - run: npm run build
+    - run: npm test
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v4
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}

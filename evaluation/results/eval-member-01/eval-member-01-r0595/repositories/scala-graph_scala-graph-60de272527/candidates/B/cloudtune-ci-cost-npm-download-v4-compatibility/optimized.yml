@@ -1,0 +1,32 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [LOW] Explicitly set fail-fast for large matrix job "cross-build" (16 combinations)
+# Estimated savings: ~2 min/run
+#
+name: CI
+on: [ push, pull_request ]
+jobs:
+  cross-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        scala: [ '2.13.18', '3.3.7' ]
+        project: [ core, dot, jsonLift, jsoniter ]
+        exclude:
+          - scala: '2.13.18'
+            project: jsoniter
+          - scala: '3.3.7'
+            project: jsonLift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: JDK with SBT caching
+        uses: actions/setup-java@v4
+        with:
+          java-version: 17
+          distribution: temurin
+          cache: sbt
+      - uses: sbt/setup-sbt@v1
+      - name: Test
+        run: |
+          sbt ++${{ matrix.scala }} ${{ matrix.project }}/test scalafmtCheckAll

@@ -1,0 +1,80 @@
+name: PlatformIO CI
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # Catch a major-version bump that forgot the user manual. The release
+      # workflow needs "Documentation/User Manual/Version <VERSION_MAJOR>.x/"
+      # to exist and to build PDFs named for that version; without this check
+      # the mismatch only surfaces when a tag is pushed, long after the fact.
+      - name: Check user manual matches firmware major version
+        run: '"Documentation/User Manual/new-major-version.sh" --check'
+
+      # The manual's "What is new" section is generated from the change history
+      # in Software/README.md. This fails when the two have drifted apart --
+      # either because the README gained entries the manual has not picked up,
+      # or because the English block was regenerated and the German translation
+      # has not caught up yet.
+      - name: Check manual "What is new" matches the change history
+        run: python3 "Documentation/User Manual/sync_whatsnew.py" --check
+
+      # The Configuration Tool carries the sound packs base64-embedded, so a
+      # user can hear one and install it without downloading anything. That is
+      # a second copy of files that live under "Documentation/Sound Packs/",
+      # and a second copy that can drift silently is the same trap as the
+      # generated manuals below.
+      - name: Check the embedded sound packs match the pack files
+        run: python3 devdocs/signal-tones/embed_sound_packs.py --check
+
+      # The manual's HTML and PDF are generated files that are nevertheless
+      # committed, and nothing used to force a rebuild when their sources
+      # changed -- so they quietly drifted, and the V9 PDFs spent a week
+      # missing a section that was already in the Markdown. build.sh stamps
+      # the HTML with a fingerprint of the sources it was built from; this
+      # fails when those sources have moved on since. Rebuilding in CI and
+      # diffing would not work: the title page carries the build month, so it
+      # would differ every month on its own.
+      - name: Check the built manuals match their sources
+        run: python3 "Documentation/User Manual/check_manual_fresh.py" --check
+
+      # The same for the FAQ (EN + DE) and the protocol description: their
+      # build.sh writes a fingerprint of the sources into the PDF's metadata,
+      # and this fails when the Markdown has moved on since (TODO E2).
+      - name: Check the FAQ and protocol PDFs match their sources
+        run: python3 Documentation/check_doc_pdfs.py --check
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.platformio/.cache
+          key: ${{ runner.os }}-pio
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install PlatformIO Core
+        run: pip install --upgrade platformio
+
+      # Every menu level is a ring in menuNav[]: each entry names its left and
+      # right neighbour, so every link is written down at both ends. A link
+      # recorded at one end only compiles fine and ships as a menu that skips
+      # an entry turning one way (V9.0, PR #222). The table is full of #ifdefs,
+      # so this checks every environment in platformio.ini, not just the one
+      # built below. Needs PlatformIO for the flags, hence after its install.
+      - name: Check the menu rings are closed in every environment
+        run: python3 Software/tests/menu_ring/check_menu_ring.py
+
+      - name: Build PlatformIO
+        # Use `pio run -d <project_dir>` rather than `pio ci`. `pio ci`
+        # copies sources to a temporary directory and builds there, which
+        # breaks `extra_scripts` paths that reference files in the real
+        # project tree (the script isn't copied). `pio run` builds in
+        # place and matches what developers run locally.
+        run: pio run -d Software/src -e heltec_wifi_lora_32_V2

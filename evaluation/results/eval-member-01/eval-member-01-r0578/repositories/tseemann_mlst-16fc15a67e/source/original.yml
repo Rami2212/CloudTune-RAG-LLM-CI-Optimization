@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+env:
+  EXE: "bin/barrnap --threads 4"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: conda-incubator/setup-miniconda@v3
+        with:
+          activate-environment: mlst
+          environment-file: environment.yml
+          miniforge-version: latest
+          channels: conda-forge,bioconda
+          conda-remove-defaults: true
+          channel-priority: strict
+          auto-update-conda: true
+
+      - name: Check tools
+        run: |
+          set +x
+          blastn -version
+          any2fasta -v
+          makeblastdb -version
+
+      - name: Run BATS suite
+        run: bats -T --abort test/test.sh

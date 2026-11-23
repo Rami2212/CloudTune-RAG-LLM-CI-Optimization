@@ -1,0 +1,676 @@
+name: install-checks
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: install-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+permissions:
+  contents: read
+
+jobs:
+  checkout-install:
+    name: Install Checkout Tools (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          check-latest: true
+          cache: true
+
+      - name: Build and verify checkout tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Keep both installs disposable; retain the original module cache.
+          module_cache="$(go env GOMODCACHE)"
+          export GOMODCACHE="$module_cache"
+          suffix="$(go env GOEXE)"
+          for destination in gobin gopath; do
+            if [ "$destination" = gobin ]; then
+              export GOBIN="$RUNNER_TEMP/trice-checkout-gobin"
+              install_dir="$GOBIN"
+            else
+              export GOBIN=""
+              export GOPATH="$RUNNER_TEMP/trice-checkout-gopath"
+              install_dir="$GOPATH/bin"
+            fi
+            echo "Checking checkout installation via $destination"
+            bash scripts/buildTriceTool.sh
+            # Go accepts native Windows paths; Git Bash uses its POSIX spelling.
+            if [ "$RUNNER_OS" = Windows ]; then install_dir="$(cygpath -u "$install_dir")"; fi
+            for tool in trice tlog; do
+              binary="$install_dir/$tool$suffix"
+              if [ ! -s "$binary" ]; then
+                echo "::error::missing or empty checkout binary: $binary"
+                go version || true
+                go env GOBIN GOPATH GOHOSTOS GOEXE || true
+                find "$install_dir" -maxdepth 1 -type f -print 2>/dev/null | sort || true
+                exit 1
+              fi
+            done
+            "$install_dir/trice$suffix" version
+            "$install_dir/trice$suffix" help
+            "$install_dir/tlog$suffix" --version
+            "$install_dir/tlog$suffix" help
+            # Exercise decoding with each installed tool, not a developer PATH.
+            for tool in trice tlog; do
+              command=("$install_dir/$tool$suffix")
+              if [ "$tool" = trice ]; then command+=(log); fi
+              output="$("${command[@]}" -port HEX -args '09 92 19 06 45 0b 10 56 3a,00' -pw MySecret -pf cobs -li off -hs off -color none -prefix off -ts off -i .github/fixtures/trice-smoke-til.json)"
+              printf '%s\n' "$output"
+              case "$output" in
+                *"Hello!"*) ;;
+                *) echo "::error::$tool installed via $destination did not decode Hello!"; exit 1 ;;
+              esac
+            done
+          done
+
+  build-artifacts:
+    name: Build snapshot artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      node: ${{ steps.tool-versions.outputs.node }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Read shared release tool versions
+        id: tool-versions
+        shell: bash
+        run: |
+          source scripts/test-tools.env
+          printf 'goreleaser=v%s\nnode=%s\nstitchmd=%s\npandoc=%s\n' "$TRICE_TOOL_GORELEASER_VERSION" "$TRICE_NODE_VERSION" "$TRICE_TOOL_STITCHMD_VERSION" "$TRICE_TOOL_PANDOC_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          check-latest: true
+          cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ steps.tool-versions.outputs.node }}
+
+      - name: Install PDF chapter assembler
+        run: go install go.abhg.dev/stitchmd@v${{ steps.tool-versions.outputs.stitchmd }}
+
+      - name: Set up EPUB converter
+        uses: r-lib/actions/setup-pandoc@v2
+        with:
+          pandoc-version: ${{ steps.tool-versions.outputs.pandoc }}
+
+      - name: Set up GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: ${{ steps.tool-versions.outputs.goreleaser }}
+          install-only: true
+
+      - name: Build snapshot artifacts
+        shell: bash
+        run: >-
+          goreleaser release
+          --snapshot
+          --clean
+          --skip=publish
+
+      - name: Verify expected snapshot artifacts exist
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dump_context() {
+            echo "::group::Generated artifact context"
+            echo "dist/:"
+            find dist -maxdepth 3 -type f -printf '%s %p\n' 2>/dev/null | sort || true
+            echo "docs/ manual files:"
+            find docs -maxdepth 1 \( -name 'Trice*Manual.md' -o -name 'Trice*Manual.pdf' \) -type f -printf '%s %p\n' 2>/dev/null | sort || true
+            echo "tool versions:"
+            go version || true
+            node --version || true
+            npm --version || true
+            npx --version || true
+            echo "::endgroup::"
+          }
+
+          require_file() {
+            local file="$1"
+            if [ ! -s "$file" ]; then
+              echo "::error::missing or empty required artifact: $file"
+              dump_context
+              exit 1
+            fi
+            printf 'OK file: %s (%s bytes)\n' "$file" "$(wc -c < "$file")"
+          }
+
+          require_glob() {
+            local pattern="$1"
+            local matches=()
+            mapfile -t matches < <(compgen -G "$pattern" | sort || true)
+
+            if [ "${#matches[@]}" -eq 0 ]; then
+              echo "::error::no artifact matches required pattern: $pattern"
+              dump_context
+              exit 1
+            fi
+
+            printf 'OK glob: %s\n' "$pattern"
+            printf '  %s\n' "${matches[@]}"
+          }
+
+          mkdir -p dist
+          for manual in TriceUserManual TriceReferenceManual; do
+            for format in pdf epub; do
+              require_file "docs/$manual.$format"
+              cp -f "docs/$manual.$format" "dist/$manual.$format"
+              require_file "dist/$manual.$format"
+            done
+          done
+
+          require_file dist/trice_tool_linux_amd64.tar.gz
+          require_file dist/trice_tool_darwin_amd64.tar.gz
+          require_file dist/trice_tool_darwin_arm64.tar.gz
+          require_file dist/trice_tool_windows_amd64.zip
+          require_file dist/TriceReferenceManual.pdf
+          require_glob 'dist/trice_target_sources_*.zip'
+          require_glob 'dist/trice_*_amd64.deb'
+          require_glob 'dist/trice_*_amd64.rpm'
+          require_glob 'dist/trice_*_amd64.apk'
+
+      - name: Upload snapshot artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: trice-snapshot-assets
+          path: |
+            dist/trice_tool_linux_amd64.tar.gz
+            dist/trice_tool_darwin_amd64.tar.gz
+            dist/trice_tool_darwin_arm64.tar.gz
+            dist/trice_tool_windows_amd64.zip
+            dist/trice_target_sources_*.zip
+            dist/trice_*_amd64.deb
+            dist/trice_*_amd64.rpm
+            dist/trice_*_amd64.apk
+            dist/TriceReferenceManual.pdf
+            dist/TriceUserManual.pdf
+            dist/TriceReferenceManual.epub
+            dist/TriceUserManual.epub
+          if-no-files-found: error
+
+  install-check-linux:
+    name: Install Check Linux Archive
+    runs-on: ubuntu-latest
+    needs: build-artifacts
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up release feature checker
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ needs.build-artifacts.outputs.node }}
+
+      - name: Download snapshot artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: trice-snapshot-assets
+          path: artifacts
+
+      - name: Unpack archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf artifacts/trice_tool_linux_amd64.tar.gz -C artifacts
+          test -x artifacts/trice_tool_linux_amd64/trice
+          test -x artifacts/trice_tool_linux_amd64/tlog
+
+      - name: Verify binary and smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          trice=artifacts/trice_tool_linux_amd64/trice
+          tlog=artifacts/trice_tool_linux_amd64/tlog
+          "$trice" version
+          "$trice" help
+          "$tlog" --version
+          "$tlog" help
+          output="$("$trice" log -port HEX -args '09 92 19 06 45 0b 10 56 3a,00' -pw MySecret -pf cobs -li off -hs off -color none -prefix off -ts off -i .github/fixtures/trice-smoke-til.json)"
+          printf '%s\n' "$output"
+          case "$output" in
+            *"Hello!"*) ;;
+            *)
+              echo "decoded smoke output did not contain Hello!"
+              exit 1
+              ;;
+          esac
+
+      - name: Verify shipped Bind CE and structured logging
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_zip="$(find artifacts -maxdepth 1 -name 'trice_target_sources_*.zip' -print -quit)"
+          node scripts/_615_verify_release_features.cjs artifacts/trice_tool_linux_amd64 "$source_zip"
+
+  install-check-macos:
+    name: Install Check macOS Archive
+    # Preserve the existing required-check name and require both native hosts.
+    runs-on: ubuntu-24.04
+    needs: install-check-macos-native
+    if: ${{ always() }}
+    steps:
+      - name: Require both native macOS package checks
+        env:
+          NATIVE_RESULT: ${{ needs.install-check-macos-native.result }}
+        run: |
+          if [ "$NATIVE_RESULT" != success ]; then
+            echo "Native macOS archive verification did not complete successfully: $NATIVE_RESULT"
+            exit 1
+          fi
+
+  install-check-macos-native:
+    name: macOS Archive (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    needs: build-artifacts
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            arch: amd64
+          - os: macos-26
+            arch: arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up release feature checker
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ needs.build-artifacts.outputs.node }}
+
+      - name: Download snapshot artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: trice-snapshot-assets
+          path: artifacts
+
+      - name: Unpack archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=artifacts/trice_tool_darwin_${{ matrix.arch }}.tar.gz
+          if [ ! -s "$archive" ]; then
+            echo "Missing native macOS archive: $archive"
+            find artifacts -maxdepth 1 -type f -print
+            exit 1
+          fi
+          tar -xzf "$archive" -C artifacts
+
+      - name: Verify binary and smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          trice=artifacts/trice_tool_darwin_${{ matrix.arch }}/trice
+          tlog=artifacts/trice_tool_darwin_${{ matrix.arch }}/tlog
+          uname -sm
+          "$trice" version
+          "$trice" help
+          "$tlog" --version
+          "$tlog" help
+          output="$("$trice" log -port HEX -args '09 92 19 06 45 0b 10 56 3a,00' -pw MySecret -pf cobs -li off -hs off -color none -prefix off -ts off -i .github/fixtures/trice-smoke-til.json)"
+          printf '%s\n' "$output"
+          case "$output" in
+            *"Hello!"*) ;;
+            *)
+              echo "decoded smoke output did not contain Hello!"
+              exit 1
+              ;;
+          esac
+
+      - name: Verify shipped Bind CE and structured logging
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_zip="$(find artifacts -maxdepth 1 -name 'trice_target_sources_*.zip' -print -quit)"
+          node scripts/_615_verify_release_features.cjs artifacts/trice_tool_darwin_${{ matrix.arch }} "$source_zip"
+
+  install-check-windows:
+    name: Install Check Windows Archive
+    runs-on: windows-latest
+    needs: build-artifacts
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up release feature checker
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ needs.build-artifacts.outputs.node }}
+
+      - name: Download snapshot artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: trice-snapshot-assets
+          path: artifacts
+
+      - name: Unpack archive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Expand-Archive -Path artifacts/trice_tool_windows_amd64.zip -DestinationPath artifacts/windows
+          if (-not (Test-Path artifacts/windows/trice_tool_windows_amd64/trice.exe)) {
+            throw 'Expected trice.exe was not found in the Windows archive.'
+          }
+          if (-not (Test-Path artifacts/windows/trice_tool_windows_amd64/tlog.exe)) {
+            throw 'Expected tlog.exe was not found in the Windows archive.'
+          }
+
+      - name: Verify binary and smoke test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $trice = './artifacts/windows/trice_tool_windows_amd64/trice.exe'
+          $tlog = './artifacts/windows/trice_tool_windows_amd64/tlog.exe'
+          & $trice version
+          & $trice help
+          & $tlog --version
+          & $tlog help
+          $output = & $trice log -port HEX -args '09 92 19 06 45 0b 10 56 3a,00' -pw MySecret -pf cobs -li off -hs off -color none -prefix off -ts off -i .github/fixtures/trice-smoke-til.json
+          $text = $output -join "`n"
+          Write-Output $text
+          if (-not $text.Contains('Hello!')) {
+            throw 'decoded smoke output did not contain Hello!'
+          }
+
+      - name: Verify shipped Bind CE and structured logging
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_zip="$(find artifacts -maxdepth 1 -name 'trice_target_sources_*.zip' -print -quit)"
+          # Use this Git Bash, even if Windows also exposes a WSL bash launcher.
+          RELEASE_FEATURE_BASH="$(cygpath -w "$BASH")" node scripts/_615_verify_release_features.cjs artifacts/windows/trice_tool_windows_amd64 "$source_zip"
+
+  install-check-debian:
+    name: Install Check Debian Package
+    runs-on: ubuntu-latest
+    needs: build-artifacts
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download snapshot artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: trice-snapshot-assets
+          path: artifacts
+
+      - name: Install Debian package
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="$(find artifacts -maxdepth 1 -name 'trice_*_amd64.deb' -print -quit)"
+          if [ -z "$package" ]; then
+            echo "::error::missing Debian package artifact: trice_*_amd64.deb"
+            find artifacts -maxdepth 1 -type f -print | sort || true
+            exit 1
+          fi
+          echo "Installing Debian package: $package"
+          sudo dpkg -i "$package"
+          test -x /usr/bin/trice
+          test -x /usr/bin/tlog
+
+      - name: Verify installed binary and smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/trice version
+          /usr/bin/trice help
+          /usr/bin/tlog --version
+          /usr/bin/tlog help
+          output="$(/usr/bin/trice log -port HEX -args '09 92 19 06 45 0b 10 56 3a,00' -pw MySecret -pf cobs -li off -hs off -color none -prefix off -ts off -i .github/fixtures/trice-smoke-til.json)"
+          printf '%s\n' "$output"
+          case "$output" in
+            *"Hello!"*) ;;
+            *)
+              echo "decoded smoke output did not contain Hello!"
+              exit 1
+              ;;
+          esac
+
+  install-check-rpm:
+    name: Install Check RPM Package
+    runs-on: ubuntu-latest
+    needs: build-artifacts
+    timeout-minutes: 10
+    container:
+      image: fedora:42
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download snapshot artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: trice-snapshot-assets
+          path: artifacts
+
+      - name: Install RPM package
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="$(find artifacts -maxdepth 1 -name 'trice_*_amd64.rpm' -print -quit)"
+          if [ -z "$package" ]; then
+            echo "::error::missing RPM package artifact: trice_*_amd64.rpm"
+            find artifacts -maxdepth 1 -type f -print | sort || true
+            exit 1
+          fi
+          echo "Installing RPM package: $package"
+          dnf install -y "$package"
+          test -x /usr/bin/trice
+          test -x /usr/bin/tlog
+
+      - name: Verify installed binary and smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/trice version
+          /usr/bin/trice help
+          /usr/bin/tlog --version
+          /usr/bin/tlog help
+          output="$(/usr/bin/trice log -port HEX -args '09 92 19 06 45 0b 10 56 3a,00' -pw MySecret -pf cobs -li off -hs off -color none -prefix off -ts off -i .github/fixtures/trice-smoke-til.json)"
+          printf '%s\n' "$output"
+          case "$output" in
+            *"Hello!"*) ;;
+            *)
+              echo "decoded smoke output did not contain Hello!"
+              exit 1
+              ;;
+          esac
+
+  install-check-apk:
+    name: Install Check Alpine Package
+    runs-on: ubuntu-latest
+    needs: build-artifacts
+    timeout-minutes: 10
+    container:
+      image: alpine:3.22
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download snapshot artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: trice-snapshot-assets
+          path: artifacts
+
+      - name: Install APK package
+        shell: sh
+        run: |
+          set -eu
+          package="$(find artifacts -maxdepth 1 -name 'trice_*_amd64.apk' -print -quit)"
+          if [ -z "$package" ]; then
+            echo "::error::missing APK package artifact: trice_*_amd64.apk"
+            find artifacts -maxdepth 1 -type f -print | sort || true
+            exit 1
+          fi
+          echo "Installing APK package: $package"
+          apk add --allow-untrusted "$package"
+          test -x /usr/bin/trice
+          test -x /usr/bin/tlog
+
+      - name: Verify installed binary and smoke test
+        shell: sh
+        run: |
+          set -eu
+          /usr/bin/trice version
+          /usr/bin/trice help
+          /usr/bin/tlog --version
+          /usr/bin/tlog help
+          output="$(/usr/bin/trice log -port HEX -args '09 92 19 06 45 0b 10 56 3a,00' -pw MySecret -pf cobs -li off -hs off -color none -prefix off -ts off -i .github/fixtures/trice-smoke-til.json)"
+          printf '%s\n' "$output"
+          case "$output" in
+            *"Hello!"*) ;;
+            *)
+              echo "decoded smoke output did not contain Hello!"
+              exit 1
+              ;;
+          esac
+
+  install-check-target-sources:
+    name: Install Check Target Sources
+    runs-on: ubuntu-latest
+    needs: build-artifacts
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download snapshot artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: trice-snapshot-assets
+          path: artifacts
+
+      - name: Unpack and compile target sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_zip="$(find artifacts -maxdepth 1 -name 'trice_target_sources_*.zip' -print -quit)"
+          if [ -z "$source_zip" ]; then
+            echo "::error::missing target source archive: trice_target_sources_*.zip"
+            find artifacts -maxdepth 1 -type f -print | sort || true
+            exit 1
+          fi
+          echo "Unpacking target source archive: $source_zip"
+          unzip -q "$source_zip" -d artifacts/target
+          source_root="$(find artifacts/target -maxdepth 1 -type d -name 'trice_target_sources_*' -print -quit)"
+          if [ -z "$source_root" ]; then
+            echo "::error::could not locate unpacked target source directory"
+            find artifacts/target -maxdepth 2 -type d -print | sort || true
+            exit 1
+          fi
+          test -s "$source_root/src/trice.h"
+          if [ ! -s "$source_root/LICENSE.md" ] || ! cmp -s LICENSE.md "$source_root/LICENSE.md"; then
+            echo "::error::target archive lacks the complete repository LICENSE.md notice: $source_root/LICENSE.md"
+            find "$source_root" -maxdepth 2 -type f -print | sort
+            exit 1
+          fi
+          if [ ! -s "$source_root/src/default_conf/SEGGER_RTT_Conf.h" ]; then
+            echo "::error::target archive lacks src/default_conf/SEGGER_RTT_Conf.h"
+            exit 1
+          fi
+          test -s "$source_root/src/trice.c"
+          # RTT's defaults and license must accompany the vendor sources.
+          for vendor_file in SEGGER_RTT_ConfDefaults.h SEGGER_RTT_LICENSE.md; do
+            if [ ! -s "$source_root/src/$vendor_file" ]; then
+              echo "::error::target archive lacks src/$vendor_file"
+              exit 1
+            fi
+          done
+          cat > "$source_root/src/triceConfig.h" <<'EOF'
+          #ifndef TRICE_CONFIG_H_
+          #define TRICE_CONFIG_H_
+          #define TRICE_BUFFER TRICE_STACK_BUFFER
+          #define TRICE_DIRECT_OUTPUT 1
+          #define TRICE_DIRECT_AUXILIARY8 1
+          #define TRICE_CYCLE_COUNTER 0
+          #endif
+          EOF
+          for source_file in "$source_root"/src/*.c; do
+            case "$(basename "$source_file")" in
+              triceUart.c) continue ;;
+            esac
+            cc -I "$source_root/src" -I "$source_root/src/default_conf" -c "$source_file" -o "/tmp/$(basename "$source_file").o"
+          done
+
+  install-check-release-pdf:
+    name: Install Check Release PDF
+    runs-on: ubuntu-latest
+    needs: build-artifacts
+    timeout-minutes: 5
+
+    steps:
+      - name: Download snapshot artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: trice-snapshot-assets
+          path: artifacts
+
+      - name: Verify release PDF
+        shell: bash
+        run: |
+          set -euo pipefail
+          for manual in TriceUserManual TriceReferenceManual; do
+            if [ ! -s "artifacts/$manual.pdf" ]; then
+              echo "::error::missing or empty release PDF artifact: artifacts/$manual.pdf"
+              find artifacts -maxdepth 1 -type f -print | sort || true
+              exit 1
+            fi
+            # The short guide is intentionally much smaller than the reference.
+            minimum=10000
+            if [ "$manual" = TriceReferenceManual ]; then minimum=100000; fi
+            size="$(wc -c < "artifacts/$manual.pdf")"
+            if [ "$size" -le "$minimum" ]; then
+              echo "::error::$manual.pdf looks too small: $size bytes"
+              find artifacts -maxdepth 1 -type f -print | sort || true
+              exit 1
+            fi
+            echo "OK release PDF: artifacts/$manual.pdf ($size bytes)"
+          done

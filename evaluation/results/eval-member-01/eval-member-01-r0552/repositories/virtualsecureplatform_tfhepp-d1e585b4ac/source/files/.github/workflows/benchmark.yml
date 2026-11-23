@@ -1,0 +1,43 @@
+name: Benchmark
+
+on:
+  push:
+
+# thanks to https://izumisy.work/entry/2022/03/28/140644
+jobs:
+  ubuntu-2604:
+    name: ubuntu-2604
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:26.04
+    steps:
+    - name: Install libraries
+      run: |
+        apt-get update
+        apt-get upgrade -y
+        apt-get install -y git build-essential g++ libomp-dev libboost-dev cmake ninja-build
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    - name: build TFHEpp
+      run: |
+        cmake . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_TEST=ON -DUSE_BLOCK_BINARY=OFF
+        cd build
+        ninja
+    - name: build original TFHE
+      run: |
+        git clone --recursive --depth 1 https://github.com/tfhe/tfhe.git
+        mkdir tfhe/build
+        cd tfhe/build
+        # CMAKE_POLICY_VERSION_MINIMUM: the original TFHE declares a
+        # cmake_minimum_required that CMake 4 (Ubuntu 26.04) no longer accepts.
+        cmake ../src -DENABLE_TESTS=on -DENABLE_NAYUKI_PORTABLE=off -DENABLE_NAYUKI_AVX=off -DENABLE_SPQLIOS_AVX=off -DENABLE_SPQLIOS_FMA=on -DCMAKE_BUILD_TYPE=optim -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+        # Build only the benchmark binary: the original TFHE's googletest
+        # unittests do not compile with gcc 15's -Werror=maybe-uninitialized.
+        make -j$(nproc) test-gate-bootstrapping-spqlios-fma
+    - name: benchmark
+      run: |
+        test/show_info.sh
+        echo "TFHEpp" && build/test/tfhe/nand
+        echo "original TFHE" && tfhe/build/test/test-gate-bootstrapping-spqlios-fma

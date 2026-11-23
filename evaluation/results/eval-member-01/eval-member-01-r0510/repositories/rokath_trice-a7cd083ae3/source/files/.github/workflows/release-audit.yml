@@ -1,0 +1,713 @@
+name: release-audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Published release tag to audit, for example v2.0.0-beta-1"
+        required: true
+        type: string
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+permissions:
+  contents: read
+
+jobs:
+  download-release-assets:
+    name: Download Selected Release Assets
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+
+    steps:
+      - name: Resolve and download selected release assets
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$RELEASE_TAG" ] || ! git check-ref-format "refs/tags/$RELEASE_TAG"; then
+            echo "::error::invalid or missing release tag: $RELEASE_TAG"
+            exit 1
+          fi
+          if ! metadata="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isPrerelease,isDraft)"; then
+            echo "::error::could not read requested release: $RELEASE_TAG"
+            exit 1
+          fi
+          tag="$(printf '%s' "$metadata" | jq -r '.tagName')"
+          if [ "$tag" != "$RELEASE_TAG" ] || [ "$(printf '%s' "$metadata" | jq -r '.isDraft')" != false ]; then
+            echo "::error::requested release is a draft or has an unexpected tag: $RELEASE_TAG"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          # Homebrew remains a stable-release route, independent of beta audits.
+          echo "prerelease=$(printf '%s' "$metadata" | jq -r '.isPrerelease')" >> "$GITHUB_OUTPUT"
+          echo "Auditing release tag: $tag"
+          mkdir -p release-assets
+
+          download_required() {
+            local pattern="$1"
+            echo "Downloading required release asset pattern: $pattern"
+            if ! gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$pattern" --dir release-assets; then
+              echo "::error::failed to download required release asset pattern: $pattern"
+              echo "::group::Assets visible on release $tag"
+              gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' || true
+              echo "::endgroup::"
+              exit 1
+            fi
+          }
+
+          require_glob() {
+            local pattern="$1"
+            local match
+            local matched=0
+            # Read in this shell so Bash 3.2 retains the match state; quoted
+            # output preserves asset names containing spaces.
+            while IFS= read -r match; do
+              if [ "$matched" -eq 0 ]; then
+                printf 'OK downloaded: %s\n' "$pattern"
+              fi
+              matched=1
+              printf '  %s\n' "$match"
+            done < <(compgen -G "release-assets/$pattern" || true)
+            if [ "$matched" -eq 0 ]; then
+              echo "::error::no downloaded release asset matches: $pattern"
+              find release-assets -maxdepth 1 -type f -exec wc -c {} + | sort || true
+              exit 1
+            fi
+          }
+
+          download_required 'trice_tool_linux_amd64.tar.gz'
+          download_required 'trice_tool_darwin_amd64.tar.gz'
+          download_required 'trice_tool_windows_amd64.zip'
+          download_required 'trice_target_sources_*.zip'
+          download_required 'trice_*_amd64.deb'
+          download_required 'trice_*_amd64.rpm'
+          download_required 'trice_*_amd64.apk'
+          download_required 'TriceReferenceManual.pdf'
+          download_required 'TriceUserManual.pdf'
+          download_required 'TriceReferenceManual.epub'
+          download_required 'TriceUserManual.epub'
+
+          require_glob 'trice_tool_linux_amd64.tar.gz'
+          require_glob 'trice_tool_darwin_amd64.tar.gz'
+          require_glob 'trice_tool_windows_amd64.zip'
+          require_glob 'trice_target_sources_*.zip'
+          require_glob 'trice_*_amd64.deb'
+          require_glob 'trice_*_amd64.rpm'
+          require_glob 'trice_*_amd64.apk'
+          require_glob 'TriceReferenceManual.pdf'
+          require_glob 'TriceUserManual.pdf'
+          require_glob 'TriceReferenceManual.epub'
+          require_glob 'TriceUserManual.epub'
+
+          echo "::group::Downloaded release assets"
+          find release-assets -maxdepth 1 -type f -exec wc -c {} + | sort
+          echo "::endgroup::"
+
+      - name: Upload release assets for audit jobs
+        uses: actions/upload-artifact@v7
+        with:
+          name: trice-release-assets
+          path: release-assets/*
+          if-no-files-found: error
+
+  audit-linux:
+    name: Release Audit Linux Archive
+    runs-on: ubuntu-latest
+    needs: download-release-assets
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ needs.download-release-assets.outputs.tag }}
+
+      - name: Set up release feature checker
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Download release assets
+        uses: actions/download-artifact@v8
+        with:
+          name: trice-release-assets
+          path: artifacts
+
+      - name: Unpack archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf artifacts/trice_tool_linux_amd64.tar.gz -C artifacts
+          test -x artifacts/trice_tool_linux_amd64/trice
+          test -x artifacts/trice_tool_linux_amd64/tlog
+
+      - name: Verify binary and smoke test
+        env:
+          RELEASE_TAG: ${{ needs.download-release-assets.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_version="${RELEASE_TAG#v}"
+          trice=artifacts/trice_tool_linux_amd64/trice
+          tlog=artifacts/trice_tool_linux_amd64/tlog
+          version_output="$("$trice" version)"
+          printf '%s\n' "$version_output"
+          case "$version_output" in
+            *"version=$expected_version"*) ;;
+            *)
+              echo "Linux archive version does not match selected release tag $RELEASE_TAG"
+              exit 1
+              ;;
+          esac
+          "$trice" help
+          tlog_version_output="$("$tlog" --version)"
+          printf '%s\n' "$tlog_version_output"
+          case "$tlog_version_output" in
+            *"version=$expected_version"*) ;;
+            *)
+              echo "Linux archive tlog version does not match selected release tag $RELEASE_TAG"
+              exit 1
+              ;;
+          esac
+          "$tlog" help
+          output="$("$trice" log -port HEX -args '09 92 19 06 45 0b 10 56 3a,00' -pw MySecret -pf cobs -li off -hs off -color none -prefix off -ts off -i .github/fixtures/trice-smoke-til.json)"
+          printf '%s\n' "$output"
+          case "$output" in
+            *"Hello!"*) ;;
+            *)
+              echo "decoded smoke output did not contain Hello!"
+              exit 1
+              ;;
+          esac
+
+      - name: Verify shipped Bind CE and structured logging
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_zip="$(find artifacts -maxdepth 1 -name 'trice_target_sources_*.zip' -print -quit)"
+          node scripts/_615_verify_release_features.cjs artifacts/trice_tool_linux_amd64 "$source_zip"
+
+  audit-macos:
+    name: Release Audit macOS Archive
+    runs-on: macos-latest
+    needs: download-release-assets
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ needs.download-release-assets.outputs.tag }}
+
+      - name: Set up release feature checker
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Download release assets
+        uses: actions/download-artifact@v8
+        with:
+          name: trice-release-assets
+          path: artifacts
+
+      - name: Unpack archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf artifacts/trice_tool_darwin_amd64.tar.gz -C artifacts
+          test -x artifacts/trice_tool_darwin_amd64/trice
+          test -x artifacts/trice_tool_darwin_amd64/tlog
+
+      - name: Verify binary and smoke test
+        env:
+          RELEASE_TAG: ${{ needs.download-release-assets.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_version="${RELEASE_TAG#v}"
+          trice=artifacts/trice_tool_darwin_amd64/trice
+          tlog=artifacts/trice_tool_darwin_amd64/tlog
+          version_output="$("$trice" version)"
+          printf '%s\n' "$version_output"
+          case "$version_output" in
+            *"version=$expected_version"*) ;;
+            *)
+              echo "macOS archive version does not match selected release tag $RELEASE_TAG"
+              exit 1
+              ;;
+          esac
+          "$trice" help
+          tlog_version_output="$("$tlog" --version)"
+          printf '%s\n' "$tlog_version_output"
+          case "$tlog_version_output" in
+            *"version=$expected_version"*) ;;
+            *)
+              echo "macOS archive tlog version does not match selected release tag $RELEASE_TAG"
+              exit 1
+              ;;
+          esac
+          "$tlog" help
+          output="$("$trice" log -port HEX -args '09 92 19 06 45 0b 10 56 3a,00' -pw MySecret -pf cobs -li off -hs off -color none -prefix off -ts off -i .github/fixtures/trice-smoke-til.json)"
+          printf '%s\n' "$output"
+          case "$output" in
+            *"Hello!"*) ;;
+            *)
+              echo "decoded smoke output did not contain Hello!"
+              exit 1
+              ;;
+          esac
+
+      - name: Verify shipped Bind CE and structured logging
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_zip="$(find artifacts -maxdepth 1 -name 'trice_target_sources_*.zip' -print -quit)"
+          node scripts/_615_verify_release_features.cjs artifacts/trice_tool_darwin_amd64 "$source_zip"
+
+  audit-windows:
+    name: Release Audit Windows Archive
+    runs-on: windows-latest
+    needs: download-release-assets
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ needs.download-release-assets.outputs.tag }}
+
+      - name: Set up release feature checker
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Download release assets
+        uses: actions/download-artifact@v8
+        with:
+          name: trice-release-assets
+          path: artifacts
+
+      - name: Unpack archive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Expand-Archive -Path artifacts/trice_tool_windows_amd64.zip -DestinationPath artifacts/windows
+          if (-not (Test-Path artifacts/windows/trice_tool_windows_amd64/trice.exe)) {
+            throw 'Expected trice.exe was not found in the Windows archive.'
+          }
+          if (-not (Test-Path artifacts/windows/trice_tool_windows_amd64/tlog.exe)) {
+            throw 'Expected tlog.exe was not found in the Windows archive.'
+          }
+
+      - name: Verify binary and smoke test
+        env:
+          RELEASE_TAG: ${{ needs.download-release-assets.outputs.tag }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedVersion = $env:RELEASE_TAG.TrimStart('v')
+          $trice = './artifacts/windows/trice_tool_windows_amd64/trice.exe'
+          $tlog = './artifacts/windows/trice_tool_windows_amd64/tlog.exe'
+          $versionOutput = & $trice version
+          Write-Output $versionOutput
+          if (-not (($versionOutput -join "`n").Contains("version=$expectedVersion"))) {
+            throw "Windows archive version does not match selected release tag $env:RELEASE_TAG"
+          }
+          & $trice help
+          $tlogVersionOutput = & $tlog --version
+          Write-Output $tlogVersionOutput
+          if (-not (($tlogVersionOutput -join "`n").Contains("version=$expectedVersion"))) {
+            throw "Windows archive tlog version does not match selected release tag $env:RELEASE_TAG"
+          }
+          & $tlog help
+          $output = & $trice log -port HEX -args '09 92 19 06 45 0b 10 56 3a,00' -pw MySecret -pf cobs -li off -hs off -color none -prefix off -ts off -i .github/fixtures/trice-smoke-til.json
+          $text = $output -join "`n"
+          Write-Output $text
+          if (-not $text.Contains('Hello!')) {
+            throw 'decoded smoke output did not contain Hello!'
+          }
+
+      - name: Verify shipped Bind CE and structured logging
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_zip="$(find artifacts -maxdepth 1 -name 'trice_target_sources_*.zip' -print -quit)"
+          # Use this Git Bash, even if Windows also exposes a WSL bash launcher.
+          RELEASE_FEATURE_BASH="$(cygpath -w "$BASH")" node scripts/_615_verify_release_features.cjs artifacts/windows/trice_tool_windows_amd64 "$source_zip"
+
+  audit-debian:
+    name: Release Audit Debian Package
+    runs-on: ubuntu-latest
+    needs: download-release-assets
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download release assets
+        uses: actions/download-artifact@v8
+        with:
+          name: trice-release-assets
+          path: artifacts
+
+      - name: Install Debian package
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="$(find artifacts -maxdepth 1 -name 'trice_*_amd64.deb' -print -quit)"
+          if [ -z "$package" ]; then
+            echo "::error::missing Debian package artifact"
+            find artifacts -maxdepth 2 -type f -printf '%s %p\n' | sort || true
+            exit 1
+          fi
+          echo "Installing Debian package: $package"
+          sudo dpkg -i "$package"
+          test -x /usr/bin/trice
+          test -x /usr/bin/tlog
+
+      - name: Verify installed binary and smoke test
+        env:
+          RELEASE_TAG: ${{ needs.download-release-assets.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_version="${RELEASE_TAG#v}"
+          version_output="$(/usr/bin/trice version)"
+          printf '%s\n' "$version_output"
+          case "$version_output" in
+            *"version=$expected_version"*) ;;
+            *)
+              echo "Debian package version does not match selected release tag $RELEASE_TAG"
+              exit 1
+              ;;
+          esac
+          /usr/bin/trice help
+          tlog_version_output="$(/usr/bin/tlog --version)"
+          printf '%s\n' "$tlog_version_output"
+          case "$tlog_version_output" in
+            *"version=$expected_version"*) ;;
+            *)
+              echo "Debian package tlog version does not match selected release tag $RELEASE_TAG"
+              exit 1
+              ;;
+          esac
+          /usr/bin/tlog help
+          output="$(/usr/bin/trice log -port HEX -args '09 92 19 06 45 0b 10 56 3a,00' -pw MySecret -pf cobs -li off -hs off -color none -prefix off -ts off -i .github/fixtures/trice-smoke-til.json)"
+          printf '%s\n' "$output"
+          case "$output" in
+            *"Hello!"*) ;;
+            *)
+              echo "decoded smoke output did not contain Hello!"
+              exit 1
+              ;;
+          esac
+
+  audit-rpm:
+    name: Release Audit RPM Package
+    runs-on: ubuntu-latest
+    needs: download-release-assets
+    timeout-minutes: 10
+    container:
+      image: fedora:42
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download release assets
+        uses: actions/download-artifact@v8
+        with:
+          name: trice-release-assets
+          path: artifacts
+
+      - name: Install RPM package
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="$(find artifacts -maxdepth 1 -name 'trice_*_amd64.rpm' -print -quit)"
+          if [ -z "$package" ]; then
+            echo "::error::missing RPM package artifact"
+            find artifacts -maxdepth 2 -type f -printf '%s %p\n' | sort || true
+            exit 1
+          fi
+          echo "Installing RPM package: $package"
+          dnf install -y "$package"
+          test -x /usr/bin/trice
+          test -x /usr/bin/tlog
+
+      - name: Verify installed binary and smoke test
+        env:
+          RELEASE_TAG: ${{ needs.download-release-assets.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_version="${RELEASE_TAG#v}"
+          version_output="$(/usr/bin/trice version)"
+          printf '%s\n' "$version_output"
+          case "$version_output" in
+            *"version=$expected_version"*) ;;
+            *)
+              echo "RPM package version does not match selected release tag $RELEASE_TAG"
+              exit 1
+              ;;
+          esac
+          /usr/bin/trice help
+          tlog_version_output="$(/usr/bin/tlog --version)"
+          printf '%s\n' "$tlog_version_output"
+          case "$tlog_version_output" in
+            *"version=$expected_version"*) ;;
+            *)
+              echo "RPM package tlog version does not match selected release tag $RELEASE_TAG"
+              exit 1
+              ;;
+          esac
+          /usr/bin/tlog help
+          output="$(/usr/bin/trice log -port HEX -args '09 92 19 06 45 0b 10 56 3a,00' -pw MySecret -pf cobs -li off -hs off -color none -prefix off -ts off -i .github/fixtures/trice-smoke-til.json)"
+          printf '%s\n' "$output"
+          case "$output" in
+            *"Hello!"*) ;;
+            *)
+              echo "decoded smoke output did not contain Hello!"
+              exit 1
+              ;;
+          esac
+
+  audit-apk:
+    name: Release Audit Alpine Package
+    runs-on: ubuntu-latest
+    needs: download-release-assets
+    timeout-minutes: 10
+    container:
+      image: alpine:3.22
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download release assets
+        uses: actions/download-artifact@v8
+        with:
+          name: trice-release-assets
+          path: artifacts
+
+      - name: Install APK package
+        shell: sh
+        run: |
+          set -eu
+          package="$(find artifacts -maxdepth 1 -name 'trice_*_amd64.apk' -print -quit)"
+          if [ -z "$package" ]; then
+            echo "missing APK package artifact" >&2
+            find artifacts -maxdepth 2 -type f -print | sort || true
+            exit 1
+          fi
+          echo "Installing APK package: $package"
+          apk add --allow-untrusted "$package"
+          test -x /usr/bin/trice
+          test -x /usr/bin/tlog
+
+      - name: Verify installed binary and smoke test
+        env:
+          RELEASE_TAG: ${{ needs.download-release-assets.outputs.tag }}
+        shell: sh
+        run: |
+          set -eu
+          expected_version="${RELEASE_TAG#v}"
+          version_output="$(/usr/bin/trice version)"
+          printf '%s\n' "$version_output"
+          case "$version_output" in
+            *"version=$expected_version"*) ;;
+            *)
+              echo "APK package version does not match selected release tag $RELEASE_TAG"
+              exit 1
+              ;;
+          esac
+          /usr/bin/trice help
+          tlog_version_output="$(/usr/bin/tlog --version)"
+          printf '%s\n' "$tlog_version_output"
+          case "$tlog_version_output" in
+            *"version=$expected_version"*) ;;
+            *)
+              echo "APK package tlog version does not match selected release tag $RELEASE_TAG"
+              exit 1
+              ;;
+          esac
+          /usr/bin/tlog help
+          output="$(/usr/bin/trice log -port HEX -args '09 92 19 06 45 0b 10 56 3a,00' -pw MySecret -pf cobs -li off -hs off -color none -prefix off -ts off -i .github/fixtures/trice-smoke-til.json)"
+          printf '%s\n' "$output"
+          case "$output" in
+            *"Hello!"*) ;;
+            *)
+              echo "decoded smoke output did not contain Hello!"
+              exit 1
+              ;;
+          esac
+
+  audit-homebrew:
+    name: Release Audit Homebrew
+    runs-on: macos-latest
+    needs: download-release-assets
+    if: needs.download-release-assets.outputs.prerelease == 'false'
+    timeout-minutes: 15
+
+    steps:
+      - name: Install from Homebrew tap
+        env:
+          RELEASE_TAG: ${{ needs.download-release-assets.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_version="${RELEASE_TAG#v}"
+          brew tap rokath/tap
+          brew update
+          brew install rokath/tap/trice
+          test -x "$(brew --prefix)/bin/tlog"
+          version_output="$(trice version)"
+          printf '%s\n' "$version_output"
+          case "$version_output" in
+            *"version=$expected_version"*) ;;
+            *)
+              echo "installed Homebrew version does not match selected release tag $RELEASE_TAG"
+              exit 1
+              ;;
+          esac
+          trice help
+          tlog_version_output="$(tlog --version)"
+          printf '%s\n' "$tlog_version_output"
+          case "$tlog_version_output" in
+            *"version=$expected_version"*) ;;
+            *)
+              echo "installed Homebrew tlog version does not match selected release tag $RELEASE_TAG"
+              exit 1
+              ;;
+          esac
+          tlog help
+
+  audit-target-sources:
+    name: Release Audit Target Sources
+    runs-on: ubuntu-latest
+    needs: download-release-assets
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ needs.download-release-assets.outputs.tag }}
+
+      - name: Download release assets
+        uses: actions/download-artifact@v8
+        with:
+          name: trice-release-assets
+          path: artifacts
+
+      - name: Unpack and compile target sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_zip="$(find artifacts -maxdepth 1 -name 'trice_target_sources_*.zip' -print -quit)"
+          if [ -z "$source_zip" ]; then
+            echo "::error::missing target source archive"
+            find artifacts -maxdepth 2 -type f -printf '%s %p\n' | sort || true
+            exit 1
+          fi
+          echo "Using target source archive: $source_zip"
+          unzip -q "$source_zip" -d artifacts/target
+          source_root="$(find artifacts/target -maxdepth 1 -type d -name 'trice_target_sources_*' -print -quit)"
+          if [ -z "$source_root" ]; then
+            echo "::error::could not locate unpacked target source root"
+            find artifacts/target -maxdepth 3 -type f -printf '%s %p\n' | sort || true
+            exit 1
+          fi
+          test -s "$source_root/src/trice.h"
+          if [ ! -s "$source_root/LICENSE.md" ] || ! cmp -s LICENSE.md "$source_root/LICENSE.md"; then
+            echo "::error::target archive lacks the complete repository LICENSE.md notice: $source_root/LICENSE.md"
+            find "$source_root" -maxdepth 2 -type f -print | sort
+            exit 1
+          fi
+          if [ ! -s "$source_root/src/default_conf/SEGGER_RTT_Conf.h" ]; then
+            echo "::error::target archive lacks src/default_conf/SEGGER_RTT_Conf.h"
+            exit 1
+          fi
+          test -s "$source_root/src/trice.c"
+          # RTT's defaults and license must accompany the vendor sources.
+          for vendor_file in SEGGER_RTT_ConfDefaults.h SEGGER_RTT_LICENSE.md; do
+            if [ ! -s "$source_root/src/$vendor_file" ]; then
+              echo "::error::target archive lacks src/$vendor_file"
+              exit 1
+            fi
+          done
+          cat > "$source_root/src/triceConfig.h" <<'EOF'
+          #ifndef TRICE_CONFIG_H_
+          #define TRICE_CONFIG_H_
+          #define TRICE_BUFFER TRICE_STACK_BUFFER
+          #define TRICE_DIRECT_OUTPUT 1
+          #define TRICE_DIRECT_AUXILIARY8 1
+          #define TRICE_CYCLE_COUNTER 0
+          #endif
+          EOF
+          for source_file in "$source_root"/src/*.c; do
+            case "$(basename "$source_file")" in
+              triceUart.c) continue ;;
+            esac
+            cc -I "$source_root/src" -I "$source_root/src/default_conf" -c "$source_file" -o "/tmp/$(basename "$source_file").o"
+          done
+
+  audit-release-pdf:
+    name: Release Audit PDF
+    runs-on: ubuntu-latest
+    needs: download-release-assets
+    timeout-minutes: 5
+
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v8
+        with:
+          name: trice-release-assets
+          path: artifacts
+
+      - name: Verify release PDF
+        shell: bash
+        run: |
+          set -euo pipefail
+          for manual in TriceUserManual TriceReferenceManual; do
+            if [ ! -s "artifacts/$manual.pdf" ]; then
+              echo "::error::missing or empty $manual.pdf artifact"
+              find artifacts -maxdepth 2 -type f -printf '%s %p\n' | sort || true
+              exit 1
+            fi
+            # The short guide is intentionally much smaller than the reference.
+            minimum=10000
+            if [ "$manual" = TriceReferenceManual ]; then minimum=100000; fi
+            size="$(wc -c < "artifacts/$manual.pdf")"
+            echo "$manual.pdf size: $size bytes"
+            if [ "$size" -le "$minimum" ]; then
+              echo "::error::$manual.pdf looks too small: $size bytes"
+              exit 1
+            fi
+          done
+
+      - name: Verify release EPUB containers
+        shell: bash
+        run: |
+          set -euo pipefail
+          for manual in TriceUserManual TriceReferenceManual; do
+            file="artifacts/$manual.epub"
+            if [ ! -s "$file" ] || ! unzip -t "$file"; then
+              echo "::error::missing, empty or damaged EPUB asset: $file"
+              find artifacts -maxdepth 1 -type f -printf '%s %p\n' | sort || true
+              exit 1
+            fi
+            if [ "$(unzip -p "$file" mimetype)" != application/epub+zip ]; then
+              echo "::error::invalid EPUB mimetype: $file"
+              exit 1
+            fi
+          done

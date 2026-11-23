@@ -1,0 +1,53 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [MEDIUM] Add concurrency group to "ci.yaml"
+# Estimated savings: ~2 min/run
+#
+# Run CI for R using https://eddelbuettel.github.io/r-ci/
+
+name: ci
+
+on:
+  push:
+  pull_request:
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  _R_CHECK_FORCE_SUGGESTS_: "false"
+
+jobs:
+  ci:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          #- {os: macOS-latest}
+          - {os: ubuntu-latest}
+          #- {os: ubuntu-24.04-arm}
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup
+        uses: eddelbuettel/github-actions/r-ci@master
+
+      - name: Dependencies
+        run: ./run.sh install_all
+
+      - name: Test
+        run: ./run.sh run_tests
+
+      - name: Logs
+        run: ./run.sh dump_logs
+        if: failure()
+
+      - name: Coverage
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        run: ./run.sh coverage
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

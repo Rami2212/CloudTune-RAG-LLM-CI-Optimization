@@ -1,0 +1,231 @@
+# adapted from https://raw.githubusercontent.com/stefanprodan/podinfo/master/.github/workflows/release.yml
+name: Docker
+
+on:
+  push:
+    paths-ignore:
+      - 'doc/**'
+    branches-ignore: ["dependabot/**"]
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+  pull_request:
+    paths-ignore:
+      - 'doc/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      VERSION: ${{ steps.prep.outputs.VERSION }}
+      SHA: ${{ steps.prep.outputs.SHA }}
+      SHORT_SHA: ${{ steps.prep.outputs.SHORT_SHA }}
+      BUILD_DATE: ${{ steps.prep.outputs.BUILD_DATE }}
+    steps:
+      - name: Prepare
+        id: prep
+        # On a pull_request event GITHUB_SHA is the ephemeral merge commit, not
+        # the commit we build, so pick the PR head SHA when there is one.
+        env:
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          VERSION=sha-${SHA::8}
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF/refs\/tags\//}
+          fi
+          {
+            echo "VERSION=$VERSION"
+            echo "SHA=$SHA"
+            echo "SHORT_SHA=${SHA::8}"
+            echo "BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          } >> "$GITHUB_OUTPUT"
+
+  build_individual_images:
+    needs: prepare
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runners: ubuntu-26.04
+            arch: amd64
+          - runners: ubuntu-26.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runners }}
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    env:
+      PUSH_PACKAGES: ${{ github.repository_owner == 'PDAL' && github.event_name != 'pull_request'  }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Lint
+        id: lint
+        run: |
+          echo "are we pushing packages" ${{ env.PUSH_PACKAGES }}
+          echo "event_name" ${{ github.event_name }}
+          echo "ref" ${{ github.ref }}
+      - name: Set up Docker
+        uses: docker/setup-docker-action@v5
+        with:
+          daemon-config: |
+            {
+              "debug": false,
+              "features": {
+                "containerd-snapshotter": true  
+              }
+            }
+      - name: Setup Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          version: latest
+      - if: ${{ env.PUSH_PACKAGES == 'true' }}
+        name: Login to GitHub Container Registry
+        uses: docker/login-action@v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Extract metadata (tags, labels) for Docker
+      # https://github.com/docker/metadata-action
+      - if: ${{ env.PUSH_PACKAGES == 'true' }}
+        name: Login to Docker Hub
+        uses: docker/login-action@v4.8.0
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Extract container metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: |
+            ghcr.io/pdal/pdal
+            docker.io/pdal/pdal
+          flavor: |
+            latest=${{ github.ref == 'refs/heads/master' }}
+            suffix=-${{ matrix.arch }},onlatest=true
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=sha-${{ needs.prepare.outputs.SHORT_SHA }},enable=${{ !startsWith(github.ref, 'refs/tags/') }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.prepare.outputs.VERSION }}
+            org.opencontainers.image.created=${{ needs.prepare.outputs.BUILD_DATE }}
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.SHA }}
+          annotations: |
+            org.opencontainers.image.version=${{ needs.prepare.outputs.VERSION }}
+            org.opencontainers.image.created=${{ needs.prepare.outputs.BUILD_DATE }}
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.SHA }}
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest
+      - name: Build image
+        uses: docker/build-push-action@v7
+        id: push
+        with:
+          push: ${{ env.PUSH_PACKAGES == 'true' }}
+          builder: ${{ steps.buildx.outputs.name }}
+          file: "./scripts/docker/ubuntu/Dockerfile"
+          context: .
+          platforms: linux/${{ matrix.arch }}
+
+          # We need to pass in the SHA to the Dockerfile so it can checkout
+          # our code. It is a different active SHA depending on whether it is a
+          # PR or a simple push
+          build-args: |
+            GITHUB_SHA=${{ needs.prepare.outputs.SHA }}
+            GITHUB_REPOSITORY=${{ github.event.pull_request.head.repo.full_name != '' && github.event.pull_request.head.repo.full_name || github.repository }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+      
+      - name: Generate artifact attestation
+        if: ${{ env.PUSH_PACKAGES == 'true' }}
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ghcr.io/pdal/pdal
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: ${{ env.PUSH_PACKAGES == 'true' }}
+
+  verify-release-image:
+    needs: [prepare, create-manifest]
+    if: ${{ !cancelled() && github.repository_owner == 'PDAL' && startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify the release image exists for both architectures
+        env:
+          VERSION: ${{ needs.prepare.outputs.VERSION }}
+        run: |
+          out=$(docker buildx imagetools inspect "pdal/pdal:${VERSION}")
+          echo "$out"
+          grep -q linux/amd64 <<<"$out" && grep -q linux/arm64 <<<"$out"
+
+  create-manifest:
+
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    runs-on: ubuntu-latest
+    env:
+      PUSH_PACKAGES: ${{ github.repository_owner == 'PDAL' && github.event_name != 'pull_request' }}  
+    needs: [prepare, build_individual_images]
+    steps:
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4.8.0
+        if: env.PUSH_PACKAGES == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4.8.0
+        if: env.PUSH_PACKAGES == 'true'
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Extract index annotations
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          annotations: |
+            org.opencontainers.image.version=${{ needs.prepare.outputs.VERSION }}
+            org.opencontainers.image.created=${{ needs.prepare.outputs.BUILD_DATE }}
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.SHA }}
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index
+
+      - name: Create and push multi-platform manifest
+        if: env.PUSH_PACKAGES == 'true'
+        env:
+          VERSION: ${{ needs.prepare.outputs.VERSION }}
+          SHORT_SHA: ${{ needs.prepare.outputs.SHORT_SHA }}
+          ANNOTATIONS: ${{ steps.meta.outputs.annotations }}
+        run: |
+          annotations=()
+          while IFS= read -r line; do
+            if [[ -n $line ]]; then annotations+=(--annotation "$line"); fi
+          done <<<"$ANNOTATIONS"
+
+          tags=()
+          if [[ $GITHUB_REF == refs/heads/master ]]; then
+            tags=("sha-${SHORT_SHA}" latest)
+          elif [[ $GITHUB_REF == refs/tags/* ]]; then
+            tags=("${VERSION}" "${VERSION%.*}")
+          fi
+
+          for tag in "${tags[@]}"; do
+            for image in ghcr.io/pdal/pdal pdal/pdal; do
+              docker buildx imagetools create "${annotations[@]}" \
+              -t "${image}:${tag}" \
+              "${image}:${tag}-amd64" \
+              "${image}:${tag}-arm64"
+            done
+          done

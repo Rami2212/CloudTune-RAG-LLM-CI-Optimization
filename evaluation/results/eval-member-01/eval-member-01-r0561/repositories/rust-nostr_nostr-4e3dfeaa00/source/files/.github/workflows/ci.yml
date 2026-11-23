@@ -1,0 +1,173 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+      - 'v[0-9]+.[0-9]+'
+
+  pull_request:
+    branches:
+      - master
+      - 'v[0-9]+.[0-9]+'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check
+        run: bash contrib/scripts/fmt.sh check
+
+  check-crates:
+    name: Check crates
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        crate:
+          - nostr
+          - nostr --features rand
+          - nostr --features os-rng
+          - nostr --features all-nips
+          - nostr --features all-nips,rand
+          - nostr --features all-nips,os-rng
+          - nostr --features all-nips --target wasm32-unknown-unknown
+          - nostr --features all-nips,rand --target wasm32-unknown-unknown
+          - nostr --features all-nips,os-rng --target wasm32-unknown-unknown
+          - nostr --features all-nips --target wasm32-wasip2
+          - nostr --features all-nips,rand --target wasm32-wasip2
+          - nostr --features all-nips,os-rng --target wasm32-wasip2
+          - nostr --no-default-features --features alloc
+          - nostr --no-default-features --features alloc,rand
+          - nostr --no-default-features --features alloc,all-nips
+          - nostr --no-default-features --features alloc,all-nips,rand
+          - nostr-browser-signer --target wasm32-unknown-unknown
+          - nostr-browser-signer-proxy
+          - nostr-blossom
+          - nostr-database
+          - nostr-database-test-suite
+          - nostr-memory
+          - nostr-gossip
+          - nostr-gossip-memory
+          - nostr-gossip-sqlite
+          - nostr-gossip-sqlite --target wasm32-unknown-unknown
+          - nostr-gossip-test-suite
+          - nostr-lmdb
+          - nostr-ndb
+          - nostr-sqlite
+          - nostr-sqlite --target wasm32-unknown-unknown
+          - nostr-sdk
+          - nostr-sdk --features local-relay
+          - nostr-sdk --target wasm32-unknown-unknown
+          - nostr-connect
+          - nwc
+          - nwc --target wasm32-unknown-unknown
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install deps
+      run: sudo apt update && sudo apt install -y libdbus-1-dev pkg-config
+
+    - name: Install WASI SDK
+      if: "contains(matrix.crate, 'wasm32-wasip2')"
+      run: |
+        wget https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-29/wasi-sdk-29.0-x86_64-linux.tar.gz
+        tar xvf wasi-sdk-29.0-x86_64-linux.tar.gz
+        
+        WASI_SDK="$(pwd)/wasi-sdk-29.0-x86_64-linux"
+        
+        echo "WASI_SDK=$WASI_SDK" >> $GITHUB_ENV
+        echo "CC_wasm32_wasip2=$WASI_SDK/bin/clang" >> $GITHUB_ENV
+        echo "AR_wasm32_wasip2=$WASI_SDK/bin/llvm-ar" >> $GITHUB_ENV
+        echo "CFLAGS_wasm32_wasip2=--sysroot=$WASI_SDK/share/wasi-sysroot" >> $GITHUB_ENV
+
+    - name: Rust Cache
+      uses: Swatinem/rust-cache@v2.7.8
+      with:
+        key: ${{ matrix.crate }}
+
+    - name: Check
+      env:
+        RUSTFLAGS: ${{ contains(matrix.crate, 'wasm32-unknown-unknown') && '--cfg getrandom_backend="unsupported"' || '' }}
+      run: cargo check -p ${{ matrix.crate }}
+
+    - name: Clippy
+      env:
+        RUSTFLAGS: ${{ contains(matrix.crate, 'wasm32-unknown-unknown') && '--cfg getrandom_backend="unsupported"' || '' }}
+      run: cargo clippy -p ${{ matrix.crate }} -- -D warnings
+
+    - name: Test
+      if: "!contains(matrix.crate, 'wasm32-')"
+      run: cargo test -p ${{ matrix.crate }}
+
+  check-docs:
+    name: Check docs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2.7.8
+
+      - name: Install deps
+        run: sudo apt update && sudo apt install -y libdbus-1-dev pkg-config
+
+      - name: Check
+        run: bash contrib/scripts/check-docs.sh
+
+  check-stable:
+    name: Check stable
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - run: rustup toolchain install stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2.7.8
+
+      - name: Install deps
+        run: sudo apt update && sudo apt install -y libdbus-1-dev pkg-config
+
+      - name: Build
+        run: CARGO_BUILD_RUSTFLAGS="-D warnings" cargo +stable build --workspace --all-targets
+
+      - name: Clippy
+        run: cargo +stable clippy --all-targets -- -D warnings
+
+  build-no-std:
+    name: Build no_std
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./nostr/examples/embedded
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Rust Cache
+      uses: Swatinem/rust-cache@v2.7.8
+
+    - name: Set default toolchain
+      run: rustup default nightly
+
+    - name: Set profile
+      run: rustup set profile minimal
+
+    - name: Install just
+      uses: extractions/setup-just@v3
+
+    - name: Init
+      run: sudo apt update && just init
+
+    - name: Build
+      run: just build

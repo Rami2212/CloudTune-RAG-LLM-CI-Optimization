@@ -1,0 +1,111 @@
+name: build
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+  schedule:
+    # Prime the caches every Monday
+    - cron: 0 1 * * MON
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.ocaml-compiler }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            ocaml-compiler: "5"
+          - os: macos-latest
+            ocaml-compiler: "5"
+          - os: windows-latest
+            ocaml-compiler: "5"
+            # alcotest-async depends on core_unix, which does not support
+            # Windows.
+            opam-files: ./alcotest.opam ./alcotest-lwt.opam ./alcotest-mirage.opam
+            dune-flags: --only-packages alcotest,alcotest-lwt,alcotest-mirage
+          # alcotest-async lower bound
+          - os: ubuntu-latest
+            ocaml-compiler: "4.14"
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    steps:
+      - name: Set git to use LF
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set-up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+
+      - name: Set-up Binaryen
+        if: ${{ matrix.runtest }}
+        uses: Aandreba/setup-binaryen@v1.0.0
+        with:
+          token: ${{ github.token }}
+
+      - name: Set-up OCaml ${{ matrix.ocaml-compiler }}
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: ${{ matrix.ocaml-compiler }}
+
+      - run: opam install ${{ matrix.opam-files || '.' }} --deps-only --with-test
+
+      # The aliases are quoted because PowerShell, the default shell on
+      # Windows, reads a bare @name as splatting the variable $name.
+      - run: opam exec -- dune build ${{ matrix.dune-flags }} '@install' '@check' '@runtest'
+
+      # The js_of_ocaml backend does not work on Windows yet: absolute paths
+      # are mangled and caml_unix_filedescr_of_channel is missing.
+      - if: runner.os != 'Windows'
+        run: opam install js_of_ocaml-compiler
+
+      - if: runner.os != 'Windows'
+        run: opam exec -- dune build '@runtest-js'
+
+      - if: runner.os != 'Windows'
+        run: opam install wasm_of_ocaml-compiler
+
+      - if: runner.os != 'Windows'
+        run: opam exec -- dune build @runtest-wasm
+        env:
+          WASM_OF_OCAML: true
+
+      - if: runner.os != 'Windows'
+        run: opam exec -- sh test/wasm-downstream/run.sh
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set-up OCaml 5
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "5"
+
+      - name: Lint opam files
+        uses: ocaml/setup-ocaml/lint-opam@v3
+
+      - name: Check formatting
+        uses: ocaml/setup-ocaml/lint-fmt@v3

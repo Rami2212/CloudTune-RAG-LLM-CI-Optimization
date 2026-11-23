@@ -1,0 +1,151 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+      - actions-*
+  pull_request:
+    branches:
+      - master
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+    - name: Setup git checkout linefeeds on Windows
+      if: runner.os == 'Windows'
+      run: |
+        git config --system core.autocrlf false
+        git config --system core.eol lf
+    - uses: actions/checkout@v4
+      # Postgresql setup adapted from Diesel CI
+      # Disable ssl as server doesn't have a trusted cert
+    - name: Setup PostgreSQL on Linux
+      if: runner.os == 'Linux'
+      run: |
+        set -ex
+        sudo apt-get update
+        sudo apt-get install -y postgresql
+        sudo sed -i "s/scram-sha-256/trust/" /etc/postgresql/16/main/pg_hba.conf
+        sudo cat /etc/postgresql/16/main/pg_hba.conf
+        sudo service postgresql restart && sleep 3
+        echo BUTANE_PG_CONNSTR="host=localhost user=postgres sslmode=disable port=5432" >> $GITHUB_ENV
+        echo "/usr/lib/postgresql/16/bin" >> $GITHUB_PATH
+    - name: Setup PostgreSQL on MacOS
+      if: runner.os == 'macOS'
+      run: |
+        set -ex
+        # `postgresql` is an alias to the latest versioned formula (e.g. postgresql@18).
+        brew install postgresql
+        # Resolve and start whichever version the alias installed. The formula is
+        # keg-only, so also expose its bin on PATH.
+        PG_FORMULA=$(brew info --json=v2 postgresql | jq -r '.formulae[0].name')
+        echo "Installed formula: $PG_FORMULA"
+        echo "$(brew --prefix "$PG_FORMULA")/bin" >> "$GITHUB_PATH"
+        export PATH="$(brew --prefix "$PG_FORMULA")/bin:$PATH"
+        brew services start "$PG_FORMULA"
+        sleep 3
+        createuser -s postgres
+        echo BUTANE_PG_CONNSTR="host=localhost user=postgres sslmode=disable port=5432" >> $GITHUB_ENV
+    - name: Install PostgreSQL on Windows
+      if: runner.os == 'Windows'
+      run: |
+        set -ex
+        choco install postgresql12 --force --params '/Password:root'
+        echo "C:\Program Files\PostgreSQL\12\bin" >> $GITHUB_PATH
+        echo "C:\Program Files\PostgreSQL\12\lib" >> $GITHUB_PATH
+        echo "PQ_LIB_DIR=C:\Program Files\PostgreSQL\12\lib" >> $GITHUB_ENV
+        echo BUTANE_PG_CONNSTR="host=localhost user=postgres password=root sslmode=disable port=5432" >> $GITHUB_ENV
+    - name: Install sqlite on Windows using vcpkg
+      if: runner.os == 'Windows'
+      run: |
+        vcpkg install sqlite3:x64-windows
+        echo "VCPKG_ROOT=C:/vcpkg" >> $GITHUB_ENV
+        echo "SQLITE3_LIB_DIR=C:/vcpkg/installed/x64-windows/lib" >> $GITHUB_ENV
+        echo "SQLITE3_INCLUDE_DIR=C:/vcpkg/installed/x64-windows/include" >> $GITHUB_ENV
+
+    - name: Add Rust nightly toolchain
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: nightly
+        components: rustfmt
+        cache: true
+    - name: Add Rust stable toolchain
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: stable
+        cache-workspaces: ". -> target"
+    - name: Install tool binaries
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-deny,cargo-nextest,editorconfig-checker,mise,typos
+    - name: Install ephemeral-postgres via mise
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      if: runner.os != 'Windows'
+      run: |
+        mise install "asdf:mise-plugins/mise-ephemeral-postgres@latest"
+        echo "$HOME/.local/share/mise/shims" >> "$GITHUB_PATH"
+    - name: Verify ephemeralpg installation
+      if: runner.os != 'Windows'
+      run: which pg_tmp
+    - name: Run editorconfig-checker
+      run: editorconfig-checker
+    - name: Build
+      run: make build
+    - name: Lint
+      run: make lint-ci
+    - name: Run cargo-deny
+      run: cargo deny check all
+    - name: Test with mise tools
+      if: runner.os != 'Windows'
+      run: |
+        mise exec "asdf:mise-plugins/mise-ephemeral-postgres@latest" -- \
+          cargo +stable nextest run --all-features --no-fail-fast
+    - name: Test without mise
+      if: runner.os == 'Windows'
+      run: cargo +stable nextest run --all-features --no-fail-fast
+
+    - name: Test doctests
+      run: |
+        cargo +stable test -p butane_codegen --doc
+        cargo +stable test -p butane --doc --features async
+
+    - name: Check example migrations have been updated
+      run: |
+        set -ex
+        make regenerate-example-migrations
+        # TODO: This file is created by one of the tests on Windows
+        rm -f butane_core/sqlite
+        git add -A
+        git diff --cached --exit-code
+    - name: Run tests in examples
+      run: |
+        set -ex
+        cargo +stable nextest run -p example --all-features
+        cd examples
+        for dir in *; do
+          cargo +stable nextest run -p $dir --all-features
+        done
