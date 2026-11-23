@@ -1,0 +1,61 @@
+name: Docker Image Build
+on:
+  push:
+    branches: [ "main" ]
+    tags:
+      - '*'
+  pull_request:
+    branches: [ "main" ]
+
+# The registry login below uses a PAT, so the workflow token only needs to read
+# the repository.
+permissions:
+  contents: read
+
+# A pull request build that has been superseded is not worth a runner. Tagged
+# builds publish, so they are left to finish.
+concurrency:
+  group: docker-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+    - name: Git Describe
+      run: git describe --tags --abbrev=8 --dirty --always --long > backend/git-describe.txt
+    - name: Docker Meta
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ghcr.io/rohitkumbhar/surmai
+    - name: Login to the Container registry
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GHCR_PACKAGE_PAT }}
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: ./Dockerfile
+        platforms: linux/amd64,linux/arm64
+        push: ${{ github.event_name != 'pull_request' }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        # Deliberately no cache-to: type=gha. One build of this two platform
+        # image exported 2.3GB across 82 entries, and the export put the build
+        # up from 173s to 273s. The repository's cache was already at 7.6GB of
+        # its 10GB, so a few of those would evict the Go caches, which save
+        # far more: 199s to 36s on the Go tests.
+        #
+        # If this build needs to be faster, a registry cache
+        # (type=registry,ref=ghcr.io/rohitkumbhar/surmai:buildcache) keeps the
+        # layers out of the Actions cache budget entirely.

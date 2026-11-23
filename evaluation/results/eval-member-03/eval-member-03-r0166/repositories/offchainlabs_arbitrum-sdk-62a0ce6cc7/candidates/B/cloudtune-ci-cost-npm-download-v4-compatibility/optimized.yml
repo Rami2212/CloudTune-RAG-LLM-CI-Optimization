@@ -1,0 +1,204 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 5 optimizations:
+# - [HIGH] Split "lint" into parallel jobs (lint + test + build)
+# - [HIGH] Split "test-integration" into parallel jobs (lint + test + build)
+# - [MEDIUM] Add concurrency group to "build-test.yml"
+# - [MEDIUM] 5 jobs clone the repo — consider artifact sharing
+# - [LOW] Explicitly set fail-fast for large matrix job "test-integration" (5 combinations)
+# Estimated savings: ~17 min/run
+#
+name: Build, Test
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  MAINNET_RPC: ${{ secrets.MAINNET_RPC }}
+
+jobs:
+  install:
+    name: Install on Node.js v${{ matrix.node-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [24]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install node_modules
+        uses: OffchainLabs/actions/node-modules/install@main
+        with:
+          cache-key: ${{ runner.os }}-yarn-${{ hashFiles('yarn.lock') }}-monorepo
+
+  lint:
+    name: Lint on Node.js v${{ matrix.node-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [24]
+    needs: install
+    permissions:
+      checks: write # https://github.com/mikepenz/action-junit-report/issues/23#issuecomment-1412597753
+    env:
+      TEST_PATH: /tmp/test-results
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install node_modules
+        uses: OffchainLabs/actions/node-modules/install@main
+        with:
+          cache-key: ${{ runner.os }}-yarn-${{ hashFiles('yarn.lock') }}-monorepo
+
+      - name: Lint sdk
+        run: |
+          yarn gen:abi
+          yarn build
+          yarn lint --format junit -o $TEST_PATH/sdk-lint.xml
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-results-${{ github.run_id }}-node-v${{ matrix.node-version }}
+          path: ${{ env.TEST_PATH }}
+
+      - name: Publish Test Report
+        uses: mikepenz/action-junit-report@v5
+        if: always() # always run even if the previous step fails
+        with:
+          report_paths: '${{ env.TEST_PATH }}/sdk-lint.xml'
+          fail_on_failure: false
+
+  audit:
+    name: Audit on Node.js v${{ matrix.node-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [24]
+    needs: install
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install node_modules
+        uses: OffchainLabs/actions/node-modules/install@main
+        with:
+          cache-key: ${{ runner.os }}-yarn-${{ hashFiles('yarn.lock') }}-monorepo
+
+      - run: yarn audit:ci
+
+  test-unit:
+    name: Test (Unit) on Node.js v${{ matrix.node-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [24]
+    needs: install
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install node_modules
+        uses: OffchainLabs/actions/node-modules/install@main
+        with:
+          cache-key: ${{ runner.os }}-yarn-${{ hashFiles('yarn.lock') }}-monorepo
+
+      - name: Build
+        run: |
+          yarn gen:abi
+          yarn build
+
+      - name: Run unit tests
+        run: CI=true yarn test:unit
+
+  test-integration:
+    name: Test (Integration) on Node.js v${{ matrix.node-version }}${{ matrix.orbit-test == '1' && ' with L3' || '' }}${{ matrix.decimals == '16' && ' with custom gas token (16 decimals)' || matrix.decimals == '20' && ' with custom gas token (20 decimals)' || matrix.decimals == '18' && ' with custom gas token (18 decimals)' || '' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false # runs all tests to completion even if one fails
+      matrix:
+        include:
+          - orbit-test: '0'
+            node-version: 24
+
+          - orbit-test: '1'
+            node-version: 24
+
+          - orbit-test: '1'
+            decimals: 16
+            node-version: 24
+
+          - orbit-test: '1'
+            decimals: 18
+            node-version: 24
+
+          - orbit-test: '1'
+            decimals: 20
+            node-version: 24
+
+    needs: install
+    env:
+      ORBIT_TEST: ${{ matrix.orbit-test }}
+      DECIMALS: ${{ matrix.decimals || '18' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install node_modules
+        uses: OffchainLabs/actions/node-modules/install@main
+        with:
+          cache-key: ${{ runner.os }}-yarn-${{ hashFiles('yarn.lock') }}-monorepo
+
+      - name: Set up the local node
+        uses: OffchainLabs/arbitrum-litro@v0.2.4
+        with:
+          version: v0.2.2
+          image-repository: ghcr.io/offchainlabs/arbitrum-testnode-ci
+          l3-enabled: ${{ matrix.orbit-test == '1' }}
+          fee-token-decimals: ${{ matrix.decimals }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          network-config-path: packages/sdk/localNetwork.json
+
+      - name: Copy .env
+        run: cp ./.env-sample ./.env
+
+      - name: Build
+        run: |
+          yarn gen:abi
+          yarn build
+
+      - name: Run integration tests
+        env:
+          NODE_OPTIONS: --no-experimental-strip-types
+        run: CI=true yarn test:integration

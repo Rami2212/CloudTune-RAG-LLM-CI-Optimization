@@ -1,0 +1,689 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && 'release' || 'checks' }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+env:
+  PUB_SUMMARY_ONLY: true
+  KOTLIN_VERSION: "2.1.0"
+
+jobs:
+  quality-checks:
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Flutter from submodule
+        run: |
+          git submodule update --init --recursive flutter
+          chmod +x flutter/bin/*
+          echo "$PWD/flutter/bin" >> "$GITHUB_PATH"
+          flutter/bin/flutter --version
+          flutter/bin/flutter config --no-analytics
+
+      - name: Check
+        run: ./scripts/check.sh
+
+  generate-screenshots:
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - device_type: phoneScreenshots
+            profile: pixel_6
+          - device_type: sevenInchScreenshots
+            profile: Nexus 7
+            screen_size: 1920x1080
+          - device_type: tenInchScreenshots
+            profile: Nexus 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Setup Java
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: "zulu"
+          java-version: "17"
+
+      - name: Setup Flutter from submodule
+        run: |
+          git submodule update --init --recursive flutter
+          chmod +x flutter/bin/*
+          echo "$GITHUB_WORKSPACE/flutter/bin" >> "$GITHUB_PATH"
+          flutter/bin/flutter config --no-analytics
+
+      - name: Get Flutter dependencies
+        run: flutter pub get --enforce-lockfile
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Generate ${{ matrix.device_type }}
+        timeout-minutes: 25
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
+        env:
+          FITBOOK_DEVICE_TYPE: ${{ matrix.device_type }}
+          SCREENSHOT_SCREEN_SIZE: ${{ matrix.screen_size }}
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: ${{ matrix.profile }}
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
+          script: ./scripts/ci-screenshots.sh
+
+      - name: Upload ${{ matrix.device_type }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: screenshots-${{ matrix.device_type }}
+          path: fastlane/metadata/android/en-US/images/${{ matrix.device_type }}
+          if-no-files-found: error
+          retention-days: 7
+
+  version-bump:
+    needs: [quality-checks, generate-screenshots]
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && needs.quality-checks.result == 'success' && needs.generate-screenshots.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      build_number: ${{ steps.bump.outputs.build_number }}
+      commit_sha: ${{ steps.release.outputs.commit_sha }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          submodules: false
+          persist-credentials: false
+
+      - name: Download phone screenshots
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: screenshots-phoneScreenshots
+          path: fastlane/metadata/android/en-US/images/phoneScreenshots
+
+      - name: Download seven-inch screenshots
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: screenshots-sevenInchScreenshots
+          path: fastlane/metadata/android/en-US/images/sevenInchScreenshots
+
+      - name: Download ten-inch screenshots
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: screenshots-tenInchScreenshots
+          path: fastlane/metadata/android/en-US/images/tenInchScreenshots
+
+      - name: Configure Git
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+      - name: Bump versions and generate changelog
+        id: bump
+        run: |
+          CURRENT_VERSION=$(grep '^version:' pubspec.yaml | sed 's/version: //' | sed 's/+.*//')
+          CURRENT_BUILD=$(grep '^version:' pubspec.yaml | sed 's/.*+//')
+          CURRENT_MSIX=$(grep 'msix_version:' pubspec.yaml | sed 's/.*msix_version: *//')
+
+          IFS='.' read -ra V <<< "$CURRENT_VERSION"
+          NEW_VERSION="${V[0]}.${V[1]}.$((${V[2]} + 1))"
+          NEW_BUILD=$((CURRENT_BUILD + 1))
+          CHANGELOG_NUMBER=$((NEW_BUILD * 10 + 3))
+
+          IFS='.' read -ra M <<< "$CURRENT_MSIX"
+          NEW_MSIX="${M[0]}.${M[1]}.$((${M[2]} + 1)).${M[3]}"
+
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "build_number=$NEW_BUILD" >> "$GITHUB_OUTPUT"
+
+          sed -i "s/^version: .*/version: $NEW_VERSION+$NEW_BUILD/" pubspec.yaml
+          sed -i "s/msix_version: .*/msix_version: $NEW_MSIX/" pubspec.yaml
+
+          CHANGELOG_FILE="fastlane/metadata/android/en-US/changelogs/$CHANGELOG_NUMBER.txt"
+          mkdir -p "$(dirname "$CHANGELOG_FILE")"
+
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -n "$LAST_TAG" ]; then
+            git --no-pager log --pretty=format:'%s' "$LAST_TAG"..HEAD
+          else
+            git --no-pager log --pretty=format:'%s'
+          fi | sort -u \
+            | grep -v "^Merge " \
+            | grep -v "^Release " \
+            | grep -v "^Bump " \
+            | grep -v "\[skip ci\]" \
+            | head -10 \
+            | sed 's/^/• /' > "$CHANGELOG_FILE"
+
+          [ -s "$CHANGELOG_FILE" ] || echo "• Bug fixes and improvements" > "$CHANGELOG_FILE"
+
+          mkdir -p fastlane/metadata/en-AU
+          cp "$CHANGELOG_FILE" fastlane/metadata/en-AU/release_notes.txt
+
+          mkdir -p assets/changelogs
+          cp "$CHANGELOG_FILE" "assets/changelogs/$(date +%s).txt"
+
+      - name: Commit, tag, and push the tested release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          git add pubspec.yaml fastlane/metadata assets/changelogs
+          git commit -m "Release $RELEASE_VERSION [skip ci]"
+          git tag "$RELEASE_VERSION"
+          gh auth setup-git
+          git push --atomic origin HEAD:main "refs/tags/${RELEASE_VERSION}"
+          echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build-android:
+    needs: version-bump
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.version-bump.outputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Setup Java
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: "zulu"
+          java-version: "17"
+
+      - name: Create brandon user directory structure (match F-Droid)
+        run: |
+          sudo mkdir -p /home/brandon
+          sudo chown $USER -R /home/brandon
+
+      - name: Move project to F-Droid location
+        env:
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          cd ..
+          mv "$REPO_NAME" /home/brandon/fitbook
+
+      - name: Setup Flutter from submodule and get dependencies
+        working-directory: /home/brandon/fitbook
+        run: |
+          git submodule update --init --recursive flutter
+          echo "/home/brandon/fitbook/flutter/bin" >> "$GITHUB_PATH"
+          export PUB_CACHE=$(pwd)/.pub-cache
+          echo "PUB_CACHE=$(pwd)/.pub-cache" >> "$GITHUB_ENV"
+          flutter/bin/flutter config --no-analytics
+          flutter/bin/flutter pub get --enforce-lockfile
+
+      - name: Decode Android keystore
+        working-directory: /home/brandon/fitbook
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/app/keystore.jks
+
+      - name: Build android
+        working-directory: /home/brandon/fitbook
+        env:
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          echo "storePassword=$ANDROID_STORE_PASSWORD" > android/key.properties
+          echo "keyPassword=$ANDROID_KEY_PASSWORD" >> android/key.properties
+          echo "keyAlias=$ANDROID_KEY_ALIAS" >> android/key.properties
+          echo "storeFile=keystore.jks" >> android/key.properties
+
+          # Use --split-per-abi WITH --target-platform to match F-Droid exactly.
+          # Without --split-per-abi: produces a universal APK with all ABI native
+          # libs and versionCode override = base*10+3 (wrong for x86_64 which needs +1).
+          # Without --target-platform: NativeAssetsManifest.json lists all 3 archs.
+          flutter build apk --release --split-per-abi --target-platform android-x64
+          flutter build apk --release --split-per-abi --target-platform android-arm64
+          flutter build apk --release --split-per-abi --target-platform android-arm
+
+          flutter build apk --release
+          mv build/app/outputs/flutter-apk/app-release.apk build/app/outputs/flutter-apk/fitbook.apk
+
+          flutter build appbundle
+          mkdir -p "${GITHUB_WORKSPACE}/build"
+          mv build/* "${GITHUB_WORKSPACE}/build"
+
+      - name: Upload Android artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          retention-days: 7
+          name: android-builds
+          path: |
+            build/app/outputs/flutter-apk/app-*-release.apk
+            build/app/outputs/flutter-apk/fitbook.apk
+            build/app/outputs/bundle/release/app-release.aab
+
+  build-linux:
+    needs: version-bump
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Setup Flutter from submodule
+        run: |
+          git submodule update --init --recursive flutter
+          chmod +x flutter/bin/*
+          echo "$GITHUB_WORKSPACE/flutter/bin" >> "$GITHUB_PATH"
+          flutter/bin/flutter config --no-analytics
+
+      - name: Get Flutter dependencies
+        run: flutter/bin/flutter pub get --enforce-lockfile
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+
+      - name: Build Linux
+        run: flutter build linux
+
+      - name: Create Linux zip
+        run: |
+          cd build/linux/x64/release/bundle
+          zip -r fitbook-linux.zip .
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          retention-days: 7
+          name: linux-builds
+          path: build/linux/x64/release/bundle/fitbook-linux.zip
+
+  build-windows:
+    needs: version-bump
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.version-bump.outputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Setup Flutter from submodule
+        run: |
+          git submodule update --init --recursive flutter
+          chmod +x flutter/bin/*
+          echo "$env:GITHUB_WORKSPACE\flutter\bin" >> $env:GITHUB_PATH
+          flutter\bin\flutter config --no-analytics
+
+      - name: Get Flutter dependencies
+        run: flutter\bin\flutter pub get --enforce-lockfile
+
+      - name: Test native Windows integrations
+        run: flutter\bin\flutter test -d windows integration_test/windows_native_smoke_test.dart
+
+      - name: Build Windows
+        run: flutter build windows
+
+      - name: Smoke test release Windows startup
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path 'build/windows/x64/runner/Release/fit_book.exe').Path
+          $process = Start-Process -FilePath $exe -PassThru
+          try {
+            Start-Sleep -Seconds 10
+            $process.Refresh()
+            if ($process.HasExited) {
+              throw "FitBook exited during release startup with code $($process.ExitCode)."
+            }
+            if ($process.MainWindowHandle -eq [IntPtr]::Zero -or -not $process.Responding) {
+              throw "FitBook Windows release did not open a responsive window."
+            }
+          } finally {
+            if (-not $process.HasExited) {
+              Stop-Process -Id $process.Id -Force
+            }
+          }
+
+      - name: Create Windows zip
+        shell: pwsh
+        run: |
+          $releaseFiles = @(Get-ChildItem -LiteralPath 'build/windows/x64/runner/Release' |
+            Where-Object { $_.Extension -ne '.pdb' })
+          Compress-Archive -LiteralPath $releaseFiles.FullName -DestinationPath './fitbook-windows.zip'
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          retention-days: 7
+          name: windows-builds
+          path: fitbook-windows.zip
+
+  build-and-deploy-web:
+    needs: version-bump
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Setup Flutter from submodule
+        run: |
+          git submodule update --init --recursive flutter
+          chmod +x flutter/bin/*
+          echo "$GITHUB_WORKSPACE/flutter/bin" >> "$GITHUB_PATH"
+          flutter/bin/flutter config --no-analytics
+
+      - name: Get Flutter dependencies
+        run: flutter/bin/flutter pub get --enforce-lockfile
+
+      - name: Enable web support
+        run: flutter config --enable-web
+
+      - name: Build Flutter web
+        env:
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: flutter build web --release --base-href "/${REPO_NAME}/"
+
+      - name: Add privacy policy to web deployment
+        run: cp docs/privacy-policy.html build/web/privacy-policy.html
+
+      - name: Setup Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - name: Upload to GitHub Pages
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: ./build/web
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+  create-github-release:
+    needs:
+      [
+        version-bump,
+        build-android,
+        build-linux,
+        build-windows,
+        publish-google-play,
+      ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ needs.version-bump.outputs.version }}
+          name: ${{ needs.version-bump.outputs.version }}
+          body_path: fastlane/metadata/en-AU/release_notes.txt
+          files: |
+            android-builds/flutter-apk/app-*-release.apk
+            android-builds/flutter-apk/fitbook.apk
+            android-builds/bundle/release/app-release.aab
+            linux-builds/fitbook-linux.zip
+            windows-builds/fitbook-windows.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-google-play:
+    needs: [version-bump, build-android]
+    if: ${{ github.ref == 'refs/heads/main' && needs.version-bump.result == 'success' && needs.build-android.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.version-bump.outputs.commit_sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: android-builds
+          path: android-builds
+
+      - uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+
+      - name: Configure Google Play credentials
+        env:
+          GOOGLE_PLAY_JSON_KEY: ${{ secrets.GOOGLE_PLAY_JSON_KEY }}
+        run: printf '%s' "$GOOGLE_PLAY_JSON_KEY" > "$RUNNER_TEMP/googlePlay.json"
+
+      - name: Publish Android App Bundle to Google Play
+        run: |
+          bundle exec fastlane supply \
+            --aab android-builds/bundle/release/app-release.aab \
+            --track production \
+            --package_name com.presley.fit_book \
+            --json_key "$RUNNER_TEMP/googlePlay.json" \
+            --release_status completed \
+            --skip_upload_metadata true \
+            --skip_upload_images true \
+            --skip_upload_screenshots true \
+            --skip_upload_changelogs true
+
+  deploy-windows-store:
+    needs: [version-bump, build-windows]
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.version-bump.outputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Setup Flutter from submodule
+        run: |
+          git submodule update --init --recursive flutter
+          echo "$env:GITHUB_WORKSPACE\flutter\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          flutter\bin\flutter config --no-analytics
+
+      - name: Get Flutter dependencies
+        run: flutter\bin\flutter pub get --enforce-lockfile
+
+      - name: Build MSIX
+        run: flutter pub run msix:create
+
+      - name: Create symbol-bearing Store upload
+        shell: pwsh
+        run: ./.github/scripts/create-store-upload.ps1
+
+      - name: Setup .NET 9.0
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: "9.0.x"
+
+      - name: Setup Microsoft Store CLI
+        uses: microsoft/setup-msstore-cli@cc9910a8d59f2eb55cbb83df0a3800cf3b5300e0 # v1.4
+
+      - name: Configure Microsoft Store CLI
+        env:
+          MSSTORE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          MSSTORE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          MSSTORE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          MSSTORE_SELLER_ID: ${{ secrets.MSSTORE_SELLER_ID }}
+        run: msstore reconfigure --tenantId $env:MSSTORE_TENANT_ID --clientId $env:MSSTORE_CLIENT_ID --clientSecret $env:MSSTORE_CLIENT_SECRET --sellerId $env:MSSTORE_SELLER_ID
+
+      - name: Prepare Microsoft Store for submission
+        shell: pwsh
+        env:
+          PRODUCT_ID: ${{ secrets.PRODUCT_ID }}
+          TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: |
+          # Microsoft requires an active package rollout to be finalized before creating a new submission:
+          # https://learn.microsoft.com/en-us/windows/apps/publish/gradual-package-rollout
+          $token = Invoke-RestMethod `
+            -Method Post `
+            -Uri "https://login.microsoftonline.com/$env:TENANT_ID/oauth2/token" `
+            -ContentType "application/x-www-form-urlencoded" `
+            -Body @{
+              grant_type = "client_credentials"
+              client_id = $env:CLIENT_ID
+              client_secret = $env:CLIENT_SECRET
+              resource = "https://manage.devcenter.microsoft.com"
+            }
+          $headers = @{ Authorization = "Bearer $($token.access_token)" }
+          $appUrl = "https://manage.devcenter.microsoft.com/v1.0/my/applications/$env:PRODUCT_ID"
+          $failedStatuses = @("CommitFailed", "PreProcessingFailed", "CertificationFailed", "ReleaseFailed", "PublishFailed")
+          $pendingDeadline = (Get-Date).AddMinutes(45)
+
+          while ($true) {
+            $app = Invoke-RestMethod -Headers $headers -Uri $appUrl
+            $pendingId = $app.pendingApplicationSubmission.id
+            if ([string]::IsNullOrWhiteSpace($pendingId)) {
+              break
+            }
+
+            $pending = Invoke-RestMethod -Headers $headers -Uri "$appUrl/submissions/$pendingId"
+            Write-Host "Existing Store submission $pendingId status=$($pending.status)"
+            if ($pending.status -in $failedStatuses) {
+              Write-Host "Existing submission is failed; msstore will replace it."
+              break
+            }
+            if ((Get-Date) -ge $pendingDeadline) {
+              throw "Timed out waiting for the existing Microsoft Store submission to finish."
+            }
+            Start-Sleep -Seconds 30
+          }
+
+          $app = Invoke-RestMethod -Headers $headers -Uri $appUrl
+          $submissionId = $app.lastPublishedApplicationSubmission.id
+          if ([string]::IsNullOrWhiteSpace($submissionId)) {
+            Write-Host "No published Store submission exists yet; no rollout to finalize."
+            exit 0
+          }
+
+          $rolloutUrl = "$appUrl/submissions/$submissionId/packagerollout"
+          $rollout = Invoke-RestMethod -Headers $headers -Uri $rolloutUrl
+          Write-Host "Published submission rollout status=$($rollout.packageRolloutStatus) percentage=$($rollout.packageRolloutPercentage)"
+
+          if ($rollout.packageRolloutStatus -eq "PackageRolloutInProgress") {
+            $rollout = Invoke-RestMethod `
+              -Method Post `
+              -Headers $headers `
+              -ContentType "application/json" `
+              -Uri "$appUrl/submissions/$submissionId/finalizepackagerollout"
+            if ($rollout.packageRolloutStatus -ne "PackageRolloutComplete") {
+              throw "Microsoft Store did not complete the active package rollout."
+            }
+            Write-Host "Finalized active Microsoft Store package rollout."
+          }
+
+      - name: Publish to Microsoft Store
+        shell: pwsh
+        env:
+          PRODUCT_ID: ${{ secrets.PRODUCT_ID }}
+        run: |
+          $uploads = @(Get-ChildItem -Path "build/windows/x64/runner/Release" -Filter "*.msixupload" -File)
+          if ($uploads.Count -ne 1) {
+            throw "Expected exactly one symbol-bearing MSIX upload, found $($uploads.Count)."
+          }
+
+          $upload = $uploads[0]
+          Write-Host "Publishing $($upload.FullName) to Microsoft Store product $env:PRODUCT_ID"
+          $storeUploadDirectory = Join-Path $env:RUNNER_TEMP "fitbook-store-upload"
+          New-Item -ItemType Directory -Path $storeUploadDirectory -Force | Out-Null
+          Copy-Item -LiteralPath $upload.FullName -Destination $storeUploadDirectory -Force
+          & msstore publish . --inputDirectory $storeUploadDirectory --appId $env:PRODUCT_ID
+          if ($LASTEXITCODE -ne 0) {
+            throw "Microsoft Store publish failed with exit code $LASTEXITCODE."
+          }
+
+          Write-Host "Verifying Microsoft Store submission status"
+          & msstore submission status $env:PRODUCT_ID
+          if ($LASTEXITCODE -ne 0) {
+            throw "Microsoft Store submission status verification failed with exit code $LASTEXITCODE."
+          }
+
+
+  virustotal:
+    needs: [create-github-release, version-bump]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Download Android artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: android-builds
+          path: android-builds
+
+      - name: VirusTotal Scan
+        id: vt
+        uses: crazy-max/ghaction-virustotal@936d8c5c00afe97d3d9a1af26d017cfdf26800a2 # v5.0.0
+        with:
+          vt_api_key: ${{ secrets.VT_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          files: |
+            android-builds/flutter-apk/app-arm64-v8a-release.apk
+            android-builds/flutter-apk/app-armeabi-v7a-release.apk
+            android-builds/flutter-apk/app-x86_64-release.apk
+
+      - name: Append VirusTotal links to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version-bump.outputs.version }}
+          ANALYSIS: ${{ steps.vt.outputs.analysis }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          VT_SECTION=$'\n\n<details>\n<summary>VirusTotal Analysis</summary>\n\n'
+          IFS=',' read -ra ENTRIES <<< "$ANALYSIS"
+          for entry in "${ENTRIES[@]}"; do
+            filename=$(basename "${entry%%=*}")
+            url="${entry#*=}"
+            VT_SECTION+="- [${filename}](${url})"$'\n'
+          done
+          VT_SECTION+=$'\n</details>'
+          CURRENT_BODY=$(gh release view "$VERSION" --repo "$REPOSITORY" --json body -q .body)
+          gh release edit "$VERSION" --repo "$REPOSITORY" --notes "${CURRENT_BODY}${VT_SECTION}"

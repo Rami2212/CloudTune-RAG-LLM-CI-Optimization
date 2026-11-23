@@ -1,0 +1,72 @@
+# Linux merge gates (Tiers 1 and 2): PRs and pushes to master only.
+# ``essential`` is the fast signal; ``full`` runs the whole linux suite.
+# Both job display names are required status checks on master.
+#
+# Every PR targeting master and every master push runs these real checks so
+# each required check name has one unambiguous result.
+# Full conda / pip matrix runs in ci-scheduled.yml (Tier 3) — no dummy needed.
+name: CI
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+  workflow_dispatch:
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  essential:
+    name: essential (linux / uv)
+    runs-on: ubuntu-latest
+    env:
+      UV_NO_SOURCES: 1
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y mdbtools
+      - run: uv python install 3.13
+      - name: Sync dependencies (PyPI cellpycore only)
+        run: uv sync
+      - name: Run essential tests
+        # No plotutils ignore: the summary-plot suite was excluded because it
+        # "needs a display", but it selects the Agg backend itself and runs
+        # headless fine. The exclusion was hiding real breakage (#567).
+        env:
+          MPLBACKEND: Agg
+        run: uv run pytest -m essential
+      - name: Run cellpy setup
+        run: uv run cellpy setup --silent
+      - name: Run cellpy check
+        run: uv run cellpy info --check
+
+  full:
+    name: full (linux / uv)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      UV_NO_SOURCES: 1
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y mdbtools
+      - run: uv python install 3.13
+      - name: Sync dependencies (PyPI cellpycore only, with plotting extras)
+        # --extra batch pulls in plotly/seaborn so the collector/plotter code
+        # paths actually execute under test (they were never exercised in CI
+        # before — the flip's curve-consumer migration needs this net).
+        run: uv sync --extra batch
+      - name: Run the full test suite
+        # The gate that catches non-essential regressions (issue #530). The
+        # plotutils exclusion is gone (#567): with --extra batch this job has
+        # plotly and seaborn, so it is the only place the figure menu actually
+        # renders. Agg keeps matplotlib headless.
+        env:
+          MPLBACKEND: Agg
+        run: uv run pytest

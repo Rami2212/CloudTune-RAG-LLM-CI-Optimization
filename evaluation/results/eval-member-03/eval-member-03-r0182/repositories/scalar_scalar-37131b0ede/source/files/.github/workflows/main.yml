@@ -1,0 +1,666 @@
+name: Main
+
+# Entry workflow for pushes to the default branch. Runs the same required tests
+# as pr.yml, then — only if every required test passes — invokes the reusable
+# release.yml (npm publish, GitHub release, Scalar registry) alongside the
+# integration publishes and the ToDesktop build. The deploys are not gated the
+# same way: they run on every main push — production for release commits,
+# staging otherwise — with their exact conditions documented on each deploy
+# job below. PRs never run this file: the pull_request / push:main trigger
+# split is the boundary that keeps production publish secrets out of reach of
+# pull requests.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: null
+
+permissions:
+  contents: read
+
+concurrency:
+  # Hardcoded (not templated on github.workflow) because cache-refresh.yml
+  # joins this exact group to stay mutually exclusive with main runs — both
+  # mount the same branch-scoped stickydisks. Keep this string in sync with
+  # the `group:` in .github/workflows/cache-refresh.yml.
+  group: CI-main-base-ci
+  cancel-in-progress: false
+
+env:
+  TURBO_FLAGS: '--concurrency=100% --filter "!./integrations/{java,rust,dotnet,docker,fastapi,django-ninja}/**" --filter "!./projects/proxy-scalar-com/**"'
+  # The Netlify CLI is pinned because netlify@27.3.0 and newer pull in
+  # @netlify/dev@5.0.4, which depends on an @netlify/ai version that was never
+  # published — every install fails to resolve. Drop the pin once upstream
+  # publishes a working release.
+  NETLIFY_CLI_VERSION: '27.1.2'
+  # netlify@27.1.2 pulls in esbuild, sharp and unix-dgram, which run build
+  # scripts. pnpm 12 turns unapproved build scripts into a hard error, so allow
+  # these explicitly when installing the Netlify CLI on the fly.
+  NETLIFY_ALLOW_BUILDS: '--allow-build=esbuild --allow-build=sharp --allow-build=unix-dgram'
+
+jobs:
+  build:
+    # Every other JS job waits on this one, and a PR's first push builds with
+    # an empty turbo cache, so the extra cores pay for themselves here.
+    runs-on: blacksmith-8vcpu-ubuntu-2204
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # Required for build provenance attestation (scalar.js CDN artifact).
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v6.0.3
+        with:
+          persist-credentials: false
+      - name: Build
+        uses: $/.github/actions/build
+        with:
+          packages: './{packages,integrations}/**'
+          archive-output: 'true'
+      - name: Copy and rename standalone.js to scalar.js
+        run: |
+          mkdir -p temp-artifacts
+          cp packages/api-reference/dist/browser/standalone.js temp-artifacts/scalar.js
+      # Build provenance for the CDN artifact: lets consumers verify with
+      # `gh attestation verify scalar.js --repo scalar/scalar` that the file
+      # was produced by this workflow on this commit. Only runs on main pushes
+      # so PR builds aren't signed with provenance.
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        name: Attest scalar.js build provenance
+        uses: actions/attest-build-provenance@v4.1.1
+        with:
+          subject-path: temp-artifacts/scalar.js
+      - name: Upload scalar.js artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: scalar-js
+          path: temp-artifacts/scalar.js
+          retention-days: 3
+      - name: Upload mock server docker entrypoint artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: mock-server-docker-entrypoint
+          path: packages/mock-server/docker/dist/docker-entrypoint.js
+          retention-days: 3
+      - name: Upload build-output artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: build-output
+          path: build-output.tar.gz
+          retention-days: 1
+          compression-level: 0
+      - if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false)
+        name: Upload webpack stats to RelativeCI
+        uses: relative-ci/agent-action@v3.2.3
+        with:
+          key: ${{ secrets.RELATIVE_CI_KEY }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          webpackStatsFile: ./packages/api-reference/dist/browser/webpack-stats.json
+
+  check-changes:
+    runs-on: blacksmith-2vcpu-ubuntu-2204
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      icons_changed: ${{ steps.changes.outputs.icons_changed }}
+      docker_package_changed: ${{ steps.changes.outputs.docker_package_changed }}
+      mock_server_docker_package_changed: ${{ steps.changes.outputs.mock_server_docker_package_changed }}
+      aspnetcore_package_changed: ${{ steps.changes.outputs.aspnetcore_package_changed }}
+      aspire_package_changed: ${{ steps.changes.outputs.aspire_package_changed }}
+      azure_functions_package_changed: ${{ steps.changes.outputs.azure_functions_package_changed }}
+      fastapi_package_changed: ${{ steps.changes.outputs.fastapi_package_changed }}
+      django_ninja_package_changed: ${{ steps.changes.outputs.django_ninja_package_changed }}
+      rust_package_changed: ${{ steps.changes.outputs.rust_package_changed }}
+      java_package_changed: ${{ steps.changes.outputs.java_package_changed }}
+      dotnet_changed: ${{ steps.changes.outputs.dotnet_changed }}
+      java_changed: ${{ steps.changes.outputs.java_changed }}
+      fastapi_changed: ${{ steps.changes.outputs.fastapi_changed }}
+      django_ninja_changed: ${{ steps.changes.outputs.django_ninja_changed }}
+      rust_changed: ${{ steps.changes.outputs.rust_changed }}
+      docker_changed: ${{ steps.changes.outputs.docker_changed }}
+    steps:
+      - uses: actions/checkout@v6.0.3
+        with:
+          persist-credentials: false
+      - id: changes
+        uses: $/.github/actions/check-changes
+
+  lint-icons:
+    if: needs.check-changes.outputs.icons_changed == 'true'
+    runs-on: blacksmith-2vcpu-ubuntu-2204
+    timeout-minutes: 15
+    needs: [build, check-changes]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6.0.3
+      - uses: pnpm/action-setup@v5.0.0
+      - name: Setup Node.js
+        uses: actions/setup-node@v6.4.0
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'pnpm'
+      - name: Install dependencies
+        run: pnpm install
+      - name: Lint Component Library Icons
+        run: pnpm --filter components lint:icons
+      - name: Lint Icon Library Icons
+        run: pnpm --filter icons lint:icons
+
+  types:
+    needs: [build]
+    runs-on: blacksmith-4vcpu-ubuntu-2204
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6.0.3
+      - name: Restore pre-built workspace
+        uses: $/.github/actions/restore-build
+      # `--only` skips the `build` dependencies of types:check: restore-build
+      # already put every package dist/ in place, and turbo used to rebuild
+      # whatever missed its cache before it could start checking types.
+      #
+      # `--cache=local:` turns the turbo cache off for this run, and it must
+      # stay off. With `--only`, a task's hash no longer covers the packages
+      # it depends on, so a cached pass would be replayed even after an
+      # upstream package changed its types.
+      - name: Check types
+        run: |
+          pnpm turbo ${{ env.TURBO_FLAGS }} --only --cache=local: types:check
+
+  # Builds the examples, projects and tooling that the build job leaves out
+  # (it only builds packages and integrations). They depend on those packages,
+  # so this restores their dist/ and builds just the apps on top. Without it,
+  # an example or scalar-app that no longer builds would only fail after merge.
+  # The cache stays off for the same reason as in the types job above.
+  build-apps:
+    needs: [build]
+    runs-on: blacksmith-4vcpu-ubuntu-2204
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6.0.3
+      - name: Restore pre-built workspace
+        uses: $/.github/actions/restore-build
+      - name: Build examples, projects and tooling
+        run: >-
+          pnpm turbo --only --cache=local:
+          --filter './examples/**'
+          --filter './projects/*'
+          --filter '!./projects/proxy-scalar-com'
+          --filter './tooling/**'
+          build
+
+  # test-packages (sharded) and test-projects live in test-js.yml so the shell
+  # loops cannot drift between pr.yml and main.yml.
+  test-js:
+    needs: [build]
+    uses: ./.github/workflows/test-js.yml
+
+  test-integrations:
+    needs: [build]
+    runs-on: blacksmith-4vcpu-ubuntu-2204
+    container:
+      image: scalarapi/playwright-runner:1.62.1
+      options: --privileged
+      env:
+        VM_ID: ${{ env.VM_ID }}
+        GITHUB_REPO_NAME: ${{ env.GITHUB_REPO_NAME }}
+        BLACKSMITH_STICKYDISK_TOKEN: ${{ env.BLACKSMITH_STICKYDISK_TOKEN }}
+        BLACKSMITH_INSTALLATION_MODEL_ID: ${{ env.BLACKSMITH_INSTALLATION_MODEL_ID }}
+        BLACKSMITH_REGION: ${{ env.BLACKSMITH_REGION }}
+    env:
+      HOME: '/root'
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6.0.3
+      - name: Restore pre-built workspace
+        uses: $/.github/actions/restore-build
+      - name: Run tests
+        run: pnpm turbo --filter './integrations/**' --only test
+      - name: Run e2e tests
+        run: pnpm --filter @scalar/nuxt test:e2e
+
+  test-proxy-server:
+    needs: [build]
+    runs-on: blacksmith-2vcpu-ubuntu-2204
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6.0.3
+      - name: Setup Go
+        uses: actions/setup-go@v6.5.0
+        with:
+          go-version-file: projects/proxy-scalar-com/go.mod
+          cache: false
+      - name: Run tests for the proxy server (Go)
+        run: cd projects/proxy-scalar-com && go test -v
+
+  test-server-side-rendering:
+    needs: [build]
+    runs-on: blacksmith-2vcpu-ubuntu-2204
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6.0.3
+      - name: Restore pre-built workspace
+        uses: $/.github/actions/restore-build
+      - name: Start SSR playground and verify it responds
+        run: |
+          pnpm --filter @scalar/server-side-rendering dev &
+          pnpm script wait -p 5173
+          curl -sSf http://localhost:5173 -o /tmp/response.html
+          grep -q "User account created successfully" /tmp/response.html
+        timeout-minutes: 2
+
+  test-block-snapshots:
+    needs: [build]
+    runs-on: blacksmith-4vcpu-ubuntu-2204
+    container:
+      image: scalarapi/playwright-runner:1.62.1
+      options: --privileged
+      env:
+        VM_ID: ${{ env.VM_ID }}
+        GITHUB_REPO_NAME: ${{ env.GITHUB_REPO_NAME }}
+        BLACKSMITH_STICKYDISK_TOKEN: ${{ env.BLACKSMITH_STICKYDISK_TOKEN }}
+        BLACKSMITH_INSTALLATION_MODEL_ID: ${{ env.BLACKSMITH_INSTALLATION_MODEL_ID }}
+        BLACKSMITH_REGION: ${{ env.BLACKSMITH_REGION }}
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6.0.3
+      - name: Restore pre-built workspace
+        uses: $/.github/actions/restore-build
+      - name: Build storybook (@scalar/blocks)
+        run: pnpm --filter blocks build:storybook
+      - name: Run storybook snapshot tests (@scalar/blocks)
+        run: pnpm --filter blocks test:e2e:storybook:ci
+
+  test-e2e-api-reference:
+    needs: [build]
+    runs-on: blacksmith-4vcpu-ubuntu-2204
+    container:
+      image: scalarapi/playwright-runner:1.62.1
+      options: --privileged
+      env:
+        VM_ID: ${{ env.VM_ID }}
+        GITHUB_REPO_NAME: ${{ env.GITHUB_REPO_NAME }}
+        BLACKSMITH_STICKYDISK_TOKEN: ${{ env.BLACKSMITH_STICKYDISK_TOKEN }}
+        BLACKSMITH_INSTALLATION_MODEL_ID: ${{ env.BLACKSMITH_INSTALLATION_MODEL_ID }}
+        BLACKSMITH_REGION: ${{ env.BLACKSMITH_REGION }}
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6.0.3
+      - name: Restore pre-built workspace
+        uses: $/.github/actions/restore-build
+      - name: Build storybook (@scalar/api-reference)
+        run: pnpm --filter api-reference build:storybook
+      - name: Run storybook snapshot tests (@scalar/api-reference)
+        run: pnpm --filter api-reference test:e2e:storybook:ci
+      - name: Run e2e tests (@scalar/api-reference)
+        run: pnpm --filter api-reference test:e2e:ci
+
+  test-e2e-scalar-app:
+    needs: [build]
+    runs-on: blacksmith-4vcpu-ubuntu-2204
+    container:
+      image: scalarapi/playwright-runner:1.62.1
+      options: --privileged
+      env:
+        VM_ID: ${{ env.VM_ID }}
+        GITHUB_REPO_NAME: ${{ env.GITHUB_REPO_NAME }}
+        BLACKSMITH_STICKYDISK_TOKEN: ${{ env.BLACKSMITH_STICKYDISK_TOKEN }}
+        BLACKSMITH_INSTALLATION_MODEL_ID: ${{ env.BLACKSMITH_INSTALLATION_MODEL_ID }}
+        BLACKSMITH_REGION: ${{ env.BLACKSMITH_REGION }}
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6.0.3
+      - name: Restore pre-built workspace
+        uses: $/.github/actions/restore-build
+      - name: Run e2e tests (scalar-app)
+        run: pnpm --filter scalar-app test:e2e:ci
+
+  # Integration build-tests on main push that touches them — gates the matching
+  # publish job in main.yml (Python) or publish-integrations.yml (other registries)
+  # from running against a broken tree.
+  integration-builds:
+    needs: [check-changes, build]
+    uses: ./.github/workflows/integration-builds.yml
+    with:
+      dotnet_changed: ${{ needs.check-changes.outputs.dotnet_changed }}
+      java_changed: ${{ needs.check-changes.outputs.java_changed }}
+      fastapi_changed: ${{ needs.check-changes.outputs.fastapi_changed }}
+      django_ninja_changed: ${{ needs.check-changes.outputs.django_ninja_changed }}
+      rust_changed: ${{ needs.check-changes.outputs.rust_changed }}
+      docker_changed: ${{ needs.check-changes.outputs.docker_changed }}
+
+  required-jobs-main:
+    if: ${{ always() }}
+    runs-on: blacksmith-2vcpu-ubuntu-2204
+    timeout-minutes: 1
+    permissions: {}
+    needs:
+      [
+        build,
+        build-apps,
+        test-server-side-rendering,
+        test-js,
+        test-integrations,
+        test-proxy-server,
+        test-e2e-scalar-app,
+        types,
+      ]
+    steps:
+      - name: Exit with error if some jobs are not successful
+        run: exit 1
+        if: ${{ always() && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'skipped') || contains(needs.*.result, 'cancelled')) }}
+
+  # Hand off to release.yml — only reached after required-jobs-main succeeded.
+  release:
+    # Runs only on main, only when required-jobs-main passed — mirroring
+    # npm-publish's old `needs: [required-jobs-main]` + `if: refs/heads/main`.
+    # With required-jobs-main as the only dependency, no other job can block
+    # the npm release. `!cancelled()` is kept purely as a defensive guard so
+    # the explicit `needs.required-jobs-main.result == 'success'` check below
+    # stays the single gate, instead of relying on the implicit success()
+    # GitHub applies when an `if:` contains no status-check function.
+    if: |
+      !cancelled() &&
+      github.ref == 'refs/heads/main' &&
+      needs.required-jobs-main.result == 'success'
+    needs: [required-jobs-main]
+    # A reusable workflow's jobs cannot request more token permissions than the
+    # calling job holds. release.yml's npm-publish and create-github-release
+    # jobs need write access, so grant it on this caller job — the workflow-level
+    # default of `contents: read` would otherwise reject the call at startup.
+    permissions:
+      contents: write
+      pull-requests: write
+      repository-projects: write
+      id-token: write
+    uses: ./.github/workflows/release.yml
+    secrets: inherit
+
+  # Fan out to non-Python, non-JS integration registries (DockerHub, NuGet,
+  # crates.io, Maven Central). Invoked here rather than inside release.yml so
+  # the web and galaxy deploys below — which need release outputs, available
+  # only when every release.yml job has finished — do not wait behind slow
+  # integration publishes such as the multi-arch aspire Docker build.
+  # Gating matches what the job had inside release.yml: only on main, only
+  # after the npm-publish job itself succeeded. check-changes and
+  # integration-builds are in `needs` purely to forward their outputs below —
+  # NOT to gate on their success. The leading !cancelled() is what makes that
+  # safe: a status-check function in an `if:` disables GitHub's default
+  # skip-a-job-when-any-need-failed-or-was-skipped behavior, so this job is
+  # still evaluated (and runs, given a successful npm publish) even when
+  # check-changes or integration-builds failed or was skipped. Their outputs
+  # then come through empty, so each publish job simply sees its package as
+  # unchanged or its build-test as not passed and skips itself — the same
+  # degraded-input behavior release.yml had. (deploy-api-client below relies on
+  # the identical !cancelled() mechanism to run when release itself is skipped.)
+  publish-integrations:
+    if: |
+      !cancelled() &&
+      github.ref == 'refs/heads/main' &&
+      needs.release.outputs.npm_publish_status == 'success'
+    needs: [check-changes, integration-builds, release]
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/publish-integrations.yml
+    with:
+      published: ${{ needs.release.outputs.published }}
+      docker_package_changed: ${{ needs.check-changes.outputs.docker_package_changed }}
+      mock_server_docker_package_changed: ${{ needs.check-changes.outputs.mock_server_docker_package_changed }}
+      aspnetcore_package_changed: ${{ needs.check-changes.outputs.aspnetcore_package_changed }}
+      aspire_package_changed: ${{ needs.check-changes.outputs.aspire_package_changed }}
+      azure_functions_package_changed: ${{ needs.check-changes.outputs.azure_functions_package_changed }}
+      rust_package_changed: ${{ needs.check-changes.outputs.rust_package_changed }}
+      java_package_changed: ${{ needs.check-changes.outputs.java_package_changed }}
+      docker_build_passed: ${{ needs.integration-builds.outputs.docker_build_passed }}
+      dotnet_build_passed: ${{ needs.integration-builds.outputs.dotnet_build_passed }}
+      rust_build_passed: ${{ needs.integration-builds.outputs.rust_build_passed }}
+      java_build_passed: ${{ needs.integration-builds.outputs.java_build_passed }}
+    secrets: inherit
+
+  # PyPI trusted publishing runs here because the publishing action does not
+  # support OIDC inside reusable workflows. Build packages without OIDC access.
+  fastapi-pack:
+    if: |
+      !cancelled() &&
+      github.ref == 'refs/heads/main' &&
+      needs.release.outputs.npm_publish_status == 'success' &&
+      needs.release.outputs.published == 'true' &&
+      needs.check-changes.outputs.fastapi_package_changed == 'true' &&
+      needs.integration-builds.outputs.fastapi_build_passed == 'true'
+    needs: [check-changes, integration-builds, release]
+    runs-on: blacksmith-2vcpu-ubuntu-2204
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v6.3.0
+        with:
+          python-version: '3.11'
+
+      - name: Install build dependencies
+        working-directory: integrations/fastapi
+        run: |
+          python -m pip install --upgrade pip
+          pip install build
+
+      - name: Build FastAPI package
+        working-directory: integrations/fastapi
+        run: python -m build
+
+      - name: Upload FastAPI distributions
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: fastapi-pypi
+          path: integrations/fastapi/dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  fastapi-publish:
+    if: ${{ !cancelled() && needs.fastapi-pack.result == 'success' }}
+    needs: fastapi-pack
+    runs-on: ubuntu-24.04
+    environment: production-pypi
+    timeout-minutes: 10
+    concurrency:
+      group: fastapi-publish
+      cancel-in-progress: false
+    permissions:
+      id-token: write
+    steps:
+      - name: Download FastAPI distributions
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: fastapi-pypi
+          path: dist/
+
+      - name: Publish FastAPI package to PyPI
+        uses: pypa/gh-action-pypi-publish@v1.14.3
+        with:
+          attestations: true
+
+  django-ninja-pack:
+    if: |
+      !cancelled() &&
+      github.ref == 'refs/heads/main' &&
+      needs.release.outputs.npm_publish_status == 'success' &&
+      needs.release.outputs.published == 'true' &&
+      needs.check-changes.outputs.django_ninja_package_changed == 'true' &&
+      needs.integration-builds.outputs.django_ninja_build_passed == 'true'
+    needs: [check-changes, integration-builds, release]
+    runs-on: blacksmith-2vcpu-ubuntu-2204
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v6.3.0
+        with:
+          python-version: '3.11'
+
+      - name: Install build dependencies
+        working-directory: integrations/django-ninja
+        run: |
+          python -m pip install --upgrade pip
+          pip install build
+
+      - name: Build Django Ninja package
+        working-directory: integrations/django-ninja
+        run: python -m build
+
+      - name: Upload Django Ninja distributions
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: django-ninja-pypi
+          path: integrations/django-ninja/dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  django-ninja-publish:
+    if: ${{ !cancelled() && needs.django-ninja-pack.result == 'success' }}
+    needs: django-ninja-pack
+    runs-on: ubuntu-24.04
+    environment: production-pypi
+    timeout-minutes: 10
+    concurrency:
+      group: django-ninja-publish
+      cancel-in-progress: false
+    permissions:
+      id-token: write
+    steps:
+      - name: Download Django Ninja distributions
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: django-ninja-pypi
+          path: dist/
+
+      - name: Publish Django Ninja package to PyPI
+        uses: pypa/gh-action-pypi-publish@v1.14.3
+        with:
+          attestations: true
+
+  # Desktop build via ToDesktop when scalar-app's version bumped on this
+  # commit. Hoisted out of release.yml for the same reason as
+  # publish-integrations above.
+  todesktop:
+    if: |
+      !cancelled() &&
+      github.ref == 'refs/heads/main' &&
+      needs.release.outputs.npm_publish_status == 'success'
+    needs: [release]
+    uses: ./.github/workflows/todesktop.yml
+    with:
+      scalar_app_released: ${{ needs.release.outputs.scalar_app_released }}
+    secrets: inherit
+
+  # Production Storybook deploy on every main push (independent of release).
+  deploy-components:
+    if: github.ref == 'refs/heads/main'
+    needs: [build]
+    runs-on: blacksmith-2vcpu-ubuntu-2204
+    environment: production-netlify
+    timeout-minutes: 10
+    concurrency:
+      group: deploy-components-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6.0.3
+      - name: Restore pre-built workspace
+        uses: $/.github/actions/restore-build
+      - name: Generate DEPLOY_ID
+        run: echo "DEPLOY_ID=$(pnpx uuid)" >> "$GITHUB_ENV"
+      - name: Build storybook
+        run: pnpm --filter components build:storybook
+      - name: Deploy Storybook to Netlify (Production)
+        run: |
+          pnpm dlx ${{ env.NETLIFY_ALLOW_BUILDS }} netlify@${{ env.NETLIFY_CLI_VERSION }} deploy --dir "./packages/components/storybook-static" \
+            --message "Deployed from GitHub (${{ env.DEPLOY_ID }})" \
+            --site ${{ vars.NETLIFY_SITE_ID_COMPONENTS }} \
+            --auth ${{ secrets.NETLIFY_AUTH_TOKEN }} \
+            --filter @scalar/components \
+            --prod
+
+  # Web app deploy: production when this commit released a public package or
+  # bumped scalar-app's version, staging otherwise. Runs on every main push;
+  # waits for release so it can read the publish result. Gates on the
+  # npm-publish job result specifically (npm_publish_status) — NOT the whole
+  # release workflow — so a failing registry push or GitHub release does not
+  # block the deploy. Integration publishes and the ToDesktop build run as
+  # siblings of this job (see publish-integrations and todesktop above), so
+  # they can neither delay nor block it. An empty value (release skipped
+  # because required tests failed) is treated like the old skipped-npm-publish
+  # case and still deploys to staging.
+  deploy-api-client:
+    if: |
+      !cancelled() &&
+      needs.build.result == 'success' &&
+      needs.check-changes.result == 'success' &&
+      needs.release.outputs.npm_publish_status != 'failure'
+    needs: [build, check-changes, release]
+    uses: ./.github/workflows/deploy-api-client.yml
+    with:
+      environment: ${{ (needs.release.outputs.published == 'true' || needs.release.outputs.scalar_app_released == 'true') && 'production' || 'staging' }}
+      pr-number: ''
+      sha: ${{ github.sha }}
+    secrets: inherit
+
+  # Galaxy deploy to staging on every main push. Gates on the npm-publish job
+  # result (npm_publish_status), not the whole release workflow — same reasoning
+  # as deploy-api-client above. Release commits additionally deploy to
+  # production via deploy-galaxy-production below, so release SHAs land in both
+  # environments.
+  deploy-galaxy:
+    if: |
+      !cancelled() &&
+      needs.build.result == 'success' &&
+      needs.check-changes.result == 'success' &&
+      needs.release.outputs.npm_publish_status != 'failure'
+    needs: [build, check-changes, release]
+    uses: ./.github/workflows/deploy-galaxy.yml
+    with:
+      environment: staging-galaxy-com
+      pr-number: ''
+      sha: ${{ github.sha }}
+    secrets: inherit
+
+  # Release commits also deploy galaxy-scalar-com to production. This runs in
+  # addition to the staging deployment above so release SHAs land in both
+  # environments.
+  deploy-galaxy-production:
+    if: |
+      !cancelled() &&
+      needs.build.result == 'success' &&
+      needs.check-changes.result == 'success' &&
+      needs.release.outputs.npm_publish_status != 'failure' &&
+      needs.release.outputs.published == 'true'
+    needs: [build, check-changes, release]
+    concurrency:
+      group: deploy-galaxy-production-${{ github.ref }}
+      cancel-in-progress: false
+    uses: ./.github/workflows/deploy-galaxy.yml
+    with:
+      environment: production-galaxy-com
+      sha: ${{ github.sha }}
+    secrets: inherit

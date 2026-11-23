@@ -1,0 +1,179 @@
+name: packages
+
+on:
+  push
+
+jobs:
+    compile:
+        name: build
+        runs-on: ubuntu-latest
+        steps:
+          - name: Check out the repo
+            uses: actions/checkout@v7
+          - name: Build on rhel8
+            uses: addnab/docker-run-action@v3
+            with:
+                image: almalinux:8
+                options: -v ${{ github.workspace }}:/work
+                run: |
+                  yum -yq install rpm-build epel-release python3 util-linux
+                  cd /work/
+                  mkdir artifacts
+                  python --version
+                  python3.6 setup.py bdist_rpm --python /usr/bin/python3.6
+                  rm /work/dist/*.tar.gz
+                  rename .rpm .rhel8.rpm /work/dist/*.rpm
+                  mv /work/dist/* artifacts/
+          - name: Build on rhel9
+            uses: addnab/docker-run-action@v3
+            with:
+                image: almalinux:9
+                options: -v ${{ github.workspace }}:/work
+                run: |
+                  yum -yq install rpm-build epel-release python3 \
+                    python3-setuptools util-linux
+                  mkdir -p /work/dist/rhel9
+                  cd /work/
+                  python3.9 setup.py bdist_rpm --python /usr/bin/python3.9 \
+                    --requires "python3-libvirt python3-libnbd python3-lxml python3-tqdm python3-lz4 nbdkit-server nbdkit-python-plugin python3-paramiko python3-typing-extensions python3-colorlog qemu-img openssh-clients"
+                  rm /work/dist/*.tar.gz
+                  rename .rpm .rhel9.rpm /work/dist/*.rpm
+                  mv /work/dist/* artifacts/
+          - name: Build on rhel10
+            uses: addnab/docker-run-action@v3
+            with:
+                image: almalinux:10
+                options: -v ${{ github.workspace }}:/work
+                run: |
+                  yum -yq install rpm-build epel-release python3 \
+                    python3-setuptools util-linux
+                  mkdir -p /work/dist/rhel10
+                  cd /work/
+                  python3.12 setup.py bdist_rpm --python /usr/bin/python3.12 \
+                    --requires "python3-libvirt python3-libnbd python3-lxml python3-tqdm python3-lz4 nbdkit-server nbdkit-python-plugin python3-paramiko python3-typing-extensions python3-colorlog qemu-img openssh-clients"
+                  rm /work/dist/*.tar.gz
+                  rename .rpm .rhel10.rpm /work/dist/*.rpm
+                  mv /work/dist/* artifacts/
+          - name: Build on opensuse 15
+            uses: addnab/docker-run-action@v3
+            with:
+                image: opensuse/leap:15
+                options: -v ${{ github.workspace }}:/work
+                run: |
+                  zypper in -y  rpm-build python3 python3-setuptools
+                  mkdir -p /work/dist/opensuse15
+                  cd /work/
+                  python3 setup.py bdist_rpm --requires "python3-libvirt-python python3-libnbd python3-lxml python3-tqdm python3-lz4 nbdkit-server nbdkit-python-plugin python3-paramiko python3-typing-extensions python3-colorlog python3-dataclasses qemu-tools openssh-clients"
+                  rm /work/dist/*.tar.gz
+                  rename .rpm .opensuse15.rpm /work/dist/*.rpm
+                  mv /work/dist/* artifacts/
+          - name: Build on opensuse 16
+            uses: addnab/docker-run-action@v3
+            with:
+                image: opensuse/leap:16.0
+                options: -v ${{ github.workspace }}:/work
+                run: |
+                  zypper in -y  rpm-build python3 python3-pip
+                  # setuptools shipped with 16.0 mangle shebang:
+                  # https://github.com/pypa/setuptools/issues/4934
+                  pip install setuptools==75.8.2
+                  mkdir -p /work/dist/opensuse16
+                  cd /work/
+                  python3 setup.py bdist_rpm --python /usr/bin/python3 --requires "python3-libvirt-python python3-libnbd python3-lxml python3-tqdm python3-lz4 nbdkit-server nbdkit-python-plugin python3-paramiko python3-typing-extensions python3-colorlog qemu-tools openssh-clients"
+                  rm /work/dist/*.tar.gz
+                  rename .rpm .opensuse16.rpm /work/dist/*.rpm
+                  mv /work/dist/* artifacts/
+          - name: Build on debian
+            uses: addnab/docker-run-action@v3
+            with:
+                image: debian:latest
+                options: -v ${{ github.workspace }}:/work
+                run: |
+                  apt-get update -qy > /dev/null
+                  apt-get install -qy python3-all \
+                    python3-stdeb \
+                    dh-python \
+                    python3-libnbd \
+                    python3-tqdm \
+                    python3-lz4 \
+                    python3-libvirt \
+                    python3-lxml \
+                    python3-paramiko \
+                    python3-colorlog > /dev/null
+                  cd /work/
+                  python3 setup.py --command-packages=stdeb.command bdist_deb
+                  mv deb_dist/*.tar.gz artifacts/
+                  mv deb_dist/*.tar.xz artifacts/
+                  mv deb_dist/*.deb artifacts/
+                  python3 setup.py sdist
+                  mv dist/*.tar.gz artifacts/
+          - name: Test installation on opensuse 15
+            uses: addnab/docker-run-action@v3
+            with:
+                image: opensuse/leap:15
+                options: -v ${{ github.workspace }}:/work
+                run: |
+                  zypper in -y --allow-unsigned-rpm /work/artifacts/*noarch*opensuse15*.rpm
+                  virtnbdbackup -h
+                  virtnbdrestore -h
+                  virtnbdmap -h
+          - name: Test installation on opensuse 16
+            uses: addnab/docker-run-action@v3
+            with:
+                image: opensuse/leap:16.0
+                options: -v ${{ github.workspace }}:/work
+                run: |
+                  zypper in -y --allow-unsigned-rpm /work/artifacts/*noarch*opensuse16*.rpm
+                  virtnbdbackup -h
+                  virtnbdrestore -h
+                  virtnbdmap -h
+          - name: Test installation on rhel8
+            uses: addnab/docker-run-action@v3
+            with:
+                image: almalinux:8
+                options: -v ${{ github.workspace }}:/work
+                run: |
+                  yum -yq install epel-release
+                  yum -yq install /work/artifacts/*noarch*rhel8.rpm
+                  virtnbdbackup -h
+                  virtnbdrestore -h
+                  virtnbdmap -h
+          - name: Test installation on rhel9
+            uses: addnab/docker-run-action@v3
+            with:
+                image: almalinux:9
+                options: -v ${{ github.workspace }}:/work
+                run: |
+                  yum -yq install epel-release
+                  yum -yq install /work/artifacts/*noarch*rhel9.rpm
+                  virtnbdbackup -h
+                  virtnbdrestore -h
+                  virtnbdmap -h
+          - name: Test installation on rhel10
+            uses: addnab/docker-run-action@v3
+            with:
+                image: almalinux:10
+                options: -v ${{ github.workspace }}:/work
+                run: |
+                  yum -yq install epel-release
+                  yum -yq install /work/artifacts/*noarch*rhel10.rpm
+                  virtnbdbackup -h
+                  virtnbdrestore -h
+                  virtnbdmap -h
+          - name: Test installation on debian
+            uses: addnab/docker-run-action@v3
+            with:
+                image: debian:latest
+                options: -v ${{ github.workspace }}:/work
+                run: |
+                  apt update -qy > /dev/null
+                  apt install -qy /work/artifacts/*.deb > /dev/null
+                  virtnbdbackup -h
+                  virtnbdrestore -h
+                  virtnbdmap -h
+          - name: Archive Results
+            if: always()
+            uses: actions/upload-artifact@v7
+            with:
+              name: packages
+              path: artifacts/
