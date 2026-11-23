@@ -1,0 +1,135 @@
+name: Build packages
+
+on:
+    push:
+    pull_request:
+    release:
+        types:
+            - published
+            - prereleased
+
+jobs:
+
+    build:
+        runs-on: ubuntu-latest
+
+        strategy:
+            fail-fast: false
+            matrix:
+              builder:
+                - 5.6-1:1.18.3-27.3.4.2-2
+                - 6.1-3:1.19.1-28.4.1-2
+              os:
+                - ubuntu20.04
+                - ubuntu22.04
+                - debian11
+                - debian12
+                - el9
+                - amzn2
+                - amzn2023
+
+        steps:
+        - uses: actions/checkout@v4
+          with:
+            fetch-depth: 0
+        - name: build emqx packages
+          env:
+            BUILDER_IMAGE: "ghcr.io/emqx/emqx-builder/${{ matrix.builder }}-${{ matrix.os }}"
+          # NOTE
+          # Doing it manually instead of just setting `container` for the job because of
+          # discrepancies in the images' environments affecting even basic things like
+          # repo checkouts.
+          # The package smoke test in build.sh publishes to an EMQX container
+          # on the same docker network.
+          run: |
+            docker network create emqtt-pkg
+            docker run -d --name emqx --network emqtt-pkg -p 127.0.0.1:18083:18083 emqx/emqx:latest
+            timeout 120 sh -c 'until curl -sf http://127.0.0.1:18083/status >/dev/null; do sleep 1; done'
+            docker run --rm --name emqtt-${{ matrix.os }}-build --network emqtt-pkg -e EMQTT_TEST_BROKER=emqx -v $(pwd):/emqtt --workdir /emqtt ${BUILDER_IMAGE} /bin/bash -c '
+              git config --global --add safe.directory "${PWD}"
+              .github/workflows/script/build.sh
+            '
+            sudo bash -c '
+              cd _packages
+              for var in $(ls); do echo $(sha256sum $var | awk "{print $1}") > $var.sha256; done
+            '
+        - uses: actions/upload-artifact@v4
+          if: ${{ github.event_name == 'release' }}
+          with:
+            name: packages
+            path: _packages/*
+
+    build-on-mac:
+        runs-on: macos-latest
+
+        strategy:
+          fail-fast: false
+          matrix:
+            otp:
+              - 27
+              - 28
+
+        steps:
+        - uses: actions/checkout@v4
+        - name: prepare
+          run: |
+            # See https://github.com/actions/setup-python/issues/577
+            # brew update
+            # Use the versioned formula for every OTP release. The unversioned
+            # erlang formula tracks the latest stable release, not the matrix
+            # version.
+            erlang_formula=erlang@${{ matrix.otp }}
+            brew install curl zip unzip gnu-sed "${erlang_formula}" coreutils
+            echo "$(brew --prefix)/opt/${erlang_formula}/bin" >> $GITHUB_PATH
+            echo "$(brew --prefix)/opt/unzip/bin" >> $GITHUB_PATH
+            echo "$(brew --prefix)/bin" >> $GITHUB_PATH
+        - name: build
+          run: |
+            echo "${PATH}"
+            erl -noshell -eval 'io:format("~s~n", [erlang:system_info(otp_release)]), halt(0).'
+            .github/workflows/script/build.sh
+            pkg=emqtt-macos-$(git describe --tags --always).zip
+            openssl dgst -sha256 _packages/$pkg | awk '{print $2}' > _packages/$pkg.sha256
+        - uses: actions/upload-artifact@v4
+          if: ${{ github.event_name == 'release' }}
+          with:
+            name: packages-mac
+            path: _packages/*
+
+    release:
+        runs-on: ubuntu-latest
+
+        needs: [build, build-on-mac]
+        if: ${{ github.event_name == 'release' }}
+
+        steps:
+        - uses: actions/checkout@v4
+        - uses: actions/download-artifact@v3
+          with:
+            name: packages
+            path: _packages
+        - uses: actions/download-artifact@v3
+          with:
+            name: packages-mac
+            path: _packages
+        - name: set aws
+          uses: aws-actions/configure-aws-credentials@v1-node16
+          with:
+            aws-access-key-id: ${{ secrets.AwsAccessKeyId }}
+            aws-secret-access-key: ${{ secrets.AwsSecretAccessKey }}
+            aws-region: us-west-2
+        - name: verify packages
+          working-directory: _packages
+          run: |
+            for var in $(ls | grep emqtt | grep -v sha256); do
+              echo "$(cat $var.sha256) $var" | sha256sum -c || exit 1
+            done
+        - name: upload aws
+          run: |
+            version=$(echo ${{ github.ref }} | sed -r  "s .*/.*/(.*) \1 g")
+            aws s3 cp --recursive ./_packages  s3://packages.emqx.io/emqtt/$version
+            aws cloudfront create-invalidation --distribution-id E3TYD0WSP4S14P --paths "/emqtt/$version/*"
+        - name: upload github
+          uses: softprops/action-gh-release@v1
+          with:
+            files: "_packages/*"

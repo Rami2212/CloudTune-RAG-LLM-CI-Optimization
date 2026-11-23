@@ -1,0 +1,294 @@
+name: Build
+
+on:
+  schedule:
+    # This builds the nightly version of Rugix.
+    - cron: "0 0 * * *"
+  # Pull requests cover other branches, so that their pushes do not run twice.
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the release (requires selecting a release tag)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}-${{ github.event_name == 'push' || inputs.publish || false }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  RUGIX_GIT_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+
+jobs:
+  checks:
+    uses: ./.github/workflows/check-and-lint.yml
+
+  validate_release:
+    if: github.event_name == 'push' && github.ref_type == 'tag' || inputs.publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate Release
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          test "$REF_TYPE" = tag
+          python3 scripts/release.py validate "$TAG"
+
+  build_binaries_linux:
+    name: "Build Binaries (${{ matrix.target }})"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-musl
+          - aarch64-unknown-linux-gnu
+          - armv7-unknown-linux-musleabihf
+          - armv7-unknown-linux-gnueabihf
+          - arm-unknown-linux-musleabihf
+          - arm-unknown-linux-gnueabihf
+          - arm-unknown-linux-musleabi
+          - arm-unknown-linux-gnueabi
+          - x86_64-unknown-linux-musl
+          - x86_64-unknown-linux-gnu
+          - i686-unknown-linux-musl
+          - riscv64gc-unknown-linux-gnu
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-tags: true
+          fetch-depth: 0
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+        with:
+          version: 2026.7.5
+          install: false
+          cache: true
+      - name: Install Rust Toolchain
+        run: |
+          rustup show active-toolchain
+          rustup target add ${{ matrix.target }}
+      - name: Install Locked Tools
+        env:
+          MISE_GITHUB_TOKEN: ${{ github.token }}
+        run: mise install --locked github:cross-rs/cross github:CycloneDX/cyclonedx-rust-cargo
+      - name: Build Binaries
+        run: mise run --skip-tools build ${{ matrix.target }}
+      - name: Upload Artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: binaries-${{ matrix.target }}
+          path: build/binaries/binaries-${{ matrix.target }}.tar
+          if-no-files-found: error
+
+  build_binaries_mac:
+    name: "Build Binaries (${{ matrix.target }})"
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-tags: true
+          fetch-depth: 0
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+        with:
+          version: 2026.7.5
+          install: false
+          cache: true
+      - name: Install Rust Toolchain
+        run: |
+          rustup show active-toolchain
+          rustup target add ${{ matrix.target }}
+      - name: Build Binaries
+        run: mise run --skip-tools build:mac ${{ matrix.target }}
+      - name: Upload Artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: binaries-${{ matrix.target }}
+          path: binaries-${{ matrix.target }}.tar
+          if-no-files-found: error
+
+  test:
+    name: Test
+    runs-on: [self-hosted, si-large]
+    permissions:
+      contents: read
+      packages: read
+    needs:
+      - build_binaries_linux
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download Binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: binaries-*
+          path: build/binaries
+          merge-multiple: true
+      - name: Extract Binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd build/binaries
+          for tar_file in *.tar; do
+            if [ -f "${tar_file}" ]; then
+              target_name="${tar_file%.tar}"
+              target_name="${target_name#binaries-}"
+              mkdir -p "$target_name"
+              tar -xf "$tar_file" -C "$target_name"
+              rm -f "$tar_file"
+            fi
+          done
+          find .
+      - name: Run Tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RUGIX_BAKERY_IMAGE="ghcr.io/rugix/rugix-bakery:branch-main"
+          RUGIX_BINARIES_DIR="$(pwd)/build/binaries"
+          export RUGIX_BINARIES_DIR
+          export RUGIX_BUNDLER="$RUGIX_BINARIES_DIR/x86_64-unknown-linux-musl/rugix-bundler"
+          podman pull "$RUGIX_BAKERY_IMAGE"
+          mise install --locked python uv
+          mise run --skip-tools test:system -n 4
+      - name: Upload Test Outputs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-outputs
+          path: tests/test-outputs/
+          if-no-files-found: ignore
+
+  build_debs:
+    name: "Build Debian Packages (${{ matrix.target }})"
+    runs-on: ubuntu-latest
+    needs:
+      - build_binaries_linux
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-musl
+          - aarch64-unknown-linux-gnu
+          - armv7-unknown-linux-musleabihf
+          - armv7-unknown-linux-gnueabihf
+          - x86_64-unknown-linux-musl
+          - x86_64-unknown-linux-gnu
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-tags: true
+          fetch-depth: 0
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+        with:
+          version: 2026.7.5
+          install: false
+      - name: Download Binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: binaries-${{ matrix.target }}
+          path: build/binaries
+      - name: Extract Binaries
+        run: |
+          cd build/binaries
+          mkdir -p ${{ matrix.target }}
+          tar -xf binaries-${{ matrix.target }}.tar -C ${{ matrix.target }}
+          rm -f binaries-${{ matrix.target }}.tar
+      - name: Build Debian Packages
+        run: mise run --skip-tools package:deb ${{ matrix.target }}
+      - name: Upload Artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: debs-${{ matrix.target }}
+          path: build/debs/*.deb
+          if-no-files-found: error
+
+  build_source_package:
+    name: "Build Debian Source Package"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-tags: true
+          fetch-depth: 0
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+        with:
+          version: 2026.7.5
+          install: false
+      - name: Build Source Package
+        run: mise run --skip-tools package:source
+      - name: Upload Artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: source-package
+          path: build/source/*
+          if-no-files-found: error
+
+  publish_release:
+    name: "Publish Release"
+    if: github.repository == 'rugix/rugix'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    needs:
+      - validate_release
+      - checks
+      - build_binaries_linux
+      - build_binaries_mac
+      - build_debs
+      - build_source_package
+      - test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download Binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: binaries-*
+          path: build/binaries
+          merge-multiple: true
+      - name: Download Debian Packages
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: debs-*
+          path: build/debs
+          merge-multiple: true
+      - name: Download Source Package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: source-package
+          path: build/source
+      - name: Publish Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: python3 scripts/release.py publish "$TAG"

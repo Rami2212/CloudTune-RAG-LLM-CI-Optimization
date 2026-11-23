@@ -1,0 +1,55 @@
+name: Nightly
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - "src/**"
+      - "templates/userscript/**"
+      - "build/**"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/nightly.yaml"
+  workflow_dispatch:
+
+concurrency:
+  group: nightly
+  cancel-in-progress: true
+
+jobs:
+  nightly:
+    if: github.repository == 'adsbypasser/adsbypasser'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build userscripts
+        run: npm run build
+        env:
+          ADSBYPASSER_NIGHTLY: "1"
+
+      - name: Deploy to nightly repository
+        run: ./build/ci/deploy-nightly.sh
+        env:
+          SOURCE_DIR: ./dist
+          TARGET_REPO: ${{ vars.GH_NIGHTLY_REPO }}
+          TARGET_REPO_TOKEN: ${{ secrets.GH_PAT }}
+          COMMIT_SHA: ${{ github.sha }}

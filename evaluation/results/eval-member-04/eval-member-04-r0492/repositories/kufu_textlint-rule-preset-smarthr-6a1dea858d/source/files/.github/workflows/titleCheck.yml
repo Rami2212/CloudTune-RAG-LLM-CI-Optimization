@@ -1,0 +1,30 @@
+name: PR Title Check
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+env:
+  NPM_CONFIG_IGNORE_SCRIPTS: 'true'
+  NPM_CONFIG_BEFORE: ''
+  PNPM_CONFIG_MINIMUM_RELEASE_AGE: '10080' # minutes (7 days)
+
+jobs:
+  conventional_commits:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set NPM_CONFIG_BEFORE
+        run: |
+          echo "NPM_CONFIG_BEFORE=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+      - name: check title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          regex="^(feat|fix|docs|chore|style|refactor|perf|test)!?(\([^\)]+\))?:[[:space:]].+"
+          if [[ "${TITLE}" =~ $regex ]]; then
+              echo OK
+          else
+              echo "::error::Pull Request のタイトルが Conventional Commits 形式にマッチしません"
+              exit 1
+          fi

@@ -1,0 +1,128 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 6 optimizations:
+# - [HIGH] Add npm dependency cache to "build-linux" job
+# - [HIGH] Add npm dependency cache to "build-mac" job
+# - [HIGH] Add npm dependency cache to "build-windows" job
+# - [HIGH] Switch "build-mac" from macOS to ubuntu runner
+# - [MEDIUM] Switch "build-windows" from Windows to ubuntu runner
+# - [MEDIUM] 3 jobs clone the repo — consider artifact sharing
+# Estimated savings: ~13 min/run
+#
+name: Build (Manual)
+'on':
+  workflow_dispatch: null
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install strip-nondeterminism
+        run: sudo apt-get install strip-nondeterminism
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install dependencies
+        run: npm ci --loglevel=info
+      - name: Fetch
+        run: npm run fetch
+      - name: Compile
+        run: npm run webpack:prod
+      - name: Package
+        run: |
+          node release-automation/build.mjs --debian --tarball --appimage --x64 --armv7l --arm64
+      - name: Print file tree
+        run: node scripts/print-file-tree.mjs dist
+      - name: Upload artifacts to GitHub Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            dist/*.deb
+            dist/*.tar.gz
+            dist/*.AppImage
+  build-mac:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install dependencies
+        run: npm ci --loglevel=info
+      - name: Fetch
+        run: npm run fetch
+      - name: Compile
+        run: npm run webpack:prod
+      - name: Package
+        run: |
+          # Need to run the universal builds as separate commands or it breaks when @electron/universal
+          # diffs the ASARs and finds spurious differences. Not clear why.
+          node release-automation/build.mjs --mac --universal --production
+          node release-automation/build.mjs --mac-legacy-11 --universal --production
+          node release-automation/build.mjs --mac-legacy-10.13-10.14 --mac-legacy-10.15 --x64
+      - name: Print file tree
+        run: node scripts/print-file-tree.mjs dist
+      - name: Upload artifacts to GitHub Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac
+          path: dist/*.dmg
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+          path: repo
+      - name: 'Move repository to D: drive'
+        run: |
+          Copy-Item -Path repo -Destination D:\repo -Recurse
+          Remove-Item -Path repo -Recurse -Force
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: 'Configure npm to use D: drive'
+        run: |
+          npm config set cache D:\npm-cache
+          npm config set prefix D:\npm-prefix
+      - name: Install dependencies
+        working-directory: D:\repo
+        run: npm ci --loglevel=info
+      - name: Fetch
+        working-directory: D:\repo
+        run: npm run fetch
+      - name: Compile
+        working-directory: D:\repo
+        run: npm run webpack:prod
+      - name: Package
+        working-directory: D:\repo
+        run: |
+          node release-automation/build.mjs --windows --microsoft-store --x64 --ia32 --arm64
+          node release-automation/build.mjs --windows-portable --x64
+          node release-automation/build.mjs --windows-legacy --ia32 --x64
+      - name: Print file tree
+        working-directory: D:\repo
+        run: node scripts/print-file-tree.mjs dist
+      - name: Upload artifacts to GitHub Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            D:\repo\dist\*.exe
+            D:\repo\dist\*.appx

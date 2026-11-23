@@ -1,0 +1,54 @@
+name: Check E2E Account Balances
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-balances:
+    name: ${{ matrix.account.label }}
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        account:
+          - label: E2E Test Account
+            key_id: e2e
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /package.json
+            /yarn.lock
+            /.yarnrc.yml
+            /.yarn-4.18.1.cjs
+            /packages/*/package.json
+            /packages/web/etc/
+            /packages/e2e/
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          package-manager-cache: false
+          node-version: 24.x
+      - name: Install dependencies
+        run: yarn workspaces focus app-osmosis-e2e
+      - name: Resolve private key
+        env:
+          KEY_ID: ${{ matrix.account.key_id }}
+          PK_PREVIEW: ${{ secrets.E2E_PRIVATE_KEY_PREVIEW }}
+        run: |
+          case "$KEY_ID" in
+            e2e) echo "PRIVATE_KEY=$PK_PREVIEW" >> "$GITHUB_ENV" ;;
+            *)
+              echo "Unknown key_id: $KEY_ID" >&2
+              exit 1
+              ;;
+          esac
+      - name: Check balances
+        env:
+          ACCOUNT_LABEL: ${{ matrix.account.label }}
+        run: yarn --cwd packages/e2e check-balances || true

@@ -1,0 +1,94 @@
+name: Build VS Code extension
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# Read-only by default; the release job asks for what it needs.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build_vscode_ext:
+    name: Build VS Code extension
+    runs-on: ubuntu-latest
+    if: ${{ github.repository == 'bazel-contrib/vscode-bazel' }} # Allow CI-runs only for events from/to this repository
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # Bazel provides Node.js and all npm dependencies; no npm install needed.
+      - uses: bazel-contrib/setup-bazel@104e3eea9447cdaa4b00d0fb46191a3985d26ab3 # 0.19.1
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
+
+      # The integration tests run bazel inside this fixture workspace. Building
+      # it up front catches fixture breakage early and warms bazelisk's cache.
+      - name: Build the test fixture workspace
+        run: bazel build //...
+        working-directory: ${{ github.workspace }}/test/bazel_workspace/
+
+      # Required for the test cases
+      - name: Install system dependencies
+        run: sudo apt install -y binutils rustfilt
+
+      # Fails if package.json changed without `bazel run //:pnpm -- install
+      # --lockfile-only` being run (Renovate and Dependabot do this themselves).
+      - name: Check pnpm-lock.yaml matches package.json
+        run: bazel run //:pnpm -- install --lockfile-only --frozen-lockfile
+
+      # Typecheck, lint, format check, buildifier, grammar snapshot and VS
+      # Code integration tests. xvfb provides the display VS Code needs;
+      # buildifier for the integration tests comes from Bazel.
+      - name: Test
+        run: xvfb-run -a bazel test //...
+
+      # Writes vscode-bazel-<version>.vsix into the checkout for the artifact
+      # step below.
+      - name: Package VS Code extension
+        run: bazel run //:export_vsix
+
+      - name: Upload Workflow Artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: vscode-bazel-prerelease.vsix
+          path: vscode-bazel-*.vsix
+          if-no-files-found: error
+
+  # Runs no code from the repository: release-please, then the .vsix the
+  # build job produced and tested is attached to the release it created.
+  release:
+    name: Release
+    needs: build_vscode_ext
+    runs-on: ubuntu-latest
+    if: ${{ github.repository == 'bazel-contrib/vscode-bazel' && github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+    permissions:
+      contents: write # create the release and upload its asset
+      pull-requests: write # open and update the release PR
+    steps:
+      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
+        id: release
+        with:
+          release-type: node
+
+      - name: Download the tested .vsix
+        if: ${{ steps.release.outputs.release_created }}
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: vscode-bazel-prerelease.vsix
+
+      - name: Upload Release Artifact
+        if: ${{ steps.release.outputs.release_created }}
+        run: gh release upload "$TAG" vscode-bazel-*.vsix
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # No checkout here, so tell gh which repository to use.
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.release.outputs.tag_name }}

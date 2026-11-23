@@ -1,0 +1,34 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [HIGH] Add npm dependency cache to "lib-build" job
+# - [MEDIUM] Use "npm ci" instead of "npm install" in "lib-build"
+# Estimated savings: ~5 min/run
+#
+name: CI
+
+on: [push]
+
+jobs:
+  lib-build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node_version:
+        - "15"
+        - "16"
+        - "17"
+    steps:
+    - uses: actions/checkout@v2
+    - uses: actions/setup-node@v2
+      with:
+        node-version: ${{ matrix.node_version }}
+    - run: npm install
+    - run: npm test
+    - name: IRC Message Action
+      uses: Gottox/irc-message-action@main
+      if: failure()
+      with:
+        channel: "Gottox"
+        nickname: gh-gottox
+        message: |-
+          [${{ github.workflow }} failed] ${{ github.ref }} https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}

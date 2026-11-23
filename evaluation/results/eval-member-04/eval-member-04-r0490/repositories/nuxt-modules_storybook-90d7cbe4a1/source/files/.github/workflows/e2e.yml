@@ -1,0 +1,132 @@
+name: E2E tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  e2e-tests:
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-${{ matrix.os }}
+      cancel-in-progress: true
+    name: 'Starter'
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    env:
+      pnpm_config_strict_dep_builds: 'false'
+      NODE_OPTIONS: --max-old-space-size=4096
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26
+          cache: pnpm
+
+      - name: Install Verdaccio
+        shell: bash
+        run: |
+          pnpm install -g verdaccio wait-on
+          # Start Verdaccio locally
+          verdaccio --listen 4873 &
+          wait-on --log http://localhost:4873
+          curl -s http://localhost:4873
+          # create test user and extract token for publishing
+          TOKEN_RES=$(curl -s -XPUT \
+                    -H "Content-type: application/json" \
+                    -d '{ "name": "test", "password": "test" }' \
+                    'http://localhost:4873/-/user/org.couchdb.user:test')
+          TOKEN=$(echo "$TOKEN_RES" | jq -r '.token')
+          # set auth token for the Verdaccio host (do NOT set registry globally here)
+          pnpm config set //localhost:4873/:_authToken $TOKEN
+          # record Verdaccio registry URL for targeted use later
+          echo "VERDACCIO_REGISTRY=http://localhost:4873/" >> $GITHUB_ENV
+
+      - name: Read Storybook version from the pnpm catalog
+        shell: bash
+        run: |
+          STORYBOOK_VERSION="$(sed -n "s/^  storybook: //p" pnpm-workspace.yaml | tr -d '\r')"
+          test -n "$STORYBOOK_VERSION"
+          echo "STORYBOOK_VERSION=$STORYBOOK_VERSION" >> $GITHUB_ENV
+
+      - name: Install dependencies
+        shell: bash
+        run: pnpm install
+
+      - name: Build packages
+        shell: bash
+        run: |
+          pnpm build
+          # Give the packages a version that cannot exist upstream. Without this,
+          # `pnpm publish` skips them ("no new packages that should be published")
+          # because Verdaccio proxies npmjs, where the current version already
+          # exists -- and the example then silently installs the stale npm copy.
+          E2E_VERSION="$(node -p "require('./packages/storybook-addon/package.json').version")-e2e.${GITHUB_RUN_ID}"
+          for pkg in packages/*/; do (cd "$pkg" && npm pkg set version="$E2E_VERSION"); done
+          echo "E2E_VERSION=$E2E_VERSION" >> $GITHUB_ENV
+          # Publish to the local Verdaccio only (do NOT change global registry)
+          pnpm publish --recursive --tag latest --no-git-checks --report-summary --registry $VERDACCIO_REGISTRY
+        env:
+          NODE_ENV: 'production'
+
+      - name: Restore public registry
+        shell: bash
+        run: |
+          # Ensure subsequent installs use the public registry by default
+          pnpm config set registry https://registry.npmjs.org/
+
+      - name: Create Sample Project
+        shell: bash
+        run: |
+          cd "${{ runner.temp }}"
+          CI=true npx nuxi init example --template minimal --packageManager pnpm --no-modules --no-install --force --gitInit=false
+          cd example
+          # Configure scoped registries globally so pnpm can find our packages
+          pnpm config set @nuxtjs:registry $VERDACCIO_REGISTRY
+          pnpm config set @storybook-vue:registry $VERDACCIO_REGISTRY
+          # Install storybook packages (storybook init doesn't work with Verdaccio).
+          # Pin the exact e2e version so that falling back to npmjs fails loudly
+          # instead of silently resolving a stale published release.
+          pnpm add -D @storybook-vue/nuxt@$E2E_VERSION storybook@$STORYBOOK_VERSION
+          # Create Storybook configuration manually
+          mkdir -p .storybook stories
+          cat > .storybook/main.ts << 'MAINEOF'
+          import type { StorybookConfig } from '@storybook-vue/nuxt'
+          const config: StorybookConfig = {
+            stories: ['../stories/**/*.stories.@(js|jsx|mjs|ts|tsx)'],
+            framework: { name: '@storybook-vue/nuxt', options: {} },
+          }
+          export default config
+          MAINEOF
+          cat > stories/Welcome.stories.ts << 'STORYEOF'
+          import type { Meta, StoryObj } from '@storybook-vue/nuxt'
+          const meta: Meta = { title: 'Welcome' }
+          export default meta
+          export const Default: StoryObj = {
+            render: () => ({ template: '<h1>Storybook works!</h1>' }),
+          }
+          STORYEOF
+          pnpm pkg set scripts.storybook="storybook dev -p 6006"
+          pnpm pkg set scripts.build-storybook="storybook build"
+          pnpm install --ignore-scripts
+          pnpm list --depth 0
+          pnpm run postinstall
+
+      - name: Build Storybook
+        shell: bash
+        working-directory: ${{ runner.temp }}/example
+        run: pnpm build-storybook

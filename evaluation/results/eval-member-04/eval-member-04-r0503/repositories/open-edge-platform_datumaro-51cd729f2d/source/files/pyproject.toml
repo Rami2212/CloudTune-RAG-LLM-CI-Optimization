@@ -1,0 +1,283 @@
+[build-system]
+requires = ["setuptools", "wheel", "pybind11", "setuptools-rust"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "datumaro"
+dynamic = ["version"]
+description = "Dataset Management Framework (Datumaro)"
+maintainers = [
+    { name = "Intel Open Edge Platform" },
+]
+license-files = ["LICENSE"]
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "attrs>=25.3",  # attrs doesn't follow semantic versioning
+    "cachetools~=7.0",
+    "defusedxml~=0.7",
+    "imagesize~=2.0",
+    "json-stream~=2.4",
+    "lxml~=6.0",
+    "numpy>=2.2,<2.5",
+    "opencv-python-headless>=4.10,<5",
+    "orjson~=3.10",
+    "pandas~=2.3",
+    "pillow~=13.0",
+    "pyarrow~=25.0",
+    "pycocotools~=2.0",
+    "PyYAML~=6.0",
+    "ruamel.yaml~=0.19.1",
+    "shapely~=2.1",
+    "tqdm~=4.67",
+    "typing_extensions~=4.15",
+]
+
+[project.scripts]
+datum = "datumaro.cli.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/open-edge-platform/datumaro"
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "prek"
+]
+
+test = [
+    "pytest>=5.3.5",
+    "pytest-cov>=4.0.0",
+    "pytest-stress",
+    "pytest-html",
+    "coverage",
+    "dill",
+    "tifffile",
+]
+
+docs = [
+    "markupsafe==3.0.4",
+    "nbconvert>=7.2.3",
+    "ipython==8.39.0",
+    "sphinx==7.4.7",
+    "pydata-sphinx-theme==0.17.1",
+    "sphinx-copybutton",
+    "sphinx-autoapi",
+    "myst-parser",
+    "nbsphinx",
+    "jupyter",
+    "jupyterlab>=4.5.7",
+    "notebook>=7.5.6",
+    "jupytext",
+    "pandoc",
+    "sphinx-design",
+    "sphinx-toolbox",
+]
+
+# Tensorflow support
+# Exclude Tensorflow from Python 3.13 as it is not supported yet
+# Also exclude TensorFlow from the MacOS checks due to the following issue:
+# https://github.com/tensorflow/tensorflow/issues/98563
+tf = [
+    "tensorflow; python_version < '3.13' and sys_platform != 'darwin'",
+    # Pin keras to a non-vulnerable version
+    "keras>=3.13.2; python_version < '3.13' and sys_platform != 'darwin'",
+]
+# TODO: Reenable tfds
+#tfds = [
+#    "tensorflow-datasets; python_version < '3.13' and sys_platform != 'darwin'",
+#    "absl-py>=0.12.0; python_version < '3.13' and sys_platform != 'darwin'",
+#]
+
+# PyTorch support
+torch = ["torch>=2.9", "torchvision>=0.24"]
+
+# Kaggle download support
+kaggle = ["kaggle"]
+
+# NDR, mpii file format, missing value detection in tabular data
+scipy = ["scipy"]
+
+# Tabular data processing
+nlp = ["nltk", "tokenizers", "portalocker"]
+
+# Comparator
+tabulate = ["tabulate"]
+
+# Any dependencies needed by the CLI
+# 2.3 has an unlisted dependency on PyTorch, which we don't need
+cli = ["tensorboardX>=1.8,!=2.3", "tabulate", "scipy", "matplotlib>=3.3.1"]
+
+# Visualizer
+visualizer = ["matplotlib>=3.3.1"]
+
+# NYU Depth Dataset v2 file format
+h5py = ["h5py>=3.15.0"]
+
+# BraTS file format
+nibabel = ["nibabel>=3.2.1"]
+
+# AVA dataset
+protobuf = ["protobuf"]
+
+experimental = ["polars~=1.35"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+zip-safe = false
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["datumaro*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "datumaro.version.__version__"}
+
+[tool.pybind11.ext_modules]
+"datumaro._capi" = { sources = ["src/datumaro/capi/pybind.cpp"], extra_compile_args = ["-O3"] }
+
+[[tool.setuptools-rust.ext-modules]]
+target = "datumaro.rust_api"
+path = "rust/Cargo.toml"
+binding = "PyO3"
+
+[tool.coverage.run]
+branch = true
+
+source = [
+    "src/",
+]
+
+omit = [
+    "src/datumaro/__main__.py",
+    "src/datumaro/version.py",
+    "tests/*",
+]
+
+[tool.cibuildwheel]
+# reference docs - https://cibuildwheel.readthedocs.io/en/stable/options/#build-skip
+build = "cp311-*_x86_64 cp312-*_x86_64 cp313-*_x86_64 cp314-*_x86_64 cp311-*_amd64 cp312-*_amd64 cp313-*_amd64 cp314-*_amd64 cp311-*_arm64 cp312-*_arm64 cp313-*_arm64 cp314-*_arm64"
+
+[tool.cibuildwheel.linux]
+before-all = [
+    "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o rustup-init.sh",
+    "sh ./rustup-init.sh -y --default-toolchain stable --profile minimal"
+]
+
+environment = { PATH="$HOME/.cargo/bin:$PATH" }
+
+[tool.coverage.report]
+# Regexes for lines to exclude from consideration
+exclude_lines = [
+    # Have to re-enable the standard pragma
+    'pragma: no cover',
+
+    # Don't complain about missing debug-only code:
+    'def __repr__',
+    'if\s+[\w\.()]+\.isEnabledFor\(log\.DEBUG\):',
+
+    # Don't complain if tests don't hit defensive assertion code:
+    'raise AssertionError',
+    'raise NotImplementedError',
+
+    # Don't complain if non-runnable code isn't run:
+    'if 0:',
+    'if __name__ == .__main__.:',
+
+    # Don't complain for the type checking code:
+    'if TYPE_CHECKING:'
+]
+
+# don't fail on the code that can be found
+ignore_errors = true
+
+skip_empty = true
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+# Exclude a variety of commonly ignored directories.
+exclude = [
+    ".bzr",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".hg",
+    ".mypy_cache",
+    ".nox",
+    ".pants.d",
+    ".pytype",
+    ".ruff_cache",
+    ".svn",
+    ".venv",
+    "__pypackages__",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+    "node_modules",
+    "venv",
+]
+
+extend-exclude = [
+    "src/datumaro/plugins/openvino_plugin/samples"
+]
+
+[tool.ruff.lint]
+select = ["ARG", "E", "F", "I", "N", "UP", "YTT", "ASYNC", "S", "COM", "C4", "FA", "PIE", "PYI", "Q", "RSE", "RET", "SIM",
+    "TID", "TC", "PL", "RUF", "C90", "D103", "ANN001", "ANN201", "ANN205", "FAST"]
+
+ignore = ["N801", "N805","N806","N807", "N818", "COM812", "RET503", "SIM108", "SIM105", "PLR2004",
+    "RUF010", "TC001",  "RUF012", "PLC0415"]
+
+fixable = ["ALL"]
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[tool.ruff.lint.per-file-ignores]
+"*test*.py" = ["S", "ANN", "D", "ARG", "PLR", "N8", "RUF001", "E741", "E4", "F403", "F405"]
+"!src/datumaro/experimental/**" = ["S", "ANN", "D", "ARG", "PLR", "PLC0415", "PLW", "C", "UP", "N8", "E741", "E402"]
+"__init__.py" = [
+    "F4"      # unused-import
+]
+"src/datumaro/plugins/data_formats/ava/ava_label_pb2.py" = [
+    "E501"      # line-too-long
+]
+"notebooks/**" = [ "E501" ]
+
+[tool.ruff.lint.isort]
+split-on-trailing-comma = false
+known-local-folder = []
+
+[tool.ruff.lint.pylint]
+max-args=7
+
+[tool.ruff.lint.mccabe]
+# Unlike Flake8, default to a complexity level of 10.
+max-complexity = 10
+
+[tool.nbqa.addopts]
+ruff = ["--ignore=E402"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+show_error_codes = true
+
+[tool.bandit]
+exclude_dirs = [
+  '.vscode/',
+  '.git/',
+  'build/',
+  'tests/',
+]
+tests = [ 'B301', 'B302', 'B303', 'B304', 'B305', 'B306', 'B308', 'B310', 'B311', 'B312', 'B313', 'B314', 'B315', 'B316', 'B317', 'B318', 'B319', 'B321', 'B323', 'B324', 'B401', 'B402', 'B403', 'B404', 'B405', 'B406', 'B407', 'B408', 'B409', 'B411', 'B412', 'B413']

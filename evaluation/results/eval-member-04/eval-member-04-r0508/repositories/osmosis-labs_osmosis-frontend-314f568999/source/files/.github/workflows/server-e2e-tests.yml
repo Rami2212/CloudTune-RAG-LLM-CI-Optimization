@@ -1,0 +1,65 @@
+name: Server E2E Workflow
+
+on:
+  workflow_dispatch:
+  push:
+
+# A newer push to the same branch supersedes this run. Stage and master runs are
+# keyed on their commit, and manual runs are kept apart from push runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ (github.ref == 'refs/heads/stage' || github.ref == 'refs/heads/master') && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/stage' && github.ref != 'refs/heads/master' }}
+
+jobs:
+  setup-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        env:
+          MAIN_BRANCH: "refs/heads/master"
+        run: |
+          if [[ "${{ github.ref }}" == "${{ env.MAIN_BRANCH }}" ]]; then
+            echo "matrix={\"include\":[{ \"server-url\":\"https://sqs.osmosis.zone\", \"env\": \"production\", \"timeseries-url\":\"https://data.app.osmosis.zone\"}]}" >> "$GITHUB_OUTPUT"
+          else
+            echo "matrix={\"include\":[{ \"server-url\":\"https://sqs.osmosis.zone\", \"env\": \"production\", \"timeseries-url\":\"https://data.app.osmosis.zone\"}, { \"server-url\":\"https://sqs.stage.osmosis.zone\", \"env\": \"staging\", \"timeseries-url\":\"https://data.app.osmosis.zone\"}]}" >> "$GITHUB_OUTPUT"
+          fi
+
+  test:
+    name: ${{ matrix.env }}
+    needs: setup-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{fromJson(needs.setup-matrix.outputs.matrix)}}
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          package-manager-cache: false
+          node-version: 24.x
+
+      - name: Cache dependencies
+        uses: actions/cache@v5
+        with:
+          path: "**/node_modules"
+          key: ${{ runner.OS }}-24.x-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: |
+            ${{ runner.OS }}-24.x-
+
+      - name: Install Dependencies
+        run: corepack yarn install --immutable
+
+      - name: Echo Current Server URL
+        run: echo "SQS Server URL:${{ matrix.server-url }}"
+
+      - name: Run Tests
+        id: tests
+        run: corepack yarn test:e2e --filter=@osmosis-labs/server
+        env:
+          NEXT_PUBLIC_SIDECAR_BASE_URL: ${{ matrix.server-url }}
+          NEXT_PUBLIC_TIMESERIES_DATA_URL: ${{ matrix.timeseries-url }}

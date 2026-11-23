@@ -1,0 +1,53 @@
+# Renovate configuration validator
+#
+# This workflow validates changes proposed into Renovate configuration file
+# (.github/renovate.json5) and prevents non-valid configuration to be used by Renovate.
+#
+# Required Secrets:
+# - None
+#
+# Automatically triggered on:
+# - Pull requests to .github/renovate.json5.
+#
+
+name: Validate Renovate configuration
+
+on:
+  pull_request:
+    paths:
+      - ".github/renovate.json5"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.after }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          disable-sudo: true
+          disable-telemetry: true
+          egress-policy: block
+          allowed-endpoints: >
+            ghcr.io:443
+            github.com:443
+            pkg-containers.githubusercontent.com:443
+
+      - name: Checkout configuration
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate configuration
+        run: |
+          # renovate: datasource=docker
+          export RENOVATE_IMAGE=ghcr.io/renovatebot/renovate:44.199.2@sha256:0538f498be1b074e2434f8449cab7b2be30f8c0d0baf3b72814010f19db5bcfb
+          docker run --rm --entrypoint "renovate-config-validator" \
+          -v "${{ github.workspace }}/.github/renovate.json5":"/renovate.json5" \
+          ${RENOVATE_IMAGE} "/renovate.json5"

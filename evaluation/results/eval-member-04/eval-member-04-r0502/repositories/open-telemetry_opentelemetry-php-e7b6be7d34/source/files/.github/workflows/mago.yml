@@ -1,0 +1,61 @@
+name: Mago (Code Quality Checks, Non Blocking)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  mago:
+    name: Mago Quality Checks
+    runs-on: ubuntu-latest
+    # Surfaces quality issues as annotations without blocking merges
+    continue-on-error: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache Mago
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .mago
+          key: ${{ runner.os }}-mago-${{ hashFiles('mago.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-mago-
+
+      - name: Setup Mago
+        uses: nhedger/setup-mago@db907a61008831176aa6d71499a8479868edb141 # v1.0.1
+        with:
+          version: "1.58.2"
+          token: ${{ github.token }}
+
+      - name: Formatting
+        id: format
+        continue-on-error: true
+        run: mago format --check
+
+      - name: Linting
+        id: lint
+        continue-on-error: true
+        run: mago lint --reporting-format=github
+
+      - name: Static Analysis
+        id: analyze
+        continue-on-error: true
+        run: mago analyze --reporting-format=github
+
+      - name: Final status
+        if: ${{ always() }}
+        env:
+          FORMAT_OUTCOME: ${{ steps.format.outcome }}
+          LINT_OUTCOME: ${{ steps.lint.outcome }}
+          ANALYZE_OUTCOME: ${{ steps.analyze.outcome }}
+        run: |
+          echo "format=$FORMAT_OUTCOME lint=$LINT_OUTCOME analyze=$ANALYZE_OUTCOME"

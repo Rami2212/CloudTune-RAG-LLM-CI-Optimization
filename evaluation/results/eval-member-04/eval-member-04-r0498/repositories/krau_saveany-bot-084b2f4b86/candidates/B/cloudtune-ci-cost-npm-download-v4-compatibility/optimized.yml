@@ -1,0 +1,143 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [MEDIUM] 3 jobs clone the repo — consider artifact sharing
+# Estimated savings: ~1 min/run
+#
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE'
+  pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE'
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.x"
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Test
+        run: go test ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: API end-to-end tests
+        run: go test -tags=e2e ./e2e -count=1
+
+      - name: Telegram end-to-end tests
+        run: go test -tags=e2e ./e2e/telegram -count=1
+
+  web:
+    name: Web checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 12.14.0
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.x"
+          cache: true
+          cache-dependency-path: go.sum
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: pnpm
+          cache-dependency-path: web/ui/pnpm-lock.yaml
+
+      - name: Install
+        run: pnpm --dir web/ui install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm --dir web/ui run typecheck
+
+      - name: Build
+        run: pnpm --dir web/ui run build
+
+      - name: Build E2E binary
+        run: |
+          mkdir -p tmp
+          go build -o tmp/saveany-bot-e2e .
+
+      - name: Upload E2E binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: saveany-e2e-binary
+          path: tmp/saveany-bot-e2e
+          if-no-files-found: error
+          retention-days: 1
+
+  web-e2e:
+    name: Browser end-to-end tests
+    needs: web
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 12.14.0
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: pnpm
+          cache-dependency-path: web/ui/pnpm-lock.yaml
+
+      - name: Install
+        run: pnpm --dir web/ui install --frozen-lockfile
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('web/ui/pnpm-lock.yaml') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-
+
+      - name: Install Chromium
+        run: pnpm --dir web/ui exec playwright install --with-deps chromium
+
+      - name: Download E2E binary
+        uses: actions/download-artifact@v8
+        with:
+          name: saveany-e2e-binary
+          path: tmp
+
+      - name: Browser tests
+        run: |
+          chmod +x tmp/saveany-bot-e2e
+          pnpm --dir web/ui exec playwright test

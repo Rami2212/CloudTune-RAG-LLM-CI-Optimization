@@ -1,0 +1,101 @@
+name: Build Docs for releases
+
+on:
+  release:
+    types: [published]
+
+# No permissions by default
+permissions: {}
+
+jobs:
+  Build-Docs:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          disable-sudo: false
+          disable-telemetry: true
+          egress-policy: block
+          allowed-endpoints: >
+            # Azure Wire Server IP
+            168.63.129.16:80
+            docs.python.org:443
+            github.com:443
+            numpy.org:443
+            release-assets.githubusercontent.com:443
+            static.crates.io:443
+      
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # otherwise, you will failed to push refs to dest repo
+          persist-credentials: false
+
+      - name: Install uv and set the python version
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: false
+          python-version: "3.11"
+          version: "0.8.15"
+
+      - name: Installing dependencies
+        run: |
+          sudo apt-get install pandoc graphviz
+          uv lock --check
+          uv sync --frozen --extra docs
+
+      - name: Build-Docs
+        run: |
+          cd docs
+          uv run make clean
+          uv run make html
+
+      - name: Create gh-pages branch
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: |
+          existed_in_remote=$(git ls-remote --heads origin gh-pages)
+
+          if [[ -z ${existed_in_remote} ]]; then
+            echo "Creating gh-pages branch"
+            git config --local user.email "action@github.com"
+            git config --local user.name "GitHub Action"
+            git checkout --orphan gh-pages
+            git reset --hard
+            touch .nojekyll
+            git add .nojekyll
+            git commit -m "Initializing gh-pages branch"
+            git push origin gh-pages
+            git checkout "$TAG_NAME"
+            echo "Created gh-pages branch"
+          else
+            echo "Branch gh-pages already exists"
+          fi
+
+      - name: Commit docs to gh-pages branch
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: |
+          git fetch
+          git checkout gh-pages
+          mkdir -p /tmp/docs_build
+          cp -r docs/build/html/* /tmp/docs_build/
+          rm -rf $TAG_NAME/*
+          echo '<html><head><meta http-equiv="refresh" content="0; url=stable/" /></head></html>' > index.html
+          mkdir -p $TAG_NAME
+          cp -r /tmp/docs_build/* ./$TAG_NAME
+          ln -sfn $TAG_NAME stable
+          rm -rf /tmp/docs_build
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add ./index.html ./stable $TAG_NAME
+          git commit -m "Update documentation" -a || true
+
+      - name: Push changes
+        uses: ad-m/github-push-action@881a6320fdb16eb5318c5054f31c218aec2b324c # v1.3.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          branch: gh-pages

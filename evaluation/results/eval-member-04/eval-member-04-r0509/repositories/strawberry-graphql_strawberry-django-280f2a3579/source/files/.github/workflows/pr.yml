@@ -1,0 +1,40 @@
+name: 🚀 AutoPub PR Check
+
+on:
+  pull_request_target:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check-release:
+    name: 📦 Check for release
+    if: github.event.pull_request.user.type != 'Bot'
+    runs-on: ubuntu-latest
+    outputs:
+      has_release: ${{ steps.check.outputs.has_release }}
+
+    steps:
+      # allow-unsafe-pr-checkout is required so autopub can check fork PRs; the
+      # sparse-checkout below limits the PR working tree to RELEASE.md and
+      # pyproject.toml, which autopub `check` parses as data only.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: "refs/pull/${{ github.event.number }}/merge"
+          allow-unsafe-pr-checkout: true
+          persist-credentials: false
+          sparse-checkout: |
+            RELEASE.md
+            pyproject.toml
+          sparse-checkout-cone-mode: false
+
+      - name: Check for release
+        id: check
+        uses: autopub/autopub-action@5fdc82e84c048a82303de6b5c5a9d027665e73cf # v1.1.1
+        with:
+          command: check
+          autopub-version: "1.0.0a63"
+          github-token: ${{ secrets.BOT_TOKEN }}
+          fail-on-missing: "true"
+          extra-plugins: strawberry-autopub-plugins

@@ -1,0 +1,95 @@
+name: PR Test
+on:
+  pull_request:
+    branches:
+      - develop
+      - release**
+  merge_group:
+    branches:
+      - develop
+      - release**
+  push:
+    branches:
+      - develop
+      - release**
+
+permissions:
+  # The id-token permission is required by Codecov to use OIDC
+  id-token: write
+
+# This is what will cancel the workflow concurrency
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+jobs:
+  pr_test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["ubuntu-24.04", "windows-2022", "macos-15"]
+        python-version: ["3.11", "3.14"]
+    name: pr test (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          disable-sudo: true
+          disable-telemetry: true
+          egress-policy: block
+          allowed-endpoints: >
+            cli.codecov.io:443
+            files.pythonhosted.org:443
+            github.com:443
+            index.crates.io:443
+            ingest.codecov.io:443
+            keybase.io:443
+            o26192.ingest.us.sentry.io:443
+            objects.githubusercontent.com:443
+            ossci-datasets.s3.amazonaws.com:443
+            pypi.org:443
+            raw.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            releases.astral.sh:443
+            static.crates.io:443
+            static.rust-lang.org:443
+            storage.googleapis.com:443
+            yann.lecun.com:80
+      
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Installing Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
+
+      - name: Install uv and set the python version
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: false
+          python-version: ${{ matrix.python-version }}
+          version: "0.8.15"
+
+      - name: Installing dependencies
+        run: uv sync --locked --all-extras --dev
+
+      # triton's bundled LLVM aborts the process when loaded after TensorFlow; tests don't use triton.
+      - name: Remove triton
+        if: runner.os == 'Linux'
+        run: uv pip uninstall triton
+
+      - name: Tests
+        run: uv run --no-sync pytest --cov --cov-report=xml
+
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          flags: ${{ matrix.os }}_Python-${{ matrix.python-version }}
+          use_oidc: true

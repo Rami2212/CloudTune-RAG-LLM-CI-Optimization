@@ -1,0 +1,42 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 4 optimizations:
+# - [HIGH] Add npm dependency cache to "build-publish" job
+# - [HIGH] Split "build-publish" into parallel jobs (lint + test + build)
+# - [MEDIUM] Add concurrency group to "test.yml"
+# - [LOW] Use shallow clone in "build-publish" job
+# Estimated savings: ~12 min/run
+#
+name: Test
+'on':
+  push:
+    branches:
+      - main
+  pull_request: null
+env:
+  NPM_CONFIG_IGNORE_SCRIPTS: 'true'
+  NPM_CONFIG_BEFORE: ''
+  PNPM_CONFIG_MINIMUM_RELEASE_AGE: '10080'
+jobs:
+  build-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set NPM_CONFIG_BEFORE
+        run: |
+          echo "NPM_CONFIG_BEFORE=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6.1.0
+      - name: Setup Node.js
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install dependencies
+        run: pnpm install
+      - name: Test
+        run: pnpm test
+      - name: Build
+        run: pnpm build
