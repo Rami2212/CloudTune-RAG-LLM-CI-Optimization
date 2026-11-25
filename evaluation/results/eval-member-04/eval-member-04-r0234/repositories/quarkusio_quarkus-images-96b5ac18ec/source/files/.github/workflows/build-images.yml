@@ -1,0 +1,150 @@
+name: Build and Test
+# The name of this workflow is significant. Comment bot uses it to
+# identify the workflow to comment on, yaml.workflow.name key in
+# https://github.com/Karm/QCommenter/blob/main/src/main/resources/application.properties
+# or actually in its .env file.
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '.build/**'
+
+jobs:
+  build-images:
+    name: Build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "base images"
+            modules: "quarkus-distroless-base-image,quarkus-micro-base-image"
+            args: ""
+          - name: "s2i binary images"
+            modules: "quarkus-binary-s2i"
+            args: ""
+          - name: "s2i native images"
+            modules: "quarkus-native-s2i"
+            args: ""
+          - name: "mandrel builder images (latest)"
+            modules: "quarkus-mandrel-builder-image"
+            args: ""
+          - name: "mandrel builder images (dev)"
+            modules: "quarkus-mandrel-builder-image"
+            args: "-Pdev"
+          - name: "graalvm ce builder images (latest)"
+            modules: "quarkus-graalvm-builder-image"
+            args: ""
+    steps:
+    - name: Install Podman and qemu
+      run: |
+        sudo apt-get update
+        sudo apt-get install podman qemu-user-binfmt binfmt-support
+        sudo update-binfmts --enable qemu-aarch64
+        sudo systemctl restart systemd-binfmt
+    - name: Re-claim some disk space
+      run: |
+        sudo swapoff -a
+        sudo rm -rf /swapfile /usr/share/dotnet /usr/local/lib/android \
+        /usr/local/share/powershell /usr/share/swift /usr/local/.ghcup
+        sudo apt-get clean
+        podman system prune -a -f
+        sudo podman system prune -a -f
+        df -h
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+        cache: 'maven'
+    - name: Build ${{ matrix.name }}
+      run: mvn install --batch-mode --projects ${{ matrix.modules }} --also-make ${{ matrix.args }}
+    - name: Test ${{ matrix.name }}
+      run: |
+        set -x
+        set +e
+        # Deal with spaces in image descriptions
+        NM="${{ matrix.name }}"
+        NM="${NM// /_}"
+        # DOCKER_GHA_SUMMARY_NAME is used in the testsuite
+        export DOCKER_GHA_SUMMARY_NAME=testsuite-logs-${NM}.txt
+        echo "DOCKER_GHA_SUMMARY_NAME=${DOCKER_GHA_SUMMARY_NAME}" >> "$GITHUB_ENV"
+        EXIT_CODE=0
+        # GraalVM CE builder images should work too, merely saving time here...
+        if [[ "${{ matrix.modules }}" == quarkus-mandrel* ]]; then
+          echo "┌── Testing ${{ matrix.name }}" >> ${DOCKER_GHA_SUMMARY_NAME}
+          mvn install --batch-mode --projects ${{ matrix.modules }} --also-make -DskipTests -Ptest ${{ matrix.args }}
+          EXIT_CODE=$?
+          if [[ $EXIT_CODE -ne 0 ]]; then
+            echo "└── Done with errors: ${{ matrix.name }}" >> ${DOCKER_GHA_SUMMARY_NAME}
+          else
+            echo "└── Done: ${{ matrix.name }}" >> ${DOCKER_GHA_SUMMARY_NAME}
+          fi
+        else
+          echo "═╡ SKIPPED: Testing ${{ matrix.name }}" >> ${DOCKER_GHA_SUMMARY_NAME}
+        fi
+        exit $EXIT_CODE
+    - name: Upload test summary
+      if: always()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+          name: ${{ env.DOCKER_GHA_SUMMARY_NAME }}
+          path: ${{ github.workspace }}/${{ env.DOCKER_GHA_SUMMARY_NAME }}
+    - name: Upload archived logs
+      if: always()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+          name: archived-logs-${{ matrix.name }}
+          path: '**/target/archived-logs/**'
+    - name: Print ${{ matrix.name}}
+      if: always()
+      run: podman images
+
+  post-process-summary:
+    name: Summary
+    runs-on: ubuntu-latest
+    needs: build-images
+    if: always()
+    steps:
+      - name: Download all test summaries
+        if: always()
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: all-logs
+      - name: Aggregate summaries
+        if: always()
+        run: |
+          echo "Aggregated Summary for builder images" > final-summary.txt
+          echo "=====================================" >> final-summary.txt
+          for file in all-logs/*/*.txt; do
+            cat "$file" >> final-summary.txt
+          done
+      - name: Upload final aggregated summary
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: final-summary-log
+          path: final-summary.txt
+      - name: Prepare and upload comment data
+        if: always() && github.event_name == 'pull_request'
+        run: |
+          PR_NUMBER=$(jq --raw-output .pull_request.number "$GITHUB_EVENT_PATH")
+          if [[ -z "$PR_NUMBER" || "$PR_NUMBER" == "null" ]]; then
+            echo "No PR found. No action."
+            exit 0
+          fi
+          ORG_NAME=$(jq --raw-output .repository.owner.login "$GITHUB_EVENT_PATH")
+          REPO_NAME=$(jq --raw-output .repository.name "$GITHUB_EVENT_PATH")
+          COMMENT_JSON_STRING=$(jq -Rs '.' < final-summary.txt)
+          echo "{\"pr_number\":\"$PR_NUMBER\",\"org\":\"$ORG_NAME\",\"repo\":\"$REPO_NAME\",\"comment_body\":$COMMENT_JSON_STRING}" > comment-data.json
+      - name: Upload comment data
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: comment-data-${{ github.event.pull_request.number }}
+          path: comment-data.json

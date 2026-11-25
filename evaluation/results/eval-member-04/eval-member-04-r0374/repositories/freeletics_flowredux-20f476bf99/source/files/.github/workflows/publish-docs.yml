@@ -1,0 +1,76 @@
+name: Publish Docs
+
+on:
+  push:
+    branches:
+      - main
+  # TODO: replace with on push tag https://github.com/actions/deploy-pages/issues/76
+  workflow_run:
+    workflows: [Publish Release]
+    types:
+      - completed
+
+jobs:
+  publish:
+
+    runs-on: ubuntu-latest
+    if: github.repository == 'freeletics/flowredux'
+
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Install JDK
+        uses: actions/setup-java@v6.1.0
+        with:
+          distribution: zulu
+          java-version: 24
+
+      - name: Install Android SDK
+        run: ./.github/android-sdk.sh
+
+      - name: Install Python
+        uses: actions/setup-python@v7.1.0
+        with:
+          python-version: 3.x
+
+      - name: Install MkDocs Material
+        run: pip install mkdocs-material
+
+      - name: Build docs
+        # need to set the version name because for the default committed snapshot version dokka tasks get skipped
+        run: ./gradlew dokkaGenerateHtml -PVERSION_NAME=
+
+      - name: Copy docs
+        run: |
+          cp README.md docs/index.md
+          sed -i '/^\[\!\[GitHub release/d' docs/index.md
+          sed -i "s/<latest-version>/$(git describe --tags --abbrev=0)/" docs/index.md
+          cp CHANGELOG.md docs/changelog.md
+          mkdir -p docs/API/dsl
+          cp -R flowredux/build/dokka/html/. docs/API/dsl
+          mkdir -p docs/API/extensions
+          cp -R flowredux-extensions/build/dokka/html/. docs/API/extensions
+
+      - name: Build MkDocs
+        run: mkdocs build
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v5.0.0
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5.0.1

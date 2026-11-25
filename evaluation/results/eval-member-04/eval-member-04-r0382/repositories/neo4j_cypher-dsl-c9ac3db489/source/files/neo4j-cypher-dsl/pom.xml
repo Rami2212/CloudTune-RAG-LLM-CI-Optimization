@@ -1,0 +1,263 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+
+    Copyright (c) 2019-2026 "Neo4j,"
+    Neo4j Sweden AB [https://neo4j.com]
+
+    This file is part of Neo4j.
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        https://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+	<modelVersion>4.0.0</modelVersion>
+
+	<parent>
+		<groupId>org.neo4j</groupId>
+		<artifactId>neo4j-cypher-dsl-parent</artifactId>
+		<version>2025.3.7-SNAPSHOT</version>
+	</parent>
+
+	<artifactId>neo4j-cypher-dsl</artifactId>
+
+	<name>Neo4j Cypher DSL (Core)</name>
+	<description>The core module of the Cypher DSL, including all supported elements and the default renderer.</description>
+
+	<properties>
+		<sonar.coverage.jacoco.xmlReportPaths>${basedir}/../${aggregate.report.dir}</sonar.coverage.jacoco.xmlReportPaths>
+	</properties>
+
+	<dependencyManagement>
+		<dependencies>
+			<dependency>
+				<groupId>org.neo4j</groupId>
+				<artifactId>neo4j-cypher-dsl-bom</artifactId>
+				<version>${project.version}</version>
+				<type>pom</type>
+				<scope>import</scope>
+			</dependency>
+		</dependencies>
+	</dependencyManagement>
+
+	<dependencies>
+		<dependency>
+			<groupId>org.apiguardian</groupId>
+			<artifactId>apiguardian-api</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>org.neo4j</groupId>
+			<artifactId>neo4j-cypher-dsl-schema-name-support</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>com.querydsl</groupId>
+			<artifactId>querydsl-core</artifactId>
+			<scope>provided</scope>
+			<optional>true</optional>
+		</dependency>
+		<dependency>
+			<groupId>org.neo4j</groupId>
+			<artifactId>neo4j-cypher-dsl-build-annotations</artifactId>
+			<version>${project.version}</version>
+			<scope>provided</scope>
+			<optional>true</optional>
+		</dependency>
+		<dependency>
+			<!--
+			QueryDSL proxy feature requires cglib. It's gonna be a pain in the future, I guess, quoting from cglibs GitHub:
+
+			"IMPORTANT NOTE: cglib is unmaintained and does not work well (or possibly at all?) in newer JDKs, particularly JDK17+.
+			If you need to support newer JDKs, we will accept well-tested well-thought-out patches...
+			but you'll probably have better luck migrating to something like ByteBuddy"
+			-->
+			<groupId>cglib</groupId>
+			<artifactId>cglib</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>com.tngtech.archunit</groupId>
+			<artifactId>archunit</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.assertj</groupId>
+			<artifactId>assertj-core</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.junit.jupiter</groupId>
+			<artifactId>junit-jupiter</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.mockito</groupId>
+			<artifactId>mockito-core</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.slf4j</groupId>
+			<artifactId>slf4j-simple</artifactId>
+			<scope>test</scope>
+		</dependency>
+	</dependencies>
+
+	<build>
+		<plugins>
+			<plugin>
+				<groupId>org.codehaus.mojo</groupId>
+				<artifactId>exec-maven-plugin</artifactId>
+				<executions>
+					<execution>
+						<id>remove-shaded-modules</id>
+						<goals>
+							<goal>exec</goal>
+						</goals>
+						<phase>generate-sources</phase>
+						<configuration>
+							<skip>false</skip>
+							<executable>bin/remove-shaded-modules.sh</executable>
+						</configuration>
+					</execution>
+				</executions>
+			</plugin>
+			<!-- Configuration for surefire added because the stuff is not able to deal with the optional required module and in turn, JUnit 5 falls over during test discovering -->
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-surefire-plugin</artifactId>
+				<configuration combine.self="append">
+					<!-- -add-opens java.base/java.lang=ALL-UNNAMED added for QueryDSL proxy mechanics based on ages old cglib -->
+					<argLine>@{argLine} -Xverify:all
+						--add-modules com.querydsl.core
+						--add-reads org.neo4j.cypherdsl.core=com.querydsl.core
+						--add-opens java.base/java.lang=ALL-UNNAMED</argLine>
+				</configuration>
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-compiler-plugin</artifactId>
+				<executions>
+					<execution>
+						<id>default-compile</id>
+						<configuration combine.self="append">
+							<compilerArgs>
+								<arg>-Aorg.neo4j.cypherdsl.build.native_config_dir=${project.groupId}/${project.artifactId}</arg>
+								<arg>-Xlint:all,-options,-path,-processing,-exports</arg>
+								<arg>-Werror</arg>
+							</compilerArgs>
+							<annotationProcessorPaths>
+								<annotationProcessorPath>
+									<groupId>org.neo4j</groupId>
+									<artifactId>neo4j-cypher-dsl-build-proc</artifactId>
+									<version>${project.version}</version>
+								</annotationProcessorPath>
+							</annotationProcessorPaths>
+						</configuration>
+					</execution>
+					<execution>
+						<id>default-testCompile</id>
+						<configuration combine.self="append">
+							<compilerArgs>
+								<arg>-Aquerydsl.generatedAnnotationClass=com.querydsl.core.annotations.Generated</arg>
+								<arg>-Xlint:all,-options,-path,-processing,-exports,-missing-explicit-ctor,-classfile</arg>
+								<arg>-Werror</arg>
+								<!-- Added because QueryDSL drags in Jetbrains annotation which we won't add explicitly. Goes together with -classfile. -->
+								<arg>-implicit:class</arg>
+							</compilerArgs>
+							<annotationProcessorPaths>
+								<annotationProcessorPath>
+									<groupId>com.querydsl</groupId>
+									<artifactId>querydsl-apt</artifactId>
+									<version>${querydsl.version}</version>
+									<classifier>general</classifier>
+								</annotationProcessorPath>
+								<annotationProcessorPath>
+									<groupId>javax.annotation</groupId>
+									<artifactId>javax.annotation-api</artifactId>
+									<version>${javax.annotation-api.version}</version>
+								</annotationProcessorPath>
+							</annotationProcessorPaths>
+						</configuration>
+					</execution>
+				</executions>
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-shade-plugin</artifactId>
+				<executions>
+					<execution>
+						<goals>
+							<goal>shade</goal>
+						</goals>
+						<phase>package</phase>
+						<configuration>
+							<artifactSet>
+								<includes>
+									<include>org.neo4j:neo4j-cypher-dsl-schema-name-support</include>
+								</includes>
+							</artifactSet>
+							<relocations>
+								<relocation>
+									<pattern>org.neo4j.cypherdsl.support.schema_name</pattern>
+									<shadedPattern>org.neo4j.cypherdsl.core.internal</shadedPattern>
+								</relocation>
+							</relocations>
+							<createSourcesJar>true</createSourcesJar>
+							<filters>
+								<filter>
+									<artifact>org.neo4j:neo4j-cypher-dsl-schema-name-support</artifact>
+									<includes>
+										<include>**/SchemaNames*class</include>
+									</includes>
+									<excludes>
+										<exclude>module-info.class</exclude>
+									</excludes>
+								</filter>
+							</filters>
+						</configuration>
+					</execution>
+				</executions>
+			</plugin>
+			<plugin>
+				<groupId>org.moditect</groupId>
+				<artifactId>moditect-maven-plugin</artifactId>
+				<executions>
+					<execution>
+						<id>add-module-infos</id>
+						<goals>
+							<goal>add-module-info</goal>
+						</goals>
+						<phase>package</phase>
+						<configuration>
+							<overwriteExistingFiles>true</overwriteExistingFiles>
+							<module>
+								<moduleInfoFile>${project.build.directory}/modules/module-info.java</moduleInfoFile>
+							</module>
+						</configuration>
+					</execution>
+				</executions>
+			</plugin>
+			<plugin>
+				<groupId>com.github.siom79.japicmp</groupId>
+				<artifactId>japicmp-maven-plugin</artifactId>
+				<configuration combine.self="append">
+					<parameter>
+						<ignoreMissingClassesByRegularExpressions>
+							<ignoreMissingClassesByRegularExpression>com\.querydsl\.core\..*</ignoreMissingClassesByRegularExpression>
+							<ignoreMissingClassesByRegularExpression>org\.neo4j\.cypherdsl\.core\.internal\.LiteralBase</ignoreMissingClassesByRegularExpression>
+							<ignoreMissingClassesByRegularExpression>org\.neo4j\.cypherdsl\.core\.internal\.StatementContext</ignoreMissingClassesByRegularExpression>
+						</ignoreMissingClassesByRegularExpressions>
+					</parameter>
+				</configuration>
+			</plugin>
+		</plugins>
+	</build>
+</project>

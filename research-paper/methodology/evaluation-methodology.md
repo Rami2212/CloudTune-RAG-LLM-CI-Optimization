@@ -6,9 +6,13 @@ The evaluation tests whether optimized CI workflows preserve required behavior w
 
 - **A — Original:** unchanged workflow; establishes the baseline.
 - **B — CI-Cost:** workflow candidate from the pinned, source-corrected CI-Cost implementation.
-- **C — RAG + LLM:** candidate from retrieval against the frozen BGE-M3 knowledge base and a fixed OpenRouter model.
+- **C — RAG + LLM:** candidate from retrieval against the frozen BGE-M3 knowledge base and a fixed OpenRouter model (nvidia/nemotron-3-ultra).
 
-There is no LLM-only arm. Results for C measure the combined RAG-plus-LLM method and cannot isolate RAG’s contribution from the LLM.
+The analysis addresses three research questions:
+
+1. **RQ1 — Execution time:** How does RAG + LLM compare with original workflows and CI-Cost in median workflow execution time?
+2. **RQ2 — Runner usage:** How does RAG + LLM affect summed job runtime compared with original workflows and CI-Cost?
+3. **RQ3 — Performance variation:** How do the frequency and magnitude of improvements, slowdowns, and ties vary across repositories?
 
 ## Evaluation set and controls
 
@@ -21,7 +25,7 @@ Before execution, screen each assigned repository for a safe, active build or te
 1. Prepare A from the original pinned workflow.
 2. Generate B with the pinned CI-Cost release and its reviewed source correction.
 3. Generate C using the frozen RAG corpus, the same pinned BGE-M3 embedding revision, retrieved evidence, repository context, and the fixed LLM configuration. Preserve retrieved record identifiers and candidate provenance.
-4. Apply the same conservative safety gate to B and C. Check YAML structure and Actions syntax, workflow triggers and permissions, job and matrix preservation, build/test commands, dependency inputs, and allowed change scope. The current automatic admission policy is limited to narrow, additive dependency-download caching. Other changes require review and are not dispatched automatically.
+4. Apply the same conservative safety gate to B and C. Check YAML structure and Actions syntax, workflow triggers and permissions, job and matrix preservation, build/test commands, dependency inputs, and allowed change scope. The current automatic admission policy is limited to narrow, additive dependency-download caching.
 
 Record each result as admitted, rejected, review-required, inconclusive, no-change, or failed. An optimizer’s no-change decision is retained in the denominator; it is not presented as an applied optimization or a measured saving. Execute optimized candidates only after they pass admission. Preserve original workflow behavior and required checks as correctness constraints.
 
@@ -36,23 +40,15 @@ The primary timing metric, **active workflow time**, is the union of intervals w
 - **Inter-job idle time:** makespan less active workflow time.
 - **Summed job runtime:** total duration across executed jobs; overlapping jobs count separately as a runner-use proxy.
 
-Do not include local candidate generation, retrieval, model latency, or queue time in active CI time. Do not call summed job runtime billed cost without billing evidence.
-
 ## Analysis and reporting
 
 For each repository, first take the median of valid repetitions in each arm. Calculate elapsed-time savings for B and C against A, and for C against B:
 
 `Savings (%) = 100 × (baseline median − candidate median) / baseline median`
 
-Repeat the calculation with summed job runtime for runner-use savings. Aggregate paired repository-level effects using the median and interquartile range, with 95% confidence intervals from 1,000 repository-bootstrap resamples when there are enough paired repositories. The repository/workflow is the analysis unit; repeated runs of one repository are not independent observations.
+Repeat the calculation with summed job runtime for runner-use savings. Report the mean, median, sample standard deviation, first and third quartiles, minimum, and maximum of paired repository-level elapsed savings. Quartiles use linear interpolation at the 25th and 75th percentiles. Calculate aggregate elapsed and runner savings as `100 × (sum of reference medians − sum of candidate medians) / sum of reference medians`; these weight repositories by reference duration. Summed medians are not total runtime across all repetitions or billed usage. Report faster, slower, and tied comparisons from the numeric medians. The repository/workflow is the analysis unit; repeated runs of one repository are not independent observations. Bootstrap confidence intervals were not reported in the current results chapter.
 
 Report candidate admission and required-check pass rates, no-change and rejection rates, failures, regressions, incomplete and platform-inconclusive runs, and the paired repository count. Keep the full 4,000-assignment denominator visible. Calculate savings only from comparable successful executions with passing safety and required-check outcomes; never fill missing measurements with estimates. Report retrieval relevance and generation latency as supplementary measures, separate from CI time.
-
-## Reproducibility and current status
-
-Keep assignment hashes, source commits, workflow and candidate hashes, CI-Cost version, RAG corpus digest, embedding revision, generator model and prompt version, run IDs, and raw job timing evidence with the results. The frozen RAG corpus is verified before C; it is not retrained or modified during the held-out evaluation.
-
-The repository contains the evaluation dataset, fixed assignments, candidate-generation components, validation and execution code, and reporting logic. Live verification of the RAG retrieval path, shared safety gate, and candidate-fork execution remains pending; therefore this methodology does not claim completed held-out results or CI time savings.
 
 ## Evaluation flow
 
@@ -70,6 +66,6 @@ flowchart TD
     G -->|Rejected, review, or no change| I[Record outcome; do not invent savings]
     H --> J[Archive run and job evidence]
     J --> K[Compute per-repository medians and paired savings]
-    K --> L[Aggregate across repositories with bootstrap intervals]
+    K --> L[Summarize means, medians, quartiles, aggregate savings, and variation]
     I --> L
 ```

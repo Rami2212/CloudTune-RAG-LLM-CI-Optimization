@@ -1,0 +1,105 @@
+name: Create Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version number (e.g., 0.7.1, 1.0.0-beta.1)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    if: github.repository == 'version-fox/vfox'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      - name: Validate version format
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?(\+[a-zA-Z0-9.-]+)?$'; then
+            echo "Error: Invalid version format. Please use semantic versioning (e.g., 1.2.3)"
+            exit 1
+          fi
+          echo "Version format validated: $VERSION"
+
+      - name: Check if tag exists
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "Error: Tag v$VERSION already exists"
+            exit 1
+          fi
+          echo "Tag check passed"
+
+      - name: Setup Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Update version file
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          VERSION_FILE="internal/version.go"
+          
+          echo "Updating version file: $VERSION_FILE"
+          sed -i "s/const RuntimeVersion = \".*\"/const RuntimeVersion = \"$VERSION\"/" "$VERSION_FILE"
+          
+          # Verify update
+          NEW_VERSION=$(grep 'const RuntimeVersion' "$VERSION_FILE" | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$NEW_VERSION" != "$VERSION" ]; then
+            echo "Error: Version update failed"
+            exit 1
+          fi
+          echo "Version updated to: $VERSION"
+
+      - name: Commit and push version bump
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          git add internal/version.go
+          git commit -m "release v$VERSION 🎉🎉🎉"
+          git push origin main
+
+      - name: Create and push tag
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          git tag -a "v$VERSION" -m "Release v$VERSION"
+          git push origin "v$VERSION"
+          echo "Tag created and pushed: v$VERSION"
+
+      - name: Wait for tag to be available
+        run: |
+          echo "Waiting for tag to sync to GitHub..."
+          sleep 5
+          echo "Tag should be available, GoReleaser will start shortly"
+
+      - name: Summary
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          echo "### Release Started" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** v$VERSION" >> $GITHUB_STEP_SUMMARY
+          echo "**Tag:** v$VERSION" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Automated Steps" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "1. Version file updated (\`internal/version.go\`)" >> $GITHUB_STEP_SUMMARY
+          echo "2. Git tag created and pushed (\`v$VERSION\`)" >> $GITHUB_STEP_SUMMARY
+          echo "3. [GoReleaser workflow](https://github.com/${{ github.repository }}/actions/workflows/go-releaser.yml) will build binaries and create draft release" >> $GITHUB_STEP_SUMMARY
+          echo "4. [Inno Setup workflow](https://github.com/${{ github.repository }}/actions/workflows/compile-inno-setup.yml) will compile Windows installers" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "1. Wait for workflows to complete (approximately 10-15 minutes)" >> $GITHUB_STEP_SUMMARY
+          echo "2. Visit [Releases page](https://github.com/${{ github.repository }}/releases)" >> $GITHUB_STEP_SUMMARY
+          echo "3. Review the draft release for \`v$VERSION\`" >> $GITHUB_STEP_SUMMARY
+          echo "4. Click **Publish release** to make it official" >> $GITHUB_STEP_SUMMARY

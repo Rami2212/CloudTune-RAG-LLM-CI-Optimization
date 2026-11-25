@@ -1,0 +1,143 @@
+name: Merge to main
+
+on:
+  push:
+    paths:
+      - "packages/**"
+    branches:
+      - main
+
+jobs:
+  version_or_publish:
+    name: Lint, test, build and publish or release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: nrwl/nx-set-shas@v4
+
+      - name: Setup Node.js 20.5
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.5.x
+
+      - name: Get yarn cache directory path
+        id: yarn-cache-dir-path
+        run: echo "dir=$(yarn config get cacheFolder)" >> $GITHUB_OUTPUT
+
+      - name: Load Yarn cache
+        uses: actions/cache@v3
+        id: yarn_cache_id
+        with:
+          path: ${{ steps.yarn-cache-dir-path.outputs.dir }}
+          key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn
+
+      - name: Node modules cache
+        uses: actions/cache@v3
+        id: node_modules_cache_id
+        with:
+          path: |
+            node_modules
+            */*/node_modules
+          key: ${{ runner.os }}-${{ hashFiles('**/yarn.lock') }}
+
+      - name: Install Dependencies
+        if: steps.yarn_cache_id.outputs.cache-hit != 'true' || steps.node_modules_cache_id.outputs.cache-hit != 'true'
+        run: yarn install --immutable
+
+      - name: Run prerelease
+        run: yarn prerelease
+        env:
+          NX_CLOUD_ACCESS_TOKEN: ${{ secrets.NX_CLOUD_ACCESS_TOKEN }}
+          # needed to generate website data files for the website linting
+          AIRTABLE_APIKEY: ${{ secrets.AIRTABLE_APIKEY }}
+          AIRTABLE_BASEID: ${{ secrets.AIRTABLE_BASEID }}
+
+      - name: Setup CI Git User
+        run: |
+          git config --global user.email "paste@twilio.com"
+          git config --global user.name "PasteBot"
+
+      - name: "Create Pull Request or Publish to npm"
+        uses: changesets/action@v1
+        with:
+          version: yarn version
+          publish: yarn release
+          commit: "chore(release): version packages"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # due to this bug in yarn https://github.com/yarnpkg/berry/issues/3606 we need to manually turn off immutable installs to update the lockfile
+          YARN_ENABLE_IMMUTABLE_INSTALLS: false
+
+  chromatic:
+    name: Chromatic baseline update
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, 'chore(release): version packages')"
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: nrwl/nx-set-shas@v4
+
+      - name: Setup Node.js 20.5
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.5.x
+
+      - name: Get yarn cache directory path
+        id: yarn-cache-dir-path
+        run: echo "dir=$(yarn config get cacheFolder)" >> $GITHUB_OUTPUT
+
+      - name: Load Yarn cache
+        uses: actions/cache@v3
+        id: yarn_cache_id
+        with:
+          path: ${{ steps.yarn-cache-dir-path.outputs.dir }}
+          key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn
+
+      - name: Node modules cache
+        uses: actions/cache@v3
+        id: node_modules_cache_id
+        with:
+          path: |
+            node_modules
+            */*/node_modules
+          key: ${{ runner.os }}-${{ hashFiles('**/yarn.lock') }}
+
+      - name: Install Dependencies
+        if: steps.yarn_cache_id.outputs.cache-hit != 'true' || steps.node_modules_cache_id.outputs.cache-hit != 'true'
+        run: yarn install --immutable
+
+      - name: Build packages
+        run: yarn build
+        env:
+          NX_CLOUD_ACCESS_TOKEN: ${{ secrets.NX_CLOUD_ACCESS_TOKEN }}
+
+      - name: Run Chromatic
+        uses: chromaui/action@v10
+        with:
+          projectToken: ${{ secrets.CHROMA_APP_CODE }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          buildScriptName: "build:storybook"
+          autoAcceptChanges: "main"
+          exitOnceUploaded: true
+          onlyChanged: true
+          externals: |
+            - 'packages/paste-design-tokens/tokens/**'
+            - 'packages/paste-icons/src/**'
+            - '.storybook/static/**'
+        env:
+          STORYBOOK_GITHUB_SHA: ${{ github.sha }}
+          # https://github.com/storybookjs/builder-vite/issues/409#issuecomment-1199236279
+          NODE_OPTIONS: --max-old-space-size=6144

@@ -1,0 +1,306 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Rust
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "c/**"
+      - "ci/rust-nightly/**"
+      - "rust/**"
+      - ".github/workflows/rust.yml"
+  push:
+    branches-ignore:
+      - 'dependabot/**'
+    paths:
+      - "c/**"
+      - "ci/rust-nightly/**"
+      - "rust/**"
+      - ".github/workflows/rust.yml"
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.ref }}-${{ github.workflow }}-rust
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash -l -eo pipefail {0}
+
+jobs:
+  rust:
+    strategy:
+      matrix:
+        # See: https://github.com/apache/arrow-adbc/pull/1803#issuecomment-2117669300
+        os:
+          - macos-15-intel
+          - macos-latest
+          - ubuntu-latest
+          - windows-latest
+          - windows-11-arm
+        minimal-versions:
+          - false
+        include:
+          - os: ubuntu-latest
+            minimal-versions: true # Test can be built with older arrow
+          - os: windows-latest
+            minimal-versions: true # Test can be built with older windows specific deps
+    name: Rust ${{ matrix.os }} ${{ matrix.minimal-versions && '(minimal versions for adbc_core)' || '' }}
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_INCREMENTAL: 0
+      RUSTFLAGS: "-Adead_code" # TODO(alexandreyc): remove this line when implementation is complete
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg-cache
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Cargo update for minimal versions
+        if: ${{ matrix.minimal-versions }}
+        working-directory: ci/rust-nightly
+        run: |
+          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback cargo generate-lockfile \
+            --manifest-path "${GITHUB_WORKSPACE}/rust/Cargo.toml" \
+            -Z direct-minimal-versions
+      - name: Use stable Rust
+        id: rust
+        run: |
+          rustup toolchain install stable --no-self-update
+          rustup default stable
+      - name: Get required Go version
+        run: |
+          (. ./.env && echo "GO_VERSION=${GO}") >> $GITHUB_ENV
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "${{ env.GO_VERSION }}"
+          check-latest: true
+          cache: true
+          cache-dependency-path: go/adbc/go.sum
+      - name: Install sqlite3
+        if: runner.os == 'Linux'
+        run: sudo apt-get install libsqlite3-dev
+
+      # Windows on x64
+      - name: Setup conda
+        uses: conda-incubator/setup-miniconda@be893c923ea9cf1cf7cd510fbdde27c7e18cbdcb  # v4.1.0
+        if: runner.os == 'Windows' && runner.arch == 'X64'
+        with:
+          miniforge-version: 26.7.2-1
+      - name: Install Dependencies
+        if: runner.os == 'Windows' && runner.arch == 'X64'
+        run: |
+          conda install -c conda-forge --file ci/conda_env_cpp.txt
+
+      # Windows on ARM
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e  # v2.33.0
+        if: runner.os == 'Windows' && runner.arch != 'X64'
+        id: msys2
+        with:
+          msystem: CLANGARM64
+          update: true
+          install: |
+            mingw-w64-clang-aarch64-gcc-compat
+            mingw-w64-clang-aarch64-tools
+      - name: Add msys2 toolchain to PATH
+        if: runner.os == 'Windows' && runner.arch != 'X64'
+        shell: pwsh
+        env:
+          MSYS_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
+        run: |
+          "$($env:MSYS_LOCATION)\clangarm64\bin" |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          New-Item -ItemType Directory -Force `
+            $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+
+      - name: Build C++/Go drivers
+        if: runner.os != 'Windows' || runner.arch == 'X64'
+        run: |
+          mkdir -p build
+          mkdir -p local
+          pushd build
+          cmake \
+            -DADBC_BUILD_TESTS=OFF \
+            -DADBC_DRIVER_FLIGHTSQL=ON \
+            -DADBC_DRIVER_MANAGER=ON \
+            -DADBC_DRIVER_SQLITE=ON \
+            -DADBC_USE_ASAN=OFF \
+            -DADBC_USE_UBSAN=OFF \
+            -DADBC_SQLITE_COMPILE_DEFINES=-DADBC_SQLITE_WITH_NO_LOAD_EXTENSION \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=../local \
+            ../c
+          cmake --build . --target install
+          popd
+
+      # reuse the cache from native-vcpkg.yml if it exists but don't write to
+      # it since we don't build all the packages
+      - name: Cache vcpkg packages
+        if: runner.os == 'Windows' && runner.arch != 'X64'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vcpkg-${{ runner.os }}-arm64-${{ hashFiles('.env', 'ci/vcpkg/**', 'c/**/vcpkg.json', '.github/workflows/native-vcpkg.yml') }}
+      - name: Build C++/Go drivers (Windows on ARM)
+        if: runner.os == 'Windows' && runner.arch != 'X64'
+        env:
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg-cache
+          VCPKG_DEFAULT_TRIPLET: arm64-windows-static-release
+          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+        run: |
+          ./ci/scripts/install_vcpkg.sh "$VCPKG_ROOT"
+          "$VCPKG_ROOT/vcpkg" install sqlite3 --overlay-triplets ./ci/vcpkg/triplets
+          mkdir -p build
+          mkdir -p local
+          pushd build
+          cmake \
+            -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake \
+            -DVCPKG_TARGET_TRIPLET=$VCPKG_DEFAULT_TRIPLET \
+            -DVCPKG_OVERLAY_TRIPLETS=$(pwd)/../ci/vcpkg/triplets \
+            -DADBC_BUILD_TESTS=OFF \
+            -DADBC_DRIVER_FLIGHTSQL=ON \
+            -DADBC_DRIVER_MANAGER=ON \
+            -DADBC_DRIVER_SQLITE=ON \
+            -DADBC_USE_ASAN=OFF \
+            -DADBC_USE_UBSAN=OFF \
+            -DADBC_SQLITE_COMPILE_DEFINES=-DADBC_SQLITE_WITH_NO_LOAD_EXTENSION \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=../local \
+            ../c
+          cmake --build . --target install
+          popd
+
+      - name: Set dynamic linker path
+        if: runner.os == 'Linux'
+        run: |
+          echo "LD_LIBRARY_PATH=${{ github.workspace }}/local/lib:$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
+          echo "ADBC_DRIVER_MANAGER_TEST_LIB=${{ github.workspace }}/local/lib/libadbc_driver_sqlite.so" >> "$GITHUB_ENV"
+      - name: Set dynamic linker path
+        if: matrix.os == 'macos-latest'
+        run: |
+          echo "DYLD_LIBRARY_PATH=/opt/homebrew/opt/sqlite/lib:${{ github.workspace }}/local/lib:$DYLD_LIBRARY_PATH" >> "$GITHUB_ENV"
+          echo "ADBC_DRIVER_MANAGER_TEST_LIB=${{ github.workspace }}/local/lib/libadbc_driver_sqlite.dylib" >> "$GITHUB_ENV"
+      - name: Set dynamic linker path
+        if: matrix.os == 'macos-15-intel'
+        run: |
+          echo "DYLD_LIBRARY_PATH=/usr/local/opt/sqlite/lib:${{ github.workspace }}/local/lib:$DYLD_LIBRARY_PATH" >> "$GITHUB_ENV"
+          echo "ADBC_DRIVER_MANAGER_TEST_LIB=${{ github.workspace }}/local/lib/libadbc_driver_sqlite.dylib" >> "$GITHUB_ENV"
+      - name: Set dynamic linker path
+        if: runner.os == 'Windows'
+        run: |
+          echo "PATH=${{ github.workspace }}/local/bin;${{ github.workspace }}/local/lib;$PATH" >> "$GITHUB_ENV"
+          echo "ADBC_DRIVER_MANAGER_TEST_LIB=${{ github.workspace }}/local/bin/adbc_driver_sqlite.dll" >> "$GITHUB_ENV"
+      - name: Clippy
+        if: runner.os != 'Linux' && ! matrix.minimal-versions
+        working-directory: rust
+        run: |
+          rustup component add clippy
+          cargo clippy --workspace --all-targets --all-features --locked -- -Dwarnings
+      - name: Clippy (nightly)
+        if: runner.os == 'Linux' && ! matrix.minimal-versions
+        working-directory: ci/rust-nightly
+        run: |
+          # -Zcrate-attr enables the unstable non_exhaustive_omitted_patterns lint
+          # (https://github.com/apache/arrow-adbc/pull/3245).
+          # It applies to all workspace packages, so we also allow unused_features for crates that
+          # don't use the lint.
+          cargo clippy --manifest-path "${GITHUB_WORKSPACE}/rust/Cargo.toml" \
+            --workspace --all-targets --all-features --locked -- -Dwarnings \
+            -Zcrate-attr='feature(non_exhaustive_omitted_patterns_lint)' \
+            -Zcrate-attr='allow(unused_features)'
+      - name: Test (Default Features)
+        env:
+          RUST_BACKTRACE: "1"
+        working-directory: rust
+        run: |
+          # cargo test does not put cdylibs where tests can load them
+          # (https://github.com/rust-lang/cargo/issues/8311)
+          cargo build --workspace
+          cargo test --all-targets --workspace
+      - name: Test (All Features)
+        env:
+          RUST_BACKTRACE: "1"
+        working-directory: rust
+        run: |
+          # cargo test does not put cdylibs where tests can load them
+          # (https://github.com/rust-lang/cargo/issues/8311)
+          cargo build --all-features --workspace
+          cargo test --all-targets --all-features --workspace
+      - name: Doctests
+        env:
+          RUST_BACKTRACE: "1"
+        working-directory: rust
+        run: >
+          cargo test --doc --all-features --workspace
+      - name: Check docs
+        working-directory: rust
+        run: >
+          cargo doc --all-features --workspace
+      - name: Install cargo-msrv
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          # Install cargo-msrv
+          cargo_msrv_version="v0.18.4"
+          cargo_msrv_hash="367a48e4ad014b119bf728a9e95e863575e02fdf6cf95ae24f44ca73b445ee14"
+          cargo_msrv_archive="cargo-msrv.tgz"
+
+          curl -L "https://github.com/foresterre/cargo-msrv/releases/download/${cargo_msrv_version}/cargo-msrv-x86_64-unknown-linux-gnu-${cargo_msrv_version}.tgz" -o "${cargo_msrv_archive}"
+          echo "${cargo_msrv_hash}  ${cargo_msrv_archive}" | sha256sum -c -
+          mkdir -p $HOME/.local/bin
+          tar xz -f "${cargo_msrv_archive}" --wildcards --strip-components=1 -C "$HOME/.local/bin" "*/cargo-msrv"
+          rm "${cargo_msrv_archive}"
+
+      - name: Verify MSRV (Minimum Supported Rust Version)
+        if: matrix.os == 'ubuntu-latest' && matrix.minimal-versions
+        working-directory: rust
+        run: |
+          find . -mindepth 2 -name Cargo.toml | while read -r dir
+          do
+            echo "Checking package '$dir'"
+            cargo msrv verify --manifest-path "$dir" || exit 1
+          done
+
+  rust-miri:
+    name: miri
+    runs-on: ubuntu-latest
+    needs:
+      - rust
+    env:
+      CARGO_INCREMENTAL: 0
+      RUSTFLAGS: "-Adead_code" # TODO(alexandreyc): remove this line when implementation is complete
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: use nightly Rust
+        run: |
+          rustup toolchain install nightly --no-self-update --component miri
+          rustup default nightly
+      - name: adbc_ffi (miri)
+        working-directory: rust
+        run: |
+          cargo +nightly miri test -p adbc_ffi
+      - name: adbc_driver_manager (miri)
+        working-directory: rust
+        run: |
+          cargo +nightly miri test -p adbc_driver_manager --test cancellation --test exporter_cancellation

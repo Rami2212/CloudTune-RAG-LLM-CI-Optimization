@@ -1,0 +1,52 @@
+name: MariaDB Builds
+on:
+  workflow_call:
+    inputs:
+      maven-cache-key:
+        description: "The cache key to use to restore/save build caches."
+        required: true
+        type: string
+      max-parallel:
+        description: "The maximum number of workers to consume, by default uses all available."
+        required: false
+        type: number
+
+jobs:
+  build-mariadb:
+    strategy:
+      max-parallel: ${{ inputs.max-parallel }}
+      fail-fast: false
+      matrix:
+        profile: [ 'mariadb-ci', 'mariadb-ci-gtids-ssl', 'mariadb-innodb-binlog', 'mariadb-ci,mariadb-feature-binlog-metadata' ]
+        version-mariadb-server: [ "11.4", "11.8", "12.3" ]
+        exclude:
+          - profile: "mariadb-ci"
+            version-mariadb-server: "11.4"
+          - profile: "mariadb-ci"
+            version-mariadb-server: "11.8"
+          - profile: "mariadb-ci-gtids-ssl"
+            version-mariadb-server: "11.8"
+          - profile: "mariadb-ci-gtids-ssl"
+            version-mariadb-server: "12.3"
+          - profile: "mariadb-innodb-binlog"
+            version-mariadb-server: "11.4"
+          - profile: "mariadb-innodb-binlog"
+            version-mariadb-server: "11.8"
+          - profile: "mariadb-ci,mariadb-feature-binlog-metadata"
+            version-mariadb-server: "11.8"
+          - profile: "mariadb-ci,mariadb-feature-binlog-metadata"
+            version-mariadb-server: "12.3"
+    name: MariaDB ${{ matrix.version-mariadb-server }} - ${{ matrix.profile }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Build MariaDB ${{ matrix.version-mariadb-server }} - ${{ matrix.profile }}
+        uses: ./.github/actions/build-debezium-mariadb
+        with:
+          maven-cache-key: ${{ inputs.maven-cache-key }}-${{ hashFiles('**/pom.xml') }}
+          version-mariadb-server: ${{ matrix.version-mariadb-server }}
+          profile: ${{ matrix.profile }}
+

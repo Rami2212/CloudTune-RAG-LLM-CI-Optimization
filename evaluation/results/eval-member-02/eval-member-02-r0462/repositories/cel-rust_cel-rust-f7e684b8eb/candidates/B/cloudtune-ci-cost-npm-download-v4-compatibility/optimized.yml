@@ -1,0 +1,111 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 5 optimizations:
+# - [HIGH] Add cargo dependency cache to "test" job
+# - [HIGH] Add cargo dependency cache to "conformance" job
+# - [HIGH] Add cargo dependency cache to "fuzz" job
+# - [HIGH] Add cargo dependency cache to "examples" job
+# - [MEDIUM] Add concurrency group to "rust.yml"
+# Estimated savings: ~34 min/run
+#
+name: Rust
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Build minimal
+        run: cargo build --verbose --no-default-features
+      - name: Build with default features
+        run: cargo build --verbose
+      - name: Build with all features
+        run: cargo build --verbose --all-features
+      - name: Clippy
+        run: cargo clippy --all-features --all-targets -- -D warnings
+      - name: Run tests
+        run: |
+          cargo test -p cel --verbose
+          cargo test -p cel --verbose --features json
+          cargo test -p cel --verbose --features regex
+          cargo test -p cel --verbose --features chrono
+  conformance:
+    name: Conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Run conformance tests
+        run: cargo test -p conformance --release
+      - name: Check generated conformance tests match their inputs
+        run: |
+          cargo run --release -p conformance --bin generate
+          cargo fmt -p conformance
+          git add --intent-to-add conformance/tests
+          git diff --exit-code HEAD -- conformance/tests || {
+            echo "::error::conformance/tests is out of date; run generate as described in conformance/README.md"
+            exit 1
+          }
+  fuzz:
+    name: Fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly toolchain
+        run: |
+          rustup toolchain install nightly
+          rustup default nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: "nightly"
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: Run fuzz tests
+        run: |
+          cd fuzz
+          cargo fuzz run value_binop -- -max_total_time=60
+          cargo fuzz run program_compile -- -max_total_time=60
+          cargo fuzz run fuzz_pratt_parser -- -max_total_time=60
+  examples:
+    name: Run Examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Run example-simple
+        run: cargo run --bin example-simple --manifest-path example/Cargo.toml
+      - name: Run example-variables
+        run: cargo run --bin example-variables --manifest-path example/Cargo.toml
+      - name: Run example-functions
+        run: cargo run --bin example-functions --manifest-path example/Cargo.toml --features chrono
+      - name: Run example-threads
+        run: cargo run --bin example-threads --manifest-path example/Cargo.toml
+      - name: Run example-serde
+        run: cargo run --bin example-serde --manifest-path example/Cargo.toml
+      - name: Run example-json
+        run: cargo run --bin example-json --manifest-path example/Cargo.toml --features json
+      - name: Run example-anyhow
+        run: cargo run --bin example-anyhow --manifest-path example/Cargo.toml --features anyhow
+      - name: Run example-budget
+        run: cargo run --bin example-budget --manifest-path example/Cargo.toml
+      - name: Run example-interrupt
+        run: cargo run --bin example-interrupt --manifest-path example/Cargo.toml
+        # Build, don't run since it starts an HTTP server
+      - name: Run example-axum
+        run: cargo build --bin example-axum --manifest-path example/Cargo.toml --features axum

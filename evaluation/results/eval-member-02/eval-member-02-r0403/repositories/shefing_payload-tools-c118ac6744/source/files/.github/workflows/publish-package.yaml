@@ -1,0 +1,111 @@
+name: Publish Package to NPM
+
+on:
+  workflow_dispatch:
+    inputs:
+      package-name:
+        description: 'Package to publish'
+        required: true
+        type: choice
+        options:
+          - abac
+          - authorization
+          - authors-info
+          - changes-button
+          - color-picker
+          - comments
+          - cover-image
+          - cross-collection
+          - custom-version-view
+          - field-type-components-override
+          - icon-select
+          - quickfilter
+          - right-panel
+          - reset-list-view
+      version-type:
+        description: 'Version to bump: patch (1.0.0 -> 1.0.1), minor (1.0.0 -> 1.1.0), major (1.0.0 -> 2.0.0)'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      manualE2E:
+        description: 'Skip automated E2E tests (assumes you have run E2E manually)'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  test-before-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: Run Vitest (package unit tests)
+        run: pnpm test:packages
+      - name: Install Playwright browsers
+        if: ${{ !inputs.manualE2E }}
+        run: pnpm --filter @shefing/dev-app exec playwright install --with-deps chromium
+      - name: Permit runner to access MongoDB Atlas
+        if: ${{ !inputs.manualE2E }}
+        uses: textbook/atlas-ip@v1
+        with:
+          atlas-private-key: ${{ secrets.ATLAS_PRIVATE_KEY }}
+          atlas-public-key: ${{ secrets.ATLAS_PUBLIC_KEY }}
+          group-id: ${{ vars.ATLAS_GROUP_ID }}
+      - name: Build test-app
+        if: ${{ !inputs.manualE2E }}
+        run: pnpm --filter @shefing/dev-app build
+        env:
+          DATABASE_URL: ${{ secrets.MONGODB_URI }}
+          PAYLOAD_SECRET: ${{ secrets.PAYLOAD_SECRET }}
+          AUTOMATION_SEED_API_KEY: ${{ secrets.AUTOMATION_SEED_API_KEY }}
+      - name: Run Playwright E2E
+        if: ${{ !inputs.manualE2E }}
+        run: pnpm --filter @shefing/dev-app test:e2e
+        env:
+          CI: true
+          DATABASE_URL: ${{ secrets.MONGODB_URI }}
+          PAYLOAD_SECRET: ${{ secrets.PAYLOAD_SECRET }}
+          AUTOMATION_SEED_API_KEY: ${{ secrets.AUTOMATION_SEED_API_KEY }}
+      - name: Skipping E2E (manualE2E enabled)
+        if: ${{ inputs.manualE2E }}
+        run: echo "manualE2E=true — skipping automated E2E. Confirm manual E2E was performed before publishing."
+
+  validate:
+    needs: test-before-publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate package exists
+        run: |
+          if [ ! -d "packages/${{ inputs.package-name }}" ]; then
+            echo "Error: Package ${{ inputs.package-name }} does not exist"
+            exit 1
+          fi
+
+          if [ ! -f "packages/${{ inputs.package-name }}/package.json" ]; then
+            echo "Error: package.json not found in packages/${{ inputs.package-name }}"
+            exit 1
+          fi
+
+          echo "Package ${{ inputs.package-name }} validated successfully"
+
+  publish:
+    needs: validate
+    uses: ./.github/workflows/publish-plugin-template.yaml
+    with:
+      plugin-name: ${{ inputs.package-name }}
+      version-type: ${{ inputs.version-type }}
+    secrets:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}

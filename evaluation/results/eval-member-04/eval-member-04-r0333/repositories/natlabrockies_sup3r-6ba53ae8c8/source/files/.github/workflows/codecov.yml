@@ -1,0 +1,41 @@
+name: Codecov
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      max-parallel: 3
+      matrix:
+        os: [ubuntu-latest]
+    env:
+      OS: ${{ matrix.os }}
+      PYTHON: '3.9'
+    steps:
+    - uses: actions/checkout@v3
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: 3.9
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v5
+    - name: Install dependencies
+      run: |
+        uv pip install --system '.[test,dev]'
+    - name: Generate coverage report
+      run: |
+        python -m pytest -x --cov=./ --cov-report=xml:coverage.xml
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v1
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        file: ./coverage.xml
+        flags: unittests
+        env_vars: OS,PYTHON
+        name: codecov-umbrella
+        fail_ci_if_error: false
+        verbose: true

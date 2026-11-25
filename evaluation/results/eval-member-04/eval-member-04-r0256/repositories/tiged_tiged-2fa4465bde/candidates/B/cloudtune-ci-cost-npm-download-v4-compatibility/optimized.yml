@@ -1,0 +1,186 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 5 optimizations:
+# - [HIGH] Split "lint" into parallel jobs (lint + test + build)
+# - [MEDIUM] Add concurrency group to "nodejs.yml"
+# - [MEDIUM] 4 jobs clone the repo — consider artifact sharing
+# - [MEDIUM] Use "npm ci" instead of "npm install" in "test"
+# - [LOW] Explicitly set fail-fast for large matrix job "test" (36 combinations)
+# Estimated savings: ~12 min/run
+#
+name: Node.js CI
+
+on:
+  pull_request:
+  push:
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  lint:
+    name: Check lint and formatting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24.x
+          check-latest: true
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint files
+        run: npm run lint
+
+      - name: Check formatting
+        run: npm run format:check
+
+      - name: Test types
+        run: npm run test-types
+
+      - name: Run tests
+        run: npm test
+
+      - name: Did we fail?
+        if: failure()
+        run: ls -R
+
+  build:
+    needs: [lint]
+    runs-on: ${{ matrix.os }}
+    name: Build artifact for ${{ matrix.os }} with Node.js ${{ matrix.node-version }}
+    outputs:
+      artifact: ${{ steps.pack.outputs.tarball }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [24.x]
+        os: [ubuntu-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node-version }}
+          check-latest: true
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Pack
+        id: pack
+        run: |
+          echo "tarball=$(npm pack | tail -n1)" >> $GITHUB_OUTPUT
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        id: artifact-upload
+        with:
+          name: artifact
+          path: ./*.tgz
+
+      - name: Run publint
+        run: npx publint@latest --strict
+
+      - name: Did we fail?
+        if: failure()
+        run: ls -R
+
+  test:
+    name: Test final build artifact with Node.js ${{ matrix.node-version }} on ${{ matrix.os }}
+    needs: [build]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22.x, 24.x, latest]
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        exclude:
+          - os: windows-latest
+            node-version: 22.x
+          - os: windows-latest
+            node-version: 24.x
+          - os: macos-latest
+            node-version: 22.x
+          - os: macos-latest
+            node-version: 24.x
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node-version }}
+          check-latest: true
+          cache: 'npm'
+
+      - name: Download artifact
+        id: download-artifact
+        uses: actions/download-artifact@v8
+        with:
+          path: ./
+          name: artifact
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install build artifact
+        run: npm install ${{ needs.build.outputs.artifact }}
+
+      - name: Erase TSConfig path aliases
+        run: npm run erase-ts-config-paths
+
+      - name: Run tests on the final build artifact
+        run: npm test
+        env:
+          TEST_DIST: true
+
+      - name: Did we fail?
+        if: failure()
+        run: ls -R
+
+  are-the-types-wrong:
+    name: Run are-the-types-wrong
+    needs: [build]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        node-version: [latest]
+        os: [ubuntu-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node-version }}
+          check-latest: true
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download artifact
+        id: download-artifact
+        uses: actions/download-artifact@v8
+        with:
+          path: ./
+          name: artifact
+
+      - name: Run are-the-types-wrong
+        run: npx @arethetypeswrong/cli@latest ${{ needs.build.outputs.artifact }} --format table

@@ -1,0 +1,213 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
+plugins {
+    id 'com.android.application'
+    alias(libs.plugins.kotlinx.serialization)
+    alias(libs.plugins.compose.compiler)
+}
+
+// Keys for the sample models: local.properties (gitignored) wins, else the environment.
+// Both empty means the devapp registers no AI model, so scenes take their non-AI path.
+def readKey = { String property, String environment ->
+    def local = rootProject.file('local.properties')
+    if (local.exists()) {
+        def properties = new Properties()
+        local.withInputStream { properties.load(it) }
+        def key = properties.getProperty(property)
+        if (key?.trim()) {
+            return key.trim()
+        }
+    }
+    return System.getenv(environment)?.trim() ?: ''
+}
+
+def openAiApiKey = readKey('openai.apiKey', 'OPENAI_API_KEY')
+def geminiApiKey = readKey('gemini.apiKey', 'GEMINI_API_KEY')
+
+android {
+    namespace = 'com.urbanairship.devapp'
+
+    compileSdk rootProject.compileSdkVersion
+
+    defaultConfig {
+        applicationId "com.urbanairship.sample"
+        minSdk rootProject.minSdkVersion
+        targetSdk rootProject.targetSdkVersion
+        versionCode 1
+        versionName "1.0"
+        vectorDrawables.useSupportLibrary = true
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        buildConfigField "String", "OPENAI_API_KEY", "\"${openAiApiKey}\""
+        buildConfigField "String", "GEMINI_API_KEY", "\"${geminiApiKey}\""
+    }
+
+    buildFeatures {
+        viewBinding = true
+        buildConfig = true
+        compose = true
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            // Not published, so we can safely use default signing
+            signingConfig = signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+
+    lint {
+        abortOnError = false
+        disable 'MissingTranslation', 'AppCompatResource'
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget = JvmTarget.JVM_17
+    }
+}
+
+
+dependencies {
+    // Kotlin
+    implementation(libs.kotlinx.coroutines.android)
+    implementation(libs.kotlinx.coroutines.core)
+    implementation(libs.kotlinx.serialization.json)
+
+    // Jetpack
+    implementation(libs.androidx.appcompat)
+    implementation(libs.androidx.activityktx)
+    implementation(libs.compose.ui.viewbinding)
+    implementation(libs.google.material)
+    implementation(libs.androidx.lifecycle.viewmodel)
+    implementation(libs.androidx.lifecycle.viewmodelktx)
+    implementation(libs.androidx.constraintlayout)
+    implementation(libs.androidx.constraintlayout.compose)
+    implementation(libs.androidx.navigation.fragment)
+    implementation(libs.androidx.navigation.ui)
+    implementation(libs.androidx.fragment.compose)
+    implementation(libs.androidx.navigation3.ui)
+    implementation(libs.androidx.navigation3.runtime)
+    implementation(libs.androidx.lifecycle.viewmodel.navigation3)
+    implementation(libs.playservices.location)
+
+    // Compose
+    implementation(platform(libs.compose.bom))
+    implementation(libs.compose.material3)
+    implementation(libs.androidx.lifecycle.viewmodel.compose)
+    implementation libs.compose.materialicons.extended
+    implementation libs.androidx.navigation.compose
+    implementation(libs.androidx.tv.material)
+
+    // Jetpack Glance
+    implementation(libs.glance.appwidget)
+
+    // Airship ADM
+    implementation project(':urbanairship-adm')
+
+    // Airship FCM
+    implementation project(':urbanairship-fcm')
+
+    // Airship Message Center
+    implementation project(':urbanairship-message-center-compose')
+
+    // Airship Preference Center
+    implementation project(':urbanairship-preference-center-compose')
+
+    // Airship Automation (In-App)
+    implementation project(":urbanairship-automation-compose")
+
+    // Airship Live Updates
+    implementation project(':urbanairship-live-update')
+
+    // Airship Feature Flags
+    implementation project(':urbanairship-feature-flag')
+
+    // Airship Debug: Normally this is a debug only dependency but we embed the view in sample app
+    implementation project(':urbanairship-debug')
+
+    implementation libs.glide
+    implementation libs.compose.ui.tooling.preview
+
+    implementation libs.snakeyaml
+
+    // Testing-only dependencies
+    // Espresso
+    androidTestImplementation(libs.androidx.test.espresso.core)
+    androidTestImplementation(libs.androidx.test.espresso.contrib) {
+        // https://github.com/android/android-test/issues/861
+        exclude group: 'org.checkerframework', module: 'checker'
+    }
+    androidTestImplementation(libs.androidx.test.espresso.web)
+    androidTestImplementation(libs.androidx.test.espresso.intents)
+    androidTestImplementation(libs.androidx.test.espresso.idling.concurrent)
+
+    // AndroidJUnitRunner and JUnit Rules
+    debugImplementation(libs.androidx.test.core)
+    androidTestImplementation(libs.androidx.test.core)
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.androidx.test.rules)
+    androidTestImplementation(libs.androidx.test.ext.junit)
+
+    // Assertions
+    androidTestImplementation(libs.google.truth)
+    androidTestImplementation(libs.androidx.test.ext.truth)
+
+    // Robolectric / Mockito
+    testImplementation(libs.junit)
+    testImplementation(libs.robolectric.core)
+    androidTestImplementation(libs.robolectric.annotations)
+
+    androidTestImplementation(libs.androidx.navigation.testing)
+    debugImplementation(libs.androidx.fragment.testing)
+    debugImplementation(libs.compose.ui.tooling.preview)
+}
+
+
+def googleServicesFile = rootProject.file('devapp/google-services.json')
+if (googleServicesFile.exists()) {
+    apply plugin: 'com.google.gms.google-services'  // Google Play services Gradle plugin
+}
+
+// Fetches the pinned Thomas Scene fixtures from urbanairship/thomas-layouts
+// into src/main/assets/sample_layouts/Scenes (see scripts/fetch-layouts.sh).
+tasks.register('fetchLayouts', Exec) {
+    workingDir rootDir
+    commandLine 'bash', './scripts/fetch-layouts.sh'
+}
+
+// The same fetch plus the per-page scenes cut from each pager, which is what the
+// screenshot sweep needs and roughly twice the Scene list to scroll. `fetchLayouts`
+// is the way back to the short list.
+tasks.register('fetchLayoutsUitests', Exec) {
+    workingDir rootDir
+    commandLine 'bash', './scripts/fetch-layouts.sh', '--uitests'
+}
+
+// Warn-only reminder to fetch the Scene fixtures if they are missing. Never
+// fails the build: the devapp must build without access to thomas-layouts
+// (the Scene list just shows empty).
+tasks.named('preBuild').configure {
+    // Only the captured File is used at execution time, keeping the check
+    // compatible with the configuration cache.
+    def scenesDir = file('src/main/assets/sample_layouts/Scenes')
+    doFirst {
+        def sceneCount = 0
+        if (scenesDir.exists()) {
+            scenesDir.eachFileRecurse(groovy.io.FileType.FILES) {
+                if (it.name != '.gitkeep') sceneCount++
+            }
+        }
+        if (sceneCount == 0) {
+            logger.warn("warning: Thomas Scene fixtures not found. Run './gradlew :devapp:fetchLayouts' to populate them. The devapp will still build, but the Thomas Scene list will be empty.")
+        }
+    }
+}

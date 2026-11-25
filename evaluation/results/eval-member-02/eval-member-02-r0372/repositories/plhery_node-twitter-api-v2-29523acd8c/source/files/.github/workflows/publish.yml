@@ -1,0 +1,30 @@
+name: npm publish
+on:
+  release:
+    types: [created]
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 'lts/*'
+          registry-url: 'https://registry.npmjs.org'
+      # Ensure npm 11.5.1 or later is installed
+      - name: Update npm
+        run: npm install -g npm@latest
+      - run: npm ci
+      - name: Check that the release tag matches the package version
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [ "$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Release tag $GITHUB_REF_NAME does not match package.json version $version"
+            exit 1
+          fi
+      # The deprecated prepublish script runs on npm ci but not on npm publish: build explicitly
+      - run: npm run build
+      - run: npm publish --provenance --access public

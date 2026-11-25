@@ -1,0 +1,226 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [HIGH] Add gradle dependency cache to "build" job
+# - [LOW] Explicitly set fail-fast for large matrix job "testcmd" (16 combinations)
+# Estimated savings: ~7 min/run
+#
+name: Build
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - '*'
+  push:
+    branches:
+      - 'main'
+      - 'hotfix-*'
+
+concurrency:
+  # On main, we don't want any jobs cancelled.
+  # On PR branches, we cancel the job if new commits are pushed.
+  group: ${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  build:
+    name: "Build"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        java-version: [ '17' ]
+    env:
+      ALLURE_MATRIX_ENV: ubuntu-jdk-${{ matrix.java-version }}
+      ALLURE_TEST_DUMP_NAME: allure-results-build-jdk-${{ matrix.java-version }}
+      ALLURE_E2E_DUMP_NAME: allure-results-e2e-jdk-${{ matrix.java-version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '20.x'
+      - name: Set up JDK ${{ matrix.java-version }}
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'zulu'
+          java-version: ${{ matrix.java-version }}
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: 'wrapper'
+      - name: Build without tests
+        run: ./gradlew build buildDeb buildRpm -x test
+      - name: Test with Allure
+        run: npx -y allure@3 run --config ./allurerc.mjs --rerun 2 --environment="${{ env.ALLURE_MATRIX_ENV }}" --dump="${{ env.ALLURE_TEST_DUMP_NAME }}" -- ./gradlew test
+      - name: Install Playwright browser
+        run: cd allure-generator && npx playwright install --with-deps chromium
+      - name: Run Playwright e2e with Allure
+        run: npx -y allure@3 run --config ./allurerc.mjs --rerun 2 --environment="${{ env.ALLURE_MATRIX_ENV }}" --dump="${{ env.ALLURE_E2E_DUMP_NAME }}" -- ./gradlew :allure-generator:testE2E
+      - name: Upload allure-commandline artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: allure-commandline
+          path: allure-commandline/build/install/allure-commandline
+      - name: Upload Allure test dump
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ALLURE_TEST_DUMP_NAME }}
+          path: ./${{ env.ALLURE_TEST_DUMP_NAME }}.zip
+      - name: Upload Allure e2e dump
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ALLURE_E2E_DUMP_NAME }}
+          path: ./${{ env.ALLURE_E2E_DUMP_NAME }}.zip
+      - name: Upload testcmd smoke results artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: testcmd-smoke-results
+          path: allure-generator/tests/fixtures/raw/commandline-smoke
+  testcmd:
+    name: "Test Allure Commandline"
+    runs-on: ${{ matrix.os }}
+    needs: build
+    env:
+      ALLURE_TESTCMD_DUMP_NAME: allure-results-testcmd-${{ matrix.os }}-jdk-${{ matrix.java-version }}-${{ matrix.install.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        java-version: [ '8', '11', '17', '20' ]
+        install:
+          - name: regular
+            path: .
+          - name: nested
+            path: testcmd/install/allure-commandline-under-a-nested-working-directory/with-windows-launcher-classpath-length-regression/allure-commandline
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '20.x'
+      - name: Set up JRE ${{ matrix.java-version }}
+        uses: actions/setup-java@v6
+        with:
+          java-package: 'jre'
+          distribution: 'zulu'
+          java-version: ${{ matrix.java-version }}
+      - name: Download allure-commandline artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: allure-commandline
+          path: ${{ matrix.install.path }}
+      - name: Download testcmd smoke results artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: testcmd-smoke-results
+          path: testcmd-smoke-results
+      - name: Add execute permissions to script
+        run: chmod +x ${{ matrix.install.path }}/bin/allure
+      - name: Run version command
+        shell: pwsh
+        run: |
+          $allure = '${{ matrix.install.path }}/bin/allure'
+          npx -y allure@3 check `
+            --name 'testcmd allure --version (${{ matrix.os }}, Java ${{ matrix.java-version }}, ${{ matrix.install.name }})' `
+            --tag testcmd `
+            --tag ${{ matrix.os }} `
+            --tag java-${{ matrix.java-version }} `
+            --tag ${{ matrix.install.name }} `
+            --dump '${{ env.ALLURE_TESTCMD_DUMP_NAME }}-version' `
+            -- pwsh -NoProfile -Command "& '$allure' --version"
+      - name: Generate demo report
+        shell: pwsh
+        run: |
+          $allure = '${{ matrix.install.path }}/bin/allure'
+          npx -y allure@3 check `
+            --name 'testcmd allure generate (${{ matrix.os }}, Java ${{ matrix.java-version }}, ${{ matrix.install.name }})' `
+            --tag testcmd `
+            --tag ${{ matrix.os }} `
+            --tag java-${{ matrix.java-version }} `
+            --tag ${{ matrix.install.name }} `
+            --dump '${{ env.ALLURE_TESTCMD_DUMP_NAME }}-generate' `
+            -- pwsh -NoProfile -Command "& '$allure' generate testcmd-smoke-results"
+      - name: Verify generated tree data
+        shell: pwsh
+        run: |
+          $requiredFiles = @(
+            'allure-report/data/behaviors.json',
+            'allure-report/data/behaviors.csv',
+            'allure-report/data/packages.json',
+            'allure-report/widgets/behaviors.json'
+          )
+
+          $missingFiles = $requiredFiles | Where-Object {
+            -not (Test-Path -LiteralPath $_ -PathType Leaf)
+          }
+
+          if ($missingFiles.Count -gt 0) {
+            $message = "Missing generated report files: $($missingFiles -join ', ')"
+            npx -y allure@3 check `
+              --name 'testcmd generated tree data (${{ matrix.os }}, Java ${{ matrix.java-version }}, ${{ matrix.install.name }})' `
+              --status failed `
+              --message $message `
+              --tag testcmd `
+              --tag ${{ matrix.os }} `
+              --tag java-${{ matrix.java-version }} `
+              --tag ${{ matrix.install.name }} `
+              --dump '${{ env.ALLURE_TESTCMD_DUMP_NAME }}-tree-data'
+            Write-Error $message
+            exit 1
+          }
+
+          $requiredFiles | ForEach-Object {
+            Write-Host "Verified $_"
+          }
+
+          $message = "Verified generated report files: $($requiredFiles -join ', ')"
+          npx -y allure@3 check `
+            --name 'testcmd generated tree data (${{ matrix.os }}, Java ${{ matrix.java-version }}, ${{ matrix.install.name }})' `
+            --status passed `
+            --message $message `
+            --tag testcmd `
+            --tag ${{ matrix.os }} `
+            --tag java-${{ matrix.java-version }} `
+            --tag ${{ matrix.install.name }} `
+            --dump '${{ env.ALLURE_TESTCMD_DUMP_NAME }}-tree-data'
+      - name: Upload Allure testcmd dump
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ALLURE_TESTCMD_DUMP_NAME }}
+          path: ./${{ env.ALLURE_TESTCMD_DUMP_NAME }}-*.zip
+          if-no-files-found: ignore
+  report:
+    needs: [build, testcmd]
+    name: "Build report"
+    runs-on: ubuntu-latest
+    if: always()
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: write
+    env:
+      ALLURE_SERVICE_TOKEN: ${{ secrets.ALLURE_SERVICE_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '20.x'
+      - name: Download Allure dumps
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          pattern: allure-results-*
+          path: ./
+          merge-multiple: true
+      - name: Generate Allure report
+        run: npx -y allure@3 generate --config ./allurerc.mjs --dump="allure-results-*.zip" --output=./build/allure-report
+      - name: Post Allure summary
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false
+        uses: allure-framework/allure-action@v0
+        with:
+          report-directory: ./build/allure-report
+          github-token: ${{ secrets.GITHUB_TOKEN }}

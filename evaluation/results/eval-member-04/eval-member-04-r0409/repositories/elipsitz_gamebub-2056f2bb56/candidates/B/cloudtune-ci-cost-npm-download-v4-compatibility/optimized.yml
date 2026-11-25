@@ -1,0 +1,51 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [MEDIUM] Add concurrency group to "rust_ci.yml"
+# Estimated savings: ~2 min/run
+#
+name: Continuous Integration
+
+on:
+  push:
+    paths-ignore:
+      - "**/README.md"
+  pull_request:
+  workflow_dispatch:
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: always
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  rust-checks:
+    name: Rust Checks
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        action:
+          - command: build
+            args: --features=rev4 --release
+          - command: fmt
+            args: --all -- --check --color always
+          - command: clippy
+            args: --features=rev4 --all-targets --workspace -- -D warnings -A clippy::identity_op
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Enable caching
+        uses: Swatinem/rust-cache@v2
+      - name: Setup Rust
+        uses: esp-rs/xtensa-toolchain@v1.5
+        with:
+          default: true
+          version: "1.93"
+          buildtargets: esp32s3
+          ldproxy: true
+      - name: Run command
+        run: cargo ${{ matrix.action.command }} ${{ matrix.action.args }}
+        working-directory: firmware/handheld

@@ -1,0 +1,43 @@
+name: Test Exercises
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-26.04, macos-15]
+        compiler: [gcc, clang]
+        exclude:
+          - os: macos-15
+            compiler: gcc
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+    - name: Determine number of available hardware threads
+      run: echo "NUM_THREADS=$(nproc || sysctl -n hw.ncpu)" >> $GITHUB_ENV
+    - name: Test Exercises
+      env:
+        CC: ${{ matrix.compiler }}
+      run: make -j ${{ env.NUM_THREADS }}
+
+  tests:
+    name: Tests
+    needs: test
+    if: always()
+    runs-on: ubuntu-26.04
+    steps:
+    - name: Check that every configuration passed
+      env:
+        RESULT: ${{ needs.test.result }}
+      run: |
+        if [[ "$RESULT" != "success" ]]; then
+          echo "The exercise tests failed on at least one configuration."
+          exit 1
+        fi

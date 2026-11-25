@@ -1,0 +1,170 @@
+name: Build and test changed container images
+
+env:
+  VPSADMINOS_CONFIG: >-
+    ${{ (github.ref == 'refs/heads/snajpa-6.18' || github.head_ref == 'snajpa-6.18') && format('{0}/os/configs/unstable.nix', github.workspace) || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      stop_on_failure:
+        description: Stop scheduling after the first unexpected result
+        required: true
+        default: false
+        type: boolean
+  push:
+    paths:
+      - .github/workflows/image-scripts.yml
+      - .github/workflows/scripts/changed-image-scripts.rb
+      - .github/workflows/scripts/test-image-script-common.sh
+      - image-scripts/**
+      - os/lib/nixos-container/**
+  pull_request:
+    paths:
+      - .github/workflows/image-scripts.yml
+      - .github/workflows/scripts/changed-image-scripts.rb
+      - .github/workflows/scripts/test-image-script-common.sh
+      - image-scripts/**
+      - os/lib/nixos-container/**
+
+jobs:
+  build:
+    name: Build OS and populate binary cache
+    runs-on: self-hosted
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Determine branch name
+        id: vars
+        run: |
+          echo "branch=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}" >> "$GITHUB_OUTPUT"
+
+      - name: Build toplevel closure
+        run: |
+          make toplevel
+          echo "BUILD_OUT=$(readlink -f os/result/toplevel)" >> "$GITHUB_ENV"
+
+      - name: Copy toplevel closure to binary cache
+        env:
+          VPSADMINOS_CACHE_SSH_KEY: ${{ secrets.VPSADMINOS_CACHE_SSH_KEY }}
+        run: |
+          install -m 600 -D <(echo "$VPSADMINOS_CACHE_SSH_KEY") .ssh/cache_id
+          NIX_SSHOPTS="-i .ssh/cache_id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" nix-copy-closure --to push@cache.int.vpsadminos.org "$BUILD_OUT"
+
+      - name: Add new profile generation
+        env:
+          BRANCH: ${{ steps.vars.outputs.branch }}
+        run: |
+          ssh -i .ssh/cache_id \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              push@cache.int.vpsadminos.org \
+              sudo push-ci-generation "$BRANCH" "$BUILD_OUT"
+  
+  detect:
+    name: Detect changed image scripts
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      images: ${{ steps.set.outputs.images }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Test common image script helpers
+        run: .github/workflows/scripts/test-image-script-common.sh
+
+      - id: set
+        shell: bash
+        run: |
+          BASE_SHA=$(jq -r '.before // .pull_request.base.sha // ""' "$GITHUB_EVENT_PATH")
+          HEAD_SHA=$GITHUB_SHA
+          DEFAULT_BRANCH=$(jq -r '.repository.default_branch // ""' "$GITHUB_EVENT_PATH")
+          CURRENT_BRANCH=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}
+
+          images=$(
+            BASE_SHA="$BASE_SHA" \
+            HEAD_SHA="$HEAD_SHA" \
+            DEFAULT_BRANCH="$DEFAULT_BRANCH" \
+            CURRENT_BRANCH="$CURRENT_BRANCH" \
+            ruby .github/workflows/scripts/changed-image-scripts.rb
+          )
+          echo "Detected images: $images"
+          echo "images=$images" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: Build and test changed images
+    needs: detect
+    if: ${{ needs.detect.outputs.images != '' }}
+    runs-on: self-hosted
+    timeout-minutes: 86400
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Prepare test state
+        id: prepare-tests
+        uses: ./.github/actions/prepare-test-state
+
+      - name: Build and test images
+        id: run-tests
+        env:
+          STOP_ON_FAILURE: ${{ github.event.inputs.stop_on_failure || 'false' }}
+        run: |
+          set -o pipefail
+
+          args=(
+            test
+            --state-dir "$TEST_RUNNER_STATE_DIR"
+            -f
+            --jobs auto
+            "image-scripts/test@{${{ needs.detect.outputs.images }}}"
+          )
+
+          if [[ "$STOP_ON_FAILURE" == "true" ]]; then
+            args+=(--stop-on-failure)
+          fi
+
+          ./test-runner.sh "${args[@]}" | tee "$TEST_RUNNER_STATE_DIR/test.log"
+
+      - name: Upload full test logs
+        id: upload-test-logs
+        if: >-
+          (failure() || cancelled()) &&
+          steps.prepare-tests.outcome == 'success' &&
+          steps.run-tests.outcome != 'skipped'
+        uses: ./.github/actions/upload-test-logs
+        with:
+          paths: |
+            ${{ steps.prepare-tests.outputs.state-directory }}/**/*.log
+            ${{ steps.prepare-tests.outputs.state-directory }}/**/*.txt
+
+      - name: Evaluate test results
+        if: >-
+          always() &&
+          steps.prepare-tests.outcome == 'success' &&
+          steps.run-tests.outcome != 'skipped'
+        uses: ./.github/actions/evaluate-test-results
+        with:
+          log-file: ${{ steps.prepare-tests.outputs.state-directory }}/test.log
+
+      - name: Summarise test logs
+        if: >-
+          always() &&
+          steps.prepare-tests.outcome == 'success' &&
+          steps.run-tests.outcome != 'skipped'
+        uses: ./.github/actions/summarise-test-logs
+        with:
+          logs-root: ${{ steps.prepare-tests.outputs.state-directory }}
+
+      - name: Cleanup test state
+        if: always()
+        uses: ./.github/actions/cleanup-test-state
+        with:
+          state-directory: ${{ steps.prepare-tests.outputs.state-directory }}
+          prepare-outcome: ${{ steps.prepare-tests.outcome }}
+          test-outcome: ${{ steps.run-tests.outcome }}
+          upload-outcome: ${{ steps.upload-test-logs.outcome }}

@@ -1,0 +1,202 @@
+GO?=go
+HOST_GOOS=$(shell ${GO} env GOOS)
+GOOS?=${HOST_GOOS}
+HOST_GOARCH=$(shell ${GO} env GOARCH)
+GOARCH?=${HOST_GOARCH}
+GOLANGCI_LINT_VERSION=$(shell awk '/GOLANGCI_LINT_VERSION:/ { print $$2 }' .github/workflows/versions.yml)
+GOLANGCI_LINT_BASENAME=golangci-lint-${GOLANGCI_LINT_VERSION}-${HOST_GOOS}-${HOST_GOARCH}
+GORELEASER_VERSION=$(shell awk '/GORELEASER_VERSION:/ { print $$2 }' .github/workflows/versions.yml)
+ifeq ($(HOST_GOOS),darwin)
+	GORELEASER_BASENAME=goreleaser_Darwin_$(shell echo ${HOST_GOARCH} | sed 's/amd64/x86_64/')
+else
+	GORELEASER_BASENAME=goreleaser_$(shell echo ${HOST_GOOS} | sed 's/^./\U&\E/g')_$(shell echo ${HOST_GOARCH} | sed 's/amd64/x86_64/')
+endif
+SYFT_VERSION=$(shell awk '/SYFT_VERSION:/ { print $$2 }' .github/workflows/versions.yml)
+SYFT_BASENAME=syft_${SYFT_VERSION}_${HOST_GOOS}_$(shell ${GO} env GOARCH)
+UPSTREAM=$(shell git remote -v | awk '/github.com[:\/]twpayne\/chezmoi(.git)? \(fetch\)/ {print $$1}')
+ifdef VERSION
+	GO_LDFLAGS+=-X main.version=${VERSION}
+endif
+ifdef COMMIT
+	GO_LDFLAGS+=-X main.commit=${COMMIT}
+endif
+ifdef DATE
+	GO_LDFLAGS+=-X main.date=${DATE}
+endif
+ifdef BUILT_BY
+	GO_LDFLAGS+=-X main.builtBy=${BUILT_BY}
+endif
+PREFIX?=/usr/local
+
+.PHONY: default
+default: build
+
+.PHONY: smoke-test
+smoke-test: run build-all test lint format
+
+.PHONY: build
+build:
+ifeq (${GO_LDFLAGS},)
+	${GO} build . || ( rm -f chezmoi ; false )
+else
+	${GO} build -ldflags "${GO_LDFLAGS}" . || ( rm -f chezmoi ; false )
+endif
+
+.PHONY: install
+install: build
+	mkdir -p "${DESTDIR}${PREFIX}/bin"
+	install -m 755 --target-directory "${DESTDIR}${PREFIX}/bin" chezmoi
+
+.PHONY: install-from-git-working-copy
+install-from-git-working-copy:
+	${GO} install -ldflags "-X main.version=$(shell git describe --abbrev=0 --tags) \
+		-X main.commit=$(shell git rev-parse HEAD) \
+		-X main.date=$(shell git show -s --format=%ct HEAD) \
+		-X main.builtBy=source"
+
+.PHONY: build-in-git-working-copy
+build-in-git-working-copy:
+	${GO} build -ldflags "-X main.version=$(shell git describe --abbrev=0 --tags) \
+		-X main.commit=$(shell git rev-parse HEAD) \
+		-X main.date=$(shell git show -s --format=%ct HEAD) \
+		-X main.builtBy=source"
+
+.PHONY: build-all
+build-all: build-darwin build-freebsd build-linux build-windows
+
+.PHONY: build-darwin
+build-darwin:
+	GOOS=darwin GOARCH=arm64 ${GO} build -o /dev/null .
+
+.PHONY: build-freebsd
+build-freebsd:
+	GOOS=freebsd GOARCH=amd64 ${GO} build -o /dev/null .
+
+.PHONY: build-linux
+build-linux:
+	GOOS=linux GOARCH=amd64 ${GO} build -o /dev/null .
+	GOOS=linux GOARCH=amd64 ${GO} build -tags=noupgrade -o /dev/null .
+
+.PHONY: build-windows
+build-windows: create-syso
+	GOOS=windows GOARCH=amd64 ${GO} build -o /dev/null .
+
+.PHONY: run
+run:
+	${GO} tool chezmoi --version
+
+.PHONY: test-all
+test-all: test test-release rm-dist test-docker test-vagrant
+
+.PHONY: rm-dist
+rm-dist:
+	rm -rf dist
+
+.PHONY: test
+test:
+	${GO} test -ldflags="-X chezmoi.io/chezmoi/internal/chezmoitest.umaskStr=0o022" ./...
+	${GO} test -ldflags="-X chezmoi.io/chezmoi/internal/chezmoitest.umaskStr=0o002" ./...
+
+.PHONY: test-docker
+test-docker:
+	( cd assets/docker && ./test.sh alpine archlinux fedora )
+
+.PHONY: test-vagrant
+test-vagrant:
+	( cd assets/vagrant && ./test.sh freebsd14 )
+
+.PHONY: coverage-html
+coverage-html: coverage
+	${GO} tool cover -html=coverage.out
+
+.PHONY: coverage
+coverage:
+	${GO} test -coverprofile=coverage.out -coverpkg=chezmoi.io/chezmoi/... ./...
+
+.PHONY: capslock
+capslock:
+	${GO} tool capslock -output=package > .config/capslock-summary.json || rm -rf .config/capslock-summary.json
+
+.PHONY: lint
+lint: ensure-golangci-lint shellcheck
+	${GO} tool actionlint
+	${GO} tool editorconfig-checker -config=.config/editorconfig-checker.json
+	./bin/golangci-lint run --config=.config/golangci.yml
+	${GO} tool lint-whitespace
+	find . -name \*.txtar | xargs ${GO} tool lint-txtar
+	${GO} tool find-typos chezmoi .
+	${GO} tool lint-commit-messages ${UPSTREAM}/master..HEAD
+
+.PHONY: lint-markdown
+lint-markdown:
+	markdownlint-cli2 --config .config/markdownlint-cli2.yaml
+
+.PHONY: format
+format: ensure-golangci-lint
+	./bin/golangci-lint fmt
+	find . -name \*.txtar | xargs ${GO} tool lint-txtar -w
+
+.PHONY: format-yaml
+format-yaml:
+	find . -name \*.yaml -o -name \*.yml | xargs uv run task format-yaml
+
+.PHONY: create-syso
+create-syso:
+	${GO} tool execute-template -output ./versioninfo.json ./assets/templates/versioninfo.json.tmpl
+	${GO} tool goversioninfo -platform-specific
+
+.PHONY: ensure-tools
+ensure-tools: \
+	ensure-golangci-lint \
+	ensure-goreleaser \
+	ensure-syft
+
+.PHONY: ensure-golangci-lint
+ensure-golangci-lint:
+	if [ ! -x bin/golangci-lint ] || ( ./bin/golangci-lint version | grep -Fqv "version ${GOLANGCI_LINT_VERSION}" ) ; then \
+		curl -fsLS "https://github.com/golangci/golangci-lint/releases/download/v${GOLANGCI_LINT_VERSION}/${GOLANGCI_LINT_BASENAME}.tar.gz" | tar -C bin --strip-components 1 -xzf - "${GOLANGCI_LINT_BASENAME}/golangci-lint" ; \
+	fi
+
+.PHONY: ensure-goreleaser
+ensure-goreleaser:
+	if [ ! -x bin/goreleaser ] || ! ( ./bin/goreleaser --version | grep -Fq "${GORELEASER_VERSION}" ) ; then \
+		curl -fsLS "https://github.com/goreleaser/goreleaser/releases/download/v${GORELEASER_VERSION}/${GORELEASER_BASENAME}.tar.gz" | tar -C bin -xzf - goreleaser ; \
+	fi
+
+.PHONY: ensure-syft
+ensure-syft:
+	if [ ! -x bin/syft ] || ( ./bin/syft --version | grep -Fqv "${SYFT_VERSION}" ) ; then \
+		curl -fsLS "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/${SYFT_BASENAME}.tar.gz" | tar -C bin -xzf - syft ; \
+	fi
+
+.PHONY: generate
+generate:
+	CHEZMOIDEV=ignoreflags=1,ignorehelp=1 ${GO} generate
+
+.PHONY: release
+release: ensure-goreleaser
+	./bin/goreleaser release \
+		--clean \
+		${GORELEASER_FLAGS}
+
+.PHONY: shellcheck
+shellcheck:
+	find . -type f -name \*.sh | xargs shellcheck
+
+.PHONY: test-release
+test-release: ensure-goreleaser
+	./bin/goreleaser release \
+		--clean \
+		--skip=chocolatey,sbom,snapcraft,sign \
+		--snapshot \
+		${GORELEASER_FLAGS}
+
+# FIXME parse go.mod instead of hardcoding tools here
+.PHONY: update-go-tools
+update-go-tools:
+	go get \
+		github.com/editorconfig-checker/editorconfig-checker/v4@latest \
+		github.com/google/capslock@latest \
+		github.com/josephspurrier/goversioninfo@latest \
+		github.com/rhysd/actionlint@latest \
+		github.com/twpayne/find-typos@latest

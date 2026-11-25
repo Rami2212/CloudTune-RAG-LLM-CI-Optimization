@@ -1,0 +1,70 @@
+name: Upstream Icon Sync
+
+# Reports which icon-related issues/PRs from the upstream
+# material-extensions/vscode-material-icon-theme repository do not yet appear to
+# be ported into this repo's association XML files. The committed state file
+# ensures repeat runs only surface new / still-unresolved items.
+
+on:
+  schedule:
+    # Weekly, Mondays at 06:00 UTC.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      include_closed:
+        description: 'Also scan closed/merged upstream items'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    name: Check upstream icon requests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: '10'
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: pnpm
+          cache-dependency-path: scripts/upstream-sync/pnpm-lock.yaml
+
+      - name: Install upstream-sync dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: scripts/upstream-sync
+
+      - name: Run upstream check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INCLUDE_CLOSED: ${{ inputs.include_closed }}
+        run: npm run check-upstream -- --write-state --report upstream-report.md
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-icon-report
+          path: upstream-report.md
+
+      - name: Open / update state pull request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          base: ${{ github.ref_name }}
+          branch: automation/upstream-sync-state
+          add-paths: scripts/upstream-sync/state.json
+          commit-message: 'chore: refresh upstream icon sync state'
+          title: 'chore: refresh upstream icon sync state'
+          body-path: upstream-report.md
+          delete-branch: true

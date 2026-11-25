@@ -1,0 +1,73 @@
+name: Release
+run-name: Release ${{ inputs.releaseVersion }} (next ${{ inputs.nextVersion }}) by ${{ github.actor }}
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      releaseVersion:
+        description: "The release version in <MAJOR>.<MINOR>.<PATCH> format"
+        required: true
+      nextVersion:
+        description: "The next version in <MAJOR>.<MINOR> format WITHOUT SNAPSHOT SUFFIX"
+        required: true
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    env:
+      GIT_COMMIT_AUTHOR_EMAIL: ${{ vars.ALLURE_CI_APP_USER_ID }}+${{ vars.ALLURE_CI_APP_SLUG }}[bot]@users.noreply.github.com
+      GIT_COMMIT_AUTHOR_NAME: ${{ vars.ALLURE_CI_APP_SLUG }}[bot]
+    steps:
+      - name: "Check release version"
+        run: |
+          expr "${{ github.event.inputs.releaseVersion }}" : '[[:digit:]][[:digit:]]*\.[[:digit:]][[:digit:]]*\.[[:digit:]][[:digit:]]*$'
+      - name: "Check next version"
+        run: |
+          expr "${{ github.event.inputs.nextVersion }}" : '[[:digit:]][[:digit:]]*\.[[:digit:]][[:digit:]]*$'
+
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.ALLURE_CI_APP_CLIENT_ID }}
+          private-key: ${{ secrets.ALLURE_CI_APP_PRIVATE_KEY }}
+          permission-contents: write
+
+      - uses: actions/checkout@v7
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: "Configure CI Git User"
+        run: |
+          git config --global user.name "${GIT_COMMIT_AUTHOR_NAME}"
+          git config --global user.email "${GIT_COMMIT_AUTHOR_EMAIL}"
+      - name: "Set release version"
+        run: |
+          sed -i -e '/version=/s/.*/version=${{ github.event.inputs.releaseVersion }}/g' gradle.properties
+          cat gradle.properties
+      - name: "Commit release version and create tag"
+        run: |
+          git commit -am "release ${{ github.event.inputs.releaseVersion }}"
+          git tag ${{ github.event.inputs.releaseVersion }}
+          git push origin ${{ github.event.inputs.releaseVersion }}
+      - name: "Set next development version"
+        run: |
+          sed -i -e '/version=/s/.*/version=${{ github.event.inputs.nextVersion }}-SNAPSHOT/g' gradle.properties
+          cat gradle.properties
+
+      - name: "Commit next development version and push it"
+        run: |
+          git commit -am "set next development version ${{ github.event.inputs.nextVersion }}"
+          git push origin ${{ github.ref }}
+      - name: "Publish Github Release"
+        uses: octokit/request-action@v2.x
+        with:
+          route: POST /repos/${{ github.repository }}/releases
+          tag_name: ${{ github.event.inputs.releaseVersion }}
+          generate_release_notes: true
+          target_commitish: ${{ github.ref }}
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}

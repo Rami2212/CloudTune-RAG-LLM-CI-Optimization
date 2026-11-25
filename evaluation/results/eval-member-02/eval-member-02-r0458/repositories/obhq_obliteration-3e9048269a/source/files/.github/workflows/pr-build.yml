@@ -1,0 +1,61 @@
+name: PR Build
+on:
+  pull_request:
+    branches:
+    - '*'
+concurrency: pr-${{ github.ref }}
+jobs:
+  prebuild:
+    name: Pre build
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Check out repository
+      uses: actions/checkout@v6
+    - name: Update Rust
+      run: rustup update stable
+    - name: Check Rust styles
+      run: cargo fmt --check
+  build-windows:
+    name: Build
+    uses: ./.github/workflows/ci-windows.yml
+    needs: prebuild
+  build-linux:
+    name: Build
+    uses: ./.github/workflows/ci-linux.yml
+    needs: prebuild
+  build-linux-aarch64:
+    name: Build
+    uses: ./.github/workflows/ci-linux-aarch64.yml
+    needs: prebuild
+  build-mac:
+    name: Build
+    uses: ./.github/workflows/ci-mac.yml
+    needs: prebuild
+  build-docs:
+    name: Build
+    uses: ./.github/workflows/ci-docs.yml
+    needs: prebuild
+  postbuild:
+    name: Post build
+    runs-on: ubuntu-24.04
+    needs: [build-windows, build-linux, build-linux-aarch64, build-mac, build-docs]
+    steps:
+    - name: Generate build information
+      run: |
+        import json
+
+        info = {
+          "pr": ${{ github.event.number }},
+          "base": "${{ github.base_ref }}",
+          "head": "${{ github.event.pull_request.head.sha }}",
+          "author": "${{ github.event.pull_request.head.user.login }}"
+        }
+
+        with open("build-info.json", "w") as fp:
+          json.dump(info, fp)
+      shell: python
+    - name: Upload build information
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-info
+        path: build-info.json

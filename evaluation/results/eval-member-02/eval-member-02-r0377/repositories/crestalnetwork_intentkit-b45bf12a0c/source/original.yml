@@ -1,0 +1,84 @@
+name: Lint
+
+on:
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  security-scan:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version-file: "pyproject.toml"
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
+        
+    - name: Install dependencies
+      run: |
+        uv sync --locked --all-extras --dev
+        
+    - name: Ruff Check
+      run: |
+        sh lint.sh ci
+
+    - name: Unit Tests
+      run: |
+        uv run pytest -m "not bdd and not integration"
+
+  go-test:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: "integrations/go.mod"
+        cache-dependency-path: "integrations/go.sum"
+
+    - name: Go Tests
+      working-directory: integrations
+      run: |
+        go test ./...
+
+  frontend:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: 24
+        cache: npm
+        cache-dependency-path: frontend/package-lock.json
+
+    - name: Install dependencies
+      run: |
+        npm ci
+
+    - name: ESLint
+      run: |
+        npm run lint
+
+    - name: Type Check
+      run: |
+        npm run typecheck
+
+    - name: Tests
+      run: |
+        npm test

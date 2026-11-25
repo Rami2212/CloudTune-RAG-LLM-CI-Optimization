@@ -1,0 +1,36 @@
+name: test
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false # run all tests so we see which gem/ruby combinations break
+      matrix:
+        ruby: ['3.2', '3.3', '3.4', head, jruby-head]
+        os: [ubuntu-latest, windows-latest]
+        task: [spec]
+        include:
+          - ruby: '3.2' # lowest supported version, same as gemspec and .rubocop.yml
+            os: ubuntu-latest
+            task: rubocop
+    steps:
+    - uses: actions/checkout@master
+    - uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: ${{ matrix.ruby }}
+        # runs 'bundle install' and caches installed gems automatically
+        # disabled on jruby-head windows where frozen install fails with "lockfile needs to be updated"
+        bundler-cache: ${{ !(matrix.ruby == 'jruby-head' && matrix.os == 'windows-latest') }}
+    - if: matrix.ruby == 'jruby-head' && matrix.os == 'windows-latest'
+      run: bundle install
+    - name: rake ${{ matrix.task }}
+      # allow ruby/jruby-head to fail since they are moving targets
+      # TODO: this will always show green, fix once https://github.com/actions/toolkit/issues/399 is resolved
+      continue-on-error: ${{ endsWith(matrix.ruby, 'head') }}
+      run: bundle exec rake ${{ matrix.task }}

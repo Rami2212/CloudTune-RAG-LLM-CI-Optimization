@@ -1,0 +1,82 @@
+name: test
+
+on:
+  push:
+    branches:
+    - main
+  pull_request:
+    branches:
+    - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  types:
+    name: Check types (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    env:
+      UV_CACHE_DIR: ~/.cache/uv
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: [ '3.11', '3.15' ]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          activate-environment: "true"
+      - name: Cache uv dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-uv-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-
+      - name: Install jupyverse and plugins
+        run: |
+          uv venv --clear
+          uv pip install --group test -e . -e api/* -e plugins/*
+        shell: bash
+      - name: Check types
+        run: |
+          uv run mypy ./api ./plugins
+      - name: Lint
+        if: matrix.python-version == '3.11'
+        run: |
+          uv run ruff check src api notebooks plugins tests
+          uv run ruff format --check src api notebooks plugins tests
+
+  test:
+    name: Run tests
+    runs-on: ${{ matrix.os }}-latest
+    env:
+      UV_CACHE_DIR: ~/.cache/uv
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu, macos, windows]
+        python-version: [ '3.11', '3.12', '3.13', '3.14', '3.15' ]
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          activate-environment: "true"
+      - name: Cache uv dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-uv-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-
+      - name: Install jupyverse and plugins
+        run: |
+          uv venv --clear
+          uv pip install --group test -e . -e api/* -e plugins/*
+        shell: bash
+      - name: Run tests
+        run: uv run pytest -v --timeout=60 --color=yes

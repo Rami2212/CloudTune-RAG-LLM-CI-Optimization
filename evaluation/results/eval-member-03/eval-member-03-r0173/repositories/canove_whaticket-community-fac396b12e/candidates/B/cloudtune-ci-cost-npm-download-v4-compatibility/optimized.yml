@@ -1,0 +1,47 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 3 optimizations:
+# - [HIGH] Add npm dependency cache to "build" job
+# - [MEDIUM] Add concurrency group to "build-backend.yaml"
+# - [MEDIUM] Use "npm ci" instead of "npm install" in "build"
+# Estimated savings: ~7 min/run
+#
+name: Test build backend
+
+on:
+  pull_request:
+    paths:
+      - "backend/**"
+
+  push:
+    branches:
+      - master
+    paths:
+      - "backend/**"
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [22.x]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install dependencies
+        working-directory: backend
+        run: npm install
+
+      - run: npm run build
+        working-directory: backend

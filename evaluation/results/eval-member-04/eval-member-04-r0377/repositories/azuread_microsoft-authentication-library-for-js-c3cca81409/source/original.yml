@@ -1,0 +1,63 @@
+name: msal-node client-credential Regression Test
+on:
+    # Allows manual triggering of workflow
+    workflow_dispatch:
+
+    pull_request:
+        types: [opened, reopened, synchronize, ready_for_review]
+        paths:
+            - "regression-tests/msal-node/client-credential/*"
+            - "lib/msal-node/**/*"
+            - "lib/msal-common/**/*"
+            - "!**.md"
+            - ".github/workflows/client-credential.yml"
+
+    merge_group:
+        types: [checks_requested]
+
+permissions:
+    # Read access for actions/checkout
+    contents: read
+    # Write access so github-action-benchmark can post the regression alert as a PR comment.
+    # Intentionally NOT contents:write — this workflow runs untrusted PR code and must not be
+    # able to modify repo contents. Baseline publishing to gh-pages is handled separately by
+    # msal-node-confidential-client-benchmarks.yml, which only runs on push to dev.
+    pull-requests: write
+
+jobs:
+    benchmark:
+        name: Run msal-node client-credential Regression Test
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+            - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+
+            - name: Install dependencies
+              run: npm install --workspace=lib/msal-common --workspace=lib/msal-node
+
+            - name: Build dependencies
+              run: npm run build --workspace=lib/msal-common --workspace=lib/msal-node
+
+            - name: Run benchmark
+              run: npm install && node index.js | tee output.txt
+              working-directory: regression-tests/msal-node/client-credential
+
+            - name: Download previous benchmark data
+              uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+              with:
+                  path: ./cache
+                  key: ${{ runner.os }}-benchmark
+
+            - name: Store benchmark result
+              uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc # v1.22.2
+              with:
+                  name: msal-node client-credential Regression Test
+                  tool: "benchmarkjs"
+                  output-file-path: regression-tests/msal-node/client-credential/output.txt
+                  external-data-json-path: ./cache/client-credential-benchmark-data.json
+                  github-token: ${{ secrets.GITHUB_TOKEN }}
+                  # Show alert with commit comment on detecting possible performance regression
+                  alert-threshold: "110%"
+                  comment-on-alert: true
+                  fail-on-alert: false
+                  alert-comment-cc-users: "@bgavrilMS @robbie-microsoft"

@@ -1,0 +1,80 @@
+DATAPLANEAPI_PATH?=$(shell pwd)
+GIT_REPO?=$(shell git config --get remote.origin.url)
+GIT_HEAD_COMMIT=$(shell git rev-parse --short HEAD)
+GIT_LAST_TAG=$(shell git describe --abbrev=0 --tags)
+GIT_TAG_COMMIT=$(shell git rev-parse --short ${GIT_LAST_TAG})
+GIT_MODIFIED1=$(shell git diff "${GIT_HEAD_COMMIT}" "${GIT_TAG_COMMIT}" --quiet || echo .dev)
+GIT_MODIFIED2=$(shell git diff --quiet || echo .dirty)
+GIT_MODIFIED=${GIT_MODIFIED1}${GIT_MODIFIED2}
+SWAGGER_VERSION=${shell curl -s https://raw.githubusercontent.com/haproxytech/client-native/master/Makefile | grep SWAGGER_VERSION -m 1 | awk -F"=" '{print $$2}'}
+BUILD_DATE=$(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
+CGO_ENABLED?=0
+GOLANGCI_LINT_VERSION=2.14.0
+CHECK_COMMIT=5.8.1
+OAPI_CODEGEN_VERSION=v2.7.0
+BIN_DIR=$(CURDIR)/bin
+OAPI_CODEGEN=$(BIN_DIR)/oapi-codegen
+
+.PHONY: install-oapi-codegen
+install-oapi-codegen:
+	@mkdir -p $(BIN_DIR)
+	@if [ ! -f $(OAPI_CODEGEN) ] || [ "$$($(OAPI_CODEGEN) --version | tail -n 1)" != "$(OAPI_CODEGEN_VERSION)" ]; then \
+		echo "Installing oapi-codegen $(OAPI_CODEGEN_VERSION)..."; \
+		GOBIN=$(BIN_DIR) go install github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@$(OAPI_CODEGEN_VERSION); \
+	fi
+
+all: update clean build
+
+update:
+	go mod tidy
+
+.PHONY: lint
+lint:
+	cd bin;GOLANGCI_LINT_VERSION=${GOLANGCI_LINT_VERSION} sh lint-check.sh
+	bin/golangci-lint run --timeout 10m --color always --max-issues-per-linter 0 --max-same-issues 0
+
+.PHONY: gofumpt
+gofumpt:
+	go install mvdan.cc/gofumpt@latest
+	gofumpt -l -w .
+
+clean:
+	rm -rf ${DATAPLANEAPI_PATH}/build
+
+.PHONY: build
+build:
+	mkdir -p ${DATAPLANEAPI_PATH}/build
+	CGO_ENABLED=$(CGO_ENABLED) go build -trimpath -ldflags "-X \"main.GitRepo=${GIT_REPO}\" -X main.GitTag=${GIT_LAST_TAG} -X main.GitCommit=${GIT_HEAD_COMMIT} -X main.GitDirty=${GIT_MODIFIED} -X main.BuildTime=${BUILD_DATE}" -o ${DATAPLANEAPI_PATH}/build/dataplaneapi ${DATAPLANEAPI_PATH}/cmd/dataplaneapi/
+
+.PHONY: e2e
+e2e: build
+	TESTNAME="$(TESTNAME)" TESTNUMBER=$(TESTNUMBER) TESTDESCRIPTION="$(TESTDESCRIPTION)" SKIP_CLEANUP=$(SKIP_CLEANUP) PREWIPE=$(PREWIPE) HAPROXY_VERSION=$(HAPROXY_VERSION) ./e2e/run.bash
+
+
+.PHONY: test
+test:
+	go test ./...
+
+.PHONY: check-commit
+check-commit:
+	cd bin;CHECK_COMMIT=${CHECK_COMMIT} sh check-commit.sh
+	bin/check-commit
+
+SPECIFICATION_DIR=specification
+
+.PHONY: specification
+specification: install-oapi-codegen
+	go run ./cmd/generate/specification --spec-dir $(SPECIFICATION_DIR) --oapi-codegen $(OAPI_CODEGEN)
+
+.PHONY: generate
+generate:
+	cd generate/swagger;docker build \
+		--build-arg SWAGGER_VERSION=${SWAGGER_VERSION} \
+		--build-arg UID=$(shell id -u) \
+		--build-arg GID=$(shell id -g) \
+		-t dataplaneapi-swagger-gen .
+	docker run --rm -v "$(shell pwd)":/data dataplaneapi-swagger-gen
+
+.PHONY: generate-native
+generate-native:
+	generate/swagger/script.sh

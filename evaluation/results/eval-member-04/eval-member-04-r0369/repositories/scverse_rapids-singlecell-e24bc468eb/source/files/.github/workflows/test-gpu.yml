@@ -1,0 +1,282 @@
+name: GPU Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types:
+      - labeled
+      - opened
+      - synchronize
+# Cancel the job if new commits are pushed
+# https://stackoverflow.com/questions/66335225/how-to-cancel-previous-runs-in-the-pr-when-you-push-new-commitsupdate-the-curre
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.mode.outputs.skip }}
+    steps:
+      - name: Require push to main, 'run-gpu-ci' or 'skip-gpu-ci' label
+        id: mode
+        env:
+          RUN: ${{ github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'run-gpu-ci') }}
+          SKIP: ${{ contains(github.event.pull_request.labels.*.name, 'skip-gpu-ci') }}
+        run: |
+          if [[ "$RUN" == "true" ]]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          elif [[ "$SKIP" == "true" ]]; then
+            echo "::notice::GPU CI skipped by the 'skip-gpu-ci' label."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::GPU CI requires a push to main or the 'run-gpu-ci' or 'skip-gpu-ci' label on the PR."
+            exit 1
+          fi
+
+  get-envs:
+    runs-on: ubuntu-latest
+    needs: check
+    if: needs.check.outputs.skip != 'true'
+    permissions:
+      contents: read
+    outputs:
+      stable-dev: ${{ steps.get-envs.outputs.stable-dev }}
+      prerelease: ${{ steps.get-envs.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          filter: blob:none
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: false
+      - id: get-envs
+        run: |
+          # Stable + dev, all cu13 (all T4; no other GPU capacity is available)
+          STABLE_DEV_JSON=$(uvx hatch env show --json | jq -c '
+            to_entries
+            | map(
+              select(.key | startswith("hatch-test"))
+              | select(
+                ((.key | contains("stable")) and (.key | endswith("13")))
+                or ((.key | contains("dev")) and (.key | endswith("13")))
+              )
+              | {
+                name: .key,
+                python: .value.python | sub("3[.]13"; "3.13.3"),
+                runner: "cirun-aws-gpu-t4",
+              }
+            )')
+          echo "stable-dev=${STABLE_DEV_JSON}" | tee -a "$GITHUB_OUTPUT"
+
+          # Prerelease environments (cu13 -> T4)
+          PRERELEASE_JSON=$(uvx hatch env show --json | jq -c '
+            to_entries
+            | map(
+              select(.key | startswith("hatch-test") and endswith("13") and contains("prerelease"))
+              | {
+                name: .key,
+                python: .value.python | sub("3[.]13"; "3.13.3"),
+                runner: "cirun-aws-gpu-t4",
+              }
+            )')
+          echo "prerelease=${PRERELEASE_JSON}" | tee -a "$GITHUB_OUTPUT"
+
+  test-stable-dev:
+    name: Test (${{ matrix.env.name }})
+    needs: get-envs
+    runs-on: ${{ matrix.env.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        env: ${{ fromJson(needs.get-envs.outputs.stable-dev) }}
+    env:
+      ENV_NAME: ${{ matrix.env.name }}
+      # Build rapids-singlecell once per job: no isolated build env, incremental build dir
+      UV_CONFIG_FILE: ${{ github.workspace }}/.github/uv-ci.toml
+      SKBUILD_BUILD_DIR: ${{ github.workspace }}/.cache/build
+      CUPY_CACHE_DIR: ${{ github.workspace }}/.cache/cupy
+      NUMBA_CACHE_DIR: ${{ github.workspace }}/.cache/numba
+      COVERAGE_CORE: sysmon
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: ${{ matrix.env.python }}
+
+      - name: Restore file mtimes from git
+        # ninja rebuilds by mtime; a fresh checkout would make the cached build dir rebuild everything
+        run: |
+          git ls-files -z | xargs -0 -P 4 -n 50 sh -c 'for f; do touch -d "@$(git log -1 --format=%ct -- "$f")" "$f"; done' sh
+      - name: Restore build and JIT caches
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache
+          key: ${{ matrix.env.name }}-cache-${{ github.run_id }}
+          restore-keys: ${{ matrix.env.name }}-cache-
+      - name: Add CUDA to PATH
+        run: |
+          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        run: |
+          uv tool install hatch
+          hatch -v env create "$ENV_NAME"
+
+      - name: Run tests
+        timeout-minutes: 30 # a full run takes 12-20; a hang would otherwise use the whole job limit
+        run: |
+          mkdir -p test-data
+          if [[ "$ENV_NAME" == *"stable"* ]]; then
+            hatch run "${ENV_NAME}:run-cov" -v --color=yes
+            hatch run "${ENV_NAME}:coverage" xml
+            hatch run "${ENV_NAME}:cov-report"
+          else
+            hatch run "${ENV_NAME}:run" -v --color=yes
+          fi
+
+      - name: Upload test results
+        if: ${{ !cancelled() && contains(matrix.env.name, 'stable') }}
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          report_type: test_results
+          files: test-data/test-results.xml
+          use_oidc: false
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Upload coverage data
+        if: contains(matrix.env.name, 'stable')
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: test-data/coverage.xml
+          use_oidc: false
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  test-prerelease:
+    name: Test (${{ matrix.env.name }})
+    needs: get-envs
+    runs-on: ${{ matrix.env.runner }}
+    timeout-minutes: 45
+    continue-on-error: true # Prerelease failures don't fail the workflow
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        env: ${{ fromJson(needs.get-envs.outputs.prerelease) }}
+    env:
+      ENV_NAME: ${{ matrix.env.name }}
+      # Build rapids-singlecell once per job: no isolated build env, incremental build dir
+      UV_CONFIG_FILE: ${{ github.workspace }}/.github/uv-ci.toml
+      SKBUILD_BUILD_DIR: ${{ github.workspace }}/.cache/build
+      CUPY_CACHE_DIR: ${{ github.workspace }}/.cache/cupy
+      NUMBA_CACHE_DIR: ${{ github.workspace }}/.cache/numba
+      COVERAGE_CORE: sysmon
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: ${{ matrix.env.python }}
+
+      - name: Restore file mtimes from git
+        # ninja rebuilds by mtime; a fresh checkout would make the cached build dir rebuild everything
+        run: |
+          git ls-files -z | xargs -0 -P 4 -n 50 sh -c 'for f; do touch -d "@$(git log -1 --format=%ct -- "$f")" "$f"; done' sh
+      - name: Restore build and JIT caches
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache
+          key: ${{ matrix.env.name }}-cache-${{ github.run_id }}
+          restore-keys: ${{ matrix.env.name }}-cache-
+      - name: Add CUDA to PATH
+        run: |
+          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" >> "$GITHUB_ENV"
+
+      - name: Check CUDA version
+        run: nvcc --version
+
+      - name: Check NVIDIA SMI
+        run: nvidia-smi
+
+      - name: Install dependencies
+        run: |
+          uv tool install hatch
+          hatch -v env create "$ENV_NAME"
+
+      - name: Run tests
+        timeout-minutes: 30
+        run: hatch run "${ENV_NAME}:run" -v --color=yes
+
+  remove-label:
+    name: Remove 'run-gpu-ci' Label
+    runs-on: ubuntu-latest
+    if: ${{ always() && github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-gpu-ci') }}
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Remove 'run-gpu-ci' label
+        run: gh api -X DELETE "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/run-gpu-ci" || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  stable-dev-green:
+    name: CI-Pass
+    if: always()
+    needs:
+      - check
+      - get-envs
+      - test-stable-dev
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check required jobs succeeded
+        if: needs.check.outputs.skip != 'true'
+        run: |
+          if [[ "${{ needs.get-envs.result }}" != "success" || "${{ needs.test-stable-dev.result }}" != "success" ]]; then
+            echo "::error::Required jobs did not succeed (get-envs=${{ needs.get-envs.result }}, test-stable-dev=${{ needs.test-stable-dev.result }})."
+            exit 1
+          fi
+
+  all-green:
+    name: All Tests Green
+    if: always()
+    needs:
+      - check
+      - get-envs
+      - test-stable-dev
+      - test-prerelease
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check required jobs succeeded (test-prerelease allowed to fail)
+        if: needs.check.outputs.skip != 'true'
+        run: |
+          if [[ "${{ needs.get-envs.result }}" != "success" || "${{ needs.test-stable-dev.result }}" != "success" ]]; then
+            echo "::error::Required jobs did not succeed (get-envs=${{ needs.get-envs.result }}, test-stable-dev=${{ needs.test-stable-dev.result }})."
+            exit 1
+          fi

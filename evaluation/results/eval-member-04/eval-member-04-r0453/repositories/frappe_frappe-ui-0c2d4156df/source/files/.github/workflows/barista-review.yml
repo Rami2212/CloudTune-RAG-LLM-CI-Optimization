@@ -1,0 +1,116 @@
+name: Barista — PR Review
+
+on:
+  pull_request:
+    # Intentionally no `synchronize` — re-reviews on every push were getting
+    # cancelled by the next push. Use `/barista review` in a PR comment to
+    # request a fresh review after pushing fixes.
+    types: [opened, reopened, ready_for_review]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.changeset/**'
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number to (re)review
+        required: true
+        type: number
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+jobs:
+  review:
+    # Kill switch: set repo variable BARISTA_ENABLED=true to enable.
+    # Skip drafts, and the release PR, which only bumps the version. Skip fork
+    # PRs (no access to bot token by design — keep PR head out of a privileged
+    # context).
+    # Comment-trigger gating: only run on /barista review from maintainers, on PRs.
+    if: >-
+      vars.BARISTA_ENABLED == 'true' && (
+        (
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.state == 'open' &&
+          github.event.pull_request.draft == false &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          github.event.pull_request.head.ref != 'changeset-release/main'
+        ) ||
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event_name == 'issue_comment' &&
+          github.event.issue.pull_request != null &&
+          github.event.issue.state == 'open' &&
+          contains(github.event.comment.body, '/barista review') &&
+          (
+            github.event.comment.author_association == 'OWNER' ||
+            github.event.comment.author_association == 'MEMBER' ||
+            github.event.comment.author_association == 'COLLABORATOR'
+          )
+        )
+      )
+    # Keep concurrency on the eligible job. Skipped comment events must not
+    # cancel an active review before this job filter runs.
+    concurrency:
+      group: barista-review-${{ github.event_name == 'pull_request' && 'auto' || 'manual' }}-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number }}
+      # Reviews are stateless, so the latest valid request should win.
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Mint barista app token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.BARISTA_APP_ID }}
+          private-key: ${{ secrets.BARISTA_PRIVATE_KEY }}
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          # History so barista can inspect recent commits near changed files.
+          fetch-depth: 200
+
+      - name: Setup Barista
+        id: setup
+        uses: ./.github/actions/barista-setup
+        with:
+          app-token: ${{ steps.app-token.outputs.token }}
+          dispatch-number: ${{ inputs.pr_number }}
+
+      - name: Run Barista
+        id: run-barista
+        uses: ./.github/actions/barista-run
+        with:
+          oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Claude only needs read access. The workflow owns comment delivery.
+          github-token: ${{ github.token }}
+          repo: ${{ github.repository }}
+          issue-number: ${{ steps.setup.outputs.number }}
+          event: ${{ github.event_name }}
+          comment-body: ${{ github.event.comment.body }}
+          comment-author: ${{ github.event.comment.user.login }}
+          prompt: "/barista-review REPO: ${{ github.repository }} PR_NUMBER: ${{ steps.setup.outputs.number }} EVENT: ${{ github.event_name }}"
+          model: ${{ vars.BARISTA_MODEL }}
+
+      - name: Post Barista review
+        id: post-review
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          BARISTA_ISSUE: ${{ steps.setup.outputs.number }}
+          EXECUTION_FILE: ${{ steps.run-barista.outputs.execution-file }}
+        run: ./.github/barista/scripts/post-review.ts
+
+      - name: Append run-stats footer
+        if: always() && steps.post-review.outcome == 'success'
+        uses: ./.github/actions/barista-append-stats
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          repo: ${{ github.repository }}
+          issue-number: ${{ steps.setup.outputs.number }}
+          execution-file: ${{ steps.run-barista.outputs.execution-file }}

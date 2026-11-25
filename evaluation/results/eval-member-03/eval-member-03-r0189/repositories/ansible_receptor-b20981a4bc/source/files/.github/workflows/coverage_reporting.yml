@@ -1,0 +1,143 @@
+---
+name: Codecov
+
+on:  # yamllint disable-line rule:truthy
+  pull_request:  # yamllint disable-line rule:empty-values
+  push:
+    branches: [devel]
+
+env:
+  DESIRED_GO_VERSION: '1.25'
+  DESIRED_PYTHON_VERSION: '3.12'
+
+jobs:
+  go_test_coverage:
+    name: go test coverage
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.DESIRED_GO_VERSION }}
+
+      - name: build and install receptor
+        run: |
+          make build-all
+          sudo cp ./receptor /usr/local/bin/receptor
+
+      - name: Download kind binary
+        run: curl --proto '=https' --tlsv1.2 -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-amd64 && chmod +x ./kind
+
+      - name: Create k8s cluster
+        run: ./kind create cluster --wait 60s
+
+      - name: Wait for nodes to be ready
+        run: kubectl wait --for=condition=Ready nodes --all --timeout=60s
+
+      - name: Interact with the cluster
+        run: kubectl get nodes
+
+      - name: Run receptor tests with coverage
+        run: make coverage
+
+      - name: Set up nox
+        uses: wntrblm/nox@2026.10.20
+        with:
+          python-versions: ${{ env.DESIRED_PYTHON_VERSION }}
+
+      - name: Provision nox environment for coverage
+        run: nox --install-only --session coverage
+        working-directory: ./receptorctl
+
+      - name: Run `receptorctl` nox coverage session
+        run: nox --no-install --session coverage
+        working-directory: ./receptorctl
+
+      - name: Run receptor-python-worker coverage
+        run: bash receptor-python-worker/run_coverage.sh # NOSONAR
+
+      - name: Merge python-worker coverage into receptorctl coverage XML
+        run: |
+          python3 - <<'EOF'
+          import xml.etree.ElementTree as ET
+
+          r = ET.parse('receptorctl/receptorctl_coverage.xml').getroot()
+          w = ET.parse('receptor-python-worker/python_worker_coverage.xml').getroot()
+
+          # Append python-worker <source> entries so SonarCloud can resolve
+          # the short filenames (e.g. "work.py") against the correct base dir,
+          # exactly like it does for the receptorctl entries.
+          r_sources = r.find('sources')
+          for src in w.find('sources'):
+              r_sources.append(src)
+
+          r_pkgs = r.find('packages')
+          for pkg in w.find('packages'):
+              r_pkgs.append(pkg)
+
+          for attr in ('lines-valid', 'lines-covered', 'branches-valid', 'branches-covered'):
+              r.set(attr, str(int(r.get(attr, 0)) + int(w.get(attr, 0))))
+
+          total = int(r.get('lines-valid', 0))
+          covered = int(r.get('lines-covered', 0))
+          r.set('line-rate', f'{covered/total:.4f}' if total else '0')
+
+          ET.indent(r)
+          ET.ElementTree(r).write('receptorctl/receptorctl_coverage.xml',
+                                  xml_declaration=True, encoding='unicode')
+          print('Merged receptor-python-worker coverage into receptorctl_coverage.xml')
+          EOF
+
+      - name: SonarCube Static Scans (on push)
+        uses: SonarSource/sonarqube-scan-action@v7
+        if: github.event_name == 'push' && github.repository == 'ansible/receptor'
+        env:
+          SONAR_TOKEN: ${{ secrets[format('{0}', vars.SONAR_TOKEN_SECRET_NAME)] }}
+        with:
+          args: >
+            -Dsonar.go.coverage.reportPaths=coverage.txt
+            -Dsonar.python.coverage.reportPaths=receptorctl/receptorctl_coverage.xml,receptor-python-worker/python_worker_coverage.xml
+
+      - name: Upload Code Coverage Report from Receptor Unit Tests
+        uses: actions/upload-artifact@v7
+        with:
+          name: receptor-coverage-report
+          path: coverage.txt
+
+      - name: Save off PR Number
+        run: echo "PR ${{ github.event.number }}" > pr_number.txt
+
+      - name: Upload PR Number
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr_number
+          path: pr_number.txt
+
+      - name: get k8s logs
+        if: ${{ failure() }}
+        run: .github/workflows/artifact-k8s-logs.sh
+
+      - name: Archive receptor binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: receptor
+          path: /usr/local/bin/receptor
+
+      - name: Upload Code Coverage Report from Receptorctl Unit Tests
+        uses: actions/upload-artifact@v7
+        with:
+          name: receptorctl-coverage-report
+          path: receptorctl/receptorctl_coverage.xml
+
+      - name: Upload Code Coverage Report from receptor-python-worker Unit Tests
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-worker-coverage-report
+          path: receptor-python-worker/python_worker_coverage.xml

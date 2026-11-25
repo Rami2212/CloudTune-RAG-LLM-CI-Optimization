@@ -1,0 +1,160 @@
+# This workflow will install Python dependencies, run tests and lint with a single version of Python
+# For more information see: https://help.github.com/actions/language-and-framework-guides/using-python-with-github-actions
+
+name: ShvatkaBotTest
+
+on:
+  workflow_call:
+
+  pull_request:
+    branches: [ master ]
+jobs:
+  lint:
+    # Skip the standalone PR run when the branch already triggers build.yml
+    # (push) so lint/test/diagrams don't run twice. Still runs for forks and
+    # for branches build.yml does not cover. Keep patterns in sync with build.yml.
+    if: >-
+      github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.fork
+      || !(startsWith(github.head_ref, 'claude/')
+      || startsWith(github.head_ref, 'codex/')
+      || startsWith(github.head_ref, 'feature/')
+      || startsWith(github.head_ref, 'tech/')
+      || startsWith(github.head_ref, 'fix/'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Install dependencies
+        run: uv sync --group test
+      - name: black (ruff format)
+        run: source .venv/bin/activate && ruff format --check .
+      - name: ruff
+        run: source .venv/bin/activate && ruff check .
+      - name: mypy
+        run: source .venv/bin/activate && mypy .
+  test:
+    # See lint job: avoid running twice when build.yml already covers the branch.
+    if: >-
+      github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.fork
+      || !(startsWith(github.head_ref, 'claude/')
+      || startsWith(github.head_ref, 'codex/')
+      || startsWith(github.head_ref, 'feature/')
+      || startsWith(github.head_ref, 'tech/')
+      || startsWith(github.head_ref, 'fix/'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Install dependencies
+        run: uv sync --group test
+      - name: Test with pytest
+        run: >
+          source .venv/bin/activate &&
+          pytest
+          --junitxml=junit.xml
+          --cov-report "xml:coverage.xml"
+          --cov=shvatka tests/
+      - name: Publish test report
+        if: always()
+        continue-on-error: true
+        uses: dorny/test-reporter@v3
+        with:
+          name: pytest results
+          path: junit.xml
+          reporter: java-junit
+      - name: Coverage summary
+        if: always()
+        continue-on-error: true
+        uses: irongut/CodeCoverageSummary@v1.3.0
+        with:
+          filename: coverage.xml
+          format: markdown
+          output: both
+      - name: Write coverage to job summary
+        if: always()
+        continue-on-error: true
+        run: cat code-coverage-results.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Coverage comment
+        id: coverageComment
+        continue-on-error: true
+        uses: MishaKav/pytest-coverage-comment@main
+        with:
+          pytest-xml-coverage-path: ./coverage.xml
+          title: Let's see coverage
+          badge-title: coverage
+          hide-badge: false
+          hide-report: true
+          create-new-comment: false
+          hide-comment: ${{ github.event_name != 'pull_request' }}
+          report-only-changed-files: false
+          remove-link-from-badge: false
+      - name: Create the Badge
+        if: github.ref == 'refs/heads/master'
+        uses: schneegans/dynamic-badges-action@v1.8.0
+        continue-on-error: true
+        with:
+          auth: ${{ secrets.BAGE_GIST }}
+          gistID: 99469cb5f8a18784c1f03d229a799427
+          filename: bage.json
+          label: Coverage Report
+          message: ${{ steps.coverageComment.outputs.coverage }}
+          color: ${{ steps.coverageComment.outputs.color }}
+          namedLogo: python
+  diagrams:
+    # See lint job: avoid running twice when build.yml already covers the branch.
+    if: >-
+      github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.fork
+      || !(startsWith(github.head_ref, 'claude/')
+      || startsWith(github.head_ref, 'codex/')
+      || startsWith(github.head_ref, 'feature/')
+      || startsWith(github.head_ref, 'tech/')
+      || startsWith(github.head_ref, 'fix/'))
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install graphviz
+        run: sudo apt install -y graphviz
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Install dependencies
+        run: uv sync --group test
+      - name: Render Aiogram-dialogs transitions and preview
+        run: source .venv/bin/activate && python -m shvatka.tgbot.dialogs.__init__
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: transitions
+          path: |
+            out/shvatka-dialogs.png
+            out/shvatka-dialogs-preview.html

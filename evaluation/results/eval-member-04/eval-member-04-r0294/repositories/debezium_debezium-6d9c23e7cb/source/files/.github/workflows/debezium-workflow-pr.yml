@@ -1,0 +1,819 @@
+name: Build Debezium (PR)
+
+on:
+  pull_request:
+    branches:
+      - main
+      - 1.*
+      - 2.*
+      - 3.*
+      - 4.*
+
+env:
+  MAVEN_FULL_BUILD_PROJECTS: "\\!debezium-microbenchmark-oracle"
+
+# Pushes to each pull request will trigger a cancellation of any existing push jobs for that pull request,
+# and will restart the build based on the latest push data for that specific pull request.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  # Checks that all commits contain sign-offs
+  check-signed-commits:
+    name: Check signed commits
+    runs-on: ubuntu-latest
+    steps:
+      - uses: debezium/dbz/.github/actions/check-dco@main
+
+  # Checks that the PR does not add or modify hidden files or directories outside the allow list
+  check-hidden-files:
+    name: "Check for hidden files"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: debezium/dbz/.github/actions/check-hidden-files@main
+        with:
+          allowed-paths: ".asciidoctorconfig, .fmf, .packit.yaml, .run"
+
+  # Checks for malicious or adversarial Unicode patterns in changed files
+  check-unicode-safety:
+    name: "Check for malicious Unicode"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: debezium/dbz/.github/actions/check-unicode-safety@main
+        with:
+          # The contributor name files hold display names copied from GitHub accounts, so their
+          # content is chosen by contributors rather than by the project and will legitimately
+          # contain any script or mark a person has in their name. They are plain data, read only
+          # by grep in jenkins-jobs/scripts/check-contributors.sh to build contributor lists, and
+          # are never compiled or executed, so it's safe to exclude these.
+          exclude-patterns: |
+            COPYRIGHT.txt
+            jenkins-jobs/scripts/config/Aliases.txt
+            jenkins-jobs/scripts/config/FilteredNames.txt
+
+  # This job is responsible for inspecting the changes in the repository and setting specific output variables
+  # that subsequent jobs can use to determine whether a particular job should be skipped or included.
+  file_changes:
+    name: "Detect repository changes"
+    needs: [ check-signed-commits, check-hidden-files, check-unicode-safety ]
+    runs-on: ubuntu-latest
+    outputs:
+      ai-changed: ${{ steps.changed-files-ai.outputs.any_changed }}
+      openlineage-changed: ${{ steps.changed-files-openlineage.outputs.any_changed }}
+      common-changed: ${{ steps.changed-files-common.outputs.any_changed }}
+      mongodb-changed: ${{ steps.changed-files-mongodb.outputs.any_changed }}
+      mariadb-changed: ${{ steps.changed-files-mariadb.outputs.any_changed }}
+      mysql-changed: ${{ steps.changed-files-mysql.outputs.any_changed }}
+      postgresql-changed: ${{ steps.changed-files-postgresql.outputs.any_changed }}
+      oracle-changed: ${{ steps.changed-files-oracle.outputs.any_changed }}
+      sqlserver-changed: ${{ steps.changed-files-sqlserver.outputs.any_changed }}
+      jdbc-changed: ${{ steps.changed-files-jdbc.outputs.any_changed }}
+      schema-generator-changed: ${{ steps.changed-files-schema-generator.outputs.any_changed }}
+      debezium-testing-changed: ${{ steps.changed-files-debezium-testing.outputs.any_changed }}
+      mysql-ddl-parser-changed: ${{ steps.changed-files-mysql-ddl-parser.outputs.any_changed }}
+      oracle-ddl-parser-changed: ${{ steps.changed-files-oracle-ddl-parser.outputs.any_changed }}
+      mariadb-ddl-parser-changed: ${{ steps.changed-files-mariadb-ddl-parser.outputs.any_changed }}
+      non-code-only-changed: ${{ steps.changed-files-non-code.outputs.only_changed }}
+      archetype-changed: ${{ steps.changed-files-archetype.outputs.any_changed }}
+    steps:
+      - name: Checkout Action
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Get modified files (Common)
+        id: changed-files-common
+        uses: tj-actions/changed-files@v47.0.6
+        with:
+          files: |
+            support/checkstyle/**
+            support/revapi/**
+            debezium-api/**
+            debezium-assembly-descriptors/**
+            debezium-connector-common/**
+            debezium-config/**
+            debezium-util/**
+            debezium-connect-plugins/**
+            debezium-embedded/**
+            debezium-parent/pom.xml
+            debezium-bom/pom.xml
+            debezium-storage/**
+            debezium-scripting/**
+            pom.xml
+            .mvn/**
+            .github/actions/**
+            .github/workflows/debezium-workflow-pr.yml
+            .github/workflows/connector-informix-workflow.yml
+            .github/workflows/apicurio-check-workflow.yml
+
+      - name: Get modified files (MongoDB)
+        id: changed-files-mongodb
+        uses: tj-actions/changed-files@v47.0.6
+        with:
+          files: |
+            debezium-sink/**
+            debezium-connector-mongodb/**
+            .github/workflows/connector-mongodb-workflow.yml
+
+      - name: Get modified files (MySQL)
+        id: changed-files-mysql
+        uses: tj-actions/changed-files@v47.0.6
+        with:
+          files: |
+            debezium-connector-mysql/**
+            debezium-connector-binlog/**
+            .github/workflows/connector-mysql-workflow.yml
+
+      - name: Get modified files (MariaDB)
+        id: changed-files-mariadb
+        uses: tj-actions/changed-files@v47.0.6
+        with:
+          files: |
+            debezium-connector-mariadb/**
+            debezium-connector-binlog/**
+            .github/workflows/connector-mariadb-workflow.yml
+
+      - name: Get modified files (PostgreSQL)
+        id: changed-files-postgresql
+        uses: tj-actions/changed-files@v47.0.6
+        with:
+          files: |
+            debezium-connector-postgres/**
+            .github/workflows/connector-postgresql-workflow.yml
+
+      - name: Get modified files (Oracle)
+        id: changed-files-oracle
+        uses: tj-actions/changed-files@v47.0.6
+        with:
+          files: |
+            debezium-connector-oracle/**
+            .github/workflows/connector-oracle-workflow.yml
+
+      - name: Get modified files (SQL Server)
+        id: changed-files-sqlserver
+        uses: tj-actions/changed-files@v47.0.6
+        with:
+          files: |
+            debezium-connector-sqlserver/**
+
+      - name: Get modified files (JDBC)
+        id: changed-files-jdbc
+        uses: tj-actions/changed-files@v47.0.6
+        with:
+          files: |
+            debezium-sink/**
+            debezium-connector-jdbc/**
+            .github/workflows/connector-jdbc-workflow.yml
+
+      - name: Get modified files (Schema Generator)
+        id: changed-files-schema-generator
+        uses: tj-actions/changed-files@v47.0.6
+        with:
+          files: |
+            debezium-schema-generator/**
+
+      - name: Get modified files (Debezium Testing)
+        id: changed-files-debezium-testing
+        uses: tj-actions/changed-files@v47.0.6
+        with:
+          files: |
+            debezium-testing/**
+
+      - name: Get modified files (MySQL DDL parser)
+        id: changed-files-mysql-ddl-parser
+        uses: tj-actions/changed-files@v47.0.6
+        with:
+          files: |
+            debezium-ddl-parser/src/main/antlr4/io/debezium/ddl/parser/mysql/**
+            debezium-ddl-parser/src/main/java/io/debezium/antlr/**
+            debezium-ddl-parser/src/test/resources/mysql/examples/**
+
+      - name: Get modified files (MariaDB DDL parser)
+        id: changed-files-mariadb-ddl-parser
+        uses: tj-actions/changed-files@v47.0.6
+        with:
+          files: |
+            debezium-ddl-parser/src/main/antlr4/io/debezium/ddl/parser/mariadb/**
+            debezium-ddl-parser/src/main/java/io/debezium/antlr/**
+            debezium-ddl-parser/src/test/resources/mariadb/examples/**
+
+      - name: Get modified files (Oracle DDL parser)
+        id: changed-files-oracle-ddl-parser
+        uses: tj-actions/changed-files@v47.0.6
+        with:
+          files: |
+            debezium-ddl-parser/src/main/antlr4/io/debezium/ddl/parser/oracle/**
+            debezium-ddl-parser/src/main/java/io/debezium/antlr/**
+            debezium-ddl-parser/src/main/java/io/debezium/ddl/parser/oracle/**
+            debezium-ddl-parser/src/test/resources/oracle/examples/**
+
+      # Files that cannot affect the build. When a pull request touches only these,
+      # the build chain below is skipped entirely. The bare *.md and *.txt patterns
+      # match the repository root only; a globstar would be needed to recurse, so
+      # text fixtures under a module's src/test/resources still trigger a build.
+      - name: Get modified files (Documentation and project metadata)
+        id: changed-files-non-code
+        uses: tj-actions/changed-files@v47.0.6
+        with:
+          files: |
+            documentation/**
+            *.md
+            *.txt
+            jenkins-jobs/scripts/config/Aliases.txt
+            jenkins-jobs/scripts/config/FilteredNames.txt
+
+      - name: Get modified files (AI)
+        id: changed-files-ai
+        uses: tj-actions/changed-files@v47.0.6
+        with:
+          files: |
+            debezium-ai/**
+
+      - name: Get modified files (OpenLineage)
+        id: changed-files-openlineage
+        uses: tj-actions/changed-files@v47.0.6
+        with:
+          files: |
+            debezium-openlineage/**
+
+      - name: Get modified files (Archetype)
+        id: changed-files-archetype
+        uses: tj-actions/changed-files@v47.0.6
+        with:
+          files: |
+            debezium-connector-archetype/**
+
+
+
+  # Approx 1m
+  build_cache:
+    name: "Update Dependencies"
+    needs: [ file_changes ]
+    if: ${{ needs.file_changes.outputs.non-code-only-changed == 'false' }}
+    runs-on: ubuntu-latest
+    # The dependency delta lookup below reads this pull request's artifacts from earlier runs
+    # through the REST API, which needs the actions:read scope.  Declaring the scopes here keeps
+    # the lookup working no matter how the repository's default token permissions are configured;
+    # without actions:read the query returns 403 and every run pays the full download cost.
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout Action (Core)
+        uses: actions/checkout@v7
+        with:
+          path: core
+
+      - name: Checkout Action (Debezium Quarkus)
+        uses: actions/checkout@v7
+        with:
+          repository: debezium/debezium-quarkus
+          path: quarkus
+          ref: ${{ github.event.pull_request.base.ref }}
+
+      - name: Checkout Action (Debezium Server)
+        uses: actions/checkout@v7
+        with:
+          repository: debezium/debezium-server
+          path: server
+          ref: ${{ github.event.pull_request.base.ref }}
+
+      - uses: ./core/.github/actions/setup-java
+
+      # Pull request builds never save caches; they restore the reference cache saved by
+      # the push workflow.  GitHub scopes cache reads to the PR's target branch and the
+      # default branch, so the restore resolves to:
+      #   1. An exact match when the PR does not change any pom
+      #   2. The latest reference cache visible to the target branch otherwise
+      # Dependencies a PR adds on top of the reference cache are captured below as a
+      # short-lived artifact and overlaid by the other jobs of this run as well as by
+      # subsequent runs of the same PR.
+      - id: maven-cache-check
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.m2/repository
+          key: maven-debezium-test-push-build-${{ hashFiles('core/**/pom.xml') }}
+          restore-keys: |
+            maven-debezium-test-push-build-
+
+      # Any file in the local Maven repository that is newer than this marker was added
+      # (or updated) on top of the reference cache and belongs in this run's delta.
+      - name: Mark restored cache contents
+        run: |
+          mkdir -p ~/.m2/repository
+          touch "${RUNNER_TEMP}/maven-cache-marker"
+
+      # Restore the dependency delta captured by the most recent previous run of this PR
+      # so that a pom change only pays the full download cost once per day (the delta
+      # artifact retention).  Extraction refreshes file times (-m) so the restored files
+      # stay newer than the marker and are re-captured into this run's delta, keeping the
+      # delta cumulative across runs.  This step is tolerant by design: without a usable
+      # delta the build below simply downloads whatever is missing.
+      - name: Restore dependency delta from previous run
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_NAME: maven-repo-delta-pr-${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # A failed lookup and an absent delta both leave the build to download what it needs, but
+          # only the first is a defect.  Keep them apart so a broken lookup cannot masquerade as a
+          # routine miss for the lifetime of the workflow.
+          if ! url=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${ARTIFACT_NAME}&per_page=10" \
+            --jq '[.artifacts[] | select(.expired == false)] | first | .archive_download_url // empty'); then
+            echo "::warning::Could not query artifacts named ${ARTIFACT_NAME}; continuing without a dependency delta"
+            exit 1
+          fi
+          if [ -z "${url}" ]; then
+            echo "No previous dependency delta found for this pull request"
+            exit 0
+          fi
+          gh api "${url#https://api.github.com/}" > "${RUNNER_TEMP}/maven-repo-delta.zip"
+          unzip -o "${RUNNER_TEMP}/maven-repo-delta.zip" -d "${RUNNER_TEMP}/maven-repo-delta-prev"
+          tar -xmzf "${RUNNER_TEMP}/maven-repo-delta-prev/maven-repo-delta.tgz" -C ~/.m2/repository
+
+      # This step is responsible for pulling down artifacts
+      # Unfortunately due to the nature of how some of the maven workflows work, the only reliable way
+      # to guarantee fully seeding the maven cache is to run a full build. This step does not execute
+      # tests, formatting, checkstyle, nor import sorts.
+      #
+      # This check is conditioned so that if the exact cache-key was not found, we will execute
+      # this step. An exact hit means the PR does not change any pom and the reference cache
+      # already contains every dependency, so the step can be skipped. This should improve
+      # response of format/checkstyle errors to users faster.
+      #
+      # This job also explicitly excludes the "debezium-microbenchmark-oracle" module temporarily.
+      # There is a dependency on xstream.jar for this module that should be fixed and made to not
+      # be required so that the module can be built on GitHub Actions.
+      - name: Download dependencies (Core)
+        if: steps.maven-cache-check.outputs.cache-hit != 'true'
+        run: >
+          ./core/mvnw -B -ntp clean install -f core/pom.xml
+          -pl ${{ env.MAVEN_FULL_BUILD_PROJECTS }}
+          -Dformat.skip=true
+          -Dcheckstyle.skip=true
+          -Dorg.slf4j.simpleLogger.showDateTime=true
+          -Dorg.slf4j.simpleLogger.dateTimeFormat="YYYY-MM-dd HH:mm:ss,SSS"
+          -DskipTests=true
+          -DskipITs=true
+
+      - name: Download dependencies (Debezium Quarkus)
+        continue-on-error: true
+        run: >
+          ./quarkus/mvnw -B -ntp clean install -f quarkus/pom.xml
+          -Passembly
+          -Dformat.skip=true
+          -Dcheckstyle.skip=true
+          -Dorg.slf4j.simpleLogger.showDateTime=true
+          -Dorg.slf4j.simpleLogger.dateTimeFormat="YYYY-MM-dd HH:mm:ss,SSS"
+          -DskipTests=true
+          -DskipITs=true
+          -DskipNonCore
+
+      - name: Download dependencies (Debezium Server)
+        # There are some corner cases where dependencies change and core no longer defines the
+        # dependency; however Debezium Server due to checking out main, may still refer to it.
+        # In this case, if the artifact fetch fails, we shouldn't fail the job.  Fixing the
+        # dependency in the Debezium Server repository with the same Jira issue tag as the
+        # main repository's PR will run the build based on the PR changes in main, and will
+        # allow validating the Debezium Server build separately.
+        continue-on-error: true
+        run: >
+          ./server/mvnw -B -ntp clean install -f server/pom.xml
+          -Dformat.skip=true
+          -Dcheckstyle.skip=true
+          -Dorg.slf4j.simpleLogger.showDateTime=true
+          -Dorg.slf4j.simpleLogger.dateTimeFormat="YYYY-MM-dd HH:mm:ss,SSS"
+          -DskipTests=true
+          -DskipITs=true
+          -DskipNonCore
+
+      # Everything newer than the marker is a dependency this PR added on top of the
+      # reference cache (including the restored delta from a previous run, kept newer by
+      # the -m extraction above).  The delta may legitimately be empty.
+      - name: Capture dependency delta
+        run: |
+          cd ~/.m2/repository
+          find . -type f -newer "${RUNNER_TEMP}/maven-cache-marker" -print0 \
+            | tar -czf "${RUNNER_TEMP}/maven-repo-delta.tgz" --null -T -
+          echo "Dependency delta contains $(tar -tzf "${RUNNER_TEMP}/maven-repo-delta.tgz" | wc -l) files"
+
+      - name: Upload dependency delta
+        uses: actions/upload-artifact@v7
+        with:
+          name: maven-repo-delta-pr-${{ github.event.pull_request.number }}
+          path: ${{ runner.temp }}/maven-repo-delta.tgz
+          retention-days: 1
+          overwrite: true
+
+  # Approx 1m
+  check_style:
+    name: "Checkstyle and Formatting"
+    needs: [ build_cache ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Action
+        uses: actions/checkout@v7
+
+      - uses: ./.github/actions/checkstyle-format
+        with:
+          maven-cache-key: maven-debezium-test-push-build-${{ hashFiles('**/pom.xml') }}
+
+  ########################################################################################
+  ## CONNECTORS
+  ## Please define callable workflows here in alphabetical connector name order.
+  ########################################################################################
+
+  build_core:
+    name: "Core Components Testing"
+    needs: [ check_style, file_changes ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Action
+        uses: actions/checkout@v7
+      - uses: ./.github/actions/build-debezium-core
+        with:
+          maven-cache-key: maven-debezium-test-push-build-${{ hashFiles('**/pom.xml') }}
+          only-build: ${{ needs.file_changes.outputs.common-changed != 'true' }}
+
+  build_cassandra:
+    name: Cassandra
+    needs: [ check_style, file_changes, build_core ]
+    runs-on: ubuntu-latest
+    if: ${{ needs.file_changes.outputs.common-changed == 'true' || needs.file_changes.outputs.debezium-testing-changed == 'true' }}
+    steps:
+      - name: Checkout Action (Core)
+        uses: actions/checkout@v7
+        with:
+          path: core
+      - name: Checkout Action (Cassandra)
+        uses: actions/checkout@v7
+        with:
+          repository: debezium/debezium-connector-cassandra
+          path: cassandra
+          ref: ${{ github.event.pull_request.base.ref }}
+      - uses: ./core/.github/actions/setup-java
+      - uses: ./core/.github/actions/maven-cache
+        with:
+          key: maven-debezium-test-push-build-${{ hashFiles('core/**/pom.xml') }}
+      - uses: ./core/.github/actions/build-debezium-cassandra
+        with:
+          path-core: core
+          path-cassandra: cassandra
+
+  build_db2:
+    name: Db2
+    needs: [ check_style, file_changes, build_core ]
+    runs-on: ubuntu-latest
+    if: ${{ needs.file_changes.outputs.common-changed == 'true' || needs.file_changes.outputs.debezium-testing-changed == 'true' }}
+    steps:
+      - name: Checkout Action (Core)
+        uses: actions/checkout@v7
+        with:
+          path: core
+      - name: Checkout Action (Db2)
+        uses: actions/checkout@v7
+        with:
+          repository: debezium/debezium-connector-db2
+          path: db2
+          ref: ${{ github.event.pull_request.base.ref }}
+      - uses: ./core/.github/actions/setup-java
+      - uses: ./core/.github/actions/maven-cache
+        with:
+          key: maven-debezium-test-push-build-${{ hashFiles('core/**/pom.xml') }}
+      - uses: ./core/.github/actions/build-debezium-db2
+        with:
+          path-core: core
+          path-db2: db2
+
+  build_ingres:
+    name: Ingres
+    needs: [ check_style, file_changes, build_core ]
+    runs-on: ubuntu-latest
+    if: ${{ needs.file_changes.outputs.common-changed == 'true' || needs.file_changes.outputs.debezium-testing-changed == 'true' || needs.file_changes.outputs.schema-generator-changed == 'true'}}
+    steps:
+      - name: Checkout Action (Core)
+        uses: actions/checkout@v7
+        with:
+          path: core
+      - name: Checkout Action (Ingres)
+        uses: actions/checkout@v7
+        with:
+          repository: debezium/debezium-connector-ingres
+          path: ingres
+          ref: ${{ github.event.pull_request.base.ref }}
+      - uses: ./core/.github/actions/setup-java
+      - uses: ./core/.github/actions/maven-cache
+        with:
+          key: maven-debezium-test-push-build-${{ hashFiles('core/**/pom.xml') }}
+      - uses: ./core/.github/actions/build-debezium-ingres
+        with:
+          path-core: core
+          path-ingres: ingres
+
+  build_ibmi:
+    name: IBMi
+    needs: [ check_style, file_changes, build_core ]
+    runs-on: ubuntu-latest
+    if: ${{ needs.file_changes.outputs.common-changed == 'true' || needs.file_changes.outputs.debezium-testing-changed == 'true' }}
+    steps:
+      - name: Checkout Action (Core)
+        uses: actions/checkout@v7
+        with:
+          path: core
+      - name: Checkout Action (IBMi)
+        uses: actions/checkout@v7
+        with:
+          repository: debezium/debezium-connector-ibmi
+          path: ibmi
+          ref: ${{ github.event.pull_request.base.ref }}
+      - uses: ./core/.github/actions/setup-java
+      - uses: ./core/.github/actions/maven-cache
+        with:
+          key: maven-debezium-test-push-build-${{ hashFiles('core/**/pom.xml') }}
+      - uses: ./core/.github/actions/build-debezium-ibmi
+        with:
+          path-core: core
+          path-ibmi: ibmi
+
+  build_informix:
+    name: Informix
+    needs: [ check_style, file_changes, build_core ]
+    if: ${{ needs.file_changes.outputs.common-changed == 'true' || needs.file_changes.outputs.debezium-testing-changed == 'true' }}
+    uses: ./.github/workflows/connector-informix-workflow.yml
+    with:
+      maven-cache-key: maven-debezium-test-push-build
+      # Needed because sibling repository
+      checkout-ref: ${{ github.event.pull_request.base.ref }}
+
+  build_jdbc:
+    name: JDBC
+    needs: [ check_style, file_changes, build_core ]
+    if: ${{ needs.file_changes.outputs.common-changed == 'true' || needs.file_changes.outputs.mysql-changed == 'true' || needs.file_changes.outputs.mysql-ddl-parser-changed == 'true' || needs.file_changes.outputs.mariadb-changed == 'true' || needs.file_changes.outputs.postgresql-changed == 'true' || needs.file_changes.outputs.sqlserver-changed == 'true' || needs.file_changes.outputs.jdbc-changed == 'true' || needs.file_changes.outputs.debezium-testing-changed == 'true' }}
+    uses: ./.github/workflows/connector-jdbc-workflow.yml
+    with:
+      maven-cache-key: maven-debezium-test-push-build
+
+  build_mariadb:
+    name: MariaDB
+    needs: [ check_style, file_changes, build_core ]
+    if: ${{ needs.file_changes.outputs.common-changed == 'true' || needs.file_changes.outputs.mariadb-changed == 'true' || needs.file_changes.outputs.mariadb-ddl-parser-changed == 'true' || needs.file_changes.outputs.schema-generator-changed == 'true' || needs.file_changes.outputs.debezium-testing-changed == 'true' }}
+    uses: ./.github/workflows/connector-mariadb-workflow.yml
+    with:
+      maven-cache-key: maven-debezium-test-push-build
+
+  build_mongodb:
+    name: MongoDB
+    needs: [ check_style, file_changes, build_core ]
+    if: ${{ needs.file_changes.outputs.common-changed == 'true' || needs.file_changes.outputs.mongodb-changed == 'true' || needs.file_changes.outputs.schema-generator-changed == 'true' || needs.file_changes.outputs.debezium-testing-changed == 'true' }}
+    uses: ./.github/workflows/connector-mongodb-workflow.yml
+    with:
+      maven-cache-key: maven-debezium-test-push-build
+
+  build_mysql:
+    name: MySQL
+    needs: [ check_style, file_changes, build_core ]
+    if: ${{ needs.file_changes.outputs.common-changed == 'true' || needs.file_changes.outputs.mysql-changed == 'true' || needs.file_changes.outputs.mysql-ddl-parser-changed == 'true' || needs.file_changes.outputs.schema-generator-changed == 'true' || needs.file_changes.outputs.debezium-testing-changed == 'true' }}
+    uses: ./.github/workflows/connector-mysql-workflow.yml
+    with:
+      maven-cache-key: maven-debezium-test-push-build
+
+  build_oracle:
+    name: Oracle
+    needs: [ check_style, file_changes, build_core ]
+    if: ${{ needs.file_changes.outputs.common-changed == 'true' || needs.file_changes.outputs.oracle-changed == 'true' || needs.file_changes.outputs.oracle-ddl-parser-changed == 'true' || needs.file_changes.outputs.schema-generator-changed == 'true' || needs.file_changes.outputs.debezium-testing-changed == 'true' }}
+    uses: ./.github/workflows/connector-oracle-workflow.yml
+    with:
+      maven-cache-key: maven-debezium-test-push-build
+
+  build_postgresql:
+    name: PostgreSQL
+    needs: [ check_style, file_changes, build_core ]
+    if: ${{ needs.file_changes.outputs.common-changed == 'true' || needs.file_changes.outputs.postgresql-changed == 'true' || needs.file_changes.outputs.schema-generator-changed == 'true' || needs.file_changes.outputs.debezium-testing-changed == 'true' }}
+    uses: ./.github/workflows/connector-postgresql-workflow.yml
+    with:
+      maven-cache-key: maven-debezium-test-push-build
+
+  build_sqlserver:
+    name: SQL Server
+    needs: [ check_style, file_changes, build_core ]
+    runs-on: ubuntu-latest
+    if: ${{ needs.file_changes.outputs.common-changed == 'true' || needs.file_changes.outputs.sqlserver-changed == 'true' || needs.file_changes.outputs.schema-generator-changed == 'true' || needs.file_changes.outputs.debezium-testing-changed == 'true' }}
+    steps:
+      - name: Checkout Action (Core)
+        uses: actions/checkout@v7
+      - uses: ./.github/actions/build-debezium-sqlserver
+        with:
+          maven-cache-key: maven-debezium-test-push-build-${{ hashFiles('**/pom.xml') }}
+
+  build_spanner:
+    name: Spanner
+    needs: [ check_style, file_changes, build_core ]
+    runs-on: ubuntu-latest
+    if: ${{ needs.file_changes.outputs.common-changed == 'true' || needs.file_changes.outputs.debezium-testing-changed == 'true' }}
+    steps:
+      - name: Checkout Action (Core)
+        uses: actions/checkout@v7
+        with:
+          path: core
+      - name: Checkout Action (Spanner)
+        uses: actions/checkout@v7
+        with:
+          repository: debezium/debezium-connector-spanner
+          path: spanner
+          ref: ${{ github.event.pull_request.base.ref }}
+      - uses: ./core/.github/actions/setup-java
+      - uses: ./core/.github/actions/maven-cache
+        with:
+          key: maven-debezium-test-push-build-${{ hashFiles('core/**/pom.xml') }}
+      - uses: ./core/.github/actions/build-debezium-spanner
+        with:
+          path-core: core
+          path-spanner: spanner
+
+  build_vitess:
+    name: Vitess
+    needs: [ check_style, file_changes, build_core ]
+    runs-on: ubuntu-latest
+    if: ${{ needs.file_changes.outputs.common-changed == 'true' || needs.file_changes.outputs.debezium-testing-changed == 'true' }}
+    steps:
+      - name: Checkout Action (Core)
+        uses: actions/checkout@v7
+        with:
+          path: core
+      - name: Checkout Action (Vitess)
+        uses: actions/checkout@v7
+        with:
+          repository: debezium/debezium-connector-vitess
+          path: vitess
+          ref: ${{ github.event.pull_request.base.ref }}
+      - uses: ./core/.github/actions/setup-java
+      - uses: ./core/.github/actions/maven-cache
+        with:
+          key: maven-debezium-test-push-build-${{ hashFiles('core/**/pom.xml') }}
+      - uses: ./core/.github/actions/build-debezium-vitess
+        with:
+          path-core: core
+          path-vitess: vitess
+
+  build_cockroachdb:
+    name: CockroachDB
+    needs: [ check_style, file_changes, build_core ]
+    runs-on: ubuntu-latest
+    if: ${{ needs.file_changes.outputs.common-changed == 'true' || needs.file_changes.outputs.debezium-testing-changed == 'true' }}
+    steps:
+      - name: Checkout Action (Core)
+        uses: actions/checkout@v7
+        with:
+          path: core
+      - name: Checkout Action (CockroachDB)
+        uses: actions/checkout@v7
+        with:
+          repository: debezium/debezium-connector-cockroachdb
+          path: cockroachdb
+          ref: ${{ github.event.pull_request.base.ref }}
+      - uses: ./core/.github/actions/setup-java
+      - uses: ./core/.github/actions/maven-cache
+        with:
+          key: maven-debezium-test-push-build-${{ hashFiles('core/**/pom.xml') }}
+      - uses: ./core/.github/actions/build-debezium-cockroachdb
+        with:
+          path-core: core
+          path-cockroachdb: cockroachdb
+  ########################################################################################
+  ## NON-CONNECTORS
+  ## Please define callable workflows here in alphabetical item name order.
+  ########################################################################################
+
+  apicurio_checks:
+    name: "Apicurio checks"
+    needs: [ check_style, file_changes, build_core ]
+    if: ${{ needs.file_changes.outputs.common-changed == 'true' || needs.file_changes.outputs.mongodb-changed == 'true' || needs.file_changes.outputs.mysql-changed == 'true' || needs.file_changes.outputs.postgresql-changed == 'true' || needs.file_changes.outputs.debezium-testing-changed == 'true' || needs.file_changes.outputs.mysql-ddl-parser-changed == 'true' }}
+    uses: ./.github/workflows/apicurio-check-workflow.yml
+    with:
+      maven-cache-key: maven-debezium-test-push-build
+
+  build_archetype:
+    name: "Connector Archetypes"
+    needs: [ check_style, file_changes, build_core ]
+    runs-on: ubuntu-latest
+    if: ${{ needs.file_changes.outputs.common-changed == 'true' || needs.file_changes.outputs.archetype-changed == 'true' }}
+    steps:
+      - name: Checkout Action
+        uses: actions/checkout@v7
+      - uses: ./.github/actions/build-debezium-archetype
+        with:
+          maven-cache-key: maven-debezium-test-build-${{ hashFiles('**/pom.xml') }}
+          only-build: ${{ needs.file_changes.outputs.common-changed != 'true' }}
+
+  build_ai:
+    name: "Debezium AI module"
+    needs: [ check_style, file_changes, build_core ]
+    runs-on: ubuntu-latest
+    if: ${{ needs.file_changes.outputs.common-changed == 'true' || needs.file_changes.outputs.ai-changed == 'true' }}
+    steps:
+      - name: Checkout Action
+        uses: actions/checkout@v7
+      - uses: ./.github/actions/build-debezium-ai
+        with:
+          maven-cache-key: maven-debezium-test-push-build-${{ hashFiles('**/pom.xml') }}
+
+  build_openlineage:
+    name: "Debezium OpenLineage module"
+    needs: [ check_style, file_changes, build_core ]
+    runs-on: ubuntu-latest
+    if: ${{ needs.file_changes.outputs.common-changed == 'true' || needs.file_changes.outputs.openlineage-changed == 'true' }}
+    steps:
+      - name: Checkout Action
+        uses: actions/checkout@v7
+      - uses: ./.github/actions/build-debezium-openlineage
+        with:
+          maven-cache-key: maven-debezium-test-push-build-${{ hashFiles('**/pom.xml') }}
+
+  build_server:
+    name: "Debezium Server"
+    needs: [ check_style, file_changes, build_core ]
+    runs-on: ubuntu-latest
+    if: ${{ needs.file_changes.outputs.common-changed == 'true' || needs.file_changes.outputs.debezium-testing-changed == 'true' || needs.file_changes.outputs.mysql-ddl-parser-changed == 'true' || needs.file_changes.outputs.jdbc-changed == 'true' }}
+    steps:
+      - name: Checkout Action (Core)
+        uses: actions/checkout@v7
+        with:
+          path: core
+      - name: Checkout Action (Debezium Server)
+        uses: actions/checkout@v7
+        with:
+          repository: debezium/debezium-server
+          path: server
+          ref: ${{ github.event.pull_request.base.ref }}
+      - name: Checkout Action (Debezium Quarkus)
+        uses: actions/checkout@v7
+        with:
+          repository: debezium/debezium-quarkus
+          path: quarkus
+          ref: ${{ github.event.pull_request.base.ref }}
+      - name: Checkout Action (Elasticsearch)
+        uses: actions/checkout@v7
+        with:
+          repository: debezium/debezium-connector-elasticsearch
+          path: elasticsearch
+          ref: ${{ github.event.pull_request.base.ref }}
+      - uses: ./core/.github/actions/setup-java
+      - uses: ./core/.github/actions/maven-cache
+        with:
+          key: maven-debezium-test-push-build-${{ hashFiles('core/**/pom.xml') }}
+      - uses: ./core/.github/actions/build-debezium-server
+        with:
+          path-core: core
+          path-quarkus: quarkus
+          path-server: server
+          path-elasticsearch: elasticsearch
+
+  build_schema_generator:
+    name: "Schema Generator"
+    needs: [ check_style, file_changes, build_core ]
+    runs-on: ubuntu-latest
+    if: ${{ needs.file_changes.outputs.common-changed == 'true' || needs.file_changes.outputs.schema-generator-changed == 'true' }}
+    steps:
+      - name: Checkout Action
+        uses: actions/checkout@v7
+      - uses: ./.github/actions/build-debezium-schema-generator
+        with:
+          maven-cache-key: maven-debezium-test-push-build-${{ hashFiles('**/pom.xml') }}
+
+  build_storage:
+    name: "Storage"
+    needs: [ check_style, file_changes, build_core ]
+    runs-on: ubuntu-latest
+    if: ${{ needs.file_changes.outputs.common-changed == 'true' || needs.file_changes.outputs.mysql-changed == 'true' || needs.file_changes.outputs.mysql-ddl-parser-changed == 'true' }}
+    steps:
+      - name: Checkout Action
+        uses: actions/checkout@v7
+      - uses: ./.github/actions/build-debezium-storage
+        with:
+          maven-cache-key: maven-debezium-test-push-build-${{ hashFiles('**/pom.xml') }}
+
+  build_testing:
+    name: "Testing Module"
+    needs: [ check_style, file_changes, build_core ]
+    runs-on: ubuntu-latest
+    if: ${{ needs.file_changes.outputs.common-changed == 'true' || needs.file_changes.outputs.debezium-testing-changed == 'true' }}
+    steps:
+      - name: Checkout Action
+        uses: actions/checkout@v7
+      - uses: ./.github/actions/build-debezium-testing
+        with:
+          maven-cache-key: maven-debezium-test-push-build-${{ hashFiles('**/pom.xml') }}
+
+  build_platform_conductor:
+    name: "Debezium Platform - conductor"
+    needs: [ check_style, file_changes, build_core ]  
+    if: ${{ needs.file_changes.outputs.common-changed == 'true' || needs.file_changes.outputs.mongodb-changed == 'true' || needs.file_changes.outputs.mariadb-changed == 'true' || needs.file_changes.outputs.mysql-changed == 'true' || needs.file_changes.outputs.postgresql-changed == 'true' || needs.file_changes.outputs.oracle-changed == 'true' || needs.file_changes.outputs.sqlserver-changed == 'true' || needs.file_changes.outputs.schema-generator-changed == 'true' || needs.file_changes.outputs.debezium-testing-changed == 'true' }}
+    uses: ./.github/workflows/platform-conductor-workflow.yml
+    with:
+      maven-cache-key: maven-debezium-test-push-build
+
+
+
+

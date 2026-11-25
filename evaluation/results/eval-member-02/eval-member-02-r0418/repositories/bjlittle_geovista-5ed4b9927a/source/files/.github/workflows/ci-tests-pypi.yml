@@ -1,0 +1,125 @@
+# Reference:
+#   - https://github.com/actions/cache
+#   - https://github.com/actions/checkout
+#   - https://github.com/actions/setup-python
+#   - https://github.com/actions/upload-artifact
+
+name: ci-tests-pypi
+
+on:
+  pull_request:
+
+  schedule:
+    # every day @ 00h03
+    - cron: "3 0 * * *"
+
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash -l {0}
+
+permissions:
+  issues: write
+
+env:
+  CARTOPY_SHARE_DIR: ~/.local/share/cartopy
+  GEOVISTA_POOCH_MUTE: true
+  # "xvfb-run" provides the display, from the xvfb and mesa the runner
+  # image ships, so no step installs them; pyvista renders off screen
+  PYVISTA_OFF_SCREEN: true
+  PY_COLORS: "1"
+  SHELLOPTS: "errexit:pipefail"
+
+jobs:
+  test-pypi:
+    name: "test pypi (py${{ matrix.version }})"
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["ubuntu-22.04"]
+        version: ["3.13", "3.14"]
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+
+    - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+      with:
+        python-version: ${{ matrix.version }}
+
+    - name: "pip install"
+      run: |
+        pip install --no-cache-dir -e .[test,exam]
+
+    - name: "pip freeze"
+      run: |
+        pip freeze
+
+    - name: "environment configure"
+      env:
+        # Maximum cache period (in weeks) before forcing a cache refresh.
+        CACHE_WEEKS: 2
+      run: |
+        echo "CACHE_PERIOD=$(date +%Y).$(expr $(date +%U) / ${CACHE_WEEKS})" >> ${GITHUB_ENV}
+        echo "DATA_VERSION=$(geovista --data-version)" >> ${GITHUB_ENV}
+
+    - name: "check cartopy cache"
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      id: cartopy-cache
+      with:
+        path: ~/.local/share/cartopy
+        key: ${{ runner.os }}-cartopy-data-${{ env.CACHE_PERIOD }}
+
+    - name: "refresh cartopy cache"
+      if: ${{ steps.cartopy-cache.outputs.cache-hit != 'true' }}
+      env:
+        CARTOPY_SHARE_DIR: ~/.local/share/cartopy
+      run: |
+        mkdir -p ${CARTOPY_SHARE_DIR}
+        cartopy_feature_download physical --output ${CARTOPY_SHARE_DIR} --no-warn
+
+    - name: "check geovista cache"
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      id: geovista-cache
+      with:
+        path: ~/.cache/geovista
+        key: ${{ runner.os }}-geovista-data-${{ env.DATA_VERSION }}-${{ env.CACHE_PERIOD }}
+
+    - name: "refresh geovista cache"
+      if: ${{ steps.geovista-cache.outputs.cache-hit != 'true' }}
+      run: |
+        geovista download --all --decompress
+
+    - name: "test pypi (py${{ matrix.version }})"
+      run: |
+        xvfb-run -a pytest --numprocesses logical --dist worksteal --failed_image_dir test_images_failed
+
+    - name: "report failure"
+      if: ${{ failure() && github.event_name == 'schedule' }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        TITLE="chore: pypi test failure"
+        BODY=$(cat <<EOL
+        The \`py${{ matrix.version }}\` tests for the latest resolved \`pip\` environment have failed.
+
+        Please investigate GHA run-id [${{ github.run_id }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+        EOL
+        )
+        gh issue create --title "${TITLE}" --body "${BODY}" --label "bot" --label "new: issue" --repo "${{ github.repository }}"
+
+    - name: "upload failed images"
+      if: ${{ failure() }}
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      with:
+        name: ci-tests-pypi-failed-images-${{ github.job }}-${{ strategy.job-index }}
+        path: ${{ github.workspace }}/test_images_failed

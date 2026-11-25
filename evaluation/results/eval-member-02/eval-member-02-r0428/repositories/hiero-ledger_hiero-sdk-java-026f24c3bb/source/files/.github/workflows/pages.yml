@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Upload Github Pages
+
+on:
+  push:
+    branches:
+      - main
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+env:
+  LC_ALL: C.UTF-8
+
+jobs:
+  publish:
+    name: Publish
+    runs-on: hiero-client-sdk-linux-medium
+    permissions:
+      contents: read
+      id-token: write
+      pages: write
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Java
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: "21.0.6"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+
+      - name: Compile SDK
+        run: ./gradlew compileJava
+
+      - name: Generate Javadoc
+        run: ./gradlew :sdk:javadoc
+
+      - name: Pages
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: ./sdk/build/docs/javadoc
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

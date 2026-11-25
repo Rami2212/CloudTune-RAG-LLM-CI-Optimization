@@ -1,0 +1,87 @@
+name: CI macOS/AppleClang
+
+on:
+  push:
+  pull_request:
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: ${{ matrix.config.name }}
+    runs-on: ${{ matrix.config.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - {
+            name: "macOS 14 AppleClang 15 C++11",
+            os: macos-14,
+            build_type: Debug,
+            cxx_standard: 11
+          }
+          - {
+            name: "macOS 14 AppleClang 15 C++20",
+            os: macos-14,
+            build_type: Debug,
+            cxx_standard: 20
+          }
+          - {
+            name: "macOS 15 AppleClang 17 C++11",
+            os: macos-15,
+            build_type: Debug,
+            cxx_standard: 11
+          }
+          - {
+            name: "macOS 15 AppleClang 17 C++14",
+            os: macos-15,
+            build_type: Debug,
+            cxx_standard: 14
+          }
+          - {
+            name: "macOS 15 AppleClang 17 C++17",
+            os: macos-15,
+            build_type: Debug,
+            cxx_standard: 17
+          }
+          - {
+            name: "macOS 15 AppleClang 17 C++20",
+            os: macos-15,
+            build_type: Debug,
+            cxx_standard: 20
+          }
+          - {
+            name: "macOS 15 AppleClang 17 C++23",
+            os: macos-15,
+            build_type: Debug,
+            cxx_standard: 23
+          }
+          - {
+            name: "macOS 15 AppleClang 17 C++26",
+            os: macos-15,
+            build_type: Debug,
+            cxx_standard: 26
+          }
+          - {
+            name: "macOS 15 AppleClang with sanitizers",
+            os: macos-15,
+            build_type: Debug,
+            cxx_standard: 17,
+            enable_sanitizers_in_tests: ON
+          }
+    steps:
+      - uses: actions/checkout@v3
+      - name: Build project
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=${{ matrix.config.build_type }} \
+            -DENABLE_TESTING=ON \
+            -DWARNINGS_AS_ERRORS_FOR_TESTS=ON \
+            -DOVERRIDE_CXX_STANDARD_FOR_TESTS=${{ matrix.config.cxx_standard }} \
+            -DENABLE_SANITIZERS_IN_TESTS=${{ matrix.config.enable_sanitizers_in_tests }}
+          cmake --build build -j
+      - name: Run tests
+        run: |
+          ctest --test-dir build/ --verbose

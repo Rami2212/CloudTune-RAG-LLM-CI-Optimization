@@ -1,0 +1,101 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 6 optimizations:
+# - [HIGH] Add npm dependency cache to "lint" job
+# - [HIGH] Add npm dependency cache to "test" job
+# - [HIGH] Add npm dependency cache to "test-zod-v4-4-1-12" job
+# - [HIGH] Add npm dependency cache to "build" job
+# - [MEDIUM] Add concurrency group to "ci.yml"
+# - [MEDIUM] 4 jobs clone the repo — consider artifact sharing
+# Estimated savings: ~19 min/run
+#
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version-file: '.nvmrc'
+
+      - run: npm ci
+
+      - run: npx prettier --check .
+
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version-file: '.nvmrc'
+
+      - run: npm ci
+
+      - run: |
+          npx vitest run
+          npm run build
+          npm run pack
+          cd e2e/issue-189/v3 && npm ci && npm i ../../../zod-schema-faker.tgz && npm run test && cd -
+          cd e2e/issue-189/v4 && npm ci && npm i ../../../zod-schema-faker.tgz && npm run test && cd -
+          cd examples/v3 && npm ci && npm i ../../zod-schema-faker.tgz && npm run build && cd -
+          cd examples/v4 && npm ci && npm i ../../zod-schema-faker.tgz && npm run build && cd -
+
+  test-zod-v4-4-1-12:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version-file: '.nvmrc'
+
+      - run: npm ci
+
+      - run: npm i --no-save zod@4.1.12
+
+      - run: npx vitest run tests/v4
+
+  build:
+    runs-on: ubuntu-latest
+
+    needs:
+      - lint
+      - test
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version-file: '.nvmrc'
+
+      - run: npm ci
+
+      - run: npm run build
+
+      - uses: JS-DevTools/npm-publish@v4.1.5
+        id: publish
+        if: ${{ github.ref == 'refs/heads/main' }}
+        with:
+          token: ${{ secrets.NPM_TOKEN }}
+          package: ./package.json
+          access: public
+          dry-run: false
+          strategy: upgrade

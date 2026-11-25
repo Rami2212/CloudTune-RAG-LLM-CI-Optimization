@@ -1,0 +1,72 @@
+name: Deploy static content to Pages
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Cache Emscripten
+        id: cache-emsdk
+        uses: actions/cache@v4
+        with:
+          path: ~/emsdk
+          key: emsdk-${{ runner.os }}-latest
+
+      - name: Install Emscripten
+        if: steps.cache-emsdk.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/emscripten-core/emsdk.git ~/emsdk
+          ~/emsdk/emsdk install latest
+          ~/emsdk/emsdk activate latest
+
+      - name: Build WASM
+        run: |
+          source ~/emsdk/emsdk_env.sh
+          make wasm
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 'lts/*'
+          cache: 'pnpm'
+          cache-dependency-path: doc/pnpm-lock.yaml
+
+      - name: Install and build docs
+        run: |
+          cd doc
+          pnpm install
+          pnpm run build
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: 'doc/dist'
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

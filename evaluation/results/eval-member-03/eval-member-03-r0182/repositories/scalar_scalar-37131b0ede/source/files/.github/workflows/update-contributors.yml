@@ -1,0 +1,55 @@
+name: Update Contributors in README
+
+on:
+  schedule:
+    # Run every Friday at 15:00 UTC
+    - cron: '0 15 * * 5'
+
+permissions:
+  contents: read
+
+jobs:
+  update-readme:
+    name: Update the README
+    if: ${{ github.repository_owner == 'scalar' }}
+    runs-on: blacksmith-2vcpu-ubuntu-2204
+    # Holds the release bot app credentials so the README PR is opened by the
+    # app rather than by GITHUB_TOKEN. Pull requests created with GITHUB_TOKEN
+    # do not trigger workflow events, so their CI checks stay pending forever.
+    environment: release-bot
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3.2.0
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Update the list of contributors
+        uses: $/.github/actions/update-contributors
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+
+      - name: Create pull request
+        uses: peter-evans/create-pull-request@v8.1.0
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          branch: contributors-readme-action-update
+          # Avoid attributing generated commits to the scheduled workflow actor.
+          author: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>
+          commit-message: 'docs(contributor): update README contributors'
+          title: 'docs(contributor): update README contributors'
+          body: Auto-generated list of contributors.
+          add-paths: README.md

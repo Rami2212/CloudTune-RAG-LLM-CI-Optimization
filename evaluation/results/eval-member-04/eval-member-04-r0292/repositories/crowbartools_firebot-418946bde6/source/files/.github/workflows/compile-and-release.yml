@@ -1,0 +1,145 @@
+name: Build and Draft Release
+
+# Only runs
+# - after PRs have been merged into master
+# - when a user specifically requests the workflow to run on a branch
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+
+jobs:
+  checkversion:
+    name: Check if version has corresponding tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      commits: ${{ steps.commits.outputs.commits }}
+      template: ${{ steps.template.outputs.template }}
+      dobuild: ${{ steps.dobuild.outputs.dobuild }}
+
+    steps:
+      - name: Checkout crowbartools/firebot
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read package.json
+        id: package
+        uses: gregoranders/nodejs-project-info@v0.0.21
+
+      - name: Retrieve package.json version
+        id: version
+        run: echo "version=${{ steps.package.outputs.version }}" >> $GITHUB_OUTPUT
+
+      - name: Get commit messages
+        id: commits
+        shell: bash
+        run: |
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          RES=$(git log --pretty=format:'- %s' --branches=origin/v5 $(git describe --tags `git rev-list --tags --max-count=1`)..HEAD)
+          echo "commits<<${EOF}" >> $GITHUB_OUTPUT
+          echo "${RES}" >> $GITHUB_OUTPUT
+          echo "${EOF}" >> $GITHUB_OUTPUT
+
+      - name: Read Release Template
+        id: template
+        shell: bash
+        run: |
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          TEMPLATE=`cat './.github/release-template.md'`
+          echo "template<<${EOF}" >> $GITHUB_OUTPUT
+          echo "${TEMPLATE}" >> $GITHUB_OUTPUT
+          echo "${EOF}" >> $GITHUB_OUTPUT
+
+      - name: "Check: package version has corresponding git tag"
+        id: dobuild
+        shell: bash
+        run: echo dobuild=$(git show-ref --tags --verify --quiet -- "refs/tags/v${{ steps.version.outputs.version }}" && echo 0 || echo 1) >> $GITHUB_OUTPUT
+
+  compile:
+    name: "Compile"
+    needs: [checkversion]
+    if: needs.checkversion.outputs.dobuild == 1
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Python deps
+        run: python -m pip install --upgrade packaging pip setuptools
+
+      - name: Setup Nodejs
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.19.0"
+
+      - name: Install correct npm version
+        run: npm install -g npm@10.8.1
+
+      - name: Linux Build Prep
+        if: runner.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install libx11-dev libxtst-dev libpng-dev
+
+      - name: MacOS Build Prep
+        if: runner.os == 'macOS'
+        # appdmg will fail to install without python setuptools since gh runners now use python 3.12. See: https://github.com/electron/forge/issues/3371
+        run: brew install python-setuptools
+
+      - name: Install Global Dependencies
+        run: npm install --global --production --omit=dev grunt-cli node-gyp
+
+      - name: Install Project Dependencies
+        run: npm ci
+
+      - name: Decrypt Secrets.gpg
+        env:
+          PASSKEY_FOR_FIREBOT_SECRETS: ${{ secrets.PASSKEY_FOR_FIREBOT_SECRETS }}
+        run: grunt secrets:decrypt
+
+      - name: Build for Platform
+        run: grunt build
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ runner.os }}
+          path: ./dist/install/${{ runner.os == 'macOS' && 'darwin' || runner.os }}/
+
+  draft:
+    name: Draft Github Release
+    needs: [checkversion, compile]
+    if: needs.checkversion.outputs.dobuild == 1
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Compilation Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./bundles/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          token: ${{ env.GITHUB_TOKEN }}
+          draft: true
+          prerelease: false
+          tag_name: v${{ needs.checkversion.outputs.version }}
+          name: Release v${{ needs.checkversion.outputs.version }}
+          body: ${{ format(needs.checkversion.outputs.template, needs.checkversion.outputs.version, needs.checkversion.outputs.commits) }}
+          generate_release_notes: false
+          files: |
+            ./bundles/Windows/firebot-v${{ needs.checkversion.outputs.version }}-setup.exe
+            ./bundles/Windows/firebot-${{ needs.checkversion.outputs.version }}-full.nupkg
+            ./bundles/Windows/RELEASES
+            ./bundles/Linux/firebot-v${{ needs.checkversion.outputs.version }}-linux-x64.tar.gz
+            ./bundles/Linux/firebot-v${{ needs.checkversion.outputs.version }}-linux-x64.deb
+            ./bundles/Linux/firebot-v${{ needs.checkversion.outputs.version }}-linux-x64.rpm
+            ./bundles/macOS/firebot-v${{ needs.checkversion.outputs.version }}-macos-arm64.dmg

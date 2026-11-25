@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  pull_request:
+    branches: ["*"]
+  push:
+    branches: ["master"]
+
+jobs:
+  build:
+    name: Build and Test
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        scala: [2.12.20, 2.13.16, 3.3.6]
+        java: [17, 21]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Container modules occupy too much disk space. The GitHub-hosted runners ran into the
+      # error: "no space left on device."
+      # This action will free up disk space by removing unnecessary files.
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        if: runner.os == 'Linux'
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin # See 'Supported distributions' for available options
+          java-version: ${{ matrix.java }}
+          check-latest: true
+          cache: "sbt"
+
+      - name: Setup sbt launcher
+        uses: sbt/setup-sbt@v1
+
+      - run: sbt ++${{ matrix.scala }} test

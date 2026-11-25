@@ -1,0 +1,126 @@
+name: Semantic Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  # Build binaries for each architecture in parallel
+  build:
+    name: Build (${{ matrix.suffix }})
+    strategy:
+      matrix:
+        include:
+          - os: macos-15
+            arch: arm64
+            suffix: darwin-arm64
+          - os: macos-15-intel
+            arch: x86_64
+            suffix: darwin-amd64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Homebrew Bash 5.2+
+        run: |
+          # macOS Apple /bin/bash is 3.2.57; PowerKit requires 5.2+.
+          brew list --versions bash >/dev/null || brew install bash
+          homebrew_bash="$(brew --prefix bash)/bin/bash"
+          "$homebrew_bash" -c '(( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 2) ))'
+          "$homebrew_bash" --version | head -1
+          echo "HOMEBREW_BASH=$homebrew_bash" >>"$GITHUB_ENV"
+
+      - name: Validate Build Environment
+        run: |
+          echo "=== Build Environment ==="
+          echo "Build shell: $($HOMEBREW_BASH --version | head -1)"
+          echo "OS: $(sw_vers -productName) $(sw_vers -productVersion)"
+          echo "Architecture: $(uname -m)"
+          echo "Xcode: $(xcodebuild -version | head -n 1)"
+          echo "Clang: $(clang --version | head -n 1)"
+
+      - name: Build binaries
+        env:
+          BUILD_SUFFIX: ${{ matrix.suffix }}
+        run: |
+          NEXT_RELEASE_VERSION=build "$HOMEBREW_BASH" scripts/build.sh "$BUILD_SUFFIX"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: binaries-${{ matrix.suffix }}
+          path: dist/*
+          retention-days: 1
+
+      - name: Build Summary
+        if: always()
+        run: |
+          echo "## 🔨 Build Summary - ${{ matrix.suffix }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Architecture:** ${{ matrix.suffix }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Runner:** ${{ matrix.os }}" >> $GITHUB_STEP_SUMMARY
+
+          if [ -d "dist" ]; then
+            echo "### 📦 Generated Artifacts" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| File | Size |" >> $GITHUB_STEP_SUMMARY
+            echo "|------|------|" >> $GITHUB_STEP_SUMMARY
+            cd dist
+            for file in *-${{ matrix.suffix }}*; do
+              if [ -f "$file" ]; then
+                size=$(du -h "$file" | cut -f1)
+                echo "| \`$file\` | $size |" >> $GITHUB_STEP_SUMMARY
+              fi
+            done
+          fi
+
+  # Single release job that waits for all builds
+  release:
+    name: Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: |
+          echo "=== Downloaded artifacts ==="
+          ls -la dist/
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 'lts/*'
+
+      - name: Install Semantic Release
+        run: |
+          npm install -g semantic-release@25 \
+            @semantic-release/changelog@6 \
+            @semantic-release/git@10 \
+            @semantic-release/github@12 \
+            conventional-changelog-conventionalcommits@9
+
+      - name: Semantic Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: semantic-release

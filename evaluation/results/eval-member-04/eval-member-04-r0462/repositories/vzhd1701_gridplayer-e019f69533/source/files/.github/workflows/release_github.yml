@@ -1,0 +1,65 @@
+name: release_github
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Custom tag to release as'
+        required: false
+        type: string
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
+  release:
+    if: github.event_name == 'push' || github.event.inputs.tag != ''
+    needs: [ build ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Extract release notes
+        id: extract-release-notes
+        uses: ffurrer2/extract-release-notes@v3
+
+      - name: Load release python packages
+        uses: actions/download-artifact@v8
+        with:
+          name: release_dist_python
+          path: dist
+
+      - name: Load release binaries
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release_dist_bin_*
+          merge-multiple: true
+          path: dist
+
+      - name: Create Release
+        if: github.event_name == 'push'
+        uses: ncipollo/release-action@v1
+        with:
+          body: ${{ steps.extract-release-notes.outputs.release_notes }}
+          artifacts: "dist/*"
+          token: ${{ secrets.GITHUB_TOKEN }}
+          draft: true
+
+      - name: Create Release (Custom Tag)
+        if: github.event_name != 'push' && github.event.inputs.tag != ''
+        uses: ncipollo/release-action@v1
+        with:
+          body: ${{ steps.extract-release-notes.outputs.release_notes }}
+          artifacts: "dist/*"
+          token: ${{ secrets.GITHUB_TOKEN }}
+          draft: true
+          tag: ${{ github.event.inputs.tag }}

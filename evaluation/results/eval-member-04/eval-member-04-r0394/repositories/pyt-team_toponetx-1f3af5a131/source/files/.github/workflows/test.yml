@@ -1,0 +1,66 @@
+name: "Test"
+
+on:
+  push:
+    branches: [main, github-actions-test]
+    paths-ignore:
+      - "docs/**"
+      - "README.md"
+      - "LICENSE.txt"
+      - ".gitignore"
+
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "README.md"
+      - "LICENSE.txt"
+      - ".gitignore"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.13", "3.14", "3.15"]
+        flavor: ["none", "all"]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Install Package [${{ matrix.flavor }}]
+        run: |
+          if [[ "${{ matrix.flavor }}" == "none" ]]; then
+            uv sync
+          else
+            uv sync --extra ${{ matrix.flavor }}
+          fi
+
+      - name: Typecheck [mypy]
+        run: uv run mypy -p toponetx
+        continue-on-error: true
+
+      - name: Run tests [pytest]
+        run: uv run pytest --cov --cov-report=xml:coverage.xml
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.xml
+          fail_ci_if_error: false

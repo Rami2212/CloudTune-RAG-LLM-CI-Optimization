@@ -1,0 +1,133 @@
+name: Publish
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      snapshot_only:
+        description: Run the snapshot publishing job without the regular release job
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  snapshot:
+    if: ${{ !contains(github.event.commits[0].message, 'nosnapshot') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    name: Snapshot
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: check skip tag
+        run: |
+          if git log -1 --pretty=%B | grep -qE 'chore: release|nosnapshot'; then
+            echo "Skipping snapshot release due to commit message."
+            exit 0
+          fi
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            **/node_modules
+            ./.yarn/cache
+          key: ${{ runner.os }}-deps-${{ hashFiles('**/yarn.lock') }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Set up Yarn
+        run: |
+          corepack enable
+          corepack prepare yarn@4.1.1 --activate
+
+      - run: yarn
+      - run: yarn lint:test
+      - run: yarn test
+      - run: yarn build:core
+      - run: yarn build:web
+
+      - name: Copy readme.md to packages
+        run: |
+          for dir in $(find packages -type d -maxdepth 1); do
+            cp readme.md $dir/readme.md
+          done
+          
+      - name: Snapshot Versioning
+        run: yarn changeset version --snapshot
+
+      - name: Snapshot Release
+        run: |
+          if git diff --quiet; then
+            echo "No changes detected"
+            exit 0
+          else
+            yarn changeset publish --no-git-tag --tag snapshot
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
+
+
+  publish:
+    if: ${{ !inputs.snapshot_only && !contains(github.event.head_commit.message, '[snapshot-only]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    name: Publish
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            **/node_modules
+            ./.yarn/cache
+          key: ${{ runner.os }}-deps-${{ hashFiles('**/yarn.lock') }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Set up Yarn
+        run: |
+          corepack enable
+          corepack prepare yarn@4.1.1 --activate
+
+      - run: yarn
+      - run: yarn lint:test
+      - run: yarn test
+      - run: yarn build:core
+      - run: yarn build:web
+      - name: Copy readme.md to packages
+        run: |
+          for dir in $(find packages -type d -maxdepth 1); do
+            cp readme.md $dir/readme.md
+          done
+
+      - name: Create Release Pull Request or Publish to npm
+        id: changesets
+        uses: changesets/action@v1
+        with:
+          version: npx zx ./scripts/version.mjs
+          publish: yarn changeset publish
+          commit: "chore: release [nosnapshot]"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

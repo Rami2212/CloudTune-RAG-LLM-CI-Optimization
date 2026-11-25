@@ -1,0 +1,122 @@
+# Trigger a release when a tag that looks like a version number is pushed.
+on:
+  push:
+    tags:
+      - '[0-9]*.[0-9]*.[0-9]*'
+
+  # Do a test run on PRs that change this file. Doesn't do the actual release.
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+
+  # Allow manually triggering workflow for testing purposes. As with pull requests, the actual
+  # release won't get created.
+  workflow_dispatch:
+
+name: Release
+
+env:
+  IS_RELEASE: ${{ startsWith(github.ref, 'refs/tags/') }}
+  VERSION_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('test-{0}', github.run_number) }}
+
+jobs:
+  release:
+    name: Release
+    permissions:
+      contents: write # Needed for creating releases
+    runs-on: ${{ matrix.runs-on }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {target: x86_64-unknown-linux-gnu, runs-on: ubuntu-22.04}
+          - {target: aarch64-unknown-linux-gnu, runs-on: ubuntu-22.04-arm}
+          - {target: riscv64gc-unknown-linux-gnu, runs-on: ubuntu-22.04-arm, build: zigbuild}
+
+          - {target: x86_64-unknown-linux-musl, runs-on: ubuntu-22.04, musl: true, args: --features=mimalloc}
+          - {target: aarch64-unknown-linux-musl, runs-on: ubuntu-22.04-arm, musl: true, args: --features=mimalloc}
+          - {target: riscv64gc-unknown-linux-musl, runs-on: ubuntu-22.04-arm, build: zigbuild, args: --features=mimalloc,}
+
+    steps:
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang
+        if: matrix.build != 'zigbuild'
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        if: matrix.musl == true
+
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
+
+      - uses: taiki-e/install-action@cargo-zigbuild
+        if: matrix.build == 'zigbuild'
+      - uses: mlugg/setup-zig@v2
+        if: matrix.build == 'zigbuild'
+        with:
+          use-cache: false
+
+      - name: Extract release notes
+        if: env.IS_RELEASE == 'true'
+        shell: bash
+        run: |
+          awk "/## ${VERSION_TAG}/{flag=1; next} /^## / && flag{exit} flag" CHANGELOG.md >REL.md
+
+      - name: Build stage1
+        run: cargo build --release --locked
+
+      - name: Configure release compiler flags
+        shell: bash
+        run: |
+          repo=$(pwd -P)
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          sysroot=$(rustc --print sysroot)
+          rust_commit=$(rustc -vV | sed -n 's/^commit-hash: //p')
+
+          flags=(
+            "--remap-path-prefix=$repo=/wild"
+            "--remap-path-prefix=$cargo_home=/cargo"
+            # Match rustc's built-in paths even when rust-src is installed.
+            "--remap-path-prefix=$sysroot/lib/rustlib/src/rust=/rustc/$rust_commit"
+          )
+
+          if [[ "${{ matrix.build }}" != zigbuild ]]; then
+            "$repo/target/release/wild" --version
+            flags+=(
+              "-Clinker=clang"
+              "-Clink-arg=--ld-path=$repo/target/release/wild"
+            )
+          fi
+
+          printf -v encoded '%s\x1f' "${flags[@]}"
+          printf 'CARGO_ENCODED_RUSTFLAGS=%s\n' \
+            "${encoded%$'\x1f'}" >> "$GITHUB_ENV"
+
+      - name: Build release binary
+        run: cargo ${{matrix.build || 'build' }} ${{matrix.args}} --profile dist --locked --target ${{ matrix.target }}
+
+      - name: Create tarballs
+        run: |
+          n="wild-linker-${VERSION_TAG}-${{ matrix.target }}"
+          mkdir "$n"
+          cp "target/${{ matrix.target }}/dist/wild" "$n"
+          cp README.md LICENSE-* CHANGELOG.md "$n"
+          readelf -p .comment "$n/wild" | grep "Linker: Wild" || echo "::warning::'$n' wasn't linked with wild"
+          tar zcf $n.tar.gz $n
+
+      - name: Release
+        if: env.IS_RELEASE == 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          body_path: REL.md
+          draft: true
+          files: |
+            wild-linker-*.tar.gz

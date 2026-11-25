@@ -1,0 +1,36 @@
+name: CI (Linux)
+on:
+  workflow_call:
+jobs:
+  build:
+    name: Linux
+    runs-on: ubuntu-22.04 # Lowest version that support Vulkan 1.3.
+    steps:
+    - name: Check out repository
+      uses: actions/checkout@v6
+    - name: Install System Packages
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libvulkan-dev
+    - name: Update Rust
+      run: rustup update stable
+    - name: Add additional Rust targets
+      run: rustup target add x86_64-unknown-none
+    - name: Install additional tools
+      run: cargo install project
+    - name: Lint Rust sources
+      run: project lint
+    - name: Build
+      run: project build -r
+    - name: Run tests
+      run: cargo test
+    - name: Create distribution tarball
+      run: |
+        ln -sr dist/bin/obliteration dist/obliteration
+        mv dist obliteration
+        tar -cvf obliteration.tar obliteration
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: obliteration-linux-amd64
+        path: obliteration.tar

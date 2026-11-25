@@ -1,0 +1,123 @@
+[2mAnalyzing workflows in C:\Users\hirun\AppData\Local\Temp\cloudtune-ci-cost-cus9wbxx\.github\workflows...[0m
+[2mFound 1 workflow file[0m
+
+[1m[36mci-cost[0m â€” GitHub Actions Cost Analyzer
+
+[2mAnalyzed 1 workflow Â· 10 jobs Â· 4 recommendations[0m
+
+[1mSEVERITY  RECOMMENDATION                                        ESTIMATED SAVINGS[0m
+[2mâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€[0m
+[31m[1mHIGH  [0m  Add pip dependency cache to "static" job              [32m~3 min per run[0m
+[31m[1mHIGH  [0m  Add pip dependency cache to "test_minimum" job        [32m~3 min per run[0m
+[31m[1mHIGH  [0m  Split "static" into parallel jobs (lint + test + ...  [32m~6 min per run[0m
+[33m[1mMEDIUM[0m  9 jobs clone the repo â€” consider artifact sharing     [32m~1 min per run[0m
+
+[2mâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€[0m
+
+[1mRecommendations:[0m
+
+[1m1. [31m[HIGH][0m[1m Add pip dependency cache to "static" job[0m
+   [2mFile: test-python.yml Â· Job: static[0m
+   Job "static" installs pip dependencies without caching. Add `actions/cache` before the install step to restore the pip cache across runs. This is one of the highest-impact optimizations for most CI workflows.
+
+   [36mFix:[0m
+   [2m# Add before your pip install step in job "static":[0m
+   [2m      - name: Cache pip packages[0m
+   [2m        uses: actions/cache@v4[0m
+   [2m        with:[0m
+   [2m          path: ~/.cache/pip[0m
+   [2m          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}[0m
+   [2m          restore-keys: |[0m
+   [2m            ${{ runner.os }}-pip-[0m
+
+[1m2. [31m[HIGH][0m[1m Add pip dependency cache to "test_minimum" job[0m
+   [2mFile: test-python.yml Â· Job: test_minimum[0m
+   Job "test_minimum" installs pip dependencies without caching. Add `actions/cache` before the install step to restore the pip cache across runs. This is one of the highest-impact optimizations for most CI workflows.
+
+   [36mFix:[0m
+   [2m# Add before your pip install step in job "test_minimum":[0m
+   [2m      - name: Cache pip packages[0m
+   [2m        uses: actions/cache@v4[0m
+   [2m        with:[0m
+   [2m          path: ~/.cache/pip[0m
+   [2m          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}[0m
+   [2m          restore-keys: |[0m
+   [2m            ${{ runner.os }}-pip-[0m
+
+[1m3. [31m[HIGH][0m[1m Split "static" into parallel jobs (lint + test + build)[0m
+   [2mFile: test-python.yml Â· Job: static[0m
+   Job "static" runs lint, test, and/or build sequentially in a single job. Splitting them into separate parallel jobs can cut total runtime by 50â€“70% since they can run concurrently. Each job only needs to wait for the steps it depends on.
+
+   [36mFix:[0m
+   [2m# Split "static" into parallel jobs:[0m
+   [2mjobs:[0m
+   [2m  lint:[0m
+   [2m    runs-on: ubuntu-latest[0m
+   [2m    steps:[0m
+   [2m      - uses: actions/checkout@v4[0m
+   [2m      - uses: actions/setup-node@v4[0m
+   [2m        with:[0m
+   [2m          node-version: '20'[0m
+   [2m          cache: 'npm'[0m
+   [2m      - run: npm ci[0m
+   [2m      - run: npm run lint[0m
+   [2m      - run: npm run typecheck[0m
+   [2m[0m
+   [2m  test:[0m
+   [2m    runs-on: ubuntu-latest[0m
+   [2m    steps:[0m
+   [2m      - uses: actions/checkout@v4[0m
+   [2m      - uses: actions/setup-node@v4[0m
+   [2m        with:[0m
+   [2m          node-version: '20'[0m
+   [2m          cache: 'npm'[0m
+   [2m      - run: npm ci[0m
+   [2m      - run: npm test[0m
+   [2m[0m
+   [2m  build:[0m
+   [2m    runs-on: ubuntu-latest[0m
+   [2m    needs: [lint, test][0m
+   [2m    steps:[0m
+   [2m      - uses: actions/checkout@v4[0m
+   [2m      - uses: actions/setup-node@v4[0m
+   [2m        with:[0m
+   [2m          node-version: '20'[0m
+   [2m          cache: 'npm'[0m
+   [2m      - run: npm ci[0m
+   [2m      - run: npm run build[0m
+
+[1m4. [33m[MEDIUM][0m[1m 9 jobs clone the repo â€” consider artifact sharing[0m
+   [2mFile: test-python.yml[0m
+   9 jobs in "test-python.yml" each run `actions/checkout`. For large repos or jobs that share build output, upload the build artifact once and download it in dependent jobs instead of re-cloning and re-building.
+
+   [36mFix:[0m
+   [2m# In your build job, upload the artifact:[0m
+   [2m      - name: Upload build artifact[0m
+   [2m        uses: actions/upload-artifact@v4[0m
+   [2m        with:[0m
+   [2m          name: build-output[0m
+   [2m          path: dist/[0m
+   [2m          retention-days: 1[0m
+   [2m[0m
+   [2m# In dependent jobs, download instead of re-building:[0m
+   [2m      - name: Download build artifact[0m
+   [2m        uses: actions/download-artifact@v4[0m
+   [2m        with:[0m
+   [2m          name: build-output[0m
+   [2m          path: dist/[0m
+
+[2mâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€[0m
+
+[1mSummary[0m
+
+  Estimated monthly cost:   [33m~$128.00/month[0m
+  Time savings per run:     [32m~13 min/run[0m
+  Estimated monthly savings: [32m~$20.80/month[0m
+
+  Issues:  [31m3 HIGH[0m  [33m1 MEDIUM[0m
+
+  [2mRun with [0m[36m--fix[0m[2m to generate optimized workflow files[0m
+
+[2mGenerating optimized workflow files in C:\Users\hirun\AppData\Local\Temp\cloudtune-ci-cost-cus9wbxx\.github\workflows\optimized...[0m
+[32mGenerated 1 optimized workflow file:[0m
+  [36mC:\Users\hirun\AppData\Local\Temp\cloudtune-ci-cost-cus9wbxx\.github\workflows\optimized\test-python.yml[0m

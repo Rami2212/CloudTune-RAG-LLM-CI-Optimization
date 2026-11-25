@@ -1,0 +1,55 @@
+name: Release on NPM and GitHub
+
+on:
+  push:
+    tags: ["*"]
+  workflow_dispatch:
+
+
+## Set permissions to the github token
+## https://github.com/softprops/action-gh-release#permissions 
+permissions:
+  contents: write
+
+jobs:
+  publish-packages:
+    if: ${{ github.repository == 'jmjuanes/siimple' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+      - run: yarn release
+      - run: bash scripts/publish-packages.sh
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-main:
+    if: ${{ github.repository == 'jmjuanes/siimple' }}
+    runs-on: ubuntu-latest
+    needs: [publish-packages]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+      - run: yarn install
+      - run: yarn run build
+      - run: yarn release
+      - run: cd siimple && npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - run: cd siimple-icons && npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  release:
+    if: ${{ github.repository == 'jmjuanes/siimple' }}
+    runs-on: ubuntu-latest
+    needs: [publish-main, publish-packages]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: softprops/action-gh-release@v2

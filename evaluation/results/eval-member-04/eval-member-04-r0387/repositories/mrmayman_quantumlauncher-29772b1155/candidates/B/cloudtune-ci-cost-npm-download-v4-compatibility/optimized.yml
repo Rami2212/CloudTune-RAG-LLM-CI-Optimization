@@ -1,0 +1,76 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [HIGH] Add cargo dependency cache to "DEB" job
+# Estimated savings: ~8 min/run
+#
+name: Build-DEB
+
+on:
+  workflow_dispatch:
+
+env:
+  BIN_NAME: quantum_launcher
+  PROJECT_NAME: quantum_launcher
+  CARGO_TERM_COLOR: always
+
+jobs:
+  DEB:
+    name: Build DEB
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false # don't fail other jobs if one fails
+      matrix:
+        build: [x86_64-linux, aarch64-linux]
+        include:
+          - build: x86_64-linux
+            os: ubuntu-latest
+            rust: stable
+            target: x86_64-unknown-linux-gnu
+            cross: false
+            arch: x86_64
+          - build: aarch64-linux
+            os: ubuntu-24.04-arm
+            rust: stable
+            target: aarch64-unknown-linux-gnu
+            cross: false
+            arch: aarch64
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      - name: Install ${{ matrix.rust }} toolchain
+        shell: bash
+        run: |
+          rustup toolchain install ${{ matrix.rust }} --no-self-update
+          rustup default ${{ matrix.rust }}
+          rustup target add ${{ matrix.target }}
+          if [ "${{ matrix.cross }}" == "true" ]; then
+            cargo install cross --locked
+          fi
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          if [ "${{ matrix.cross }}" == "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Build DEB
+        run: |
+          sudo apt-get install fakeroot
+          mkdir -p dist build
+
+          install -D "assets/freedesktop/quantum-launcher.desktop" "build/usr/share/applications/quantum-launcher.desktop"
+          install -D "assets/freedesktop/quantum-launcher.metainfo.xml" "build/usr/share/metainfo/quantum-launcher.metainfo.xml"
+          install -D "assets/icon/256x256/ql_logo.png" "build/usr/share/icons/hicolor/256x256/apps/io.github.Mrmayman.QuantumLauncher.png"
+          install -D "target/${{ matrix.target }}/release/${{ env.BIN_NAME }}" "build/usr/bin/quantum-launcher"
+          mv "assets/freedesktop/debian" "build/DEBIAN"
+          fakeroot dpkg-deb --build build dist/$PROJECT_NAME-${{ matrix.build }}.deb
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: quantum-launcher-ubuntu-${{ matrix.arch }}
+          path: dist

@@ -1,0 +1,123 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 7 optimizations:
+# - [HIGH] Add gradle dependency cache to "windows" job
+# - [HIGH] Add gradle dependency cache to "macOS" job
+# - [HIGH] Add gradle dependency cache to "linux" job
+# - [HIGH] Switch "macOS" from macOS to ubuntu runner
+# - [MEDIUM] Add concurrency group to "gradle.yml"
+# - [MEDIUM] Switch "windows" from Windows to ubuntu runner
+# - [MEDIUM] 3 jobs clone the repo — consider artifact sharing
+# Estimated savings: ~18 min/run
+#
+name: CI
+
+on:
+  push:
+    branches:
+      - 'master'
+  pull_request:
+    branches:
+      - '*'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  windows:
+    name: Windows (Java 21)
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+          submodules: recursive
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'zulu'
+          java-version: 21
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+      - name: Build & Test
+        run: ./gradlew build test -PskipSpotless
+      - name: Upload Test Report
+        uses: actions/upload-artifact@v4
+        if: ${{ failure() }}
+        with:
+          name: windows-test-report
+          path: jsvg/build/reports
+      - name: Upload Test Diffs
+        uses: actions/upload-artifact@v4
+        if: ${{ failure() }}
+        with:
+          name: windows-test-diffs
+          path: build/ref_test
+
+  macOS:
+    name: MacOS (Java 21)
+    runs-on: macos-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          submodules: recursive
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: 21
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+      - name: Build & Test
+        run: ./gradlew build test -PskipSpotless
+      - name: Upload Test Report
+        uses: actions/upload-artifact@v4
+        if: ${{ failure() }}
+        with:
+          name: macos-test-report
+          path: jsvg/build/reports
+      - name: Upload Test Diffs
+        uses: actions/upload-artifact@v4
+        if: ${{ failure() }}
+        with:
+          name: macos-test-diffs
+          path: build/ref_test
+
+  linux:
+    name: Linux (Java 21)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          submodules: recursive
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: 21
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+      - name: Build & Test
+        run: ./gradlew build test -PskipSpotless
+      - name: Upload Test Report
+        uses: actions/upload-artifact@v4
+        if: ${{ failure() }}
+        with:
+          name: linux-test-report
+          path: jsvg/build/reports
+      - name: Upload Test Diffs
+        uses: actions/upload-artifact@v4
+        if: ${{ failure() }}
+        with:
+          name: linux-test-diffs
+          path: build/ref_test

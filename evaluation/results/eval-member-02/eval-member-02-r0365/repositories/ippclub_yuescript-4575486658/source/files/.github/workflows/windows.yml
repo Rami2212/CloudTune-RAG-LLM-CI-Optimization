@@ -1,0 +1,87 @@
+name: Windows
+
+on:
+  push:
+    branches: [ main ]
+    tags: 'v*.*.*'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    if: "startsWith(github.ref, 'refs/tags/') || !contains(github.event.head_commit.message, '[skip CI]')"
+    steps:
+      - uses: actions/checkout@v2
+      - name: Setup msbuild
+        uses: microsoft/setup-msbuild@v1.0.2
+      - name: Windows build & test
+        run: |
+          msbuild win-build\Yuescript.sln /p:Configuration=Debug /p:Platform=x86
+          bin\windows\Win32\Debug\yue.exe spec\inputs -t spec\generated --tl_enabled
+          bin\windows\Win32\Debug\yue.exe spec\inputs\teal_lang.yue -o spec\generated\teal_lang.lua
+          bin\windows\Win32\Debug\yue.exe spec\inputs\loops.yue -o spec\generated\5.1\loops.lua --target=5.1
+          bin\windows\Win32\Debug\yue.exe spec\inputs\try_catch.yue -o spec\generated\5.1\try_catch.lua --target=5.1
+          bin\windows\Win32\Debug\yue.exe spec\inputs\attrib.yue -o spec\generated\5.1\attrib.lua --target=5.1
+          bin\windows\Win32\Debug\yue.exe spec\inputs\import_global.yue -o spec\generated\5.1\import_global.lua --target=5.1
+          bin\windows\Win32\Debug\yue.exe spec\inputs\test\loops_spec.yue -o spec\generated\5.1\test\loops_spec.lua --target=5.1
+          bin\windows\Win32\Debug\yue.exe spec\inputs\test\try_catch_spec.yue -o spec\generated\5.1\test\try_catch_spec.lua --target=5.1
+          bin\windows\Win32\Debug\yue.exe -e spec/inputs/compile_doc.yue spec/generated doc
+          bin\windows\Win32\Debug\yue.exe -e "io.popen('git diff --no-index spec\\outputs spec\\generated')\read('*a') |> ((r)-> r ~= '' and (print(r) or os.exit 1))"
+          msbuild win-build\Yuescript.sln /p:Configuration=Debug /p:Platform=x64
+          bin\windows\x64\Debug\yue.exe spec\inputs -t spec\generated --tl_enabled
+          bin\windows\x64\Debug\yue.exe spec\inputs\teal_lang.yue -o spec\generated\teal_lang.lua
+          bin\windows\x64\Debug\yue.exe spec\inputs\loops.yue -o spec\generated\5.1\loops.lua --target=5.1
+          bin\windows\x64\Debug\yue.exe spec\inputs\try_catch.yue -o spec\generated\5.1\try_catch.lua --target=5.1
+          bin\windows\x64\Debug\yue.exe spec\inputs\attrib.yue -o spec\generated\5.1\attrib.lua --target=5.1
+          bin\windows\x64\Debug\yue.exe spec\inputs\import_global.yue -o spec\generated\5.1\import_global.lua --target=5.1
+          bin\windows\x64\Debug\yue.exe spec\inputs\test\loops_spec.yue -o spec\generated\5.1\test\loops_spec.lua --target=5.1
+          bin\windows\x64\Debug\yue.exe spec\inputs\test\try_catch_spec.yue -o spec\generated\5.1\test\try_catch_spec.lua --target=5.1
+          bin\windows\x64\Debug\yue.exe -e spec/inputs/compile_doc.yue spec/generated doc
+          bin\windows\x64\Debug\yue.exe -e "io.popen('git diff --no-index spec\\outputs spec\\generated')\read('*a') |> ((r)-> r ~= '' and (print(r) or os.exit 1))"
+      - name: Setup MSVC dev cmd
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: Setup Lua
+        uses: luarocks/gh-actions-lua@v11
+      - name: Setup LuaRocks
+        uses: luarocks/gh-actions-luarocks@v6
+      - name: Install and run busted
+        run: |
+          luarocks make
+          luarocks install busted
+          busted
+      - name: pack
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          msbuild win-build\Yuescript.sln /p:Configuration=Release /p:Platform=x86
+          msbuild win-build\Yuescript.sln /p:Configuration=Release /p:Platform=x64
+          (cd bin\windows\Win32\Release && 7z a ..\..\..\..\yue-windows-x86.7z yue.exe && cd ..\..\..\..)
+          (cd bin\windows\x64\Release && 7z a ..\..\..\..\yue-windows-x64.7z yue.exe && cd ..\..\..\..)
+      - name: Windows build Lua 5.1 dll
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          msbuild win-build\Yuescript.sln /p:Configuration=Release51 /p:Platform=x86
+          msbuild win-build\Yuescript.sln /p:Configuration=Release51 /p:Platform=x64
+          (cd bin\windows\Win32\Release && 7z a ..\..\..\..\yue-windows-x86-lua51-dll.7z yue.dll && cd ..\..\..\..)
+          (cd bin\windows\x64\Release && 7z a ..\..\..\..\yue-windows-x64-lua51-dll.7z yue.dll && cd ..\..\..\..)
+      - name: Windows build Lua 5.3 dll
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          msbuild win-build\Yuescript.sln /p:Configuration=Release53 /p:Platform=x86
+          msbuild win-build\Yuescript.sln /p:Configuration=Release53 /p:Platform=x64
+          (cd bin\windows\Win32\Release && 7z a ..\..\..\..\yue-windows-x86-lua53-dll.7z yue.dll && cd ..\..\..\..)
+          (cd bin\windows\x64\Release && 7z a ..\..\..\..\yue-windows-x64-lua53-dll.7z yue.dll && cd ..\..\..\..)
+      - name: release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            yue-windows-x86.7z
+            yue-windows-x64.7z
+            yue-windows-x86-lua51-dll.7z
+            yue-windows-x64-lua51-dll.7z
+            yue-windows-x86-lua53-dll.7z
+            yue-windows-x64-lua53-dll.7z
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

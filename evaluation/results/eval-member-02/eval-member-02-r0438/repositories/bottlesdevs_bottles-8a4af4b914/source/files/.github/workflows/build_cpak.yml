@@ -1,0 +1,357 @@
+name: Build cpak
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["*"]
+  schedule:
+    - cron: '40 7 * * 2'
+  workflow_dispatch:
+    inputs:
+      full_test_suite:
+        description: Run the complete test suite before release
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+  attestations: write
+  id-token: write
+
+concurrency:
+  group: build-cpak-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: identity
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME//\//-}-${{ matrix.arch }}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/bottlesdevs/bottles:$tag" >> "$GITHUB_OUTPUT"
+
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302
+        with:
+          images: ghcr.io/bottlesdevs/bottles
+          tags: type=raw,value=${{ steps.identity.outputs.tag }}
+
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          context: .
+          file: build-aux/cpak/Containerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          pull: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=bottles-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=bottles-${{ matrix.arch }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Verify image
+        env:
+          IMAGE: ${{ steps.identity.outputs.image }}
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          docker run --rm \
+            --entrypoint sh \
+            --env EXPECTED_ARCH \
+            "$IMAGE" -ceu '
+              test "$(dpkg --print-architecture)" = "$EXPECTED_ARCH"
+              test -x /usr/bin/bottles
+              test -x /usr/bin/bottles-real
+              test -x /usr/bin/bottles-cli
+              test -x /usr/local/bin/umu-run
+              case "$EXPECTED_ARCH" in
+                amd64)
+                  test -e /usr/lib/x86_64-linux-gnu/libpcsclite.so.1
+                  test -e /usr/lib/i386-linux-gnu/libpcsclite.so.1
+                  test -e /usr/lib/x86_64-linux-gnu/libxkbregistry.so.0
+                  test -e /usr/lib/i386-linux-gnu/libxkbregistry.so.0
+                  ;;
+                arm64)
+                  test -e /usr/lib/aarch64-linux-gnu/libpcsclite.so.1
+                  test -e /usr/lib/aarch64-linux-gnu/libxkbregistry.so.0
+                  ;;
+              esac
+              test -r /usr/share/bottles/bottles/backend/managers/eagletracing.py
+              test -r /usr/share/bottles/bottles/backend/identity.py
+              gresource extract /usr/share/bottles/bottles.gresource /com/usebottles/bottles/details-preferences.ui | grep -F switch_eagle_tracing
+              bottles-cli --version
+              python3 -c "from requests.adapters import SOCKSProxyManager; SOCKSProxyManager(\"socks5h://127.0.0.1:9\")"
+            '
+
+      - name: Test bottle and dependency handling
+        env:
+          IMAGE: ${{ steps.identity.outputs.image }}
+          FULL_TEST_SUITE: ${{ inputs.full_test_suite || false }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/bottles-test-results"
+          docker run --rm \
+            --entrypoint sh \
+            --env FULL_TEST_SUITE \
+            --volume "$RUNNER_TEMP/bottles-test-results:/results" \
+            --volume "$GITHUB_WORKSPACE:/tests:ro" \
+            "$IMAGE" -ceu '
+              test_tools="xauth xvfb blueprint-compiler python3-pytest python3-pytest-mock python3-freezegun"
+              if test "$FULL_TEST_SUITE" = true; then
+                test_tools="$test_tools gcc-mingw-w64-i686 gcc-mingw-w64-x86-64 wixl nsis python3-pyatspi"
+              fi
+              sh /tests/build-aux/cpak/install-test-tools.sh $test_tools
+              mkdir -p /app/share/bottles
+              ln -s /usr/share/bottles/bottles.gresource /app/share/bottles/bottles.gresource
+              cd /tests
+              export PYTHONDONTWRITEBYTECODE=1
+              export TMPDIR="$HOME/artifacts/bottles-identity-ci"
+              mkdir -p "$TMPDIR"
+              export TMP="$TMPDIR" TEMP="$TMPDIR"
+              command -v dbus-run-session
+              xvfb-run -a /usr/bin/bottles-real --help
+              if test "$FULL_TEST_SUITE" = true; then
+                xvfb-run -a timeout 900 python3 -m pytest -q -ra --junitxml=/results/pytest.xml --import-mode=importlib bottles/tests
+                xvfb-run -a dbus-run-session -- timeout 600 python3 build-aux/cpak/test-startup.py
+              else
+              xvfb-run -a python3 -m pytest -q \
+                bottles/tests/backend/test_downloader.py \
+                bottles/tests/backend/manager/test_component.py \
+                bottles/tests/backend/test_identity.py \
+                bottles/tests/backend/test_health.py \
+                bottles/tests/backend/test_config.py \
+                bottles/tests/backend/test_identity_ui.py \
+                bottles/tests/frontend/test_open_uri.py \
+                bottles/tests/frontend/test_eagle_dialog.py \
+                bottles/tests/frontend/test_bottle_preferences.py \
+                bottles/tests/frontend/test_program_stop.py \
+                bottles/tests/frontend/test_program_launch.py \
+                bottles/tests/backend/manager/test_journal.py \
+                bottles/tests/backend/manager/test_playtime.py \
+                bottles/tests/backend/manager/test_importer.py \
+                bottles/tests/backend/manager/test_default_drives.py \
+                bottles/tests/backend/manager/test_dependency_extraction.py \
+                bottles/tests/backend/manager/test_dependency_install.py \
+                bottles/tests/backend/manager/test_dependency_removal.py \
+                bottles/tests/backend/manager/test_installer.py \
+                bottles/tests/backend/manager/test_backup.py \
+                bottles/tests/backend/manager/test_config_import.py \
+                bottles/tests/backend/wine/test_dpi_scaling.py \
+                bottles/tests/backend/manager/test_offline_cache.py \
+                bottles/tests/backend/manager/test_manager.py::test_create_bottle_rejects_win32_for_wow64_only_runner \
+                bottles/tests/backend/manager/test_manager.py::test_gaming_creation_detects_sync_without_overwriting_saved_settings \
+                bottles/tests/backend/manager/test_manager.py::test_finished_signal_cleans_up_in_memory_sessions \
+                bottles/tests/backend/manager/test_manager.py::test_prefix_creation_reports_wineboot_failure_before_waiting \
+                bottles/tests/backend/manager/test_manager.py::test_custom_prefix_without_placeholder_uses_its_current_config \
+                bottles/tests/backend/manager/test_manager.py::test_loaded_prefix_keeps_user_files_after_account_change \
+                bottles/tests/backend/manager/test_manager.py::test_full_backup_import_preserves_files_for_another_account \
+                bottles/tests/backend/utils/test_manager.py \
+                bottles/tests/backend/utils/test_wine.py \
+                bottles/tests/backend/utils/test_steam.py \
+                bottles/tests/backend/test_nvapi.py \
+                bottles/tests/frontend/test_bottle_drop.py \
+                bottles/tests/frontend/test_preferences_children.py \
+                bottles/tests/frontend/test_bottle_list_order.py \
+                bottles/tests/frontend/test_dependency_entry.py \
+                bottles/tests/frontend/test_dependency_batch.py \
+                bottles/tests/frontend/test_importer_selection.py \
+                bottles/tests/frontend/test_offline_components.py \
+                bottles/tests/frontend/test_preferences_window.py \
+                bottles/tests/frontend/test_external_runner_component.py \
+                bottles/tests/frontend/test_playtime_service.py \
+                bottles/tests/frontend/test_playtime_reset.py \
+                bottles/tests/backend/test_playtime_reset.py \
+                bottles/tests/frontend/test_drive_dialog.py \
+                bottles/tests/frontend/test_drives_dialog.py \
+                bottles/tests/frontend/test_onboard.py \
+                bottles/tests/frontend/test_installer_icon.py \
+                bottles/tests/backend/umu/test_executor.py \
+                bottles/tests/backend/umu/test_database.py \
+                bottles/tests/backend/manager/test_sandbox.py \
+                bottles/tests/frontend/test_umu_search.py \
+                bottles/tests/frontend/test_umu_paths.py \
+                bottles/tests/frontend/test_umu_library.py \
+                bottles/tests/frontend/test_library_view.py \
+                bottles/tests/frontend/test_bottle_move.py \
+                bottles/tests/frontend/test_display.py \
+                bottles/tests/backend/wine/test_executor.py \
+                bottles/tests/backend/wine/test_wineserver.py \
+                bottles/tests/backend/wine/test_uninstaller.py \
+                bottles/tests/backend/wine/test_start.py
+              fi
+            '
+
+      - name: Upload full test results
+        if: ${{ always() && inputs.full_test_suite }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: bottles-tests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/bottles-test-results
+          retention-days: 7
+
+      - name: Verify Soda and DPI settings
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ steps.identity.outputs.image }}
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          case "$EXPECTED_ARCH" in
+            amd64) soda_arch=x86_64 ;;
+            arm64) soda_arch=aarch64 ;;
+          esac
+          soda_dir="$RUNNER_TEMP/soda-$EXPECTED_ARCH"
+          mkdir -p "$soda_dir"
+          gh release download soda-11.0-10 \
+            --repo bottlesdevs/wine \
+            --pattern "soda-11.0-10-$soda_arch.tar.xz" \
+            --dir "$soda_dir"
+          tar -C "$soda_dir" -xJf "$soda_dir/soda-11.0-10-$soda_arch.tar.xz"
+          runner="$(find "$soda_dir" -mindepth 1 -maxdepth 1 -type d -name "soda-*-$soda_arch" -print -quit)"
+          test -n "$runner"
+          docker run --rm \
+            --entrypoint sh \
+            --env EXPECTED_ARCH \
+            --volume "$runner:/runner:ro" \
+            --volume "$GITHUB_WORKSPACE/build-aux/cpak/test-dpi-scaling.py:/dpi-test.py:ro" \
+            --volume "$GITHUB_WORKSPACE/build-aux/cpak/install-test-tools.sh:/install-test-tools:ro" \
+            "$IMAGE" -ceu '
+              sh /install-test-tools xauth xvfb
+              export LD_LIBRARY_PATH="/runner/lib:/runner/lib64:/runner/lib/wine/aarch64-unix:/runner/lib/wine/x86_64-unix:$LD_LIBRARY_PATH"
+              if test "$EXPECTED_ARCH" = arm64; then
+                export FEX_APP_CONFIG=/runner/share/fex-emu/Config.json
+                export FEX_APP_CONFIG_LOCATION=/runner/share/fex-emu
+              fi
+              export WINEARCH=win64
+              export WINEDEBUG=-all
+              export TMPDIR="$HOME/artifacts/bottles-soda-ci"
+              export TMP="$TMPDIR" TEMP="$TMPDIR"
+              mkdir -p "$TMPDIR"
+              export WINEPREFIX="$TMPDIR/prefix"
+              ldd /runner/bin/wine | tee "$TMPDIR/soda-ldd.log"
+              ! grep -F "not found" "$TMPDIR/soda-ldd.log"
+              xvfb-run -a /runner/bin/wine wineboot -u
+              native="$(xvfb-run -a /runner/bin/wine cmd /c echo "%PROCESSOR_ARCHITECTURE%" | tr -d "\r" | grep -E "^(ARM64|AMD64|x86)$" | tail -1)"
+              x86="$(xvfb-run -a /runner/bin/wine /runner/lib/wine/i386-windows/cmd.exe /c echo "%PROCESSOR_ARCHITECTURE%" | tr -d "\r" | grep -E "^(ARM64|AMD64|x86)$" | tail -1)"
+              if test "$EXPECTED_ARCH" = arm64; then
+                test "$native" = ARM64
+                x64="$(xvfb-run -a /runner/bin/wine /runner/lib/wine/x86_64-windows/cmd.exe /c echo "%PROCESSOR_ARCHITECTURE%" | tr -d "\r" | grep -E "^(ARM64|AMD64|x86)$" | tail -1)"
+                test "$x64" = AMD64
+              else
+                test "$native" = AMD64
+              fi
+              test "$x86" = x86
+              PYTHONPATH=/usr/share/bottles xvfb-run -a timeout 180 python3 /dpi-test.py /runner/bin/wine "$WINEPREFIX"
+              /runner/bin/wineserver -w
+            '
+
+      - name: Publish summary
+        run: echo "${{ steps.identity.outputs.image }}@${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+
+  index:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: publish
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME//\//-}"
+          image="ghcr.io/bottlesdevs/bottles:$tag"
+          docker buildx imagetools create \
+            --tag "$image" \
+            --tag "ghcr.io/bottlesdevs/bottles:sha-${GITHUB_SHA::7}" \
+            "ghcr.io/bottlesdevs/bottles:$tag-amd64" \
+            "ghcr.io/bottlesdevs/bottles:$tag-arm64"
+          manifest="$(docker buildx imagetools inspect --raw "$image")"
+          jq -e '.manifests[] | select(.platform.architecture == "amd64" and .platform.os == "linux")' <<< "$manifest"
+          jq -e '.manifests[] | select(.platform.architecture == "arm64" and .platform.os == "linux")' <<< "$manifest"
+          digest="$(docker buildx imagetools inspect "$image" | awk '$1 == "Digest:" && digest == "" {digest=$2} END {print digest}')"
+          test -n "$digest"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Pin published image
+        if: github.ref == 'refs/heads/main'
+        env:
+          IMAGE_DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          repository="$(jq -r '.image | split("@")[0]' cpak.json)"
+          jq --arg image "${repository}@${IMAGE_DIGEST}" '.image = $image' cpak.json > cpak.json.next
+          mv cpak.json.next cpak.json
+          if ! git diff --quiet -- cpak.json; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add cpak.json
+            git commit -m "chore: pin published image [skip ci]"
+            git push origin "HEAD:${{ github.event.repository.default_branch }}"
+          fi
+
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532
+
+      - name: Install cpak-sign
+        run: |
+          curl -fsSLO https://github.com/Containerpak/cpak/releases/download/v2.14.0/cpak-sign-linux-amd64
+          echo '474aa7302475d06aa725ba36dd38751c32da1950cf5dbeb9f25cfc535d1f302c  cpak-sign-linux-amd64' | sha256sum -c -
+          install -Dm755 cpak-sign-linux-amd64 /usr/local/bin/cpak-sign
+
+      - name: Sign the package state
+        env:
+          CPAK_REGISTRY_USERNAME: ${{ github.actor }}
+          CPAK_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          repository="$(printf '%s' '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          image="$(jq -r '.image' cpak.json)"
+          index="$(docker buildx imagetools inspect --raw "$image")"
+          for arch in amd64 arm64; do
+            digest="$(jq -er --arg arch "$arch" '.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch) | .digest' <<< "$index")"
+            state="cpak-state-${arch}"
+            bundle="${state}.sigstore.json"
+            cpak-sign state \
+              --origin "github.com/${repository}" \
+              --image-digest "$digest" \
+              --generation "${{ github.run_number }}" \
+              --output "$state"
+            cosign sign-blob --yes --new-bundle-format=true \
+              --bundle "$bundle" "$state"
+            cpak-sign attach \
+              --image "ghcr.io/${repository}" \
+              --state "$state" \
+              --bundle "$bundle"
+          done
+
+      - name: Publish summary
+        run: docker buildx imagetools inspect "${{ steps.publish.outputs.image }}" >> "$GITHUB_STEP_SUMMARY"

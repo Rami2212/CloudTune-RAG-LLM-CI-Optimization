@@ -1,0 +1,343 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**/*'
+      - '!.github/workflows/*.yml'
+      - '.github/workflows/test.yml'
+      - '!.github/dependabot.yml'
+      - '!.vscode/**'
+      - '!docs/**'
+      - '!*.md'
+      - '!LICENSE'
+      - '!zizmor.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - '**/*'
+      - '!.github/workflows/*.yml'
+      - '.github/workflows/test.yml'
+      - '!.github/dependabot.yml'
+      - '!.vscode/**'
+      - '!docs/**'
+      - '!*.md'
+      - '!LICENSE'
+      - '!zizmor.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  cancel-in-progress: ${{ github.ref_name != 'main' }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+
+jobs:
+  npm:
+    concurrency:
+      cancel-in-progress: ${{ github.ref_name != 'main' }}
+      group: ${{ github.workflow }}-npm-${{ github.event.pull_request.number || github.sha }}
+
+    name: npm
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # Need full history to check branch ancestry
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          cache: false # cache can be poisoned by malicious actors.
+
+      - name: Use Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: lts/*
+          package-manager-cache: false # cache can be poisoned by malicious actors.
+          registry-url: https://registry.npmjs.org/
+
+      - name: Install dependencies
+        run: pnpm i --frozen-lockfile --prefer-offline
+
+      - name: Publish (dry run)
+        run: pnpm stage publish --no-git-checks --tag latest --dry-run # the workflow runs in a detached head state, so git checks fail
+
+  unit:
+    runs-on: ubuntu-latest
+
+    name: Unit Tests
+
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+
+      - name: Use Node.js LTS
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: lts/*
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm i
+
+      - name: Build
+        run: pnpm build
+
+      - name: Test
+        run: pnpm test
+
+  node:
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      EXAMPLE_TYPE: ${{ matrix.type }}
+
+    strategy:
+      matrix:
+        node-version: [22, 24, 26]
+        os: [macos-latest, ubuntu-latest, windows-latest]
+        type:
+          [
+            cjs,
+            cjs-compiled,
+            esm,
+            esm-multi-config,
+            esm-tsconfig-paths,
+            esm-tsconfig-paths-inherited,
+            esm-tsconfig-paths-no-baseurl,
+            esm-top-level-await,
+            esm-environments,
+            esm-jsx,
+            esm-kysely@0.28.17,
+          ]
+      fail-fast: false
+
+    runs-on: ${{ matrix.os }}
+
+    name: ${{ matrix.os }} + Node.js v${{ matrix.node-version }} + ${{ matrix.type }}
+
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: "pnpm"
+
+      - name: Calculate additional flags
+        id: flags
+        shell: bash
+        run: |
+          ADDITIONAL_FLAGS="--debug"
+
+          if [[ "$EXAMPLE_TYPE" == 'esm-multi-config' ]]; then
+            ADDITIONAL_FLAGS+=" --config=./.config/kysely.test.config.ts"
+          fi
+
+          if [[ "$EXAMPLE_TYPE" == 'esm-environments' ]]; then
+            ADDITIONAL_FLAGS+=" --environment=lib2"
+          fi
+
+          if [[ "$EXAMPLE_TYPE" == 'cjs-compiled' ]]; then
+            ADDITIONAL_FLAGS+=" --config=./dist/kysely.config.js"
+          fi
+
+          echo "ADDITIONAL_FLAGS=$ADDITIONAL_FLAGS" >> "$GITHUB_OUTPUT"
+          echo "ADDITIONAL_FLAGS=$ADDITIONAL_FLAGS" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        run: pnpm i && pnpm build && cd "examples/node-$EXAMPLE_TYPE" && pnpm i
+
+      - name: kysely -v
+        working-directory: examples/node-${{ matrix.type }}
+        run: pnpm kysely -v
+
+      - name: kysely migrate:make <migration-name> ${{ steps.flags.outputs.ADDITIONAL_FLAGS }}
+        working-directory: examples/node-${{ matrix.type }}
+        run: |
+          read -r -a flags <<< "$ADDITIONAL_FLAGS"
+          pnpm kysely migrate:make moshe "${flags[@]}"
+
+      - name: kysely migrate:list ${{ steps.flags.outputs.ADDITIONAL_FLAGS }}
+        working-directory: examples/node-${{ matrix.type }}
+        run: |
+          read -r -a flags <<< "$ADDITIONAL_FLAGS"
+          pnpm kysely migrate:list "${flags[@]}"
+
+      - name: kysely migrate:latest ${{ steps.flags.outputs.ADDITIONAL_FLAGS }}
+        working-directory: examples/node-${{ matrix.type }}
+        run: |
+          read -r -a flags <<< "$ADDITIONAL_FLAGS"
+          pnpm kysely migrate:latest "${flags[@]}"
+
+      - name: kysely sql <query> ${{ steps.flags.outputs.ADDITIONAL_FLAGS }}
+        working-directory: examples/node-${{ matrix.type }}
+        run: |
+          read -r -a flags <<< "$ADDITIONAL_FLAGS"
+          pnpm kysely sql "insert into moshe (id, is_moshe) values (1, true)" "${flags[@]}"
+          pnpm kysely "${flags[@]}" sql "select * from moshe"
+
+      - name: kysely migrate:rollback --all ${{ steps.flags.outputs.ADDITIONAL_FLAGS }}
+        working-directory: examples/node-${{ matrix.type }}
+        run: |
+          read -r -a flags <<< "$ADDITIONAL_FLAGS"
+          pnpm kysely migrate:rollback --all "${flags[@]}"
+
+      - name: kysely migrate:list ${{ steps.flags.outputs.ADDITIONAL_FLAGS }} (nearest config search)
+        if: ${{ matrix.type != 'esm-multi-config' && matrix.type != 'cjs-compiled' }}
+        working-directory: examples/node-${{ matrix.type }}/${{ startsWith(matrix.type, 'esm-environments') && 'packages' || 'migrations' }}
+        run: |
+          read -r -a flags <<< "$ADDITIONAL_FLAGS"
+          pnpm kysely migrate:list "${flags[@]}"
+
+  bun:
+    runs-on: ubuntu-latest
+
+    name: ubuntu-latest + Bun
+
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+
+      - name: Use Node.js LTS
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: lts/*
+          cache: "pnpm"
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: pnpm i && pnpm build && bun link && cd examples/bun && bun install
+
+      - name: kysely -v
+        working-directory: examples/bun
+        run: bun --bun kysely -v
+
+      - name: kysely migrate:make <migration-name>
+        working-directory: examples/bun
+        run: bun --bun kysely migrate:make moshe --debug
+
+      - name: kysely migrate:list
+        working-directory: examples/bun
+        run: bun --bun kysely migrate:list --debug
+
+      - name: kysely migrate:latest
+        working-directory: examples/bun
+        run: bun --bun kysely migrate:latest --debug
+
+      - name: kysely migrate:rollback --all
+        working-directory: examples/bun
+        run: bun --bun kysely migrate:rollback --all --debug
+
+      - name: kysely migrate:list (nearest config search)
+        working-directory: examples/bun/migrations
+        run: bun --bun kysely migrate:list --debug
+
+  deno:
+    strategy:
+      matrix:
+        config-flavor: [deno-json, package-json]
+      fail-fast: false
+
+    runs-on: ubuntu-latest
+
+    name: ubuntu-latest + Deno + ${{ matrix.config-flavor }}
+
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+
+      - name: Use Node.js LTS
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: lts/*
+          cache: "pnpm"
+
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: vx.x.x
+
+      - name: Build CTL
+        run: pnpm i && pnpm build
+
+      - name: Install example dependencies
+        working-directory: examples/deno-${{ matrix.config-flavor }}
+        run: deno install --node-modules-dir
+
+      - name: kysely -v
+        working-directory: examples/deno-${{ matrix.config-flavor }}
+        run: deno task kysely -v
+
+      - name: kysely migrate:make <migration-name>
+        working-directory: examples/deno-${{ matrix.config-flavor }}
+        run: deno task kysely migrate:make moshe --debug
+
+      - name: kysely migrate:list
+        working-directory: examples/deno-${{ matrix.config-flavor }}
+        run: deno task kysely migrate:list --debug
+
+      - name: kysely migrate:latest
+        working-directory: examples/deno-${{ matrix.config-flavor }}
+        run: deno task kysely migrate:latest --debug
+
+      - name: kysely migrate:rollback --all
+        working-directory: examples/deno-${{ matrix.config-flavor }}
+        run: deno task kysely migrate:rollback --all --debug
+
+      - name: kysely migrate:list (nearest config search)
+        working-directory: examples/deno-${{ matrix.config-flavor }}/migrations
+        run: deno task kysely migrate:list --debug

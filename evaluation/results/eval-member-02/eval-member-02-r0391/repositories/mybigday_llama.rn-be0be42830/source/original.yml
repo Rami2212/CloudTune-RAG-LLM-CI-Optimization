@@ -1,0 +1,336 @@
+name: CI
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup
+        uses: ./.github/actions/setup
+
+      - name: Lint files
+        run: npm run lint
+
+      - name: Typecheck files
+        run: npm run typecheck
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Setup
+        uses: ./.github/actions/setup
+
+      - name: Setup ccache
+        uses: ./.github/actions/setup-ccache
+        continue-on-error: true
+        with:
+          key: tests-${{ hashFiles('vendor/VERSIONS') }}
+          max-size: 300M
+
+      - name: Run ts unit tests
+        run: npm test -- --maxWorkers=2 --coverage
+
+      - name: Run c++ unit tests
+        run: |
+          cd tests
+          chmod +x build_and_test.sh run_tests.sh
+          ./build_and_test.sh
+          ./run_tests.sh
+
+      - name: Save ccache
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/save-ccache
+
+  build-ios-from-source:
+    runs-on: macos-26
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup
+        uses: ./.github/actions/setup
+        with:
+          bootstrap: metal
+
+      # React Native itself is most of this build and only changes with the
+      # example's dependencies, so this cache is not tied to the llama.cpp version.
+      - name: Setup ccache
+        uses: ./.github/actions/setup-ccache
+        continue-on-error: true
+        with:
+          key: ios-from-source
+          max-size: 1500M
+
+      - name: Cache build & pods
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: |
+            example/ios/Pods
+            example/ios/build
+          key: ${{ runner.os }}-pods-${{ hashFiles('example/ios/Podfile.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pods-
+
+      - name: Upgrade CocoaPods to version 1.15.2
+        run: |
+          gem uninstall cocoapods --ignore-dependencies
+          gem install cocoapods -v 1.15.2
+
+      - name: Install cocoapods
+        run: |
+          npm run example run pods
+
+      - name: Build example for iOS
+        run: |
+          npm run build:ios
+
+      - name: Save ccache
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/save-ccache
+
+  # Every xcframework slice compiles the whole library, so the slices are split
+  # over parallel jobs: this one and build-ios-framework-slices. This job builds
+  # the slice the example app runs on and proves the prebuilt path with it.
+  # (All slices are packaged together by the release and sync workflows.)
+  build-ios-frameworks:
+    runs-on: macos-26
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup
+        uses: ./.github/actions/setup
+        with:
+          bootstrap: metal
+
+      - name: Setup ccache
+        uses: ./.github/actions/setup-ccache
+        continue-on-error: true
+        with:
+          key: ios-frameworks-simulator
+          max-size: 1500M
+
+      - name: Cache build & pods
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: |
+            example/ios/Pods
+            example/ios/build
+          key: ${{ runner.os }}-pods-${{ hashFiles('example/ios/Podfile.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pods-
+
+      - name: Upgrade CocoaPods to version 1.15.2
+        run: |
+          gem uninstall cocoapods --ignore-dependencies
+          gem install cocoapods -v 1.15.2
+
+      - name: Install cocoapods
+        run: |
+          npm run example run pods
+        env:
+          RNLLAMA_BUILD_FROM_SOURCE: 0
+
+      - name: Build frameworks
+        run: |
+          ./scripts/build-ios.sh ios-simulator
+
+      - name: Build example for iOS
+        run: |
+          npm run build:ios
+
+      - name: Save ccache
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/save-ccache
+
+  build-ios-framework-slices:
+    runs-on: macos-26
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Grouped so that each job compiles for two architectures.
+          - name: tvos-simulator
+            slices: tvos-simulator
+          - name: devices
+            slices: ios-device tvos-device
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate embedded Metal kernels
+        run: ./scripts/bootstrap.sh metal
+
+      - name: Setup ccache
+        uses: ./.github/actions/setup-ccache
+        continue-on-error: true
+        with:
+          key: ios-frameworks-${{ matrix.name }}-${{ hashFiles('vendor/VERSIONS') }}
+          max-size: 600M
+
+      - name: Build frameworks
+        run: |
+          ./scripts/build-ios.sh ${{ matrix.slices }}
+
+      - name: Save ccache
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/save-ccache
+
+  build-android-from-source:
+    runs-on: ubuntu-latest
+    steps:
+      # Runners currently have ~90 GB free, several times what this job needs.
+      # Only spend time on cleaning up if that stops being true.
+      - name: Free disk space if short
+        run: |
+          df -h /
+          available_gb=$(df --output=avail -BG / | tail -n 1 | tr -dc '0-9')
+          if [ "$available_gb" -lt 40 ]; then
+            sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache
+            df -h /
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup
+        uses: ./.github/actions/setup
+        with:
+          bootstrap: hexagon-sdk
+
+      # Pin the JDK: with the runner's newer default, a JVM restricted-method
+      # warning fails the Android Gradle Plugin's CMake configure.
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Cache Hexagon HTP & OpenCL artifacts
+        id: htp-cache
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: |
+            bin
+            vendor/llama.cpp/ggml/src/ggml-hexagon/htp/v73
+          key: ${{ runner.os }}-htp-${{ hashFiles('scripts/build-hexagon-htp.sh', 'scripts/build-opencl.sh', 'scripts/docker-build-wrapper.sh', 'vendor/llama.cpp/ggml/src/ggml-hexagon/htp/**', 'vendor/OpenCL-Headers/**', 'vendor/OpenCL-ICD-Loader/**') }}
+
+      - name: Setup ccache
+        uses: ./.github/actions/setup-ccache
+        continue-on-error: true
+        with:
+          key: android-src-${{ hashFiles('vendor/VERSIONS') }}
+          # Debug objects carry DWARF, so they need more room than the release job's.
+          max-size: 1500M
+
+      - name: Build example for Android
+        env:
+          HEXAGON_SDK_VERSION: 6.7.0.0
+          HEXAGON_TOOLS_VERSION: 21.0.04
+          # Build only the variants that exercise distinct code paths: generic
+          # CPU, arm64 with dotprod+i8mm+hexagon+opencl, and x86_64. The
+          # remaining arm64 variants differ only in the -march of the ggml-cpu
+          # backend; build-android-libs still builds all of them.
+          ORG_GRADLE_PROJECT_rnllamaVariants: rnllama,rnllama_v8_2_dotprod_i8mm_hexagon_opencl,rnllama_x86_64
+          ORG_GRADLE_PROJECT_rnllamaHtpArtifactsUpToDate: ${{ steps.htp-cache.outputs.cache-hit == 'true' }}
+        run: |
+          export HEXAGON_SDK_ROOT="$HOME/.hexagon-sdk/$HEXAGON_SDK_VERSION"
+          export HEXAGON_TOOLS_ROOT="$HEXAGON_SDK_ROOT/tools/HEXAGON_Tools/$HEXAGON_TOOLS_VERSION"
+          npm run build:android
+
+      - name: Save ccache
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/save-ccache
+
+  build-android-libs:
+    runs-on: ubuntu-latest
+    steps:
+      # Runners currently have ~90 GB free, several times what this job needs.
+      # Only spend time on cleaning up if that stops being true.
+      - name: Free disk space if short
+        run: |
+          df -h /
+          available_gb=$(df --output=avail -BG / | tail -n 1 | tr -dc '0-9')
+          if [ "$available_gb" -lt 40 ]; then
+            sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache
+            df -h /
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup
+        uses: ./.github/actions/setup
+        with:
+          bootstrap: hexagon-sdk
+
+      # Pin the JDK: with the runner's newer default, a JVM restricted-method
+      # warning fails the Android Gradle Plugin's CMake configure.
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Cache Hexagon HTP & OpenCL artifacts
+        id: htp-cache
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: |
+            bin
+            vendor/llama.cpp/ggml/src/ggml-hexagon/htp/v73
+          key: ${{ runner.os }}-htp-${{ hashFiles('scripts/build-hexagon-htp.sh', 'scripts/build-opencl.sh', 'scripts/docker-build-wrapper.sh', 'vendor/llama.cpp/ggml/src/ggml-hexagon/htp/**', 'vendor/OpenCL-Headers/**', 'vendor/OpenCL-ICD-Loader/**') }}
+
+      - name: Setup ccache
+        uses: ./.github/actions/setup-ccache
+        continue-on-error: true
+        with:
+          key: android-libs-${{ hashFiles('vendor/VERSIONS') }}
+
+      # Same steps as `npm run build:android-libs`, except that the DSP libraries
+      # and the OpenCL stub are taken from the cache while their sources (the
+      # cache key) are unchanged.
+      - name: Build libraries
+        run: |
+          if [ "${{ steps.htp-cache.outputs.cache-hit }}" != "true" ]; then
+            ./scripts/build-hexagon-htp.sh
+            ./scripts/build-opencl.sh
+          fi
+          ./scripts/build-android.sh
+
+      # This step exists to prove the prebuilt path works, using the libraries the
+      # previous step just built. It has to be -P, not a sed on
+      # example/android/gradle.properties: android/gradle.properties force-enables
+      # from-source builds for llama.rn, and a subproject's own gradle.properties
+      # outranks the root project's. Only the command line beats both.
+      - name: Build example for Android
+        run: |
+          cd example/android
+          ./gradlew assembleDebug --stacktrace -PrnllamaBuildFromSource=false
+
+      - name: Save ccache
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/save-ccache

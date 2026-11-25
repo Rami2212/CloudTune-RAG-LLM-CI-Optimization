@@ -1,0 +1,162 @@
+# Reference:
+#   - https://github.com/actions/checkout
+#   - https://github.com/actions/download-artifact
+#   - https://github.com/actions/upload-artifact
+#   - https://github.com/prefix-dev/setup-pixi
+#   - https://github.com/pypa/build
+#   - https://github.com/pypa/gh-action-pypi-publish
+#   - https://test.pypi.org/help/#apitoken
+#   - https://docs.pypi.org/trusted-publishers/
+
+name: ci-wheels
+
+on:
+  pull_request:
+
+  push:
+    branches:
+      - "main"
+      - "v*x"
+      - "!pixi-auto-update"
+      - "!pre-commit-ci-update-config"
+      - "!dependabot/*"
+    tags:
+      - "v*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash -l {0}
+
+permissions: {}
+
+jobs:
+  build-artifacts:
+    name: "build pypi artifacts"
+    runs-on: "ubuntu-latest"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: "build sdist and wheel"
+        run: |
+          # geovista is a pure python package, so simply use pypa/build
+          pipx run build
+
+      - name: "show sdist and wheel"
+        run: |
+          ls -l ${{ github.workspace }}/dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: pypi-artifacts-${{ github.job }}-${{ strategy.job-index }}
+          path: ${{ github.workspace }}/dist
+
+
+  test-artifacts:
+    needs: [build-artifacts]
+    name: "test wheel (${{ matrix.version }})"
+    runs-on: "ubuntu-latest"
+
+    env:
+      ENV_NAME: "ci-wheels"
+
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ["py313", "py314"]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: pypi-artifacts-*
+          path: ${{ github.workspace }}/dist
+          merge-multiple: true
+
+      - name: "setup pixi"
+        uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e
+        with:
+          cache-write: false
+          environments: "${{ matrix.version }}"
+          frozen: true
+          activate-environment: true
+
+      - name: "test wheel (${{ matrix.version }})"
+        run: |
+          WHEEL=$(ls -1 dist/*.whl)
+          pixi run --frozen python -m pip install --no-deps ${WHEEL}
+          pixi run --frozen python -c 'import geovista; print(geovista.__version__)'
+
+
+  show-artifacts:
+    needs: [build-artifacts]
+    name: "show artifacts"
+    runs-on: "ubuntu-latest"
+
+    steps:
+    - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      with:
+        pattern: pypi-artifacts-*
+        path: ${{ github.workspace }}/dist
+        merge-multiple: true
+
+    - shell: bash
+      run: |
+        ls -l ${{ github.workspace }}/dist
+
+
+  publish-artifacts-test-pypi:
+    needs: [test-artifacts]
+    name: "Publish to Test PyPI"
+    runs-on: "ubuntu-latest"
+    permissions:
+      id-token: write  # Mandatory for PyPI Trusted Publishing OpenID Connect (OIDC)
+    environment: test-pypi
+
+    # upload to Test PyPI for every commit on main branch
+    if: ${{ github.event_name == 'push' && github.event.ref == 'refs/heads/main' }}
+    steps:
+    - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      with:
+        pattern: pypi-artifacts-*
+        path: ${{ github.workspace }}/dist
+        merge-multiple: true
+
+    - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086
+      with:
+        repository-url: https://test.pypi.org/legacy/
+        skip-existing: true
+        print-hash: true
+
+
+  publish-artifacts-pypi:
+    needs: [test-artifacts]
+    name: "Publish to PyPI"
+    runs-on: "ubuntu-latest"
+    permissions:
+      id-token: write  # Mandatory for PyPI Trusted Publishing OpenID Connect (OIDC)
+    environment: pypi
+
+    # upload to PyPI for every tag starting with 'v'
+    if: ${{ github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags/v') }}
+    steps:
+    - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      with:
+        pattern: pypi-artifacts-*
+        path: ${{ github.workspace }}/dist
+        merge-multiple: true
+
+    - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086
+      with:
+        print-hash: true
