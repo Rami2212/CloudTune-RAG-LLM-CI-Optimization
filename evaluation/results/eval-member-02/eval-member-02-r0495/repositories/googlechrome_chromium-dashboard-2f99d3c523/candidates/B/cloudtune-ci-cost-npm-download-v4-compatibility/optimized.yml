@@ -1,0 +1,70 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [HIGH] Split "python_tests" into parallel jobs (lint + test + build)
+# Estimated savings: ~6 min/run
+#
+name: Continuous Integration
+env:
+ CLOUDSDK_PYTHON: python3.13
+on:
+  pull_request:
+  merge_group:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+jobs:
+  python_tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24.x'
+
+      - name: set up Java JDK
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: 'temurin'
+          java-version: '25'
+
+      - name: set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.13'
+
+      - name: pre-installation
+        run: |
+          # Remove existing google-cloud-sdk packages in Ubuntu.
+          sudo rm -rf /usr/lib/google-cloud-sdk
+          curl https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-sdk-497.0.0-linux-x86_64.tar.gz | tar -zx > /dev/null
+          # Substitute the downloaded google-cloud-sdk packages, due to https://stackoverflow.com/questions/42697026/install-google-cloud-components-error-from-gcloud-command.
+          sudo mv google-cloud-sdk /usr/lib/
+          sudo gcloud components update
+          sudo gcloud components install app-engine-python beta cloud-datastore-emulator app-engine-python-extras
+          gcloud config set project cr-status-staging
+          gcloud version
+
+      - name: installation
+        run: |
+          npm config set script-shell bash --global
+          make setup
+
+      - name: lint
+        run: make lint
+
+      - name: mypy
+        run: make mypy
+
+      - name: test
+        run: npm test
+
+      - name: build
+        run: make build

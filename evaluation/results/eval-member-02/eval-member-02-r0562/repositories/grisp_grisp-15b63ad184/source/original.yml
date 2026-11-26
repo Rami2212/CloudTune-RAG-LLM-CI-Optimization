@@ -1,0 +1,74 @@
+name: Check for new OTP Release Candidate
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 * * * *' # Every hour
+
+permissions: {}
+
+jobs:
+  get-rel-candidate:
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      has_rc: ${{ steps.set-matrix.outputs.has_rc }}
+    steps:
+      - name: Fetch OTP prerelease releases
+        id: set-matrix
+        shell: bash
+        run: |
+          release_json=$(curl -fsSL -H "Accept: application/vnd.github+json" https://api.github.com/repos/erlang/otp/releases | tr -d '\000-\037')
+          matrix=$(jq -c '[.[] | select(.tag_name | test("^OTP-.+-rc[0-9]+$")) | {tag_name}] | {release: .[:1]}' <<< "$release_json")
+          echo "has_rc=$(jq -r '.release | length > 0' <<< "$matrix")" >> $GITHUB_OUTPUT
+          echo "matrix=$matrix" >> $GITHUB_OUTPUT
+
+  check-otp:
+    needs: get-rel-candidate
+    if: needs.get-rel-candidate.outputs.has_rc == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+    strategy:
+      matrix: ${{ fromJson(needs.get-rel-candidate.outputs.matrix) }}
+    steps:
+      - name: Extract tag name
+        run: |
+          echo "Checking tag: ${MATRIX_RELEASE_TAG_NAME}"
+          echo "${MATRIX_RELEASE_TAG_NAME}" > last_seen_ver.txt
+          echo "LAST_OTP=${MATRIX_RELEASE_TAG_NAME}" >> $GITHUB_ENV
+        env:
+          MATRIX_RELEASE_TAG_NAME: ${{ matrix.release.tag_name }}
+
+      - uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5
+        id: version-cache
+        env:
+          cache-name: cached-version
+        with:
+          path: last_cached_ver.txt
+          key: ${{ env.LAST_OTP }}
+
+      - name: Compare with Cached Version
+        id: compare-vsn
+        continue-on-error: true
+        run: |
+          diff last_cached_ver.txt last_seen_ver.txt
+
+      - name: Update Cached Version
+        run: |
+          cp last_seen_ver.txt last_cached_ver.txt
+
+      - name: Trigger OTP Package Build
+        if: ${{ steps.compare-vsn.outcome == 'failure' }}
+        run: |
+          OTP=$(echo "${MATRIX_RELEASE_TAG_NAME}" | cut -d'-' -f2-)
+          echo "Triggering build for OTP version: $OTP"
+          curl -fL -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.everest-preview+json" \
+            https://api.github.com/repos/grisp/grisp/dispatches \
+            -d "{\"event_type\":\"new-otp-release\",\"client_payload\":{\"otp\":\"${OTP}\",\"unit\":false,\"integration\":true}}"
+        env:
+          MATRIX_RELEASE_TAG_NAME: ${{ matrix.release.tag_name }}

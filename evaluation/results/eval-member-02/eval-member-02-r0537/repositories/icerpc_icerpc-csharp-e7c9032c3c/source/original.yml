@@ -1,0 +1,154 @@
+name: "Build .NET Packages"
+
+on:
+  workflow_call:
+    inputs:
+      icerpc_version:
+        required: false
+        type: string
+      channel:
+        required: true
+        type: string
+      authenticode_sign:
+        required: false
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      icerpc_version:
+        description: "The IceRPC version to build"
+        required: false
+      channel:
+        description: "Release channel (e.g., stable, nightly)"
+        required: true
+        default: "nightly"
+      authenticode_sign:
+        description: "Sign the assemblies with Authenticode (ignored on forks)"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  build-packages:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 10
+    env:
+      VERSION: ${{ inputs.icerpc_version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup .NET
+        uses: ./.github/actions/setup-dotnet
+
+      - name: Build IceRPC
+        run: dotnet build --configuration Release
+
+      - name: Collect Files to Sign
+        if: github.repository == 'icerpc/icerpc-csharp' && inputs.authenticode_sign
+        run: |
+            # Sign each project's assembly in every bin folder where it's found, not just its own. This is needed
+            # because each Tools package ships the whole bin folder of its generator and build telemetry projects, and
+            # these folders contain copies of IceRpc.dll and other first-party assemblies.
+            $names = (Get-ChildItem -Path src -Directory).Name
+            $assemblies = Get-ChildItem -Path src -Filter *.dll -Recurse -File |
+              Where-Object { $names -contains $_.BaseName -and $_.DirectoryName -like "*\bin\Release\net*" } |
+              ForEach-Object { Resolve-Path -Relative $_.FullName }
+            $assemblies | Set-Content -Path "${{ github.workspace }}\catalog.txt" -Encoding UTF8
+
+      # Shutdown the build server before signing to ensure MSBuild tasks are not loaded in the build server process.
+      - name: Shutdown build server
+        if: github.repository == 'icerpc/icerpc-csharp' && inputs.authenticode_sign
+        run: dotnet build-server shutdown
+
+      - name: Sign .NET Assemblies
+        if: github.repository == 'icerpc/icerpc-csharp' && inputs.authenticode_sign
+        uses: azure/trusted-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: https://eus.codesigning.azure.net/
+          signing-account-name: zeroc
+          certificate-profile-name: zeroc-ice
+          files-catalog: ${{ github.workspace }}\catalog.txt
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # Use --no-build to avoid rebuilding, we want to use the signed assemblies that were built in the previous step.
+      - name: Pack IceRPC
+        run: dotnet pack --no-build --configuration Release --output .
+
+      - name: Update IceRPC Templates version
+        run: |
+          $oldVersion = '0.8.0-preview.1'
+          $newVersion = '${{ env.VERSION }}'
+          Get-ChildItem -Path 'src/IceRpc.Templates' -Recurse -Filter '*.csproj' |
+            ForEach-Object {
+              $path = $_.FullName
+              Write-Host "Updating $path"
+              (Get-Content $path -Raw) -replace [regex]::Escape($oldVersion), $newVersion | Set-Content $path
+            }
+        if: ${{ inputs.channel == 'nightly' }}
+
+      - name: Pack IceRPC Templates
+        working-directory: src/IceRpc.Templates
+        run: dotnet pack --configuration Release --output ../../
+
+      - name: Verify packaged Authenticode signatures
+        if: github.repository == 'icerpc/icerpc-csharp' && inputs.authenticode_sign
+        shell: pwsh
+        run: |
+          $exceptions = @(
+            # These upstream binaries are not Authenticode-signed.
+            'tools/Google.Protobuf.dll'
+            'tools/windows_x64/protoc.exe'
+          )
+          $packages = @(Get-ChildItem -Path . -Filter '*.nupkg' -File)
+          if ($packages.Count -eq 0) {
+            throw 'No NuGet packages found for Authenticode verification.'
+          }
+
+          $failures = [System.Collections.Generic.List[string]]::new()
+          $verified = 0
+          foreach ($package in $packages) {
+            $extractPath = Join-Path ([System.IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
+            try {
+              [System.IO.Compression.ZipFile]::ExtractToDirectory($package.FullName, $extractPath)
+              $binaries = Get-ChildItem -LiteralPath $extractPath -Recurse -File -Force |
+                Where-Object { $_.Extension -in '.dll', '.exe' }
+              foreach ($binary in $binaries) {
+                $relativePath = [System.IO.Path]::GetRelativePath($extractPath, $binary.FullName).Replace('\', '/')
+                if ($relativePath -in $exceptions) {
+                  continue
+                }
+                $signature = Get-AuthenticodeSignature -LiteralPath $binary.FullName
+                if ($signature.Status -ne 'Valid') {
+                  $failures.Add("$($package.Name): $relativePath ($($signature.Status))")
+                } elseif (-not $signature.TimeStamperCertificate) {
+                  $failures.Add("$($package.Name): $relativePath (missing timestamp)")
+                } else {
+                  $verified++
+                }
+              }
+            } finally {
+              if (Test-Path -LiteralPath $extractPath) {
+                Remove-Item -LiteralPath $extractPath -Recurse -Force
+              }
+            }
+          }
+          if ($failures.Count -gt 0) {
+            foreach ($failure in $failures) {
+              Write-Host "::error::$failure"
+            }
+            throw "Found $($failures.Count) packaged binaries without valid, timestamped Authenticode signatures."
+          }
+          Write-Host "Verified $verified Authenticode signatures in $($packages.Count) NuGet packages."
+
+      - name: Upload NuGet packages
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nuget-packages
+          path: |
+            ./*.nupkg
+            ./*.snupkg

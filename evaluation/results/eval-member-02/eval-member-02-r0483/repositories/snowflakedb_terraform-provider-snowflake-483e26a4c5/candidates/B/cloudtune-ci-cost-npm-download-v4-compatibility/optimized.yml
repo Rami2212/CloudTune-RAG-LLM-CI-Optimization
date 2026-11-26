@@ -1,0 +1,49 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [MEDIUM] Add concurrency group to "docs-and-format.yml"
+# Estimated savings: ~2 min/run
+#
+name: Documentation And Code Formatting
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+  # Optional: allow read access to pull request. Use with `only-new-issues` option.
+  # pull-requests: read
+
+jobs:
+  docs-and-fmt:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@7b8cf10d4e4a01d4992d18a89f4d7dc5a3e6d6f4 # v4.3.0
+        with:
+          go-version-file: ./go.mod
+          cache: false
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+        id: setup_terraform
+        with:
+          terraform_version: 1.11.4
+          terraform_wrapper: false
+
+      - name: Install dependencies
+        run: make dev-setup
+
+      - name: Check documentation and code formatting
+        run: make pre-push-check

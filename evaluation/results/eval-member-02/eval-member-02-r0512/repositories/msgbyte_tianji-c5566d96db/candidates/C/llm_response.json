@@ -1,0 +1,54 @@
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "logprobs": null,
+      "message": {
+        "content": "{\n  \"decision\": \"APPLY\",\n  \"workflow_yaml\": \"name: \\\"CI\\\"\\n\\non:\\n  push:\\n    branches:\\n      - master\\n    paths:\\n      - \\\"src/**\\\"\\n      - \\\"package.json\\\"\\n      - \\\"pnpm-lock.yaml\\\"\\n  workflow_dispatch:\\n\\njobs:\\n  ci:\\n    runs-on: ubuntu-latest\\n    timeout-minutes: 10\\n    steps:\\n      - name: checkout\\n        uses: actions/checkout@v6\\n      - name: Install Node.js\\n        uses: actions/setup-node@v6\\n        with:\\n          node-version: 22\\n      - name: Install pnpm\\n        uses: pnpm/action-setup@v6\\n        with:\\n          version: 10.27.0\\n          run_install: false\\n      - name: Get pnpm store directory\\n        shell: bash\\n        run: |\\n          echo \\\"STORE_PATH=$(pnpm store path --silent)\\\" >> $GITHUB_ENV\\n      - uses: actions/cache@v5\\n        name: Setup pnpm cache\\n        with:\\n          path: ${{ env.STORE_PATH }}\\n          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}\\n          restore-keys: |\\n            ${{ runner.os }}-pnpm-store-\\n      - name: Install dependencies\\n        run: pnpm install --frozen-lockfile\\n      - name: Check LLM model data\\n        run: pnpm check:llm\\n      - name: Check Type\\n        run: pnpm check:type\\n      - name: Check Build\\n        run: pnpm build\\n\",\n  \"rationale\": \"The workflow currently has no job timeout, which risks runaway consumption if a step hangs. Historical CI runs show typical durations of 3-4 minutes. Adding a 10-minute timeout (2.5-3x typical runtime) provides operational headroom while bounding worst-case resource use. This matches the P-LIT-CUSTOM-TIMEOUT pattern, which reports 12.9% (free) and 8.1% (paid) VM time reduction from custom timeouts, and is demonstrated in experiment examples (e.g., batch-interactive-three--fb8b16eb65a11508) where a 5-minute timeout was added to similar Node.js workflows.\",\n  \"evidence_ids\": [\"pattern:P-LIT-CUSTOM-TIMEOUT\", \"experiment:batch-interactive-three--fb8b16eb65a11508\"]\n}",
+        "reasoning": "Let me analyze the workflow and the evidence to determine if there's a suitable CI optimization.\n\nThe workflow is a Node.js/pnpm project with:\n- Checkout\n- Setup Node.js\n- Setup pnpm\n- Cache pnpm store\n- Install dependencies\n- Check LLM model data\n- Check Type\n- Check Build\n\nLooking at the evidence, I see several patterns. Let me check which ones are applicable:\n\n1. **P-LIT-GHA-CACHE** - Cache dependency downloads: The workflow already has a pnpm cache setup, so this might already be implemented.\n\n2. **P-LIT-CUSTOM-TIMEOUT** - Bound jobs with a custom timeout: The workflow doesn't have a timeout set. The evidence shows this can save significant time (12.9% free, 8.1% paid). The experiment examples show adding `timeout-minutes: 5` to jobs.\n\n3. **P-LIT-CANCEL-STALE** - Cancel superseded runs: This is a CI service level change, not a workflow YAML change.\n\n4. **P-LIT-FAIL-FAST** - Cancel remaining matrix jobs after failure: This workflow doesn't use a matrix.\n\n5. **P-LIT-CHANGE-FILTER** - Filter workflow triggers by changed paths: The workflow already has path filters on push.\n\n6. **P-LIT-SKIP-WORKFLOW** - Skip explicitly dispensable workflow runs: Limited impact.\n\n7. **P-LIT-DISTRIBUTED-CACHE** - Share cached build dependencies: This is more about infrastructure.\n\n8. **P-LIT-UNUSED-DEP-SKIP** - Evaluate skipping unused-dependency updates: This is a CI service level change.\n\nThe most applicable pattern seems to be **P-LIT-CUSTOM-TIMEOUT** since:\n- The workflow has no timeout set\n- The evidence shows significant savings (12.9% free, 8.1% paid)\n- The experiment examples show adding `timeout-minutes: 5` to jobs\n- The workflow runs on ubuntu-latest and does Node.js/pnpm operations which typically complete within a few minutes\n\nLet me check the workflow duration from the CI history:\n- Run 1: ~4 minutes (16:00:39 to 16:04:28)\n- Run 2: ~3 minutes (19:03:25 to 19:06:32)\n- Run 3: ~4 minutes (18:13:52 to 18:17:35)\n- Run 4: ~3 minutes (18:33:52 to 18:37:11)\n- Run 5: ~3 minutes (17:44:49 to 17:47:48)\n\nThe runs typically take 3-4 minutes. A timeout of 5-10 minutes would be reasonable with headroom.\n\nThe pattern P-LIT-CUSTOM-TIMEOUT has evidence from the literature (S01) and experimental examples showing it works. The experiment examples show adding `timeout-minutes: 5` to jobs.\n\nI should apply this optimization by adding a `timeout-minutes` to the job. Given the historical run times of 3-4 minutes, a timeout of 10 minutes would provide good headroom (2.5-3x the typical runtime).\n\nLet me also check if there are any contraindications: \"Valid slow runs exceed the proposed limit\" - with 10 minutes and typical runs of 3-4 minutes, this seems safe.\n\nThe evidence IDs I can use:\n- pattern:P-LIT-CUSTOM-TIMEOUT (from pattern catalogue)\n- experiment:batch-interactive-three--fb8b16eb65a11508 (shows adding timeout-minutes: 5)\n- experiment:batch-hiruni-pattern-bat-ae496965ffa682a2-r2 (shows cache example, but not directly relevant)\n\nI'll use the pattern catalogue entry and the experiment example as evidence.",
+        "reasoning_details": [
+          {
+            "format": "unknown",
+            "index": 0,
+            "text": "Let me analyze the workflow and the evidence to determine if there's a suitable CI optimization.\n\nThe workflow is a Node.js/pnpm project with:\n- Checkout\n- Setup Node.js\n- Setup pnpm\n- Cache pnpm store\n- Install dependencies\n- Check LLM model data\n- Check Type\n- Check Build\n\nLooking at the evidence, I see several patterns. Let me check which ones are applicable:\n\n1. **P-LIT-GHA-CACHE** - Cache dependency downloads: The workflow already has a pnpm cache setup, so this might already be implemented.\n\n2. **P-LIT-CUSTOM-TIMEOUT** - Bound jobs with a custom timeout: The workflow doesn't have a timeout set. The evidence shows this can save significant time (12.9% free, 8.1% paid). The experiment examples show adding `timeout-minutes: 5` to jobs.\n\n3. **P-LIT-CANCEL-STALE** - Cancel superseded runs: This is a CI service level change, not a workflow YAML change.\n\n4. **P-LIT-FAIL-FAST** - Cancel remaining matrix jobs after failure: This workflow doesn't use a matrix.\n\n5. **P-LIT-CHANGE-FILTER** - Filter workflow triggers by changed paths: The workflow already has path filters on push.\n\n6. **P-LIT-SKIP-WORKFLOW** - Skip explicitly dispensable workflow runs: Limited impact.\n\n7. **P-LIT-DISTRIBUTED-CACHE** - Share cached build dependencies: This is more about infrastructure.\n\n8. **P-LIT-UNUSED-DEP-SKIP** - Evaluate skipping unused-dependency updates: This is a CI service level change.\n\nThe most applicable pattern seems to be **P-LIT-CUSTOM-TIMEOUT** since:\n- The workflow has no timeout set\n- The evidence shows significant savings (12.9% free, 8.1% paid)\n- The experiment examples show adding `timeout-minutes: 5` to jobs\n- The workflow runs on ubuntu-latest and does Node.js/pnpm operations which typically complete within a few minutes\n\nLet me check the workflow duration from the CI history:\n- Run 1: ~4 minutes (16:00:39 to 16:04:28)\n- Run 2: ~3 minutes (19:03:25 to 19:06:32)\n- Run 3: ~4 minutes (18:13:52 to 18:17:35)\n- Run 4: ~3 minutes (18:33:52 to 18:37:11)\n- Run 5: ~3 minutes (17:44:49 to 17:47:48)\n\nThe runs typically take 3-4 minutes. A timeout of 5-10 minutes would be reasonable with headroom.\n\nThe pattern P-LIT-CUSTOM-TIMEOUT has evidence from the literature (S01) and experimental examples showing it works. The experiment examples show adding `timeout-minutes: 5` to jobs.\n\nI should apply this optimization by adding a `timeout-minutes` to the job. Given the historical run times of 3-4 minutes, a timeout of 10 minutes would provide good headroom (2.5-3x the typical runtime).\n\nLet me also check if there are any contraindications: \"Valid slow runs exceed the proposed limit\" - with 10 minutes and typical runs of 3-4 minutes, this seems safe.\n\nThe evidence IDs I can use:\n- pattern:P-LIT-CUSTOM-TIMEOUT (from pattern catalogue)\n- experiment:batch-interactive-three--fb8b16eb65a11508 (shows adding timeout-minutes: 5)\n- experiment:batch-hiruni-pattern-bat-ae496965ffa682a2-r2 (shows cache example, but not directly relevant)\n\nI'll use the pattern catalogue entry and the experiment example as evidence.",
+            "type": "reasoning.text"
+          }
+        ],
+        "refusal": null,
+        "role": "assistant"
+      },
+      "native_finish_reason": "stop"
+    }
+  ],
+  "created": 1795506035,
+  "id": "gen-1795506035-i7ZZQ45aVv48zCcuz6TE",
+  "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+  "object": "chat.completion",
+  "provider": "Nvidia",
+  "service_tier": null,
+  "system_fingerprint": null,
+  "usage": {
+    "completion_tokens": 1437,
+    "completion_tokens_details": {
+      "audio_tokens": 0,
+      "image_tokens": 0,
+      "reasoning_tokens": 870
+    },
+    "cost": 0,
+    "cost_details": {
+      "upstream_inference_completions_cost": 0,
+      "upstream_inference_cost": 0,
+      "upstream_inference_prompt_cost": 0
+    },
+    "is_byok": false,
+    "prompt_tokens": 31885,
+    "prompt_tokens_details": {
+      "audio_tokens": 0,
+      "cache_write_tokens": 0,
+      "cached_tokens": 0,
+      "video_tokens": 0
+    },
+    "total_tokens": 33322
+  }
+}

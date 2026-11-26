@@ -1,0 +1,125 @@
+# Coordinates core pull request checks from one immutable merge revision.
+name: Pull Request
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: pr-core-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    name: Prepare PR
+    runs-on: ubuntu-26.04
+    # Callers run a check unless its output is 'false', so a missing output runs the check.
+    outputs:
+      source_sha: ${{ github.sha }}
+      lint: ${{ steps.impact.outputs.lint }}
+      build: ${{ steps.impact.outputs.build }}
+      jvm: ${{ steps.impact.outputs.jvm }}
+      android: ${{ steps.impact.outputs.android }}
+      ios: ${{ steps.impact.outputs.ios }}
+      screenshot: ${{ steps.impact.outputs.screenshot }}
+      test_modules: ${{ steps.impact.outputs.test_modules }}
+      screenshot_tests: ${{ steps.impact.outputs.screenshot_tests }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Select checks
+        id: impact
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 -B .github/scripts/ci-impact.py "$BASE_SHA" "$HEAD_SHA"
+
+      - name: Test CI scripts
+        run: |
+          python3 -B .github/scripts/tests/test_ci_impact.py
+          bash scripts/ci-has-code-changes.sh --self-test
+          python3 -B .github/scripts/tests/test_ci_kdoc_only_change.py
+          python3 -B .github/scripts/tests/test_sync_wiki_examples.py
+          python3 -B scripts/sync-wiki-examples.py --check
+          bash .github/scripts/sync-gif-baselines.sh --self-test
+          bash .github/scripts/sync-wiki-screenshots.sh --self-test
+          bash .github/scripts/sync-hero-image.sh --self-test
+          bash .github/scripts/sync-wiki-docs.sh --self-test
+          bash .github/scripts/sync-dev-docs.sh --self-test
+          bash .github/scripts/validate-snapshot-provenance.sh --self-test
+
+  assemble:
+    name: PR Assemble
+    needs: prepare
+    uses: ./.github/workflows/assemble.yml
+    with:
+      should-run: ${{ needs.prepare.outputs.build != 'false' }}
+      source-sha: ${{ needs.prepare.outputs.source_sha }}
+
+  compile:
+    name: PR Compile
+    needs: prepare
+    uses: ./.github/workflows/compile.yml
+    with:
+      should-run: ${{ needs.prepare.outputs.build != 'false' }}
+      source-sha: ${{ needs.prepare.outputs.source_sha }}
+
+  lint:
+    name: PR Lint
+    needs: prepare
+    uses: ./.github/workflows/lint.yml
+    with:
+      should-run: ${{ needs.prepare.outputs.lint != 'false' }}
+      source-sha: ${{ needs.prepare.outputs.source_sha }}
+
+  test:
+    name: PR Test
+    needs: prepare
+    uses: ./.github/workflows/test.yml
+    with:
+      source-sha: ${{ needs.prepare.outputs.source_sha }}
+      jvm: ${{ needs.prepare.outputs.jvm != 'false' }}
+      android: ${{ needs.prepare.outputs.android != 'false' }}
+      ios: ${{ needs.prepare.outputs.ios != 'false' }}
+      screenshot: ${{ needs.prepare.outputs.screenshot != 'false' }}
+      test-modules: ${{ needs.prepare.outputs.test_modules }}
+      screenshot-tests: ${{ needs.prepare.outputs.screenshot_tests }}
+
+  core-result:
+    name: PR Core Checks
+    if: ${{ always() }}
+    needs:
+      - prepare
+      - assemble
+      - compile
+      - lint
+      - test
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Verify core checks
+        env:
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          ASSEMBLE_RESULT: ${{ needs.assemble.result }}
+          COMPILE_RESULT: ${{ needs.compile.result }}
+          LINT_RESULT: ${{ needs.lint.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          for result in \
+            "$PREPARE_RESULT" \
+            "$ASSEMBLE_RESULT" \
+            "$COMPILE_RESULT" \
+            "$LINT_RESULT" \
+            "$TEST_RESULT"
+          do
+            if [ "$result" != "success" ]; then
+              echo "A required core check did not succeed: $result"
+              exit 1
+            fi
+          done

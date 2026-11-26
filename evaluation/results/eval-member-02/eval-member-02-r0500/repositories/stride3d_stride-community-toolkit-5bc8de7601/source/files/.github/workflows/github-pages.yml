@@ -1,0 +1,70 @@
+name: Build & Deploy Docs (GitHub Pages)
+on:
+  workflow_dispatch:
+  # (Optionally re-enable push triggers)
+  # push:
+  #   branches: [ main ]
+  #   paths-ignore:
+  #     - 'README.md'
+  #     - 'BuildDocs.ps1'
+  #     - 'wiki/**'
+  #     - '.github/**'
+
+# Only allow one deployment at a time, cancel previous in-progress runs on new pushes
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+permissions:
+  contents: read      # to checkout
+  pages: write        # to deploy pages
+  id-token: write     # to authenticate deployment
+
+jobs:
+  build:
+    name: Build documentation
+    runs-on: windows-latest
+    steps:
+    #- name: Display .NET Core information
+    #  run: dotnet --info
+
+    - name: Checkout Stride Community Toolkit
+      uses: actions/checkout@v7
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v6
+      with:
+        dotnet-version: 10.x
+
+    # - name: Configure Pages
+    #   id: pages
+    #   uses: actions/configure-pages@v5
+
+    - name: Install docfx
+      run: dotnet tool update -g docfx
+      #run: dotnet tool install -g docfx --version 2.65.1
+
+    - name: Build documentation
+      working-directory: docs
+      run: docfx docfx.json
+
+    - name: Upload Pages artifact
+      uses: actions/upload-pages-artifact@v5
+      with:
+        path: docs/_site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write      # required for Pages deployment
+      id-token: write   # required for OIDC
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v5

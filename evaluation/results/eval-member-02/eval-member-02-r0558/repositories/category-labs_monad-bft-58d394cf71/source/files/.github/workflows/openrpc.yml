@@ -1,0 +1,130 @@
+name: Validate OpenRPC documentation
+
+on:
+  push:
+    branches: ["master"]
+  pull_request:
+    paths:
+      - "monad-rpc/**"
+      - ".github/workflows/openrpc.yml"
+
+concurrency:
+  group: >
+    ${{
+      github.event_name == 'pull_request'
+      && format('pr-{0}-openrpc', github.event.pull_request.number)
+      || format('push-{0}-openrpc', github.ref)
+    }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04-32
+    permissions:
+      contents: read
+      packages: read
+      pull-requests: write
+
+    container:
+      image: ghcr.io/${{ github.repository }}/builder:master
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Generate OpenRPC documentation
+        run: cargo run --bin monad-rpc-docs | python -m json.tool > openrpc.json
+
+      - name: Validate OpenRPC documentation
+        run: |
+          uvx check-jsonschema@0.37.0 \
+            --schemafile "https://github.com/open-rpc/meta-schema/releases/download/1.14.9/open-rpc-meta-schema.json" \
+            openrpc.json
+
+      - name: Archive OpenRPC documentation
+        uses: actions/upload-artifact@v4
+        with:
+          name: Monad RPC OpenRPC
+          path: openrpc.json
+
+      # On pull requests, generate the master baseline and diff.
+      - name: Generate master baseline
+        if: github.event_name == 'pull_request'
+        run: |
+          git config --global --add safe.directory '*'
+          git fetch origin master
+          git checkout FETCH_HEAD --detach
+          git submodule update --init --recursive
+          cargo run --bin monad-rpc-docs | python -m json.tool > openrpc-master.json
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const pr = context.payload.pull_request.number;
+            const marker = '<!-- openrpc-diff -->';
+
+            const master = fs.readFileSync('openrpc-master.json', 'utf8');
+            const current = fs.readFileSync('openrpc.json', 'utf8');
+
+            let body;
+            if (master === current) {
+              body = `${marker}\n### OpenRPC Documentation\n\nNo changes detected in the OpenRPC specification.`;
+            } else {
+              const { execSync } = require('child_process');
+              let diff = execSync('diff -u openrpc-master.json openrpc.json || true', { encoding: 'utf8' });
+              if (diff.length > 32768) {
+                diff = diff.slice(0, 32768) + '\n\n... (diff truncated, see artifact for full document)';
+              }
+              body = [
+                marker,
+                '### OpenRPC Documentation',
+                '',
+                'The OpenRPC specification has changed in this PR.',
+                '',
+                '<details>',
+                '<summary>Diff (click to expand)</summary>',
+                '',
+                '```diff',
+                diff,
+                '```',
+                '',
+                '</details>',
+              ].join('\n');
+            }
+
+            const { data: comments } = await github.rest.issues.listComments({
+              ...context.repo,
+              issue_number: pr,
+              per_page: 100,
+            });
+            const existing = comments.find(c => c.body.startsWith(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                ...context.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: pr,
+                body,
+              });
+            }

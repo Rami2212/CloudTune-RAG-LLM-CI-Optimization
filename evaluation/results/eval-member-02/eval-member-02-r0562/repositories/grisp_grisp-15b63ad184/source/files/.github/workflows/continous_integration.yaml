@@ -1,0 +1,63 @@
+name: Continuous Integration
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  ci:
+    runs-on: ubuntu-22.04
+    name: Erlang ${{matrix.otp}} / rebar ${{matrix.rebar3}}
+    permissions:
+      actions: write
+      contents: read
+    strategy:
+      matrix:
+        otp: ['26', '27', '28', '29']
+        rebar3: ['3']
+        # latest rebar3 versions that do not give problems with selected OTPs
+        include:
+          - otp: '25'
+            rebar3: '3.24.0'
+    steps:
+
+      - uses: actions/checkout@ee0669bd1cc54295c223e0bb666b733df41de1c5 # v2
+        with:
+          persist-credentials: false
+
+      - uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
+        with:
+          otp-version: ${{matrix.otp}}
+          rebar3-version: ${{matrix.rebar3}}
+
+      - uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5
+        env:
+          cache-name: rebar3
+        with:
+          path: |
+            ~/.cache/rebar3
+            _build
+          key: ci-${{runner.os}}-${{env.cache-name}}-otp_${{matrix.otp}}-rebar_${{matrix.rebar3}}-${{hashFiles('rebar.lock')}}
+          restore-keys: |
+            ci-${{runner.os}}-${{env.cache-name}}-otp_${{matrix.otp}}-rebar_${{matrix.rebar3}}
+            ci-${{runner.os}}-${{env.cache-name}}-otp_${{matrix.otp}}
+
+      - name: Compile
+        run: rebar3 do clean, compile
+
+      - name: Test
+        run: rebar3 eunit
+
+      - name: Analyze
+        run: rebar3 dialyzer
+
+      - name: ExDoc
+        if: matrix.otp == '29'
+        run: rebar3 ex_doc

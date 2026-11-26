@@ -1,0 +1,76 @@
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+# See https://docs.github.com/en/actions/using-jobs/using-concurrency#example-using-a-fallback-value
+concurrency:
+  group: ${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  # Debug and dry-run for build telemetry. Keep IceRpcBuildTelemetry as is.
+  IceRpcBuildTelemetryDebug: true
+  IceRpcBuildTelemetryDryRun: true
+
+jobs:
+  build_and_test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-26, windows-2025-vs2026]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - name: Dump System Information
+        if: runner.os != 'Windows'
+        shell: bash
+        run: ulimit -a
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup .NET
+        uses: ./.github/actions/setup-dotnet
+      - name: Build
+        run: dotnet build
+        shell: bash
+      - name: Publish Local Packages
+        run: ./build/publish-local-packages.sh
+        shell: bash
+      - name: Run Tests
+        uses: ./.github/actions/test
+      - name: Install Templates
+        run: dotnet new install src/IceRpc.Templates/bin/Debug/IceRpc.Templates.*.nupkg
+        shell: bash
+      - name: Test Templates
+        uses: ./.github/actions/test-templates
+
+      - name: Build Examples
+        env:
+          # Set IceRpcVersion to use the locally built packages
+          IceRpcVersion: "0.8.0-preview.1"
+        run: |
+          for solution in examples/*/*/*.slnx; do dotnet build "$solution"; done
+        shell: bash
+      - name: Build DocFX Examples
+        run: dotnet build docfx/examples/Examples.slnx
+        shell: bash
+
+  # On a release branch, the examples must build with the published IceRpc packages, since that is what a user who
+  # checks out the branch gets. build_and_test builds them against the locally published packages, which hide a
+  # package version that is not published yet. On main, the examples are meant to track the local build.
+  build_examples_with_published_packages:
+    if: endsWith(github.base_ref || github.ref_name, '.x')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup .NET
+        uses: ./.github/actions/setup-dotnet
+      - name: Build Examples
+        run: |
+          for solution in examples/*/*/*.slnx; do dotnet build "$solution"; done
+        shell: bash

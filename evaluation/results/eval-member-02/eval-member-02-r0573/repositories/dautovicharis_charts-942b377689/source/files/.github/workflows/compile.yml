@@ -1,0 +1,42 @@
+# Reusable compile check for pull request orchestration.
+name: Compile
+
+on:
+  workflow_call:
+    inputs:
+      should-run:
+        description: Whether Prepare PR selected the compile check.
+        required: true
+        type: boolean
+      source-sha:
+        description: Immutable merge revision being checked.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  skipped:
+    name: No-op
+    if: ${{ !inputs.should-run }}
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Report no-op
+        run: echo 'Prepare PR found no change that needs the compile check.'
+
+  compile:
+    name: Compile
+    if: ${{ inputs.should-run }}
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          ref: ${{ inputs.source-sha }}
+      - uses: ./.github/actions/setup-jdk
+        with:
+          # Only warm-gradle-cache.yml writes caches; a write here scopes the entry to the PR.
+          cache-read-only: true
+      - name: Compile
+        run: ./gradlew ciCompile

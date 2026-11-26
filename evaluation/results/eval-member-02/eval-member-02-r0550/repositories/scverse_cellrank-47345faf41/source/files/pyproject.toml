@@ -1,0 +1,250 @@
+[build-system]
+build-backend = "hatchling.build"
+requires = [ "hatch-vcs", "hatchling" ]
+
+[project]
+name = "cellrank"
+description = "CellRank: dynamics from multi-view single-cell data"
+readme = "README.md"
+keywords = [
+  "bio-informatics",
+  "GPCCA",
+  "Markov chain",
+  "RNA velocity",
+  "single-cell",
+]
+license = "BSD-3-Clause"
+license-files = [ "LICENSE" ]
+maintainers = [
+  { name = "Marius Lange", email = "mlange@ethz.ch" },
+  { name = "Philipp Weiler" },
+]
+authors = [
+  { name = "Marius Lange" },
+  { name = "Michal Klein" },
+  { name = "Philipp Weiler" },
+]
+requires-python = ">=3.12"
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Natural Language :: English",
+  "Operating System :: MacOS :: MacOS X",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3.15",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+  "Topic :: Scientific/Engineering :: Mathematics",
+  "Topic :: Scientific/Engineering :: Visualization",
+  "Typing :: Typed",
+]
+dynamic = [ "version" ]
+dependencies = [
+  "anndata>=0.13",
+  "docrep>=0.3",
+  "joblib>=1.4",
+  "matplotlib>=3.9",
+  "networkx>=3.4",
+  "numba>=0.60",
+  "numpy>=2",
+  "pandas>=2.2",
+  "pygpcca>=1.1",
+  "rich>=13",
+  "scanpy>=1.11",
+  "scikit-learn>=1.6",
+  "scipy>=1.14",
+  "seaborn>=0.13",
+  "session-info2>=0.2",
+  "wrapt>=1.16",
+]
+# pyGAM caps scipy below the current release; only `cellrank.models.GAM` needs it.
+optional-dependencies.gam = [ "pygam>=0.10" ]
+optional-dependencies.jax = [ "jax", "jaxlib" ]
+optional-dependencies.moscot = [ "moscot" ]
+# petsc4py/slepc4py give pyGPCCA its fast `method='krylov'` solver for
+# macrostates and fate probabilities. mpi4py is intentionally omitted: pyGPCCA
+# runs serially, and requiring mpi4py forces a system-MPI build that breaks
+# `pip install cellrank[petsc]` on machines without MPI. See docs/installation.md
+# for installing a distributed MPI build.
+optional-dependencies.petsc = [ "petsc4py", "slepc4py" ]
+optional-dependencies.plot = [ "adjusttext" ]
+optional-dependencies.r = [ "rpy2>=3.3" ]
+optional-dependencies.scvelo = [ "scvelo>=0.3" ]
+urls."Bug Tracker" = "https://github.com/scverse/cellrank/issues"
+urls."Source Code" = "https://github.com/scverse/cellrank"
+urls.Documentation = "https://cellrank.readthedocs.io"
+urls.Download = "https://cellrank.readthedocs.io/en/latest/installation.html"
+urls.Homepage = "https://github.com/scverse/cellrank"
+
+[dependency-groups]
+dev = [
+  "pre-commit>=3",
+]
+test = [
+  "adjusttext",
+  "coverage[toml]>=7",
+  "igraph>=1",
+  "jax",
+  "moscot",
+  "pillow>=10",
+  "pygam>=0.10",
+  "pytest>=8",
+  "pytest-cov>=6",
+  "pytest-mock>=3.14",
+  "pytest-timeout",
+  "pytest-xdist",
+  "scvelo>=0.3",
+]
+docs = [
+  "scverse-doc[full]>=0.4",
+  "sphinx>=7.4",
+  "sphinx-autobuild",
+  "sphinx-autodoc-typehints>=2.5",
+  "sphinx-tippy>=0.4.3",
+  "sphinxcontrib-bibtex>=2.6",
+  "sphinxcontrib-spelling>=8",
+]
+
+[tool.hatch]
+version.source = "vcs"
+build.targets.wheel.packages = [ "src/cellrank" ]
+envs.default.installer = "uv"
+envs.default.dependency-groups = [ "dev" ]
+envs.docs.scripts.auto = "sphinx-autobuild docs docs/_build/html --open-browser --watch README.md {args}"
+envs.docs.scripts.build = "sphinx-build -M html docs docs/_build {args}"
+envs.docs.scripts.clean = "git clean -fdX -- {args:docs}"
+envs.docs.scripts.open = "python -m webbrowser -t docs/_build/html/index.html"
+envs.docs.dependency-groups = [ "docs" ]
+envs.hatch-test.matrix = [
+  { deps = [ "stable" ], python = [ "3.12", "3.14" ] },
+  { deps = [ "pre" ], python = [ "3.14" ] }
+]
+envs.hatch-test.overrides.matrix.deps.env-vars = [ { value = "allow", key = "UV_PRERELEASE", if = [ "pre" ] } ]
+envs.hatch-test.dependency-groups = [ "test" ]
+
+[tool.pixi]
+# PETSc/SLEPc and R's mgcv have no PyPI wheels; this environment takes them from conda-forge: `pixi run -e krylov test`.
+# Not named `petsc` or `r`: pixi turns those extras into features that would install from PyPI.
+workspace.channels = [ "conda-forge" ]
+workspace.platforms = [ "linux-64" ]
+dependencies.python = "3.12.*"
+pypi-dependencies.cellrank = { path = ".", editable = true, extras = [ "plot" ] }
+feature.krylov.dependencies = { petsc4py = "*", slepc4py = "*", rpy2 = ">=3.3", r-mgcv = "*" }
+# one BLAS thread: conda-forge BLAS otherwise oversubscribes cores; PETSc must not catch xdist workers' SIGPIPE
+feature.krylov.tasks.test = { cmd = "pytest", env = { OMP_NUM_THREADS = "1", MPLBACKEND = "agg", PETSC_OPTIONS = "-no_signal_handler" } }
+environments.krylov = [ "krylov", "test" ]
+
+[tool.uv]
+# Include test deps in `uv sync` so local dev has them (e.g. adjusttext, pytest)
+default-groups = [ "dev", "test" ]
+
+[tool.ruff]
+line-length = 120
+src = [ "src" ]
+format.docstring-code-format = true
+lint.select = [
+  "B",   # flake8-bugbear
+  "BLE", # flake8-blind-except
+  "C4",  # flake8-comprehensions
+  "D",   # flake8-docstrings
+  "E",   # pycodestyle
+  "F",   # pyflakes
+  "I",   # isort
+  "NPY", # NumPy-specific rules
+  "PT",  # flake8-pytest-style
+  "Q",   # flake8-quotes
+  "RET", # flake8-raise
+  "SIM", # flake8-simplify
+  "T20", # flake8-print
+  "TID", # flake8-tidy-imports
+  "UP",  # pyupgrade
+  "W",   # pycodestyle
+]
+lint.ignore = [
+  # `zip()` without an explicit `strict=` parameter (67 pre-existing, fix separately)
+  "B905",
+  # Missing docstring in public module
+  "D100",
+  # Missing docstring in public package
+  "D104",
+  # Missing docstring in magic method
+  "D105",
+  # Missing docstring in __init__
+  "D107",
+  # Do not assign a lambda expression, use a def -> lambda expression assignments are convenient
+  "E731",
+  # allow I, O, l as variable names -> I is the identity matrix, i, j, k, l is reasonable indexing notation
+  "E741",
+  "PT011",  # TODO/
+  # Do not implicitly `return None` in function able to return non-`None` value
+  "RET502",
+  # Missing explicit `return` at the end of function able to return non-`None` value
+  "RET503",
+]
+lint.exclude = [
+  ".eggs",
+  ".git",
+  ".ruff_cache",
+  ".tox",
+  "__pypackages__",
+  "_build",
+  "build",
+  "dist",
+]
+lint.per-file-ignores."*/__init__.py" = [ "F401" ]
+lint.per-file-ignores."docs/*" = [ "D" ]
+lint.per-file-ignores."tests/*" = [ "D" ]
+lint.unfixable = [ "B", "BLE", "C4", "RET", "T20" ]
+lint.flake8-quotes.inline-quotes = "double"
+lint.flake8-tidy-imports.ban-relative-imports = "all"
+lint.pydocstyle.convention = "numpy"
+
+[tool.pytest]
+ini_options.testpaths = "tests"
+ini_options.addopts = [ "--import-mode=importlib", "--strict-markers", "--strict-config" ]
+ini_options.xfail_strict = true
+
+[tool.coverage]
+run.source = [ "src/" ]
+run.omit = [
+  "*/__init__.py",
+]
+run.branch = true
+run.parallel = true
+report.precision = 2
+report.exclude_lines = [
+  '\#.*pragma:\s*no.?cover',
+  '^\s*raise AssertionError\b',
+  '^\s*raise NotImplementedError\b',
+  '^\s*return NotImplemented\b',
+  "^if __name__ == .__main__.:$",
+]
+report.skip_empty = true
+report.show_missing = true
+report.sort = "Miss"
+
+[tool.rstcheck]
+ignore_directives = [
+  "toctree",
+  "currentmodule",
+  "autosummary",
+  "module",
+  "automodule",
+  "autoclass",
+  "bibliography",
+  "grid",
+]
+ignore_roles = [
+  "mod",
+  "class",
+  "attr",
+  "func",
+  "meth",
+  "doc",
+  "cite",
+]

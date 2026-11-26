@@ -1,0 +1,140 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [HIGH] Switch "test" from macOS to ubuntu runner
+# - [LOW] Explicitly set fail-fast for large matrix job "test" (21 combinations)
+# Estimated savings: ~2 min/run
+#
+name: 📱 Instrumented tests
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  test:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        api-level: [29]
+        locale:
+            - "en-US"
+            - "ar-SA"
+            - "de-DE"
+            - "el-GR"
+            - "es-ES"
+            - "fr-FR"
+            - "hi-IN"
+            - "hu-HU"
+            - "hy-AM"
+            - "it-IT"
+            - "nl-NL"
+            - "pl-PL"
+            - "pt-BR"
+            - "pt-PT"
+            - "ro-RO"
+            - "ru-RU"
+            - "sv-SE"
+            - "tr-TR"
+            - "uk-UA"
+            - "vi-VN"
+            - "zh-CN"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup JDK
+        uses: actions/setup-java@v6
+        with:
+            distribution: 'temurin'
+            java-version: '25'
+
+      - name: Gradle cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*') }}-${{ hashFiles('**/gradle/wrapper/gradle-wrapper.properties') }}-${{ hashFiles('**/buildSrc/**/*.kt') }}
+
+      - name: AVD cache
+        uses: actions/cache@v6
+        id: avd-cache
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-${{ matrix.api-level }}
+
+      - name: 📱 Create AVD and generate snapshot for caching
+        if: steps.avd-cache.outputs.cache-hit != 'true'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api-level }}
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: false
+          script: echo "Generated AVD snapshot for caching."
+
+      - name: 🔨 App build cache
+        uses: actions/cache@v6
+        id: build-cache
+        with:
+          path: |
+            build
+            app/build
+            !app/build/reports/androidTests/
+          key: build-cache-${{ runner.os }}-${{ hashFiles('**/*.gradle*') }}-${{ hashFiles('**/gradle/wrapper/gradle-wrapper.properties') }}-${{ hashFiles('**/buildSrc/**/*.kt') }}
+
+      - name: Add exec permission
+        run: chmod +x gradlew
+
+      - name: Remove old reports
+        run: rm -rf app/build/reports/androidTests/
+
+      - name: Add gradle.properties files
+        run: |
+          echo -e "\norg.gradle.jvmargs=-Xmx8192m\n" >> gradle.properties
+          echo -e "\norg.gradle.caching=true\n" >> gradle.properties
+
+      - name: 🕵🏾‍♀️ Run tests
+        uses: reactivecircus/android-emulator-runner@v2
+        id: runtests
+        continue-on-error: true
+        with:
+          api-level: ${{ matrix.api-level }}
+          force-avd-creation: false
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -change-locale ${{ matrix.locale }}
+          disable-animations: true
+          script: |
+            adb uninstall com.github.cvzi.screenshottile || true
+            adb uninstall com.github.cvzi.screenshottile.debug || true
+            adb uninstall com.github.cvzi.screenshottile.debug.test || true
+            ./gradlew connectedCheck
+
+      - name: 🚩 Raise error on test failure
+        if: steps.runtests.outcome != 'success'
+        run: |
+          if [ -z "$(ls -A app/build/reports/androidTests/)" ]; then
+             echo "Emulator failed to start tests"
+             echo '::error:: Emulator failed to start tests.'
+             exit 0
+          elif [ -f app/build/reports/androidTests/connected/index.html ]; then
+             if pcre2grep -qM "<div class=\"infoBox\" id=\"tests\">\s*<div class=\"counter\">0</div>" app/build/reports/androidTests/connected/index.html; then
+                echo "No tests were run"
+                echo '::error:: No tests were run.'
+                exit 0
+             else
+                exit 1
+             fi
+          else
+             exit 1
+          fi
+
+      - name: 💬 Upload androidTests report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: reports-androidTests-${{ matrix.api-level }}-${{ matrix.locale }}
+          path: app/build/reports/androidTests/

@@ -1,0 +1,69 @@
+name: build and deploy
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      update:
+        description: "build + deploy"
+        required: true
+        default: "Build & Deploy"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    if: ${{ contains(github.event.head_commit.message, 'version:') || contains(github.event.head_commit.message, '[build]') }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Build distributable
+        run: |
+          npm ci
+          ls -al
+          npm run build
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifact
+          path: ./dist
+
+  deploy:
+    needs: build
+    if: ${{ contains(github.ref, 'main') || contains(github.event.head_commit.message, '[deploy]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifact
+          path: dist
+
+      - name: Zip files
+        run: zip -r dist.zip ./dist/*
+
+      - name: Install chrome-webstore-upload-cli
+        run: npm install -g chrome-webstore-upload-cli
+
+      - name: Upload extension to Chrome Web Store
+        run: >
+          npx chrome-webstore-upload-cli upload
+          --extension-id ${{ secrets.EXTENSION_ID }}
+          --client-id ${{ secrets.CLIENT_ID }}
+          --client-secret ${{ secrets.CLIENT_SECRET }}
+          --refresh-token ${{ secrets.REFRESH_TOKEN }}
+          --source dist

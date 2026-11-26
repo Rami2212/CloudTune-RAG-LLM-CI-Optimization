@@ -1,0 +1,109 @@
+name: Packaging
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - cran/*
+  schedule:
+    - cron: "0 2 * * *"
+  
+jobs:
+  binaries:
+    permissions:
+      id-token: write
+      contents: read
+    runs-on: ${{ matrix.config.runner }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        
+        config: 
+          - {r_version: 'release', os: macOS, version: cpu-intel, runner: macos-15-intel}
+          - {r_version: 'release', os: macOS, version: cpu-m1, runner: macos-latest}
+          
+          - {r_version: 'release', os: ubuntu, version: cpu, runner: [self-hosted, linux]}
+          - {r_version: 'release', os: ubuntu, version: cu128, runner: [self-hosted, linux]}
+          
+          - {r_version: 'release', os: windows, version: cpu, runner: windows-2022}
+          - {r_version: 'release', os: windows, version: cu128, runner: windows-2022}
+          
+        include:
+          
+          - config: {version: cu128}
+            cuda: 12.8
+            cuda_patch: 0
+          
+          - config: {os: ubuntu}
+            container: ubuntu:20.04
+            type: 'source'
+            r_install_tar: "tar"
+            
+          - config: {os: windows}
+            type: 'win.binary'
+            r_install_tar: ""
+            
+          - config: {os: macOS}
+            type: 'mac.binary'
+            r_install_tar: ""
+  
+            
+    env:
+      CUDA: ${{ matrix.cuda }}
+      CMAKE_FLAGS: "-DBUNDLE_DEPENDENCIES=ON"
+      BUILD_LANTERN: 1
+      DEBIAN_FRONTEND: noninteractive
+      R_INSTALL_TAR: ${{ matrix.r_install_tar }}
+
+    steps:
+    
+      - uses: actions/checkout@v7
+      
+      - uses: ./.github/actions/setup-r
+        with:
+          r_version: ${{ matrix.config.r_version}}
+          makevars: true
+      
+      - name: Setup cmake
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: "3.25.1"
+
+      - name: Install CUDA
+        if: ${{matrix.cuda != ''}}
+        uses: Jimver/cuda-toolkit@v0.2.24
+        id: cuda-toolkit
+        with:
+          cuda: "${{matrix.cuda}}.${{matrix.cuda_patch}}"
+          
+      - name: Install CuDNN
+        if: ${{ matrix.cuda != '' }}
+        uses: ./.github/actions/install-cudnn
+        with:
+          cuda_version: ${{ matrix.cuda }}
+          
+      - uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          cache: false
+          extra-packages: any::rcmdcheck
+          needs: check
+           
+      - name: Build binary package
+        id: build
+        run: |
+          dest_path <- contrib.url("../binaries", type="binary")
+          dir.create(dest_path, recursive = TRUE)
+          binary_path <- pkgbuild::build(binary = TRUE, dest_path=dest_path)
+          tools::write_PACKAGES(dest_path, type = "${{ matrix.type }}", addFiles = TRUE)
+          cat("pkg_version=", desc::desc_get("Version"), "\n", file = Sys.getenv("GITHUB_OUTPUT"), sep="")
+        shell: Rscript {0}
+        
+      - id: 'upload-s3'
+        uses: ./.github/actions/upload-dir-to-s3
+        with:
+          path: "../binaries"
+          destination: 's3://torch-binaries/packages/${{ matrix.config.version }}/${{ steps.build.outputs.pkg_version }}/'
+          aws_role_to_assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws_region: ${{ secrets.AWS_REGION }}
+      

@@ -1,0 +1,65 @@
+# This workflow is centrally managed in https://github.com/asyncapi/.github/
+# Don't make changes to this file in this repo as they will be overwritten with changes made to the same file in above mentioned repo
+
+# The given workflow is responsible for generating docs and creating PR with them when there is a commit with docs: prefix
+
+# This workflow will be updated in all repos with the topic get-global-docs-autoupdate
+
+name: 'Update generated parts of documentation on docs: commits'
+
+on:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read            # Just to limit GITHUB_TOKEN as we use GH_TOKEN only
+
+jobs:
+  docs-gen:
+    name: 'Generate docs and create PR'
+    runs-on: ubuntu-latest
+    # PR should be created within this GH action only if it is a docs: commit
+    # Otherwise it will conflict with release workflow
+    if: startsWith(github.event.commits[0].message, 'docs:')
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Determine what node version to use
+        # This workflow is from our own org repo and safe to reference by 'master'.
+        uses: asyncapi/.github/.github/actions/get-node-version-from-package-lock@master # //NOSONAR
+        with:
+          node-version: ${{ vars.NODE_VERSION }}
+        id: lockversion
+      - name: Use Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "${{ steps.lockversion.outputs.version }}"
+          cache: 'npm'
+          cache-dependency-path: '**/package-lock.json'
+      - name: Install dependencies
+        run: npm ci
+      - name: Regenerate docs
+        run: npm run generate:assets --if-present
+      - name: Create Pull Request with updated docs
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+          commit-message: 'chore: update generated docs'
+          committer: asyncapi-bot <info@asyncapi.io>
+          author: asyncapi-bot <info@asyncapi.io>
+          title: 'chore: update generated docs'
+          body: 'Update of docs that are generated and were forgotten on PR level.'
+          branch: gen-docs-update/${{ github.job }}
+      - name: Report workflow status to Slack
+        if: failure() # Only, on failure, send a message on the 94_bot-failing-ci slack channel
+        uses: 8398a7/action-slack@77eaa4f1c608a7d68b38af4e3f739dcd8cba273e # v3.19.0
+        with:
+          status: ${{ job.status }}
+          fields: repo,action,workflow
+          text: 'AsyncAPI docs generation workflow failed'
+          author_name: asyncapi-bot
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_CI_FAIL_NOTIFY }}     

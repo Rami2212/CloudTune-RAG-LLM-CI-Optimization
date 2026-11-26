@@ -1,0 +1,112 @@
+name: Build Release
+
+on:
+  workflow_call:
+    inputs:
+      build_number:
+        required: false
+        default: "1"
+        type: string
+      channel:
+        required: true
+        type: string
+      publish:
+        required: false
+        type: boolean
+        default: false
+      authenticode_sign:
+        required: false
+        type: boolean
+        default: false
+
+  workflow_dispatch:
+    inputs:
+      build_number:
+        description: "Build number for nightly releases"
+        required: false
+        default: "1"
+      channel:
+        description: "Release channel (e.g., stable, nightly)"
+        required: true
+        default: "nightly"
+      publish:
+        description: "Publish the packages"
+        required: false
+        default: false
+        type: boolean
+      authenticode_sign:
+        description: "Sign the assemblies with authenticode"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  configure:
+    runs-on: ubuntu-24.04
+    outputs:
+      semver_version: ${{ steps.set-vars.outputs.semver_version }}
+      authenticode_sign: ${{ steps.set-vars.outputs.authenticode_sign }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set version variables
+        id: set-vars
+        run: |
+          if [[ "${{ inputs.channel }}" == "nightly" ]]; then
+            DATE=$(date +%Y%m%d)
+            BUILD=${{ inputs.build_number }}
+            VERSION=0.8.0
+            # Set version variables for nightly packages according to platform conventions:
+
+            # e.g. 0.8.0-nightly.20250625.1
+            echo "semver_version=${VERSION}-nightly.${DATE}.${BUILD}" >> $GITHUB_OUTPUT
+          fi
+          # else do not define version variables to use the version from the repository
+
+          # Always sign stable releases; otherwise honor the authenticode_sign input.
+          if [[ "${{ inputs.channel }}" == "stable" ]] || [[ "${{ inputs.authenticode_sign }}" == "true" ]]; then
+            echo "authenticode_sign=true" >> $GITHUB_OUTPUT
+          else
+            echo "authenticode_sign=false" >> $GITHUB_OUTPUT
+          fi
+
+  build-packages:
+    name: Build .NET Packages
+    uses: ./.github/workflows/build-packages.yml
+    needs: configure
+    with:
+      icerpc_version: ${{ needs.configure.outputs.semver_version }}
+      channel: ${{ inputs.channel }}
+      authenticode_sign: ${{ needs.configure.outputs.authenticode_sign == 'true' }}
+    secrets: inherit
+
+  test-release:
+    name: Test Release
+    uses: ./.github/workflows/test-release.yml
+    with:
+      channel: ${{ inputs.channel }}
+      icerpc_version: ${{ needs.configure.outputs.semver_version }}
+      run_id: ${{ github.run_id }}
+    needs:
+      - configure
+      - build-packages
+    secrets: inherit
+
+  publish-release:
+    name: Publish Release
+    if: ${{ inputs.publish == true }}
+    needs:
+      - test-release
+      - build-packages
+    uses: ./.github/workflows/publish-release.yml
+    permissions:
+      contents: read
+      actions: read
+      # A reusable workflow cannot get permissions its caller does not grant.
+      id-token: write
+    with:
+      channel: ${{ inputs.channel }}
+      run_id: ${{ github.run_id }}
+    secrets: inherit

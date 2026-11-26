@@ -1,0 +1,132 @@
+name: Release Workflow
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  attestations: write
+  contents: write
+  id-token: write
+
+env:
+  RED4EXT_BUILD_CONFIG: Release
+  RED4EXT_CHECKSUM_ALGORITHM: SHA256
+
+jobs:
+  release:
+    name: Release ${{ github.ref_name }}
+    runs-on: windows-latest
+    environment: release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set version environment variable
+        run: |
+          $version = ${env:GITHUB_REF_NAME} -replace '^v', ''
+
+          Add-Content -LiteralPath ${env:GITHUB_ENV} -Encoding UTF8 -Value "RED4EXT_VERSION=${version}"
+
+      - name: Set package names environment variables
+        run: |
+          Add-Content -LiteralPath ${env:GITHUB_ENV} -Encoding UTF8 -Value "RED4EXT_PACKAGE_NAME=red4ext-${env:RED4EXT_VERSION}.zip"
+          Add-Content -LiteralPath ${env:GITHUB_ENV} -Encoding UTF8 -Value "RED4EXT_PACKAGE_SYMBOLS_NAME=red4ext-symbols-${env:RED4EXT_VERSION}.zip"
+
+      - name: Create build directory
+        run: mkdir build
+
+      - name: Configure
+        working-directory: build
+        run: |
+          cmake `
+            -DRED4EXT_GIT_METADATA=OFF `
+            -DRED4EXT_EXTRA_WARNINGS=ON `
+            -DRED4EXT_TREAT_WARNINGS_AS_ERRORS=ON `
+            "${{ github.workspace }}"
+
+      - name: Build
+        working-directory: build
+        run: |
+          cmake `
+            --build . `
+            --config ${env:RED4EXT_BUILD_CONFIG}
+
+      - name: Install
+        working-directory: build
+        run: |
+          cmake `
+            --install . `
+            --prefix "${{ github.workspace }}/build/install" `
+            --config ${env:RED4EXT_BUILD_CONFIG}
+
+      - name: Create release package
+        working-directory: build/install
+        run: 7z a -r ${env:RED4EXT_PACKAGE_NAME} *.dll *.txt
+
+      - name: Create debug symbols package
+        working-directory: build/install
+        run: 7z a -r ${env:RED4EXT_PACKAGE_SYMBOLS_NAME} *.pdb
+
+      - name: Compute package checksum
+        working-directory: build/install
+        run: |
+          $fileHash = Get-FileHash -Algorithm ${env:RED4EXT_CHECKSUM_ALGORITHM} -LiteralPath ${env:RED4EXT_PACKAGE_NAME}
+          $fileHash | Format-List
+
+          $checksum = $fileHash.Hash
+          Add-Content -LiteralPath ${env:GITHUB_ENV} -Encoding UTF8 -Value "RED4EXT_CHECKSUM_PACKAGE=${checksum}"
+
+      - name: Compute debug symbols checksum
+        working-directory: build/install
+        run: |
+          $fileHash = Get-FileHash -Algorithm ${env:RED4EXT_CHECKSUM_ALGORITHM} -LiteralPath ${env:RED4EXT_PACKAGE_SYMBOLS_NAME}
+          $fileHash | Format-List
+
+          $checksum = $fileHash.Hash
+          Add-Content -LiteralPath ${env:GITHUB_ENV} -Encoding UTF8 -Value "RED4EXT_CHECKSUM_SYMBOLS=${checksum}"
+
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            build/install/**/*.dll
+            build/install/**/*.pdb
+            build/install/${{ env.RED4EXT_PACKAGE_NAME }}
+            build/install/${{ env.RED4EXT_PACKAGE_SYMBOLS_NAME }}
+
+      - name: Upload packages to GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          fail_on_unmatched_files: true
+          body: |-
+            ${{ github.event.release.body }}
+
+            ---
+
+            | Filename                                  | ${{ env.RED4EXT_CHECKSUM_ALGORITHM }} |
+            | ----------------------------------------- | ------------------------------------- |
+            | `${{ env.RED4EXT_PACKAGE_NAME }}`         | `${{ env.RED4EXT_CHECKSUM_PACKAGE }}` |
+            | `${{ env.RED4EXT_PACKAGE_SYMBOLS_NAME }}` | `${{ env.RED4EXT_CHECKSUM_SYMBOLS }}` |
+          files: |
+            build/install/${{ env.RED4EXT_PACKAGE_NAME }}
+            build/install/${{ env.RED4EXT_PACKAGE_SYMBOLS_NAME }}
+
+      - name: Upload package to Nexus Mods
+        if: ${{ !github.event.release.prerelease }}
+        uses: Nexus-Mods/upload-action@v1.0.0-beta.11
+        with:
+          api_key: ${{ secrets.NEXUSMODS_API_KEY }}
+          mod_id: 14315125999948
+          file_id: 2476822
+          display_name: RED4ext
+          version: ${{ env.RED4EXT_VERSION }}
+          update_mod_version: true
+          primary_mod_manager_download: true
+          filename: build/install/${{ env.RED4EXT_PACKAGE_NAME }}
+          description: |-
+            ${{ github.event.release.html_url }}
+
+            ${{ env.RED4EXT_CHECKSUM_ALGORITHM }}: ${{ env.RED4EXT_CHECKSUM_PACKAGE }}
+          changelog: ${{ github.event.release.html_url }}

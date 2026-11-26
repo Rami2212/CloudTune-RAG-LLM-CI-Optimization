@@ -1,0 +1,40 @@
+name: docs
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  docfx:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup .NET
+        uses: ./.github/actions/setup-dotnet
+
+      - name: Build
+        run: dotnet build
+        shell: bash
+
+      - name: Build Docs
+        run: |
+            set -e
+            dotnet tool install --global docfx
+            cd docfx
+            docfx metadata --property "Configuration=Debug;DocFxBuild=true;LangVersion=preview" --warningsAsErrors
+            docfx build
+
+      - name: Sync to S3
+        if: github.repository == 'icerpc/icerpc-csharp' && github.event_name == 'push'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          aws s3 sync ./docfx/_site s3://${{ secrets.AWS_S3_BUCKET }}/csharp/${{ github.ref_name }}/api \
+            --delete --cache-control "no-cache, no-store"

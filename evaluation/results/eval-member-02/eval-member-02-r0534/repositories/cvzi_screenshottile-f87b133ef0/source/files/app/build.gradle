@@ -1,0 +1,127 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
+plugins {
+    alias libs.plugins.android.application
+    alias libs.plugins.kotlin.android
+    alias libs.plugins.kotlin.kapt
+    alias libs.plugins.devtools.ksp
+    alias libs.plugins.license.report
+}
+
+android {
+    signingConfigs {
+        release {
+            if (project.properties['keyStore.release.storeFile'] != null) {
+                storeFile file(project.properties['keyStore.release.storeFile'])
+                storePassword project.properties['keyStore.release.storePassword']
+                keyAlias project.properties['keyStore.release.keyAlias']
+                keyPassword project.properties['keyStore.release.keyPassword']
+            } else {
+                storeFile rootProject.file('mykey.jks')
+                storePassword 'password'
+                keyAlias 'key0'
+                keyPassword 'password'
+            }
+            enableV1Signing false
+            enableV2Signing true
+            enableV3Signing true
+        }
+        debug {
+            storeFile rootProject.file('app/debug.keystore')
+        }
+    }
+    defaultConfig {
+        applicationId 'com.github.cvzi.screenshottile'
+
+        minSdk libs.versions.sdk.min.get().toInteger()
+        compileSdk = libs.versions.sdk.compile.get().toInteger()
+        targetSdk libs.versions.sdk.target.get().toInteger()
+
+        versionCode 150
+        versionName '2.21.4'
+
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
+        buildConfigField 'com.github.cvzi.screenshottile.MutableBoolean', 'TESTING_MODE', 'new com.github.cvzi.screenshottile.MutableBoolean(false)'
+    }
+    namespace 'com.github.cvzi.screenshottile'
+    buildTypes {
+        release {
+            minifyEnabled true
+            shrinkResources true
+            signingConfig signingConfigs.release
+            debuggable false
+            proguardFiles getDefaultProguardFile(
+                    'proguard-android-optimize.txt'),
+                    'proguard-rules.pro'
+        }
+        debug {
+            applicationIdSuffix '.debug'
+            versionNameSuffix '.debug'
+            minifyEnabled false
+            shrinkResources false
+        }
+    }
+    productFlavors {
+    }
+    buildFeatures {
+        viewBinding true
+        buildConfig true
+        dataBinding true
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlin {
+        compilerOptions {
+            jvmTarget = JvmTarget.JVM_17
+        }
+    }
+    testOptions {
+        unitTests {
+            includeAndroidResources true
+        }
+        unitTests.all {
+            testLogging {
+                showStandardStreams true
+            }
+        }
+    }
+    lint {
+        disable 'MissingTranslation'
+        abortOnError false
+    }
+}
+
+ksp {
+    arg "appfunctions:aggregateAppFunctions", "true"
+}
+
+licenseReport {
+    // Run via `gradlew --no-configuration-cache licenseReleaseReport`
+    generateCsvReport = false
+    generateHtmlReport = true
+    generateJsonReport = false
+    copyHtmlReportToAssets = true
+    showVersions = true
+}
+
+dependencies {
+    implementation(libs.appfunctions) {
+        exclude group: "org.jetbrains.kotlinx", module: "kotlinx-coroutines-guava"
+    }
+    implementation(libs.appfunctions.service) {
+        exclude group: "org.jetbrains.kotlinx", module: "kotlinx-coroutines-guava"
+    }
+    ksp libs.appfunctions.compiler
+
+    implementation platform(libs.kotlin.bom)
+    implementation libs.bundles.implementation.app
+    implementation libs.documentfile
+    androidTestImplementation libs.bundles.android.test
+    testImplementation libs.bundles.test
+
+    // For appfunctions test activity
+    debugImplementation libs.appsearch
+    debugImplementation libs.appsearch.ktx
+}

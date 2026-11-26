@@ -1,0 +1,201 @@
+# Reusable publication of the static API reference and demo. Releases and snapshots
+# share the mechanics but retain separate callers and policies.
+name: Publish Static Assets
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: Release channel to publish.
+        required: true
+        type: string
+      charts-version:
+        description: Version recorded in the publication metadata.
+        required: true
+        type: string
+      source-sha:
+        description: HDCharts commit represented by this publication.
+        required: true
+        type: string
+      source-ref:
+        description: Git ref to build and publish.
+        required: true
+        type: string
+      replace-static-assets:
+        description: Replace existing static assets for an unreleased version.
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      POSTHOG_PROJECT_TOKEN:
+        required: true
+      AWS_ROLE_ARN:
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: static-assets-${{ inputs.mode }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish-api-reference:
+    name: Publish API reference
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    environment: ${{ inputs.mode == 'release' && 'Production' || 'Snapshot' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.source-ref }}
+      - uses: ./.github/actions/setup-jdk
+        with:
+          gradle-cache: ${{ inputs.mode != 'release' }}
+          cache-read-only: true
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Build API reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew generateApiDocs -PchartsReleaseVersion="${{ inputs.charts-version }}" --no-daemon --stacktrace --build-cache
+      - name: Validate API reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.mode }}" == "release" ]]; then
+            asset_dir="docs/static/api/${{ inputs.charts-version }}"
+          else
+            asset_dir="docs/static/api/snapshot"
+          fi
+          [[ -f "${asset_dir}/index.html" ]] || {
+            echo "Missing generated API reference: ${asset_dir}/index.html" >&2
+            exit 1
+          }
+      - name: Publish API reference
+        env:
+          CURRENT_VERSION: ${{ inputs.charts-version }}
+          CHARTS_VERSION: ${{ inputs.charts-version }}
+          SOURCE_SHA: ${{ inputs.source-sha }}
+          DOCS_STATIC_BUCKET: ${{ vars.DOCS_STATIC_BUCKET }}
+          REPLACE_STATIC_ASSETS: ${{ inputs.replace-static-assets }}
+        shell: bash
+        run: bash .github/scripts/publish-docs-to-s3.sh "${{ inputs.mode }}" api
+
+  publish-demo:
+    name: Publish demo
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    environment: ${{ inputs.mode == 'release' && 'Production' || 'Snapshot' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.source-ref }}
+      - uses: ./.github/actions/setup-jdk
+        with:
+          gradle-cache: ${{ inputs.mode != 'release' }}
+          cache-read-only: true
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Build demo
+        env:
+          POSTHOG_PROJECT_TOKEN: ${{ secrets.POSTHOG_PROJECT_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse --verify "${{ inputs.source-sha }}^{commit}")"
+          commit_date="$(LC_ALL=C git log -1 --format=%cd --date=format:'%-d %b %Y' "${commit}")"
+          ./gradlew generateWebDemo -PchartsReleaseVersion="${{ inputs.charts-version }}" \
+            -PchartsCommit="${commit}" -PchartsCommitDate="${commit_date}" \
+            -Pdevelopment=false \
+            --no-daemon --stacktrace --build-cache
+      - name: Validate demo
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.mode }}" == "release" ]]; then
+            asset_dir="docs/static/demo/${{ inputs.charts-version }}"
+          else
+            asset_dir="docs/static/demo/snapshot"
+          fi
+          [[ -f "${asset_dir}/index.html" ]] || {
+            echo "Missing generated demo: ${asset_dir}/index.html" >&2
+            exit 1
+          }
+      - name: Publish demo
+        env:
+          CURRENT_VERSION: ${{ inputs.charts-version }}
+          CHARTS_VERSION: ${{ inputs.charts-version }}
+          SOURCE_SHA: ${{ inputs.source-sha }}
+          DOCS_STATIC_BUCKET: ${{ vars.DOCS_STATIC_BUCKET }}
+          REPLACE_STATIC_ASSETS: ${{ inputs.replace-static-assets }}
+        shell: bash
+        run: bash .github/scripts/publish-docs-to-s3.sh "${{ inputs.mode }}" demo
+
+  publish-shared-static-assets:
+    name: Publish shared static assets
+    runs-on: ubuntu-26.04
+    needs: [publish-api-reference, publish-demo]
+    if: >-
+      ${{
+        always() &&
+        needs.publish-api-reference.result == 'success' &&
+        needs.publish-demo.result == 'success'
+      }}
+    environment: ${{ inputs.mode == 'release' && 'Production' || 'Snapshot' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source-ref }}
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Publish shared static assets
+        env:
+          CURRENT_VERSION: ${{ inputs.charts-version }}
+          CHARTS_VERSION: ${{ inputs.charts-version }}
+          DOCS_STATIC_BUCKET: ${{ vars.DOCS_STATIC_BUCKET }}
+        shell: bash
+        run: bash .github/scripts/publish-docs-to-s3.sh "${{ inputs.mode }}" shared
+
+  finalize-publication:
+    name: Finalize static publication
+    runs-on: ubuntu-26.04
+    needs: publish-shared-static-assets
+    if: >-
+      ${{
+        !cancelled() &&
+        needs.publish-shared-static-assets.result == 'success'
+      }}
+    environment: ${{ inputs.mode == 'release' && 'Production' || 'Snapshot' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source-ref }}
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Write publication metadata
+        env:
+          CURRENT_VERSION: ${{ inputs.charts-version }}
+          CHARTS_VERSION: ${{ inputs.charts-version }}
+          SOURCE_SHA: ${{ inputs.source-sha }}
+          DOCS_STATIC_BUCKET: ${{ vars.DOCS_STATIC_BUCKET }}
+        shell: bash
+        run: bash .github/scripts/publish-docs-to-s3.sh "${{ inputs.mode }}" metadata
+      - name: Invalidate CloudFront cache
+        env:
+          CURRENT_VERSION: ${{ inputs.charts-version }}
+          CLOUDFRONT_DISTRIBUTION_ID: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}
+        shell: bash
+        run: bash .github/scripts/invalidate-docs-cloudfront.sh "${{ inputs.mode }}"

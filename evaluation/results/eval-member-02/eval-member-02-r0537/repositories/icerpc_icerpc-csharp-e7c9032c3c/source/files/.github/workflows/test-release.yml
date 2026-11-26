@@ -1,0 +1,90 @@
+name: "Test NuGet Packages"
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "The channel to publish to (e.g., stable, nightly)"
+        required: true
+      icerpc_version:
+        description: "The IceRPC version to test for nightly releases"
+        required: false
+      run_id:
+        description: "The run ID to use for downloading artifacts"
+        required: true
+  workflow_call:
+    inputs:
+      channel:
+        required: true
+        type: string
+      icerpc_version:
+        required: false
+        type: string
+      run_id:
+        required: true
+        type: string
+
+env:
+  # Disable IceRpc build telemetry
+  IceRpcBuildTelemetry: false
+
+jobs:
+  test-packages:
+    strategy:
+      matrix:
+        include:
+          - os: macos-26
+          - os: ubuntu-24.04
+          - os: windows-2025-vs2026
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup .NET
+        uses: ./.github/actions/setup-dotnet
+
+      - name: Set IceRPC version
+        run: |
+          # A stable build does not set icerpc_version: its packages carry the repository version. The examples
+          # must build against that version, not against their default version restored from a public feed.
+          $version = "${{ inputs.icerpc_version }}"
+          if (-not $version) {
+            $version = dotnet msbuild build/IceRpc.Version.props -getProperty:Version
+          }
+          echo "IceRpcVersion=$version" >> $env:GITHUB_ENV
+        shell: pwsh
+
+      - name: Download NuGet artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          mkdir packages -Force
+          gh run download "$RUN_ID" --repo icerpc/icerpc-csharp --name "nuget-packages" --dir packages
+        shell: pwsh
+
+      - name: Configure NuGet sources
+        run: |
+          # Point the icerpc.dev source in examples/nuget.config at the locally built packages.
+          # The existing packageSourceMapping for icerpc.* and zeroc.slice.codec is preserved.
+          dotnet nuget remove source icerpc.dev --configfile examples/nuget.config
+          dotnet nuget add source --configfile examples/nuget.config -n icerpc.dev ${{ github.workspace }}/packages
+        shell: pwsh
+
+      - name: Install dotnet new templates
+        run: |
+          $version = $env:IceRpcVersion
+          dotnet new install IceRpc.Templates::$version --nuget-source ${{ github.workspace }}/packages
+        shell: pwsh
+
+      - name: 🔨 Build Examples
+        run: |
+          $examples = Get-ChildItem -Path examples -Recurse -Include *.slnx
+          foreach ($example in $examples) { dotnet build $example.FullName }
+        shell: pwsh
+
+      - name: 🧪 Test Templates
+        uses: ./.github/actions/test-templates
+        with:
+          packages-source: ${{ github.workspace }}/packages

@@ -1,0 +1,224 @@
+name: CILibcNext
+
+# Builds against the unreleased `libc-0.2` branch of rust-lang/libc, so that a libc change which
+# breaks `std` or the compile-time checks of `esp-idf-sys/src/checks/libc.rs` shows up before it
+# is published. Two independent jobs:
+# - `std`: `std` alone against libc-0.2, with the toolchain users build with (the latest nightly for
+#   riscv32imc, `esp` for Xtensa); no ESP-IDF is needed for that
+# - `checks`: `esp-idf-sys` against libc-0.2, with newlib and with picolibc, and with a toolchain whose
+#   `std` builds with its own libc, so that a `std` broken by libc-0.2 does not hide the checks. It then
+#   builds with the known mismatches as well, which the checks skip, lists them, and fails while there
+#   are any
+#
+# To use few of the runners which the esp-rs organization shares, Monday to Saturday run the `checks`
+# with a subset of their matrix, and Sunday and manual runs with the full matrix (`checks-full`). Every
+# job waits for one of the six runner slots which the CI workflows of this repository share (see `ci.yml`).
+
+on:
+  schedule:
+    - cron: "50 6 * * 1-6"
+    - cron: "50 6 * * 0"
+  workflow_dispatch:
+
+# A new run for the same branch or PR cancels the one still in progress
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  rust_toolchain: nightly
+  # For the `checks` job on riscv32imc: the `std` of newer nightlies does not build with its own
+  # libc (0.2.191) for ESP-IDF (rust-lang/rust#164555)
+  rust_toolchain_pinned: nightly-2026-10-19
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  std:
+    name: "std / libc-0.2 / ${{ matrix.target }} / ${{ matrix.time }}"
+    runs-on: ubuntu-latest
+    # The slot follows from the position of the job in its matrix; the list covers matrices of up to 60 jobs
+    concurrency: &runner-slot
+      group: esp-idf-runner-slot-${{ fromJSON('[0,1,2,3,4,5,0,1,2,3,4,5,0,1,2,3,4,5,0,1,2,3,4,5,0,1,2,3,4,5,0,1,2,3,4,5,0,1,2,3,4,5,0,1,2,3,4,5,0,1,2,3,4,5,0,1,2,3,4,5]')[strategy.job-index] }}
+      queue: max
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - riscv32imc-esp-espidf
+          - xtensa-esp32-espidf
+        # 64-bit and 32-bit `time_t`
+        time:
+          - time64
+          - time32
+    env:
+      RUSTFLAGS: "--cfg espidf_${{ matrix.time }}"
+    steps:
+      - name: Setup | Checkout
+        uses: actions/checkout@v3
+
+      # The toolchains are installed by hand rather than with the dtolnay/rust-toolchain and
+      # esp-rs/xtensa-toolchain actions, so that their downloads can be retried: they fail
+      # now and then on a reset connection, and composite actions cannot be wrapped in a retry
+      - name: Setup | Rust
+        if: matrix.target == 'riscv32imc-esp-espidf'
+        run: |
+          .github/retry.sh rustup toolchain install ${{ env.rust_toolchain }} --profile minimal --component rust-src
+          rustup default ${{ env.rust_toolchain }}
+
+      - name: Setup | Rust for Xtensa
+        if: matrix.target != 'riscv32imc-esp-espidf'
+        run: |
+          host=$(rustup show | grep "Default host" | sed -e 's/.* //')
+          .github/retry.sh curl -sSfL https://github.com/esp-rs/espup/releases/latest/download/espup-$host -o "$HOME/.cargo/bin/espup"
+          chmod +x "$HOME/.cargo/bin/espup"
+          # A failed install must not leave a partial toolchain behind for the next attempt to skip
+          export ESPUP_EXPORT_FILE="$HOME/exports"
+          for attempt in 1 2 3; do
+            rm -rf "$HOME/.rustup/toolchains/esp"
+            "$HOME/.cargo/bin/espup" install -l debug --targets esp32,esp32s2,esp32s3 && break
+            [ "$attempt" -lt 3 ] && { echo "::warning::espup install attempt $attempt failed; retrying in 20s"; sleep 20; } || exit 1
+          done
+          source "$ESPUP_EXPORT_FILE"
+          echo "$PATH" >> "$GITHUB_PATH"
+          rustup default esp
+
+      - name: Setup | libc-0.2
+        run: |
+          .github/retry.sh git clone --depth 1 --branch libc-0.2 https://github.com/rust-lang/libc "$RUNNER_TEMP/libc"
+          git -C "$RUNNER_TEMP/libc" log -1 --format='libc-0.2 is at %h: %s'
+
+      # A `[patch]` reaches the libc that `-Zbuild-std` builds `std` with only if it has the version
+      # which the lockfile of `std` pins, so the patch is a copy of libc-0.2 with that version.
+      # `std` is built for an empty crate which depends on libc, outside of the workspace
+      - name: Build | std against libc-0.2
+        shell: bash
+        run: |
+          lock="$(rustc --print sysroot)/lib/rustlib/src/rust/library/Cargo.lock"
+          version=$(grep -A1 '^name = "libc"$' "$lock" | sed -n 's/^version = "\(.*\)"/\1/p')
+          echo "The lockfile of std pins libc $version"
+          cp -r "$RUNNER_TEMP/libc" "$RUNNER_TEMP/libc-std"
+          sed -i "0,/^version = .*/s//version = \"$version\"/" "$RUNNER_TEMP/libc-std/Cargo.toml"
+          mkdir -p "$RUNNER_TEMP/std/src"
+          printf '[package]\nname = "std-libc-next"\nversion = "0.0.0"\nedition = "2021"\n\n[dependencies]\nlibc = "0.2"\n\n[workspace]\n' > "$RUNNER_TEMP/std/Cargo.toml"
+          echo 'pub use libc;' > "$RUNNER_TEMP/std/src/lib.rs"
+          cd "$RUNNER_TEMP/std"
+          cargo build --target ${{ matrix.target }} -Zbuild-std=std,panic_abort \
+            --config "patch.crates-io.libc.path=\"$RUNNER_TEMP/libc-std\"" 2>&1 | tee "$RUNNER_TEMP/build.log"
+          if sed 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/build.log" | grep -q 'was not used in the crate graph'; then
+            echo "::error::The libc-0.2 patch was not used"
+            exit 1
+          fi
+
+  # Monday to Saturday: both libcs with one RISC-V and one Xtensa target, on the newest ESP-IDF release
+  checks:
+    name: &checks-name "esp-idf-sys checks / libc-0.2 / ${{ matrix.target }} / ${{ matrix.idf-version }}${{ matrix.libc && format(' / {0}', matrix.libc) || '' }}"
+    if: github.event.schedule == '50 6 * * 1-6'
+    runs-on: ubuntu-latest
+    concurrency: *runner-slot
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - riscv32imc-esp-espidf
+          - xtensa-esp32-espidf
+        idf-version:
+          - v6.1
+        libc:
+          - newlib
+          - picolibc
+    env: &checks-env
+      ESP_IDF_VERSION: ${{ matrix.idf-version }}
+      ESP_IDF_SDKCONFIG_DEFAULTS: ${{ matrix.libc && format('sdkconfig.defaults;sdkconfig.defaults.{0}', matrix.libc) || 'sdkconfig.defaults' }}
+      RUSTFLAGS: "${{ startsWith(matrix.idf-version, 'v4') && '--cfg espidf_time32' || '--cfg espidf_time64' }}${{ matrix.libc == 'picolibc' && ' --cfg espidf_picolibc' || '' }}"
+    steps: &checks-steps
+      - name: Setup | Checkout
+        uses: actions/checkout@v3
+
+      - name: Setup | Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/powershell
+          df -h /
+
+      - name: Setup | Rust
+        if: matrix.target == 'riscv32imc-esp-espidf'
+        run: |
+          .github/retry.sh rustup toolchain install ${{ env.rust_toolchain_pinned }} --profile minimal --component rustfmt,rust-src
+          rustup default ${{ env.rust_toolchain_pinned }}
+
+      - name: Setup | Rust for Xtensa
+        if: matrix.target != 'riscv32imc-esp-espidf'
+        run: |
+          host=$(rustup show | grep "Default host" | sed -e 's/.* //')
+          .github/retry.sh curl -sSfL https://github.com/esp-rs/espup/releases/latest/download/espup-$host -o "$HOME/.cargo/bin/espup"
+          chmod +x "$HOME/.cargo/bin/espup"
+          # A failed install must not leave a partial toolchain behind for the next attempt to skip
+          export ESPUP_EXPORT_FILE="$HOME/exports"
+          for attempt in 1 2 3; do
+            rm -rf "$HOME/.rustup/toolchains/esp"
+            "$HOME/.cargo/bin/espup" install -l debug --targets esp32,esp32s2,esp32s3 && break
+            [ "$attempt" -lt 3 ] && { echo "::warning::espup install attempt $attempt failed; retrying in 20s"; sleep 20; } || exit 1
+          done
+          source "$ESPUP_EXPORT_FILE"
+          echo "$PATH" >> "$GITHUB_PATH"
+          echo "LIBCLANG_PATH=${LIBCLANG_PATH}" >> "$GITHUB_ENV"
+          echo "CLANG_PATH=${CLANG_PATH}" >> "$GITHUB_ENV"
+          rustup default esp
+
+      # A manifest-level `[patch]` does not reach `-Zbuild-std`, so `std` keeps the libc of its lockfile
+      - name: Setup | libc-0.2
+        id: libc
+        run: |
+          .github/retry.sh git clone --depth 1 --branch libc-0.2 https://github.com/rust-lang/libc "$RUNNER_TEMP/libc"
+          git -C "$RUNNER_TEMP/libc" log -1 --format='libc-0.2 is at %h: %s'
+          printf '\n[patch.crates-io]\nlibc = { path = "%s" }\n' "$RUNNER_TEMP/libc" >> Cargo.toml
+
+      - name: Build | esp-idf-sys against libc-0.2
+        shell: bash
+        run: |
+          cargo build -p esp-idf-sys --target ${{ matrix.target }} -Zbuild-std=std,panic_abort 2>&1 | tee "$RUNNER_TEMP/build.log"
+          if sed 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/build.log" | grep -q 'was not used in the crate graph'; then
+            echo "::error::The libc-0.2 patch was not used"
+            exit 1
+          fi
+
+      # Builds with the known mismatches as well, which the build above skips, lists them in the job
+      # summary, and fails while there are any. A failure of the step above means a new mismatch
+      - name: Build | Known esp-idf-sys/libc-0.2 mismatches
+        if: ${{ !cancelled() && steps.libc.outcome == 'success' }}
+        shell: bash
+        env:
+          ESP_IDF_LIBC_MISMATCHES: err
+        run: |
+          status=0
+          cargo build -p esp-idf-sys --target ${{ matrix.target }} -Zbuild-std=std,panic_abort \
+            --message-format=json-diagnostic-rendered-ansi > "$RUNNER_TEMP/mismatches.json" || status=$?
+          python3 .github/libc_mismatches.py "$status" "$RUNNER_TEMP/mismatches.json" \
+            "${{ matrix.target }} / ${{ matrix.idf-version }}${{ matrix.libc && format(' / {0}', matrix.libc) || '' }}"
+
+  # Sunday and manual runs: also ESP-IDF v5.5, and v4.4 for the 32-bit `time_t`
+  checks-full:
+    name: *checks-name
+    if: github.event.schedule == '50 6 * * 0' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    concurrency: *runner-slot
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - riscv32imc-esp-espidf
+          - xtensa-esp32-espidf
+        # The ESP-IDF releases with both libcs: newlib is the default of v5.5, picolibc the one of v6.x
+        idf-version:
+          - v5.5.5
+          - v6.1
+        libc:
+          - newlib
+          - picolibc
+        include:
+          # 32-bit `time_t` (newlib only)
+          - target: riscv32imc-esp-espidf
+            idf-version: v4.4.8
+    env: *checks-env
+    steps: *checks-steps

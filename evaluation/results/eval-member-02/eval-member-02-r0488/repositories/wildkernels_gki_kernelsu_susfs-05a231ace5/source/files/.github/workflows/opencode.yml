@@ -1,0 +1,165 @@
+name: opencode
+
+# Runs OpenCode on new issues and on pull requests, inside this repo's runner.
+#
+# Billing: OpenCode Go subscription. The action runs OpenCode itself, so it is a
+# validated client for Go's session header, and usage draws on the plan's monthly
+# allowance instead of pay-as-you-go credit (opencode.ai/v2/docs/console/go).
+#
+# Setup: OPENCODE_API_KEY secret (Console personal key, oc_sk_...). No GitHub App
+# install: use_github_token passes GITHUB_TOKEN instead of an OIDC exchange.
+#
+# Nothing runs unless the OPENCODE_API_KEY secret exists: a preflight job probes
+# it and both real jobs depend on the result, so a missing key is a skip rather
+# than a failed run on every issue and PR.
+#
+# These events are not comment-triggered, so each job carries its own prompt and
+# its own guard - bot actors are skipped so an OpenCode comment cannot re-trigger
+# the workflow, and pull_request only runs for branches in this repo (fork PRs get
+# a read-only token and no secrets, so they would only fail) and skips drafts.
+
+on:
+  issues:
+    types: [opened]
+  # pull_request_target, not pull_request: a fork PR never receives secrets and
+  # needs a maintainer to approve the run, so OpenCode could not comment on
+  # outside contributions at all. pull_request_target runs in the base repo's
+  # context with the secret available and no approval click, which is the only
+  # way this behaves like a normal PR bot.
+  #
+  # Safety: the review job never checks out the PR head - it runs on the base
+  # repo with read-only contents and checks the change through the API. Nothing
+  # from the fork is executed, so untrusted code cannot reach the token.
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+# pr-review runs on pull_request_target, where the base repo's token and secrets
+# are present. Keep it out of the code: comment and read only.
+
+concurrency:
+  group: opencode-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: false
+
+# GitHub does not allow `secrets` in a job-level if:, so "no key" cannot skip the
+# workflow from an expression. Two layers instead:
+#   * vars.OPENCODE_ENABLED == 'false'  -> every job skips before it starts, so a
+#     repo that has no key (or wants OpenCode paused) pays nothing
+#   * the preflight job probes the secret itself and the real jobs depend on it,
+#     which is the authoritative check for "key missing"
+jobs:
+  preflight:
+    if: vars.OPENCODE_ENABLED != 'false'
+    # `secrets` is not an allowed context in a job-level `if`, so the key is
+    # probed in a step and the real jobs depend on the result. Without it every
+    # OpenCode run fails on auth - once per new issue and once per PR push.
+    runs-on: ubuntu-latest
+    outputs:
+      key: ${{ steps.check.outputs.present }}
+    steps:
+      - id: check
+        env:
+          KEY: ${{ secrets.OPENCODE_API_KEY }}
+        run: |
+          if [ -n "${KEY:-}" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::OPENCODE_API_KEY is not set - skipping OpenCode"
+          fi
+
+  issue-triage:
+    needs: preflight
+    if: |
+      vars.OPENCODE_ENABLED != 'false' &&
+      needs.preflight.outputs.key == 'true' &&
+      github.event_name == 'issues' &&
+      !endsWith(github.actor, '[bot]') &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      # OpenCode only sets these itself in OIDC mode; with use_github_token the
+      # workflow owns the git identity used for any commit it makes.
+      - name: Set git identity
+        run: |
+          git config --global user.name "opencode[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Run OpenCode
+        uses: anomalyco/opencode/github@latest
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # opencode-go/<model> resolves through the registry OpenCode ships
+          # (models.dev): provider opencode-go, base URL
+          # https://opencode.ai/inference/go/openai/v1, $0.15/$0.60 per M, 1M ctx.
+          # Go blocks DeepSeek unless the workspace privacy setting allows the
+          # Global region - Settings > Privacy > Regions.
+          model: opencode-go/deepseek-v4.1-flash
+          use_github_token: true
+          prompt: |
+            Review this issue. If there's a clear fix or relevant docs:
+            - Provide documentation links
+            - Add error handling guidance for code examples
+            Otherwise, do not comment.
+
+  pr-review:
+    # Runs for fork PRs too, which is the point: pull_request_target gives it the
+    # base repo's token and the OPENCODE_API_KEY secret without a maintainer
+    # approving each run. Drafts churn on every push and bot actors would
+    # re-trigger the review, so both are skipped.
+    #
+    # The checkout is deliberately the BASE repo at the PR's base ref, never the
+    # fork's head: OpenCode reads the change through the API. Nothing from the
+    # contributor's branch is built or executed here, so a hostile PR cannot
+    # reach the token, and the job is limited to reading plus commenting.
+    needs: preflight
+    if: |
+      vars.OPENCODE_ENABLED != 'false' &&
+      needs.preflight.outputs.key == 'true' &&
+      github.event_name == 'pull_request_target' &&
+      !endsWith(github.actor, '[bot]') &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout base repository
+        uses: actions/checkout@v7
+        with:
+          # the base ref, not the PR head - see the note above
+          ref: ${{ github.event.pull_request.base.ref }}
+          fetch-depth: 0
+
+      - name: Set git identity
+        run: |
+          git config --global user.name "opencode[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Run OpenCode
+        uses: anomalyco/opencode/github@latest
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          model: opencode-go/deepseek-v4.1-flash
+          use_github_token: true
+          prompt: |
+            Review this pull request:
+            - Check for code quality issues
+            - Look for potential bugs
+            - Suggest improvements

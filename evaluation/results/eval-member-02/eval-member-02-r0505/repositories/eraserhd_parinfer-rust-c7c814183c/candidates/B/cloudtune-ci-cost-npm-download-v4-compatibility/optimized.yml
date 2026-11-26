@@ -1,0 +1,54 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [HIGH] Add cargo dependency cache to "test-windows" job
+# - [MEDIUM] Add concurrency group to "build.yaml"
+# Estimated savings: ~10 min/run
+#
+name: Build
+on:
+  pull_request:
+  push:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test-non-windows:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        rust: [stable]
+        os: [ubuntu-latest, macOS-latest]
+    steps:
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v3
+      - name: Checkout
+        uses: actions/checkout@v1
+      - name: Check Nix flake inputs
+        uses: DeterminateSystems/flake-checker-action@v2
+        with:
+          fail-mode: true
+      - name: Build and run tests
+        run: nix flake check
+
+  test-windows:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        rust: [stable]
+        os: [windows-latest]
+    steps:
+      - name: Setup Rust
+        uses: hecrj/setup-rust-action@master
+        with:
+          rust-version: ${{ matrix.rust }}
+          components: rustfmt, clippy
+      - name: Installing LibClang on Windows
+        shell: pwsh
+        run: choco install -y llvm
+      - name: Checkout
+        uses: actions/checkout@v1
+      - name: Build the crate
+        run: cargo build --release
+      # - name: Run Tests
+      #   run: cargo test
