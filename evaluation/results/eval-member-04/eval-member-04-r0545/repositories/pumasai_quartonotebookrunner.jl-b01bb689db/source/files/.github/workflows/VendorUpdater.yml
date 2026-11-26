@@ -1,0 +1,40 @@
+name: VendorUpdater
+on:
+  schedule:
+    - cron: 0 0 * * *
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  VendorUpdater:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: julia-actions/setup-julia@fa02766e078afaaf09b14210362cee14137e6a32 # v3.0.2
+        with:
+          version: '1'
+
+      - name: "Update dependencies"
+        run: import Pkg; Pkg.update()
+        shell: julia --project=src/QuartoNotebookWorker/src/vendor --color=yes {0}
+
+      - name: "Run vendor script"
+        run: julia --project=src/QuartoNotebookWorker/src/vendor --color=yes src/QuartoNotebookWorker/src/vendor/vendor.jl
+
+      - name: "Create pull request"
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "Automatic update of vendored dependencies"
+          title: "Automatic update of vendored dependencies"
+          labels: |
+            vendor
+            dependencies
+          body: |-
+            This pull request updates all vendored packages.
+          branch-suffix: random
+          delete-branch: true

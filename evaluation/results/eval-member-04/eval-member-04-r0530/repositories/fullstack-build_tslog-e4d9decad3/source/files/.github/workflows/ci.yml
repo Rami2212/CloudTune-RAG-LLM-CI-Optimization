@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [master, v4, v5, development]
+  pull_request:
+    branches: [master, v4, v5, development]
+
+jobs:
+    test-node:
+        runs-on: ubuntu-latest
+
+        strategy:
+            fail-fast: false
+            matrix:
+                node-version: ['22', '24', '26', 'latest']
+
+        env:
+            CI: true
+
+        steps:
+            - uses: actions/checkout@v5
+            - name: Use Node.js ${{ matrix.node-version }}
+              uses: actions/setup-node@v5
+              with:
+                  node-version: ${{ matrix.node-version }}
+            - run: npm ci
+
+            # Fail fast if the AI-facing docs (llms.txt/RECIPES.md) drifted from the source.
+            - name: Check doc sync
+              run: npm run check-doc-sync
+
+            # Guard the gzip budgets of the slim and full browser bundles.
+            - name: Check bundle size
+              run: npm run check-bundle-size
+
+            # Run the full test suite on every supported Node version.
+            # Coverage + Codecov report only on the minimum supported version (22)
+            # to avoid redundant uploads and overhead.
+            - name: Run tests (with coverage)
+              if: matrix.node-version == '22'
+              run: npm run coverage
+
+            - name: Run tests
+              if: matrix.node-version != '22'
+              run: npm test
+
+            - name: Report coverage
+              if: matrix.node-version == '22'
+              uses: codecov/codecov-action@v5
+              with:
+                  token: ${{ secrets.CODECOV_TOKEN }}
+
+    test-browser:
+        runs-on: ubuntu-latest
+        strategy:
+            fail-fast: false
+            matrix:
+                browser: [chromium, firefox, webkit]
+        env:
+            CI: true
+        steps:
+            - uses: actions/checkout@v5
+            - uses: actions/setup-node@v5
+              with:
+                  node-version: 22
+            - run: npm ci
+            - name: Install Playwright ${{ matrix.browser }}
+              run: npx playwright install --with-deps ${{ matrix.browser }}
+            - name: Run browser tests (${{ matrix.browser }})
+              run: npx playwright test --project=${{ matrix.browser }}
+
+    test-bun:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v5
+            - uses: actions/setup-node@v5
+              with:
+                  node-version: 22
+            - uses: oven-sh/setup-bun@v2
+              with:
+                  bun-version: latest
+            - run: npm ci
+            - name: Run tests with Bun
+              run: npm run test:bun
+
+    # Real framework dev servers (Next.js + Turbopack, TanStack Start + Vite) — proves source-mapped
+    # log positions work out of the box against environments unit tests cannot reach. Fixtures install
+    # the LATEST framework versions on purpose: this job is the canary for upstream changes.
+    test-e2e-apps:
+        runs-on: ubuntu-latest
+        env:
+            CI: true
+        steps:
+            - uses: actions/checkout@v5
+            - uses: actions/setup-node@v5
+              with:
+                  node-version: 22
+            - run: npm ci
+            - name: Build
+              run: npm run build
+            - name: Run framework E2E fixtures
+              run: npm run test:e2e-apps
+
+    test-deno:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v5
+            - uses: actions/setup-node@v5
+              with:
+                  node-version: 22
+            - uses: denoland/setup-deno@v2
+              with:
+                  deno-version: v2.x
+            - run: npm ci
+            - name: Build for Deno
+              run: npm run build
+            - name: Run Deno tests
+              run: deno test --allow-read --allow-env tests/deno_runner.ts

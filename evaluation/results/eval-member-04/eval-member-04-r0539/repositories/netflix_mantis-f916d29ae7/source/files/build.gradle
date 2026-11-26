@@ -1,0 +1,190 @@
+/*
+ * Copyright 2019 Netflix, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+buildscript {
+    repositories {
+        gradlePluginPortal()
+        mavenCentral()
+        maven {
+            url "https://plugins.gradle.org/m2/"
+        }
+        maven { url 'https://artifacts-oss.netflix.net/maven-oss-releases' }
+    }
+    dependencies {
+        classpath 'com.netflix.nebula:gradle-netflixoss-project-plugin:11.6.0'
+        classpath 'com.netflix.nebula:nebula-dependency-recommender:11.+'
+        classpath 'io.mantisrx:mantis-gradle-plugin:1.2.7'
+        classpath "io.freefair.gradle:lombok-plugin:8.+"
+        classpath 'eu.appsatori:gradle-fatjar-plugin:0.3'
+        classpath("com.github.johnrengelman:shadow:8.1.1")
+        classpath 'gradle.plugin.org.inferred:gradle-processors:3.3.0'
+        // todo: baseline is disabled due to no working version on java 8
+        // classpath 'com.palantir.baseline:gradle-baseline-java:4.+'
+        classpath 'com.bmuschko:gradle-docker-plugin:6.7.0'
+        classpath "com.palantir.gradle.gitversion:gradle-git-version:3.0.0"
+    }
+}
+
+ext.versions = [
+        akka     : "2.6.15",
+        akkaHttp : "10.2.7",
+        commons  : "3.5",
+        flink    : "1.14.2",
+        hadoop   : "2.7.7",
+        jsr305   : "3.0.1",
+        junit4   : "4.11",
+        junit5   : "5.4.+",
+        mockito  : "2.0.+",
+        mockito3 : "3.+",
+        mockito5 : "5.+",
+        scala    : "2.12",
+        spectator: "1.3.+",
+        slf4j    : "1.7.0",
+        vavr     : "0.9.2",
+]
+
+ext.libraries = [
+        akkaActor      : "com.typesafe.akka:akka-actor_${versions.scala}:${versions.akka}",
+        akkaHttp       : "com.typesafe.akka:akka-http_${versions.scala}:${versions.akkaHttp}",
+        akkaHttpJackson: "com.typesafe.akka:akka-http-jackson_${versions.scala}:${versions.akkaHttp}",
+        akkaHttpCaching: "com.typesafe.akka:akka-http-caching_${versions.scala}:${versions.akkaHttp}",
+        akkaStream     : "com.typesafe.akka:akka-stream_${versions.scala}:${versions.akka}",
+        akkaSlf4j      : "com.typesafe.akka:akka-slf4j_${versions.scala}:${versions.akka}",
+        akkaTest       : "com.typesafe.akka:akka-testkit_${versions.scala}:${versions.akka}",
+        akkaHttpTest   : "com.typesafe.akka:akka-http-testkit_${versions.scala}:${versions.akkaHttp}",
+        asyncHttpClient: "org.asynchttpclient:async-http-client:2.12.3",
+        commonsIo      : "commons-io:commons-io:2.11.0",
+        commonsLang3   : "org.apache.commons:commons-lang3:${versions.commons}",
+        commonsMath3   : "org.apache.commons:commons-math3:${versions.commons}",
+        flinkCore      : "org.apache.flink:flink-core:${versions.flink}",
+        flinkRpcApi    : [
+                "org.apache.flink:flink-rpc-core:${versions.flink}",
+        ],
+        flinkRpcImpl   : [
+                "org.apache.flink:flink-rpc-akka:${versions.flink}",
+        ],
+        junit4         : [
+                "junit:junit:${versions.junit4}",
+                "junit:junit-dep:${versions.junit4}",
+        ],
+        hadoopCommon   : "org.apache.hadoop:hadoop-common:${versions.hadoop}",
+        hadoopS3       : "org.apache.hadoop:hadoop-aws:${versions.hadoop}",
+        httpClient     : "org.apache.httpcomponents:httpclient:4.5.14",
+        jsr305         : "com.google.code.findbugs:jsr305:${versions.jsr305}", // For Nonnull annotation
+        junitJupiter   : [
+                "org.junit.jupiter:junit-jupiter-api:${versions.junit5}",
+                "org.junit.jupiter:junit-jupiter-engine:${versions.junit5}",
+                "org.junit.jupiter:junit-jupiter-params:${versions.junit5}",
+        ],
+        mantisShaded   : "io.mantisrx:mantis-shaded:2.0.97",
+        mockitoCore3   : "org.mockito:mockito-core:${versions.mockito3}",
+        mockitoCore    : "org.mockito:mockito-core:${versions.mockito5}",
+        wiremockjre8   : "com.github.tomakehurst:wiremock-jre8:2.+",
+        mockneat       : "net.andreinc:mockneat:0.4.8",
+        rxJava         : "io.reactivex:rxjava:1.3.8",
+        rxNettyShaded  : "com.netflix:mantis-rxnetty:0.4.19.1",
+        slf4jApi       : "org.slf4j:slf4j-api:${versions.slf4j}",
+        slf4jLog4j12   : "org.slf4j:slf4j-log4j12:${versions.slf4j}",
+        spectatorApi   : "com.netflix.spectator:spectator-api:${versions.spectator}",
+        spectatorExtIpc: "com.netflix.spectator:spectator-ext-ipc:${versions.spectator}",
+        spectatorNflxPlugin: "com.netflix.spectator:spectator-nflx-plugin:${versions.spectator}",
+        spotifyFutures : "com.spotify:completable-futures:0.3.1",
+        vavr           : "io.vavr:vavr:${versions.vavr}",
+        vavrJackson    : "io.vavr:vavr-jackson:${versions.vavr}",
+        vavrTest       : "io.vavr:vavr-test:${versions.vavr}",
+        zip4j          : "net.lingala.zip4j:zip4j:2.9.0"
+]
+
+allprojects {
+    apply plugin: 'nebula.netflixoss'
+
+    java {
+        toolchain {
+            languageVersion.set(JavaLanguageVersion.of(17))
+        }
+    }
+}
+
+// def printAllReleasedArtifacts = project.tasks.create('printAllReleasedArtifacts')
+// project.snapshot.configure { finalizedBy printAllReleasedArtifacts }
+// project.tasks.named("build").configure { finalizedBy printAllReleasedArtifacts }
+subprojects {
+    apply plugin: 'java-library'
+
+    // Apply lombok plugin.
+    apply plugin: "io.freefair.lombok"
+    lombok {
+        version = "1.18.36"
+    }
+
+    group = 'io.mantisrx'
+
+    if (project.hasProperty('useMavenLocal')) {
+        repositories {
+            mavenLocal()
+        }
+    }
+
+    configurations.compileClasspath {
+        if (!"mantis-shaded".equals(project.name)) {
+            exclude group: 'com.fasterxml.jackson.core'
+            exclude group: 'com.fasterxml.jackson.datatype'
+            exclude group: 'com.fasterxml.jackson.module'
+            exclude group: 'com.fasterxml.jackson.dataformat'
+            exclude group: 'com.google.guava', module: 'guava'
+            exclude group: 'io.netty', module: 'netty'
+            exclude group: 'io.vavr', module: 'vavr-jackson'
+            exclude group: 'jline', module: 'jline'
+            exclude group: 'org.apache.curator'
+            exclude group: 'org.apache.zookeeper'
+            exclude group: 'org.apache.jute'
+        }
+        exclude group: 'ch.qos.logback', module: 'logback-classic'
+    }
+
+    repositories {
+        mavenCentral()
+        maven {
+            url "https://netflixoss.jfrog.io/artifactory/maven-oss-candidates"
+        }
+    }
+
+    tasks.withType(Javadoc).all {
+        enabled = false
+    }
+
+    tasks.withType(JavaCompile) {
+        options.compilerArgs << "-Xlint:deprecation"
+    }
+
+    // test tasks config
+    task akkaTest(type: Test) {
+        maxParallelForks = 1
+        filter {
+            includeTestsMatching "*AkkaTest"
+            setFailOnNoMatchingTests(false)
+        }
+    }
+
+    test {
+        filter {
+            excludeTestsMatching "*AkkaTest"
+            setFailOnNoMatchingTests(false)
+        }
+    }
+}
+
+// apply from: file('baseline.gradle')

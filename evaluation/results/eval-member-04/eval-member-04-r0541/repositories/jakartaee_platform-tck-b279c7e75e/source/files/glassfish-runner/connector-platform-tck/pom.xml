@@ -1,0 +1,481 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+
+    Copyright (c) 2025 Contributors to the Eclipse Foundation.
+    Copyright (c) 2024 Oracle and/or its affiliates. All rights reserved.
+
+    This program and the accompanying materials are made available under the
+    terms of the Eclipse Public License v. 2.0, which is available at
+    http://www.eclipse.org/legal/epl-2.0.
+
+    This Source Code may also be made available under the following Secondary
+    Licenses when the conditions for such availability set forth in the
+    Eclipse Public License v. 2.0 are satisfied: GNU General Public License,
+    version 2 with the GNU Classpath Exception, which is available at
+    https://www.gnu.org/software/classpath/license.html.
+
+    SPDX-License-Identifier: EPL-2.0 OR GPL-2.0 WITH Classpath-exception-2.0
+    
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.eclipse.ee4j</groupId>
+        <artifactId>project</artifactId>
+        <version>2.0.3</version>
+        <relativePath />
+    </parent>
+
+    <groupId>jakarta.tck</groupId>
+    <artifactId>glassfish.connector-platform-tck</artifactId>
+    <version>11.0.3</version>
+    <packaging>jar</packaging>
+
+    <properties>
+        <maven.compiler.release>17</maven.compiler.release>
+           
+        <!-- glassfish properties -->
+        <glassfish.major>8</glassfish.major>
+        <glassfish.home>${project.build.directory}/glassfish${glassfish.major}</glassfish.home>
+        <glassfish.lib.dir>${glassfish.home}/glassfish/lib</glassfish.lib.dir>
+        
+        <glassfish.runner.version>11.0.3</glassfish.runner.version>
+        <tck.version>11.0.3</tck.version>
+
+        <whitebox.directory>target/whiteboxes</whitebox.directory>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>jakarta.tck</groupId>
+                <artifactId>glassfish-runner-bom</artifactId>
+                <version>${glassfish.runner.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+
+        <!-- The actual TCK containing the tests -->
+        <dependency>
+            <groupId>jakarta.tck</groupId>
+            <artifactId>connector</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- TCK dependencies-->
+        <dependency>
+            <groupId>jakarta.tck</groupId>
+            <artifactId>common</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>jakarta.tck.arquillian</groupId>
+            <artifactId>arquillian-protocol-lib</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>jakarta.tck.arquillian</groupId>
+            <artifactId>arquillian-protocol-common</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>jakarta.tck.arquillian</groupId>
+            <artifactId>arquillian-protocol-javatest</artifactId>
+        </dependency>
+
+        <!-- Junit5 -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.platform</groupId>
+            <artifactId>junit-platform-launcher</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.vintage</groupId>
+            <artifactId>junit-vintage-engine</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.jboss.arquillian.container</groupId>
+            <artifactId>arquillian-container-test-spi</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.jboss.arquillian.junit5</groupId>
+            <artifactId>arquillian-junit5-container</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!--
+            The Arquillian connector that starts GlassFish and deploys archives to it.
+        -->
+        <dependency>
+            <groupId>ee.omnifish.arquillian</groupId>
+            <artifactId>arquillian-glassfish-server-managed</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <artifactId>maven-dependency-plugin</artifactId>
+                <version>3.2.0</version>
+                <executions>
+                    <execution>
+                        <id>1-unpack</id>
+                        <goals>
+                            <goal>unpack</goal>
+                        </goals>
+                        <phase>initialize</phase>
+                        <configuration>
+                            <artifactItems>
+                                <artifactItem>
+                                    <groupId>org.glassfish.main.distributions</groupId>
+                                    <artifactId>glassfish</artifactId>
+                                    <version>${glassfish.version}</version>
+                                    <type>zip</type>
+                                    <overWrite>true</overWrite>
+                                    <outputDirectory>${project.build.directory}</outputDirectory>
+                                </artifactItem>
+                            </artifactItems>
+                        </configuration>
+                    </execution>
+
+                    <execution>
+                        <id>2-copy-lib</id>
+                        <goals>
+                            <goal>copy</goal>
+                        </goals>
+                        <phase>initialize</phase>
+                        <configuration>
+                            <artifactItems>
+                                 <artifactItem>
+                                    <groupId>jakarta.tck.arquillian</groupId>
+                                    <artifactId>arquillian-protocol-lib</artifactId>
+                                    <overWrite>true</overWrite>
+                                    <outputDirectory>${glassfish.lib.dir}</outputDirectory>
+                                    <destFileName>arquillian-protocol-lib.jar</destFileName>
+                                </artifactItem>
+                                <!--
+                                    AppClientDeploymentPackager & JavaTestDeploymentPackager needs this on the Eclipse CI since 
+                                    it can't fully resolve jakarta.tck.arquillian:arquillian-protocol-lib in code for some reason.
+                                -->
+                                <artifactItem>
+                                    <groupId>jakarta.tck.arquillian</groupId>
+                                    <artifactId>arquillian-protocol-lib</artifactId>
+                                    <type>jar</type>
+                                    <overWrite>true</overWrite>
+                                    <outputDirectory>${project.build.directory}/protocol</outputDirectory>
+                                    <destFileName>protocol.jar</destFileName>
+                                </artifactItem>
+
+                            </artifactItems>
+                        </configuration>
+                    </execution>
+
+                    <execution>
+                        <id>3-install-whiteboxes</id>
+                        <goals>
+                            <goal>copy</goal>
+                        </goals>
+                        <phase>initialize</phase>
+                        <configuration>
+                            <artifactItems>
+                                <artifactItem>
+                                    <groupId>jakarta.tck</groupId>
+                                    <artifactId>whitebox</artifactId>
+                                    <outputDirectory>${glassfish.lib.dir}</outputDirectory>
+                                    <destFileName>whitebox.jar</destFileName>
+                                </artifactItem>
+                                <artifactItem>
+                                    <groupId>jakarta.tck</groupId>
+                                    <artifactId>annotated</artifactId>
+                                    <version>${tck.version}</version>
+                                    <type>rar</type>
+                                    <outputDirectory>${whitebox.directory}</outputDirectory>
+                                    <destFileName>whitebox-anno_no_md.rar</destFileName>
+                                </artifactItem>
+                                <artifactItem>
+                                    <groupId>jakarta.tck</groupId>
+                                    <artifactId>ibanno</artifactId>
+                                    <version>${tck.version}</version>
+                                    <type>rar</type>
+                                    <outputDirectory>${whitebox.directory}</outputDirectory>
+                                    <destFileName>whitebox-ibanno_no_md.rar</destFileName>
+                                </artifactItem>
+                                <artifactItem>
+                                    <groupId>jakarta.tck</groupId>
+                                    <artifactId>mdcomplete</artifactId>
+                                    <type>rar</type>
+                                    <outputDirectory>${whitebox.directory}</outputDirectory>
+                                    <destFileName>whitebox-mdcomplete.rar</destFileName>
+                                </artifactItem>
+                                <artifactItem>
+                                    <groupId>jakarta.tck</groupId>
+                                    <artifactId>mixedmode</artifactId>
+                                    <type>rar</type>
+                                    <outputDirectory>${whitebox.directory}</outputDirectory>
+                                    <destFileName>whitebox-mixedmode.rar</destFileName>
+                                </artifactItem>
+                                <artifactItem>
+                                    <groupId>jakarta.tck</groupId>
+                                    <artifactId>multianno</artifactId>
+                                    <type>rar</type>
+                                    <outputDirectory>${whitebox.directory}</outputDirectory>
+                                    <destFileName>whitebox-multianno.rar</destFileName>
+                                </artifactItem>
+                                <artifactItem>
+                                    <groupId>jakarta.tck</groupId>
+                                    <artifactId>whitebox-notx</artifactId>
+                                    <type>rar</type>
+                                    <outputDirectory>${whitebox.directory}</outputDirectory>
+                                    <destFileName>whitebox-notx.rar</destFileName>
+                                </artifactItem>
+                                <artifactItem>
+                                    <groupId>jakarta.tck</groupId>
+                                    <artifactId>whitebox-notx-param</artifactId>
+                                    <type>rar</type>
+                                    <outputDirectory>${whitebox.directory}</outputDirectory>
+                                    <destFileName>whitebox-notx-param.rar</destFileName>
+                                </artifactItem>
+                                <artifactItem>
+                                    <groupId>jakarta.tck</groupId>
+                                    <artifactId>whitebox-tx</artifactId>
+                                    <type>rar</type>
+                                    <outputDirectory>${whitebox.directory}</outputDirectory>
+                                    <destFileName>whitebox-tx.rar</destFileName>
+                                </artifactItem>
+                                <artifactItem>
+                                    <groupId>jakarta.tck</groupId>
+                                    <artifactId>whitebox-tx-param</artifactId>
+                                    <type>rar</type>
+                                    <outputDirectory>${whitebox.directory}</outputDirectory>
+                                    <destFileName>whitebox-tx-param.rar</destFileName>
+                                </artifactItem>
+                                <artifactItem>
+                                    <groupId>jakarta.tck</groupId>
+                                    <artifactId>whitebox-xa</artifactId>
+                                    <type>rar</type>
+                                    <outputDirectory>${whitebox.directory}</outputDirectory>
+                                    <destFileName>whitebox-xa.rar</destFileName>
+                                </artifactItem>
+                                <artifactItem>
+                                    <groupId>jakarta.tck</groupId>
+                                    <artifactId>whitebox-xa-param</artifactId>
+                                    <type>rar</type>
+                                    <outputDirectory>${whitebox.directory}</outputDirectory>
+                                    <destFileName>whitebox-xa-param.rar</destFileName>
+                                </artifactItem>
+                            </artifactItems>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            
+            <plugin>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <version>3.5.3</version>
+                <configuration>
+                    <dependenciesToScan>jakarta.tck:connector</dependenciesToScan>
+
+                    <systemPropertyVariables>
+                        <glassfish.home>${glassfish.home}</glassfish.home>
+                        
+                        <glassfish.enableDerby>true</glassfish.enableDerby>
+                        
+                        <glassfish.systemProperties>
+                            j2eelogin.name=j2ee
+                            j2eelogin.password=j2ee
+                            eislogin.name=cts1
+                            eislogin.password=cts1
+                        </glassfish.systemProperties>
+                        
+                        <glassfish.postBootCommands>
+                            --passwordfile ${project.basedir}/j2ee.pass create-file-user --groups staff:mgr j2ee
+                            --passwordfile ${project.basedir}/javajoe.pass create-file-user --groups guest javajoe
+                            create-jdbc-connection-pool --restype javax.sql.DataSource --datasourceclassname org.apache.derby.jdbc.ClientDataSource --property databaseName=derbyDB:serverName=localhost:portNumber=1527:user=cts1:password=cts1:createDatabase=create cts-derby-pool
+                            create-jdbc-resource --connectionpoolid cts-derby-pool jdbc/DB1
+                            create-jdbc-connection-pool --restype javax.sql.XADataSource --datasourceclassname org.apache.derby.jdbc.ClientXADataSource --property serverName=localhost:portNumber=1527:user=cts1:password=cts1:DatabaseName=derbyDB:connectionAttributes=";create\=true;" --steadypoolsize 32 --maxpoolsize 64 cts-derby-XA-pool   
+                            create-jdbc-resource --connectionpoolid cts-derby-XA-pool eis/JDBCwhitebox-xa
+                            create-jdbc-resource --connectionpoolid cts-derby-XA-pool eis/JDBCwhitebox-notx
+                            list-jdbc-connection-pools
+                            ping-connection-pool cts-derby-XA-pool
+                            deploy ${whitebox.directory}/whitebox-tx.rar
+                            create-connector-connection-pool --raname whitebox-tx --property eisPrincipalName=j2ee:userName=j2ee:password=j2ee:TSRValue=comp/TransactionSynchronizationRegistry --connectiondefinition com.sun.ts.tests.common.connector.whitebox.TSConnectionFactory cts-connector-pool-whitebox-tx-pool.rar
+                            create-connector-resource --poolname cts-connector-pool-whitebox-tx-pool.rar eis/whitebox-tx
+                            deploy ${whitebox.directory}/whitebox-xa.rar
+                            create-connector-connection-pool --raname whitebox-xa --property eisPrincipalName=j2ee:userName=j2ee:password=j2ee:TSRValue=comp/TransactionSynchronizationRegistry --connectiondefinition com.sun.ts.tests.common.connector.whitebox.TSConnectionFactory cts-connector-pool-whitebox-xa-pool.rar
+                            create-connector-resource --poolname cts-connector-pool-whitebox-xa-pool.rar eis/whitebox-xa
+                            deploy ${whitebox.directory}/whitebox-notx.rar
+                            create-connector-connection-pool --raname whitebox-notx --property eisPrincipalName=j2ee:userName=j2ee:password=j2ee:TSRValue=comp/TransactionSynchronizationRegistry --connectiondefinition com.sun.ts.tests.common.connector.whitebox.TSConnectionFactory cts-connector-pool-whitebox-notx-pool.rar
+                            create-connector-resource --poolname cts-connector-pool-whitebox-notx-pool.rar eis/whitebox-notx
+                            deploy ${whitebox.directory}/whitebox-mdcomplete.rar
+                            create-connector-connection-pool --raname whitebox-mdcomplete --property eisPrincipalName=j2ee:userName=j2ee:password=j2ee:TSRValue=comp/TransactionSynchronizationRegistry --connectiondefinition com.sun.ts.tests.common.connector.whitebox.TSConnectionFactory cts-connector-pool-whitebox-mdcomplete-pool.rar
+                            create-connector-resource --poolname cts-connector-pool-whitebox-mdcomplete-pool.rar eis/whitebox-mdcomplete
+                            deploy ${whitebox.directory}/whitebox-anno_no_md.rar
+                            create-connector-connection-pool --raname whitebox-anno_no_md --property eisPrincipalName=cts1:userName=j2ee:password=cts1:TSRValue=comp/TransactionSynchronizationRegistry --connectiondefinition com.sun.ts.tests.common.connector.whitebox.TSConnectionFactory cts-connector-pool-whitebox-anno_no_md-pool.rar  
+                            create-connector-resource --poolname cts-connector-pool-whitebox-anno_no_md-pool.rar eis/whitebox-anno_no_md
+                            deploy ${whitebox.directory}/whitebox-mixedmode.rar
+                            create-connector-connection-pool --raname whitebox-mixedmode --property eisPrincipalName=j2ee:userName=j2ee:password=j2ee:TSRValue=comp/TransactionSynchronizationRegistry --connectiondefinition com.sun.ts.tests.common.connector.whitebox.TSConnectionFactory cts-connector-pool-whitebox-mixedmode-pool.rar 
+                            create-connector-resource --poolname cts-connector-pool-whitebox-mixedmode-pool.rar eis/whitebox-mixedmode
+                            deploy ${whitebox.directory}/whitebox-multianno.rar
+                            create-connector-connection-pool --raname whitebox-multianno --property eisPrincipalName=j2ee:userName=j2ee:password=j2ee:TSRValue=comp/TransactionSynchronizationRegistry --connectiondefinition com.sun.ts.tests.common.connector.whitebox.TSConnectionFactory cts-connector-pool-whitebox-multianno.rar
+                            create-connector-resource --poolname cts-connector-pool-whitebox-multianno.rar eis/whitebox-multianno
+                            deploy ${whitebox.directory}/whitebox-tx-param.rar
+                            create-connector-connection-pool --raname whitebox-tx-param --property eisPrincipalName=j2ee:userName=j2ee:password=j2ee:TSRValue=comp/TransactionSynchronizationRegistry --connectiondefinition com.sun.ts.tests.common.connector.whitebox.TSConnectionFactory cts-connector-pool-whitebox-tx-param.rar 
+                            create-connector-resource --poolname cts-connector-pool-whitebox-tx-param.rar eis/whitebox-tx-param
+                            deploy ${whitebox.directory}/whitebox-notx-param.rar
+                            create-connector-connection-pool --raname whitebox-notx-param --property eisPrincipalName=j2ee:userName=j2ee:password=j2ee:TSRValue=comp/TransactionSynchronizationRegistry --connectiondefinition com.sun.ts.tests.common.connector.whitebox.TSConnectionFactory cts-connector-pool-whitebox-notx-param.rar
+                            create-connector-resource --poolname cts-connector-pool-whitebox-notx-param.rar eis/whitebox-notx-param
+                            deploy ${whitebox.directory}/whitebox-xa-param.rar
+                            create-connector-connection-pool --raname whitebox-xa-param --property eisPrincipalName=j2ee:userName=j2ee:password=j2ee:TSRValue=comp/TransactionSynchronizationRegistry --connectiondefinition com.sun.ts.tests.common.connector.whitebox.TSConnectionFactory cts-connector-pool-whitebox-xa-param.rar  
+                            create-connector-resource --poolname cts-connector-pool-whitebox-xa-param.rar eis/whitebox-xa-param
+                            deploy ${whitebox.directory}/whitebox-ibanno_no_md.rar
+                            create-connector-connection-pool --raname whitebox-ibanno_no_md --property eisPrincipalName=j2ee:userName=j2ee:password=j2ee:TSRValue=comp/TransactionSynchronizationRegistry --connectiondefinition com.sun.ts.tests.common.connector.whitebox.TSConnectionFactory cts-connector-pool-whitebox-ibanno_no_md.rar 
+                            create-connector-resource --poolname cts-connector-pool-whitebox-ibanno_no_md.rar eis/whitebox-ibanno_no_md
+                            list-connector-resources
+                            list-jndi-entries
+                            create-jms-resource --restype jakarta.jms.QueueConnectionFactory jms/QueueConnectionFactory
+                            create-jms-resource --restype jakarta.jms.Queue --property imqDestinationName=MDB_QUEUE_REPLY MDB_QUEUE
+                            create-jms-resource --restype jakarta.jms.Queue --property imqDestinationName=MDB_QUEUE_REPLY MDB_QUEUE_REPLY
+                        </glassfish.postBootCommands>
+                        
+                        <java.naming.factory.initial>com.sun.enterprise.naming.impl.SerialInitContextFactory</java.naming.factory.initial>
+                        <ts.home>${project.basedir}/jakartaeetck</ts.home>
+                        <project.basedir>${project.basedir}</project.basedir>
+                    </systemPropertyVariables>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+   <profiles>
+        <profile>
+            <id>javatest</id>
+
+            <activation>
+                <activeByDefault>true</activeByDefault>
+            </activation>
+
+            <build>
+                <plugins>
+                    <plugin>
+                        <artifactId>maven-failsafe-plugin</artifactId>
+                        <version>3.5.4</version>
+                        <executions>
+                            <execution>
+                                <id>connector-tests-javatest</id>
+                                <goals>
+                                    <goal>integration-test</goal>
+                                    <goal>verify</goal>
+                                </goals>
+                                <configuration>
+                                    <groups>tck-javatest</groups>
+                                    <includes>
+                                        <include>**/ClientTest.*</include>
+                                        <include>**/*Servlet*.*</include>
+                                        <include>**/*Jsp**.*</include>
+                                    </includes>
+                                    
+                                    <systemPropertyVariables>
+                                        <arquillian.xml>arquillian.xml</arquillian.xml>
+                                    </systemPropertyVariables>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        
+        
+        <profile>
+            <id>appclient</id>
+
+            <dependencies>
+                <dependency>
+                    <groupId>jakarta.tck.arquillian</groupId>
+                    <artifactId>arquillian-protocol-appclient</artifactId>
+                </dependency>
+                <dependency>
+                    <groupId>jakarta.tck.arquillian</groupId>
+                    <artifactId>arquillian-protocol-lib</artifactId>
+                </dependency>
+                <dependency>
+                    <groupId>jakarta.tck.arquillian</groupId>
+                    <artifactId>tck-porting-lib</artifactId>
+                </dependency>
+            </dependencies>
+
+            <build>
+                <plugins>
+                    <plugin>
+                        <artifactId>maven-dependency-plugin</artifactId>
+                        <version>3.8.1</version>
+                        <executions>
+                            <execution>
+                                <id>2-copy-lib</id>
+                                <goals>
+                                    <goal>copy</goal>
+                                </goals>
+                                <phase>initialize</phase>
+                                <configuration>
+                                    <artifactItems>
+                                        <!-- The application client container needs these two dependencies -->
+                                        <artifactItem>
+                                            <groupId>jakarta.tck.arquillian</groupId>
+                                            <artifactId>tck-porting-lib</artifactId>
+                                            <overWrite>true</overWrite>
+                                            <outputDirectory>${project.build.directory}/lib</outputDirectory>
+                                            <destFileName>tck-porting-lib.jar</destFileName>
+                                        </artifactItem>
+                                        <artifactItem>
+                                            <groupId>jakarta.tck.arquillian</groupId>
+                                            <artifactId>arquillian-protocol-lib</artifactId>
+                                            <overWrite>true</overWrite>
+                                            <outputDirectory>${glassfish.lib.dir}</outputDirectory>
+                                            <destFileName>arquillian-protocol-lib.jar</destFileName>
+                                        </artifactItem>
+
+                                    </artifactItems>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                
+                    <plugin>
+                        <artifactId>maven-failsafe-plugin</artifactId>
+                        <version>3.5.4</version>
+                        <executions>
+                            <execution>
+                                <id>connector-tests-appclient</id>
+                                <goals>
+                                    <goal>integration-test</goal>
+                                    <goal>verify</goal>
+                                </goals>
+                                <configuration>
+                                    <groups>tck-appclient</groups>
+                                    <includes>
+                                        <include>**/ClientTest.*</include>
+                                        <include>**/*EjbTest.*</include>
+                                    </includes>
+                                    
+                                    <systemPropertyVariables>
+                                        <arquillian.xml>appclient-arquillian.xml</arquillian.xml>
+                                    </systemPropertyVariables>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+   
+    </profiles>
+</project>
