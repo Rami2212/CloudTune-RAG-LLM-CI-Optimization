@@ -27,7 +27,7 @@ from evaluation.third_party.ci_cost.setup import (
 
 from evaluation.candidate_validator import validate_and_archive, validate_baseline
 from evaluation.ci_executor import (
-    ForkExperiment, GitHub, RunPending, RunQueueTimeout, RunExecutionTimeout,
+    ForkExperiment, GitHub, GitHubRateLimit, RunPending, RunQueueTimeout, RunExecutionTimeout,
     automatic_fork_deletion_enabled,
     arm_name, log_progress, summarize_records,
 )
@@ -43,7 +43,7 @@ from evaluation.repository_preparation import (GitHubReader, file_sha256, read_e
 from evaluation.run_pipeline import ROOT, load_config, prepare
 
 
-PROTOCOL = "cloudtune-local-fork-abc-v14-stale-arm-branch-recovery"
+PROTOCOL = "cloudtune-local-fork-abc-v15-bounded-retries-rate-limit-stop"
 
 
 class StateStore:
@@ -504,9 +504,10 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False,
     elif state.get("config_sha256") != config_sha:
         raise ValueError("Frozen config changed; use a new evaluation_id")
     elif state.get("protocol") in {
+            "cloudtune-local-fork-abc-v14-stale-arm-branch-recovery",
             "cloudtune-local-fork-abc-v12-queue-timeout-120s",
             "cloudtune-local-fork-abc-v13-run-timeout-10m"}:
-        # v13/v14 add bounded run recovery and safe handling for stale refs.
+        # v13-v15 add bounded run recovery, stale-ref handling and safe retries.
         # Keep checkpoints resumable when the frozen experiment config matches.
         state["protocol"] = PROTOCOL
         state["implementation_sha256"] = code_sha
@@ -637,23 +638,32 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False,
                              max_tokens=config["rag"]["max_tokens"],
                              required_job_names=config["execution"].get("required_job_names", []))
                 except RagDevicePaused as exc:
-                    # Hardware unavailability is not an optimizer verdict.
-                    # Keep C absent so explicit resume retries this same trial.
-                    repo["status"] = "RAG_PAUSED"
+                    # Hardware failures are isolated to this repository; the
+                    # batch continues after recording that no C candidate exists.
+                    repo["status"] = "INCOMPLETE"
                     repo["failure_reason"] = str(exc)
+                    repo["retry_exhausted"] = True
                     save()
-                    log_progress("ERROR", f"{repo_id}: LLM + RAG paused: {exc}")
-                    return _save_report(output, state)
+                    log_progress("ERROR", f"{repo_id}: RAG unavailable; skipping after retry policy: {exc}")
+                    _save_report(output, state)
+                    continue
                 except OpenRouterPaused as exc:
-                    # Unlike an invalid candidate, an unavailable free provider
-                    # must not become a permanent C=ERROR on this checkpoint.
-                    # Stop before creating any fork; resume the frozen request
-                    # only after a human explicitly restarts the controller.
-                    repo["status"] = "LLM_PAUSED"
+                    # A provider rate limit is the one LLM condition that stops
+                    # the batch. Other exhausted failures skip this repository.
+                    if exc.http_status == 429:
+                        repo["status"] = "RATE_LIMITED"
+                        repo["rate_limit_source"] = "openrouter"
+                        repo["failure_reason"] = str(exc)
+                        save()
+                        log_progress("ERROR", f"{repo_id}: OpenRouter rate limit; stopping batch")
+                        return _save_report(output, state)
+                    repo["status"] = "INCOMPLETE"
                     repo["failure_reason"] = str(exc)
+                    repo["retry_exhausted"] = True
                     save()
-                    log_progress("OPTIMIZER", f"{repo_id}: LLM + RAG paused: {exc}")
-                    return _save_report(output, state)
+                    log_progress("OPTIMIZER", f"{repo_id}: OpenRouter failed after retries; skipping repository: {exc}")
+                    _save_report(output, state)
+                    continue
                 except (ValueError, RuntimeError, OSError, KeyError, json.JSONDecodeError) as exc:
                     # A provider/network/generation failure is a valid research
                     # outcome, not a reason to drop the repository or fabricate
@@ -813,15 +823,26 @@ def run_fork_evaluation(config: dict, *, resume_only: bool = False,
             log_progress("PENDING", f"{repo_id}: {pending}; pending run={repo.get('pending', {}).get('run_id') if repo.get('pending') else None}")
             save()
             return _save_report(output, state)
+        except GitHubRateLimit as exc:
+            repo["status"] = "RATE_LIMITED"
+            repo["rate_limit_source"] = "github"
+            repo["failure_reason"] = str(exc)[:400]
+            save()
+            _save_report(output, state)
+            log_progress("ERROR", f"{repo_id}: GitHub rate limit; stopping batch")
+            raise
         except Exception as exc:
             # Durable checkpoint is retained. We do not dispatch again after
             # an ambiguous failure, and we never label a failed run a speedup.
+            # Safe GET requests have already had three attempts; never replay a
+            # write whose outcome could be uncertain. Move on to the next repo.
             repo["status"] = "INCOMPLETE"
             repo["failure_reason"] = type(exc).__name__ + ": " + str(exc)[:400]
-            log_progress("ERROR", f"{repo_id}: interrupted by {type(exc).__name__}; inspect checkpoint")
+            repo["retry_exhausted"] = True
+            log_progress("ERROR", f"{repo_id}: failed after retry policy; preserving checkpoint and continuing: {type(exc).__name__}: {exc}")
             save()
             _save_report(output, state)
-            raise
+            continue
         _save_report(output, state)
     return _save_report(output, state)
 
@@ -902,15 +923,9 @@ def main() -> int:
                     print("A/B/C admission blocked; no fork created for blocked repositories.",
                           file=sys.stderr, flush=True)
                     return 2
-                if any(value == "LLM_PAUSED" for value in status.values()):
-                    print("OpenRouter request paused; inspect archived llm_error.json "
-                          "and resume explicitly with the same frozen evaluation ID. "
-                          "No automatic LLM retry or CI dispatch occurred.",
-                          file=sys.stderr, flush=True)
-                    return 2
-                if any(value == "RAG_PAUSED" for value in status.values()):
-                    print("RAG embedding device failed; restore the requested GPU and restart "
-                          "the SAME command. No automatic retry, CPU fallback or CI dispatch occurred.",
+                if any(value == "RATE_LIMITED" for value in status.values()):
+                    print("GitHub or OpenRouter rate limit reached; batch stopped. "
+                          "Wait for the provider reset, then resume the same command.",
                           file=sys.stderr, flush=True)
                     return 2
                 active = {"SELECTED", "WAITING_FOR_GITHUB_RUN", "READY_FOR_NEXT_CONTROLLER_RUN"}

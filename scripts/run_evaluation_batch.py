@@ -141,9 +141,13 @@ def _record(batch_id: str, position: int, repo_id: str) -> tuple[dict, dict, dic
 
 
 def _terminal(repo_state: dict, repo_report: dict) -> bool:
+    status = repo_report.get("status") or repo_state.get("status", "NOT_STARTED")
+    if status == "INCOMPLETE" and repo_state.get("retry_exhausted") is True:
+        # The controller has exhausted safe retries. A pending run remains
+        # checkpointed and its fork is preserved, while the batch advances.
+        return True
     if repo_state.get("pending"):
         return False
-    status = repo_report.get("status") or repo_state.get("status", "NOT_STARTED")
     if status == "PREFLIGHT_BLOCKED":
         return not repo_state.get("fork_repo")
     if status == "SKIPPED":
@@ -567,6 +571,10 @@ def run_batch(member: int, batch_id: str, *, preflight_only: bool, max_repositor
         if stage == "preflight":
             result = _invoke(member, index, "preflight", batch_id)
             _, current, report = _record(batch_id, index, repo_id)
+            if current.get("status") == "RATE_LIMITED" or report.get("status") == "RATE_LIMITED":
+                publish_batch(member, rows, batch_id)
+                print("GitHub or OpenRouter rate limit reached; batch stopped. Wait for reset, then resume the same command.", flush=True)
+                return 2
             stage = _stage(current, report)
             accepted = (stage == "ready" and result == 0) or (
                 stage == "finished" and current.get("status") == "PREFLIGHT_BLOCKED" and result == 2)
@@ -602,6 +610,10 @@ def run_batch(member: int, batch_id: str, *, preflight_only: bool, max_repositor
         if not preflight_only and stage == "ready":
             result = _invoke(member, index, "hosted", batch_id)
             _, current, report = _record(batch_id, index, repo_id)
+            if current.get("status") == "RATE_LIMITED" or report.get("status") == "RATE_LIMITED":
+                publish_batch(member, rows, batch_id)
+                print("GitHub or OpenRouter rate limit reached; batch stopped. Wait for reset, then resume the same command.", flush=True)
+                return 2
             stage = _stage(current, report)
             if stage != "finished" or result != 0:
                 publish_batch(member, rows, batch_id)
@@ -610,6 +622,10 @@ def run_batch(member: int, batch_id: str, *, preflight_only: bool, max_repositor
         elif not preflight_only and stage == "hosted":
             result = _invoke(member, index, "hosted", batch_id)
             _, current, report = _record(batch_id, index, repo_id)
+            if current.get("status") == "RATE_LIMITED" or report.get("status") == "RATE_LIMITED":
+                publish_batch(member, rows, batch_id)
+                print("GitHub or OpenRouter rate limit reached; batch stopped. Wait for reset, then resume the same command.", flush=True)
+                return 2
             if _stage(current, report) != "finished" or result != 0:
                 publish_batch(member, rows, batch_id)
                 print("Hosted checkpoint unresolved; restart SAME command after review.", flush=True)
