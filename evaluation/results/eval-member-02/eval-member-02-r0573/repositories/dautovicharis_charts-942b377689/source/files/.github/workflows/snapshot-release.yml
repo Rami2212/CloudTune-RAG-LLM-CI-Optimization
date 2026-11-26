@@ -1,0 +1,317 @@
+# Coordinates Maven, static docs assets, and Android builds for one snapshot.
+# It runs when recent code changes justify a snapshot publish.
+name: Snapshot Release
+on:
+  workflow_call:
+    secrets:
+      POSTHOG_PROJECT_TOKEN:
+        required: true
+      AWS_ROLE_ARN:
+        required: true
+      CHARTS_WORKFLOW_TOKEN:
+        required: true
+      MAVEN_CENTRAL_USERNAME:
+        required: true
+      MAVEN_CENTRAL_PASSWORD:
+        required: true
+      SIGNING_KEY_ID:
+        required: true
+      SIGNING_PASSWORD:
+        required: true
+      SIGNING_IN_MEMORY_KEY:
+        required: true
+      ANDROID_RELEASE_KEYSTORE_BASE64:
+        required: true
+      ANDROID_RELEASE_STORE_PASSWORD:
+        required: true
+      ANDROID_RELEASE_KEY_ALIAS:
+        required: true
+      ANDROID_RELEASE_KEY_PASSWORD:
+        required: true
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: Optional note for the manual snapshot run.
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: snapshot-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Check for Changes
+    runs-on: ubuntu-26.04
+    outputs:
+      has_changes: ${{ steps.changes.outputs.has_changes }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Detect recent changes
+        id: changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            echo "Manual snapshot run requested."
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          files=$(git log --since="24 hours ago" --name-only --pretty=format: | sort -u)
+          if [ -z "${files:-}" ]; then
+            echo "No commits in the last 24 hours."
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          filtered="$(printf '%s\n' "${files}" | bash scripts/ci-has-code-changes.sh --filter snapshot | sort -u)"
+          if [ -z "${filtered:-}" ]; then
+            echo "Only ignored paths changed in the last 24 hours."
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Changes detected in the last 24 hours:"
+            echo "$filtered"
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  prepare-snapshot:
+    name: Prepare Snapshot Release
+    runs-on: ubuntu-26.04
+    needs: changes
+    if: ${{ needs.changes.outputs.has_changes == 'true' }}
+    environment: Snapshot
+    outputs:
+      snapshot_version: ${{ steps.version.outputs.snapshot_version }}
+      release_notes_version: ${{ steps.version.outputs.release_notes_version }}
+      is_snapshot: ${{ steps.version.outputs.is_snapshot }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: ./.github/actions/setup-jdk
+        with:
+          cache-read-only: true
+
+      - name: Resolve snapshot version from Axion
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          SNAPSHOT_VERSION=$(./gradlew -q currentVersion \
+            | awk 'NF {v=$NF} END {gsub(/\r/, "", v); print v}')
+          if [ -z "${SNAPSHOT_VERSION:-}" ]; then
+            echo "Failed to resolve version from Axion currentVersion task." >&2
+            exit 1
+          fi
+
+          # Check if version contains SNAPSHOT
+          if [[ "$SNAPSHOT_VERSION" != *"-SNAPSHOT"* ]]; then
+            echo "⏭️  Skipping snapshot release - version is not a SNAPSHOT: ${SNAPSHOT_VERSION}"
+            echo "is_snapshot=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_snapshot=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "snapshot_version=${SNAPSHOT_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "release_notes_version=${SNAPSHOT_VERSION%-SNAPSHOT}" >> "$GITHUB_OUTPUT"
+          echo "Config chartsVersion: ${SNAPSHOT_VERSION}"
+
+      - name: Record immutable snapshot source
+        id: source
+        shell: bash
+        run: echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Validate charts-docs workflow token
+        if: ${{ steps.version.outputs.is_snapshot == 'true' }}
+        env:
+          CHARTS_WORKFLOW_TOKEN: ${{ secrets.CHARTS_WORKFLOW_TOKEN }}
+        shell: bash
+        run: |
+          if [[ -z "${CHARTS_WORKFLOW_TOKEN:-}" ]]; then
+            echo "Missing CHARTS_WORKFLOW_TOKEN. It must be a release-bot token with contents:write and ruleset-bypass access to HDCharts/charts-docs main." >&2
+            exit 1
+          fi
+
+  sync-release-notes:
+    name: Sync snapshot release notes, wiki docs, and GIF baselines
+    needs: prepare-snapshot
+    if: ${{ needs.prepare-snapshot.outputs.is_snapshot == 'true' }}
+    uses: ./.github/workflows/sync-snapshot-docs.yml
+    with:
+      source-ref: ${{ needs.prepare-snapshot.outputs.source_sha }}
+      release-notes-version: ${{ needs.prepare-snapshot.outputs.release_notes_version }}
+      write-provenance-manifest: true
+      charts-version: ${{ needs.prepare-snapshot.outputs.snapshot_version }}
+    secrets:
+      CHARTS_WORKFLOW_TOKEN: ${{ secrets.CHARTS_WORKFLOW_TOKEN }}
+
+  publish-static-assets:
+    name: Publish snapshot API reference and demo
+    needs: [prepare-snapshot, sync-release-notes]
+    if: ${{ needs.prepare-snapshot.outputs.is_snapshot == 'true' }}
+    uses: ./.github/workflows/publish-static-assets.yml
+    with:
+      mode: snapshot
+      charts-version: ${{ needs.prepare-snapshot.outputs.snapshot_version }}
+      source-sha: ${{ needs.prepare-snapshot.outputs.source_sha }}
+      source-ref: ${{ needs.prepare-snapshot.outputs.source_sha }}
+    secrets:
+      POSTHOG_PROJECT_TOKEN: ${{ secrets.POSTHOG_PROJECT_TOKEN }}
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+
+  publish-maven:
+    name: Publish Snapshot to Maven Central
+    needs: [prepare-snapshot, publish-static-assets]
+    if: ${{ needs.prepare-snapshot.outputs.is_snapshot == 'true' }}
+    runs-on: ubuntu-26.04
+    environment: Snapshot
+    steps:
+      - name: Checkout snapshot source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.prepare-snapshot.outputs.source_sha }}
+      - name: Set up JDK 17
+        uses: ./.github/actions/setup-jdk
+        with:
+          cache-read-only: true
+
+      - name: Record snapshot publishing diagnostics
+        shell: bash
+        run: |
+          echo "Before snapshot publishing (UTC): $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          echo "Runner CPU count: $(nproc)"
+          echo "Maven Central repository CDN trace (download path):"
+          if ! curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
+            https://repo1.maven.org/cdn-cgi/trace | awk '/^(ip|colo)=/'; then
+            echo "::warning::Could not record Maven Central repository CDN trace."
+          fi
+
+          cat > "$RUNNER_TEMP/snapshot-publishing-diagnostics.init.gradle" <<'GRADLE'
+          if (gradle.parent == null) {
+              println "Snapshot publishing Gradle: ${gradle.gradleVersion}"
+              println "Snapshot publishing max workers: ${gradle.startParameter.maxWorkerCount}"
+              println "Snapshot publishing parallel projects: ${gradle.startParameter.parallelProjectExecutionEnabled}"
+          }
+          GRADLE
+
+      - name: Resolve upload parallelism
+        id: upload-parallelism
+        shell: bash
+        env:
+          # Repository variable (Settings > Secrets and variables > Actions > Variables).
+          # 1 = fully serialized uploads (known good); 2+ = that many concurrent
+          # upload workers. Change the variable, not the workflow, to tune this.
+          MAVEN_UPLOAD_MAX_PARALLEL: ${{ vars.MAVEN_UPLOAD_MAX_PARALLEL }}
+        run: |
+          set -euo pipefail
+
+          n="${MAVEN_UPLOAD_MAX_PARALLEL:-1}"
+          if ! [[ "$n" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::warning::MAVEN_UPLOAD_MAX_PARALLEL must be a positive integer, got '${n}'. Falling back to 1."
+            n=1
+          fi
+
+          if [ "$n" -eq 1 ]; then
+            # One project at a time, one worker: at most one upload in flight.
+            flags="--no-parallel --max-workers=1"
+          else
+            # N workers with parallel projects: at most N concurrent uploads.
+            flags="--max-workers=$n"
+          fi
+
+          echo "gradle-flags=$flags" >> "$GITHUB_OUTPUT"
+          echo "Snapshot upload parallelism: $n ($flags)"
+
+      - name: Publish snapshot to Maven Central
+        id: publish
+        uses: ./.github/actions/publish-charts-modules
+        env:
+          POSTHOG_PROJECT_TOKEN: ${{ secrets.POSTHOG_PROJECT_TOKEN }}
+        with:
+          maven-central-username: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          maven-central-password: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          signing-key-id: ${{ secrets.SIGNING_KEY_ID }}
+          signing-password: ${{ secrets.SIGNING_PASSWORD }}
+          signing-in-memory-key: ${{ secrets.SIGNING_IN_MEMORY_KEY }}
+          # Diagnostics init script prints the effective maxWorkerCount and
+          # parallelProjectExecutionEnabled, confirming what the variable selected.
+          gradle-arguments: >-
+            --init-script "${{ runner.temp }}/snapshot-publishing-diagnostics.init.gradle"
+            ${{ steps.upload-parallelism.outputs.gradle-flags }}
+            -Pdevelopment=false
+
+      - name: Record snapshot publishing outcome
+        if: ${{ always() && (steps.publish.outcome == 'success' || steps.publish.outcome == 'failure') }}
+        shell: bash
+        run: |
+          echo "After snapshot publishing (UTC): $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          echo "Snapshot publishing outcome: ${{ steps.publish.outcome }}"
+          echo "Maven Central repository CDN trace (download path):"
+          if ! curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
+            https://repo1.maven.org/cdn-cgi/trace | awk '/^(ip|colo)=/'; then
+            echo "::warning::Could not record Maven Central repository CDN trace."
+          fi
+
+  announce-snapshot:
+    name: Announce Snapshot Release
+    needs: [prepare-snapshot, publish-static-assets, publish-maven]
+    if: ${{ needs.prepare-snapshot.outputs.is_snapshot == 'true' }}
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+      - name: Publish GitHub prerelease with highlights
+        id: publish
+        uses: ./.github/actions/publish-github-prerelease
+        with:
+          source-sha: ${{ needs.prepare-snapshot.outputs.source_sha }}
+          version: ${{ needs.prepare-snapshot.outputs.release_notes_version }}
+      - name: Comment on commit
+        uses: actions/github-script@v9
+        env:
+          RELEASE_URL: ${{ steps.publish.outputs.release-url }}
+        with:
+          script: |
+            const releaseUrl = process.env.RELEASE_URL;
+
+            const message = [
+              `📚 [Documentation](https://charts.hdcode.dev/)`,
+              `📦 [Maven Central](https://central.sonatype.com/repository/maven-snapshots/io/github/hdcharts/charts/maven-metadata.xml)`,
+            ].join('\n');
+
+            await github.rest.repos.createCommitComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: context.sha,
+              body: `${message}\n\n🔗 [GitHub Pre-Release](${releaseUrl})`,
+            });
+
+  build-android:
+    name: Build Android Snapshot
+    needs: [prepare-snapshot, publish-static-assets, publish-maven]
+    if: ${{ needs.prepare-snapshot.outputs.is_snapshot == 'true' }}
+    uses: ./.github/workflows/android-build.yml
+    with:
+      channel: snapshot
+      source-sha: ${{ needs.prepare-snapshot.outputs.source_sha }}
+      published-version: ${{ needs.prepare-snapshot.outputs.snapshot_version }}
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+      ANDROID_RELEASE_KEYSTORE_BASE64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
+      ANDROID_RELEASE_STORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_STORE_PASSWORD }}
+      ANDROID_RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
+      ANDROID_RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}

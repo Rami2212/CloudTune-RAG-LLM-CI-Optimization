@@ -1,0 +1,217 @@
+# Reusable charts test suite for pull request orchestration.
+name: Test
+
+on:
+  workflow_call:
+    inputs:
+      source-sha:
+        description: Immutable merge revision being checked.
+        required: true
+        type: string
+      jvm:
+        description: Whether Prepare PR selected the JVM tests.
+        required: true
+        type: boolean
+      android:
+        description: Whether Prepare PR selected the Android instrumented tests.
+        required: true
+        type: boolean
+      ios:
+        description: Whether Prepare PR selected the iOS tests.
+        required: true
+        type: boolean
+      screenshot:
+        description: Whether Prepare PR selected the screenshot tests.
+        required: true
+        type: boolean
+      test-modules:
+        description: Comma-separated Gradle projects for the ciTest* tasks. Empty runs every module.
+        required: false
+        type: string
+        default: ''
+      screenshot-tests:
+        description: Comma-separated screenshot test classes. Empty runs every class.
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+# Gradle reads ORG_GRADLE_PROJECT_<name> as the project property <name>. Passing the selection
+# through the environment keeps it out of the shell commands.
+jobs:
+  skipped:
+    name: No tests selected
+    if: ${{ !inputs.jvm && !inputs.android && !inputs.screenshot && !inputs.ios }}
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Report no-op
+        run: echo 'Prepare PR selected no test job for this change.'
+
+  jvm-tests:
+    name: JVM Tests
+    if: ${{ inputs.jvm }}
+    runs-on: ubuntu-26.04
+    env:
+      ORG_GRADLE_PROJECT_ciTestModules: ${{ inputs.test-modules }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          ref: ${{ inputs.source-sha }}
+
+      - name: Set up JDK 17
+        uses: ./.github/actions/setup-jdk
+        with:
+          # Only warm-gradle-cache.yml writes caches; a write here scopes the entry to the PR.
+          cache-read-only: true
+
+      - name: Run JVM tests
+        run: ./gradlew ciTestJvm --no-daemon
+
+      - name: Upload JVM test reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: jvm-test-reports
+          if-no-files-found: warn
+          path: |
+            **/build/reports/tests/**
+            **/build/test-results/**
+
+  android-instrumented-tests:
+    name: Android Instrumented Tests ${{ matrix.shard }}/2
+    if: ${{ inputs.android }}
+    runs-on: ubuntu-26.04
+    env:
+      ORG_GRADLE_PROJECT_ciTestModules: ${{ inputs.test-modules }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          ref: ${{ inputs.source-sha }}
+
+      - name: Set up JDK 17
+        uses: ./.github/actions/setup-jdk
+        with:
+          # Only warm-gradle-cache.yml writes caches; a write here scopes the entry to the PR.
+          cache-read-only: true
+
+      # Starting the emulator takes minutes, so check first that this shard has device tests to run.
+      - name: Select device test modules
+        id: shard
+        run: |
+          set -euo pipefail
+          if ! ./gradlew ciTestAndroidInstrumented -PandroidTestShard=${{ matrix.shard }} --dry-run --no-daemon --console=plain > dry-run.log 2>&1; then
+            cat dry-run.log
+            exit 1
+          fi
+          task_lines="$(grep -c 'connectedAndroidTest' dry-run.log || true)"
+          modules="$(sed -n 's/^\(:.*\):connectedAndroidTest SKIPPED$/\1/p' dry-run.log | paste -sd ' ' -)"
+          if [ "$task_lines" -gt 0 ] && [ -z "$modules" ]; then
+            echo "The dry-run lists ${task_lines} connectedAndroidTest task(s) but none matched the expected '<project>:connectedAndroidTest SKIPPED' line format." | tee -a "$GITHUB_STEP_SUMMARY"
+            grep 'connectedAndroidTest' dry-run.log
+            exit 1
+          fi
+          echo "modules=${modules}" >> "$GITHUB_OUTPUT"
+          if [ -n "$modules" ]; then
+            echo "Shard ${{ matrix.shard }} runs device tests for: ${modules}" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Shard ${{ matrix.shard }} has no selected module with device tests, so the emulator does not start." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Enable KVM for the Android emulator
+        if: ${{ steps.shard.outputs.modules != '' }}
+        run: |
+          echo 'KERNEL=="kvm", MODE="0666", GROUP="kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run Android instrumented tests on emulator
+        if: ${{ steps.shard.outputs.modules != '' }}
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: aosp_atd
+          arch: x86_64
+          profile: Nexus 6
+          emulator-options: -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -no-snapshot
+          script: adb shell setprop debug.hwui.drawing_enabled 1 && adb shell wm density 280 && ./gradlew ciTestAndroidInstrumented -PandroidTestShard=${{ matrix.shard }} --no-daemon
+
+      - name: Upload Android instrumented test reports
+        if: ${{ always() && steps.shard.outputs.modules != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-instrumented-test-reports-${{ matrix.shard }}
+          if-no-files-found: warn
+          path: |
+            **/build/reports/androidTests/connected/**
+            **/build/outputs/androidTest-results/connected/**
+
+  screenshot-tests:
+    name: Screenshot Tests
+    if: ${{ inputs.screenshot }}
+    runs-on: ubuntu-26.04
+    env:
+      ORG_GRADLE_PROJECT_ciScreenshotTests: ${{ inputs.screenshot-tests }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          ref: ${{ inputs.source-sha }}
+
+      - name: Set up JDK 17
+        uses: ./.github/actions/setup-jdk
+        with:
+          # Only warm-gradle-cache.yml writes caches; a write here scopes the entry to the PR.
+          cache-read-only: true
+
+      - name: Run screenshot tests
+        run: ./gradlew ciTestScreenshot --no-daemon
+
+      - name: Upload screenshot test reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: screenshot-test-reports
+          if-no-files-found: warn
+          path: |
+            sample/androidApp/build/reports/screenshotTest/**
+            sample/androidApp/build/test-results/validateDebugScreenshotTest/**
+
+  ios-tests:
+    name: iOS Tests
+    if: ${{ inputs.ios }}
+    runs-on: macos-26
+    env:
+      ORG_GRADLE_PROJECT_ciTestModules: ${{ inputs.test-modules }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          ref: ${{ inputs.source-sha }}
+
+      - name: Set up JDK 17
+        uses: ./.github/actions/setup-jdk
+        with:
+          kotlin-native: true
+          # Only warm-gradle-cache.yml writes caches; a write here scopes the entry to the PR.
+          cache-read-only: true
+
+      - name: Run iOS tests
+        run: ./gradlew ciTestIos --no-daemon
+
+      - name: Upload iOS test reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ios-test-reports
+          if-no-files-found: warn
+          path: |
+            **/build/reports/iosSimulatorArm64Test/**
+            **/build/test-results/iosSimulatorArm64Test/**

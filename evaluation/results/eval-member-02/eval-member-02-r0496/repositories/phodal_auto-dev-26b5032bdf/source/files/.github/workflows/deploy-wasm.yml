@@ -1,0 +1,96 @@
+name: Deploy WASM to GitHub Pages
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow only one concurrent deployment, skipping runs queued between the run in-progress and latest queued.
+# However, do NOT cancel in-progress runs as we want to allow these production deployments to complete.
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  # Build job
+  build:
+    name: Build Kotlin/Wasm
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Download WASM Fonts for UTF-8 Support
+        run: |
+          echo "📦 Downloading Noto Sans SC TTF for full UTF-8 support..."
+          ./gradlew :mpp-ui:downloadWasmFonts --no-daemon --info
+
+      - name: Build WASM Distribution
+        run: |
+          # Clean to ensure fresh build
+          ./gradlew :mpp-ui:clean --no-daemon
+          # Build distribution with webpack (optimizer now enabled)
+          ./gradlew :mpp-ui:wasmJsBrowserDistribution --info --no-daemon
+
+      - name: List build artifacts
+        run: |
+          echo "Listing files in `mpp-ui/build/dist/wasmJs/productionExecutable/`"
+          cd mpp-ui/build/dist/wasmJs/productionExecutable/ || { echo "Directory not found"; exit 1; }
+          echo "--- find -ls ---"
+          find . -ls
+          echo "--- sizes (human readable) ---"
+          find . -type f -print0 | xargs -0 du -h 2>/dev/null | sort -h || true
+          echo "--- detailed ls ---"
+          find . -print0 | xargs -0 ls -la --group-directories-first 2>/dev/null || true
+          echo "--- disk usage summary ---"
+          du -sh .
+
+      - name: Fix permissions
+        run: |
+          chmod -v -R +rX "mpp-ui/build/dist/wasmJs/productionExecutable/" | while read line; do
+            echo "::warning title=Invalid file permissions automatically fixed::$line"
+          done
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: mpp-ui/build/dist/wasmJs/productionExecutable/
+
+  # Deployment job
+  deploy:
+    name: Deploy to GitHub Pages
+    # Add a dependency to the build job
+    needs: build
+
+    # Grant GITHUB_TOKEN the permissions required to make a Pages deployment
+    permissions:
+      pages: write      # to deploy to Pages
+      id-token: write   # to verify the deployment originates from an appropriate source
+
+    # Deploy to the github-pages environment
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    # Specify runner + deployment step
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

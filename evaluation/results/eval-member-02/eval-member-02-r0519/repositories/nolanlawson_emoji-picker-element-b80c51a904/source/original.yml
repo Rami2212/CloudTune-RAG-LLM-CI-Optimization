@@ -1,0 +1,119 @@
+# Largely borrowed from https://github.com/lit/lit/blob/56e8efd/.github/workflows/benchmarks.yml
+name: Benchmarks
+
+on: [pull_request]
+
+jobs:
+  benchmarks:
+    name: benchmarks
+
+    # We can't currently run benchmarks on PRs from forked repos, because the
+    # tachometer action reports results by posting a comment, and we can't post
+    # comments without a github token.
+    if: github.event.pull_request == null || github.event.pull_request.head.repo.full_name == github.repository
+
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: corepack enable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+      - run: pnpm i --frozen-lockfile
+
+      - name: install chromedriver
+        run: |
+          # install the chromedriver corresponding to whatever version of chrome is installed
+          pnpm i chromedriver@^$(google-chrome --version | awk '{print $3}' | cut -d. -f1)
+          pnpm benchmark:runtime:setup
+
+      # first-load
+      - name: Benchmark first-load
+        run: |
+          ./node_modules/.bin/tach \
+            --config ./test/benchmark/first-load.tachometer.json \
+            --json-file ./test/benchmark/first-load.results.json
+
+      - name: Report first-load
+        uses: andrewiggins/tachometer-reporter-action@v2
+        with:
+          report-id: emoji-picker-element-first-load
+          path: test/benchmark/first-load.results.json
+          pr-bench-name: this-change
+          base-bench-name: tip-of-tree
+
+      # second-load
+      - name: Benchmark second-load
+        run: |
+          ./node_modules/.bin/tach \
+            --config ./test/benchmark/second-load.tachometer.json \
+            --json-file ./test/benchmark/second-load.results.json
+
+      - name: Report second-load
+        uses: andrewiggins/tachometer-reporter-action@v2
+        with:
+          report-id: emoji-picker-element-second-load
+          path: test/benchmark/second-load.results.json
+          pr-bench-name: this-change
+          base-bench-name: tip-of-tree
+
+      # database-interactions
+      - name: Benchmark database-interactions
+        run: |
+          ./node_modules/.bin/tach \
+            --config ./test/benchmark/database-interactions.tachometer.json \
+            --json-file ./test/benchmark/database-interactions.results.json
+
+      - name: Report database-interactions
+        uses: andrewiggins/tachometer-reporter-action@v2
+        with:
+          report-id: emoji-picker-element-database-interactions
+          path: test/benchmark/database-interactions.results.json
+          pr-bench-name: this-change
+          base-bench-name: tip-of-tree
+
+      # change-tab
+      - name: Benchmark change-tab
+        run: |
+          ./node_modules/.bin/tach \
+            --config ./test/benchmark/change-tab.tachometer.json \
+            --json-file ./test/benchmark/change-tab.results.json
+
+      - name: Report change-tab
+        uses: andrewiggins/tachometer-reporter-action@v2
+        with:
+          report-id: emoji-picker-element-change-tab
+          path: test/benchmark/change-tab.results.json
+          pr-bench-name: this-change
+          base-bench-name: tip-of-tree
+
+      # search
+      - name: Benchmark search
+        run: |
+          ./node_modules/.bin/tach \
+            --config ./test/benchmark/search.tachometer.json \
+            --json-file ./test/benchmark/search.results.json
+
+      - name: Report search
+        uses: andrewiggins/tachometer-reporter-action@v2
+        with:
+          report-id: emoji-picker-element-search
+          path: test/benchmark/search.results.json
+          pr-bench-name: this-change
+          base-bench-name: tip-of-tree
+
+      # many-custom-emoji
+      - name: Benchmark many-custom-emoji
+        run: |
+          ./node_modules/.bin/tach \
+            --config ./test/benchmark/many-custom-emoji.tachometer.json \
+            --json-file ./test/benchmark/many-custom-emoji.results.json
+
+      - name: Report many-custom-emoji
+        uses: andrewiggins/tachometer-reporter-action@v2
+        with:
+          report-id: emoji-picker-element-many-custom-emoji
+          path: test/benchmark/many-custom-emoji.results.json
+          pr-bench-name: this-change
+          base-bench-name: tip-of-tree

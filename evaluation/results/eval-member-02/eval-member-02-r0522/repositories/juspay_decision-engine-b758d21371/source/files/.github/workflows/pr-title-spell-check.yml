@@ -1,0 +1,35 @@
+name: PR Title Spell Check
+
+on:
+  pull_request:
+    types:
+      - opened
+      - edited
+      - synchronize
+
+  # The merge queue requires this check too. There the PR title is the queued commit's first line.
+  merge_group:
+    types:
+      - checks_requested
+
+jobs:
+  typos:
+    name: Spell check PR title
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Store PR title in a file
+        shell: bash
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+          COMMIT_MESSAGE: ${{ github.event.merge_group.head_commit.message }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = merge_group ]; then TITLE="${COMMIT_MESSAGE%%$'\n'*}"; fi
+          echo "$TITLE" > pr_title.txt
+
+      - name: Spell check
+        uses: crate-ci/typos@v1
+        with:
+          files: ./pr_title.txt

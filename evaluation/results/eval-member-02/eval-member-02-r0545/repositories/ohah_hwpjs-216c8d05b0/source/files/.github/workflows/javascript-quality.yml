@@ -1,0 +1,1406 @@
+name: JavaScript Quality
+
+on:
+  workflow_call:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  document-search-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.20.0'
+      - name: Test document search Native registration
+        run: node --test tools/tests/document-search-native-registration.test.mjs tools/tests/document-search-native-snapshot.test.mjs
+      - name: Install pinned document search Zig toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          search_zig_dir="$RUNNER_TEMP/document-search-zig"
+          mkdir "$search_zig_dir"
+          node --input-type=module -e 'import fs from "node:fs"; const p=JSON.parse(fs.readFileSync("tools/document-search-zig-toolchain.json")); for (const k of ["url","archiveSha256","archiveBytes"]) console.log(p[k]);' > "$search_zig_dir/pin.txt"
+          mapfile -t search_zig_pin < "$search_zig_dir/pin.txt"
+          curl --fail --location --proto '=https' --tlsv1.2 "${search_zig_pin[0]}" --output "$search_zig_dir/toolchain.tar.xz"
+          test "$(stat -c %s "$search_zig_dir/toolchain.tar.xz")" = "${search_zig_pin[2]}"
+          printf '%s  %s\n' "${search_zig_pin[1]}" "$search_zig_dir/toolchain.tar.xz" | sha256sum --check --strict
+          mkdir "$search_zig_dir/compiler"
+          tar -xJf "$search_zig_dir/toolchain.tar.xz" --strip-components=1 -C "$search_zig_dir/compiler"
+          chmod -R a-w "$search_zig_dir/compiler"
+          printf 'HWPJS_SEARCH_ZIG=%s\n' "$search_zig_dir/compiler/zig" >> "$GITHUB_ENV"
+      - name: Run all registered document search Native contracts once
+        shell: bash
+        run: |
+          set -euo pipefail
+          node tools/run-document-search-native.mjs --execute --zig="$HWPJS_SEARCH_ZIG" --out="$RUNNER_TEMP/document-search-native"
+      - name: Preserve first document search Native evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: document-search-native-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/document-search-native
+            ${{ runner.temp }}/document-search-zig/pin.txt
+          retention-days: 7
+          if-no-files-found: error
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.20.0'
+      - name: Install frozen workspace dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Test strict font decode ownership and recovery
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --experimental-transform-types --test --test-concurrency=1 --test-reporter=tap \
+            tools/tests/hwp5-strict-font-owner.test.mjs \
+            tools/tests/hwp5-strict-font-late-save.test.mjs \
+            apps/demo/tests/strict-layout-save-tool.test.ts 2>&1 | tee "$RUNNER_TEMP/strict-font-decode.tap"
+          grep -Eq '^# tests 14$' "$RUNNER_TEMP/strict-font-decode.tap"
+          grep -Eq '^# pass 14$' "$RUNNER_TEMP/strict-font-decode.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/strict-font-decode.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/strict-font-decode.tap"
+      - name: Test readonly document search SDK and source boundaries
+        timeout-minutes: 1
+        run: |
+          node --experimental-transform-types --test --test-concurrency=1 \
+            tools/tests/document-text-readonly-owner-contract.test.mjs \
+            tools/tests/document-text-batch-delegation.test.mjs \
+            tests/canvas/hwp5-readonly-public-reader.test.mjs \
+            tests/canvas/hwp5-readonly-core-path.test.mjs \
+            tests/canvas/hwpx-control-text-freshness-sdk.test.mjs \
+            tests/canvas/document-text-coordinate-boundary.test.ts \
+            tools/tests/selected-run-owner-contract.test.mjs
+      - name: Test selected-run Native fixture ownership contract
+        run: python3 -B -m unittest discover -s tools/tests -p 'test_document_text_selected_run_fixture.py' -v
+      - name: Test current public demo dependency notices
+        run: node --test tools/tests/ui-license-inputs.test.mjs
+
+      - name: Existing PAGE restart SDK issuer source tests
+        run: node --test tools/tests/page-restart-api.test.mjs
+      - name: Test headless generated-cell source authority and public Core types
+        run: |
+          bun test --no-install ./packages/core/tests/commands/created-cell-headless-text.test.ts ./packages/core/tests/commands/inline-object-owner-query.test.ts
+          node --test --test-concurrency=1 tools/tests/created-cell-headless-admission.test.mjs
+          bunx --no-install tsc -p tools/tests/tsconfig.created-cell-headless.json
+      - name: Test generated-cell Native registration graph
+        run: node --test --test-concurrency=1 tools/tests/generated-cell-native-registration.test.mjs
+      - name: Test form text raw line endings and measured wrapping
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test --test-concurrency=1 --test-reporter=tap tests/form-text-eol-layout.test.mjs | tee "$RUNNER_TEMP/hwpjs-form-text-eol-node.tap"
+          grep -Eq '^# tests 9$' "$RUNNER_TEMP/hwpjs-form-text-eol-node.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/hwpjs-form-text-eol-node.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/hwpjs-form-text-eol-node.tap"
+      - name: Preserve form text line-ending Node evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: form-text-eol-node-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hwpjs-form-text-eol-node.tap
+          retention-days: 7
+          if-no-files-found: warn
+      - name: Test bounded Native fixture preflight
+        run: |
+          test -f ./tools/tests/native-fixture-preflight.test.mjs || exit 1
+          node --test ./tools/tests/native-fixture-preflight.test.mjs
+      - name: Build core and vanilla for demo source regressions
+        run: |
+          test -f ./tools/build-packages.mjs || exit 1
+          test -f ./apps/docs/docs/public/editor/hwpjs/hwpjs.wasm || exit 1
+          bun ./tools/build-packages.mjs --package=core --web --wasm="$PWD/apps/docs/docs/public/editor/hwpjs/hwpjs.wasm"
+          bun ./tools/build-packages.mjs --package=vanilla --web --wasm="$PWD/apps/docs/docs/public/editor/hwpjs/hwpjs.wasm"
+      - name: Verify committed Native known owner-window profile
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          node tools/known-native-profile-inputs.mjs packages/core/dist apps/docs/docs/public/editor/hwpjs/hwpjs.wasm > "$RUNNER_TEMP/known-native-inputs.json"
+          export HWPJS_TEST_WASM="$(node -e 'console.log(require(process.argv[1]).wasm)' "$RUNNER_TEMP/known-native-inputs.json")"
+          export HWPJS_TEST_WASM_SHA256="$(node -e 'console.log(require(process.argv[1]).sha256)' "$RUNNER_TEMP/known-native-inputs.json")"
+          node --test --test-concurrency=1 --test-reporter=tap tools/tests/forms-known-profile.test.mjs | tee "$RUNNER_TEMP/forms-known-profile.tap"
+          grep -Eq '^# tests 2$' "$RUNNER_TEMP/forms-known-profile.tap"
+          grep -Eq '^# pass 2$' "$RUNNER_TEMP/forms-known-profile.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/forms-known-profile.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/forms-known-profile.tap"
+      - name: Test Native input provenance checks
+        run: node --test tools/tests/known-native-profile-inputs.test.mjs
+      - name: Test shortcut defaults, presentation and input boundaries
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          NO_COLOR=1 FORCE_COLOR=0 bun test --no-install ./apps/demo/tests/shortcut-settings-persistence.test.ts ./apps/demo/tests/formatting-marks-shortcut.test.ts ./apps/demo/tests/shortcut-presentation.test.ts ./apps/demo/tests/new-document-shortcut.test.ts ./apps/demo/tests/contextual-table-row-shortcut.test.ts ./apps/demo/tests/contextual-object-properties-shortcut.test.ts ./packages/core/tests/keymap/defaults.test.ts ./packages/core/tests/keymap/resolve.test.ts ./packages/core/tests/keymap/config.test.ts ./packages/vanilla/tests/shortcuts.test.ts 2>&1 | tee "$RUNNER_TEMP/shortcuts.log"
+          grep -Eq '^[[:space:]]*79 pass$' "$RUNNER_TEMP/shortcuts.log"
+          grep -Eq '^[[:space:]]*0 fail$' "$RUNNER_TEMP/shortcuts.log"
+          ! grep -Eq '[1-9][0-9]* skip' "$RUNNER_TEMP/shortcuts.log"
+          bunx --no-install tsc --noEmit -p tools/tsconfig.editor-shortcuts.json
+      - name: Test page ruler geometry and lifecycle
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --experimental-transform-types --test --test-concurrency=1 --test-reporter=tap apps/demo/tests/page-ruler.test.mjs apps/demo/tests/page-ruler-surface.test.mjs apps/demo/tests/page-ruler-lifetime.test.mjs apps/demo/tests/page-status.test.mjs packages/vanilla/tests/page-frame.test.ts 2>&1 | tee "$RUNNER_TEMP/page-ruler.tap"
+          grep -Eq '^# tests 36$' "$RUNNER_TEMP/page-ruler.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/page-ruler.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/page-ruler.tap"
+          bunx --no-install tsc --noEmit -p tools/tsconfig.page-ruler.json
+      - name: Test object activation and current properties dialogs
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --experimental-transform-types --test --test-concurrency=1 --test-reporter=tap tests/canvas/object-activation-target.test.mjs tests/canvas/drawing-observation.test.mjs tests/canvas/drawing-observation-body-completeness.test.mjs packages/vanilla/tests/object-activation.test.mjs apps/demo/tests/object-activation-relay.test.mjs apps/demo/tests/chart-data-controller.test.mjs apps/demo/tests/chart-data-view.test.mjs apps/demo/tests/drawing-properties.test.mjs apps/demo/tests/drawing-properties-view.test.mjs apps/demo/tests/chart-properties.test.mjs 2>&1 | tee "$RUNNER_TEMP/object-activation.tap"
+          # H5 query/body cohort is 89, the relays add 6, and HWP5 margin properties add 2.
+          object_expected_tests=$((89 + 6 + 2))
+          grep -Eq "^# tests ${object_expected_tests}$" "$RUNNER_TEMP/object-activation.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/object-activation.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/object-activation.tap"
+          bunx --no-install tsc --noEmit -p tools/tsconfig.object-activation.json
+          bunx --no-install tsc --noEmit -p apps/demo/tests/tsconfig.drawing-properties.json
+      - name: HWP5 chart creation transport contracts
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test --test-concurrency=1 --test-reporter=tap tests/own-chart-create/current-transport.test.mjs tests/own-chart-create/pie-source-contract.test.mjs tests/hwp5/pie-created-table-flow.test.mjs
+          bun test --no-install ./tests/own-chart-create/pie-core-queue.test.mjs ./tests/own-chart-create/current-sdk-queue.test.mjs
+          node --experimental-transform-types --import ./tools/tests/picture-resize-source-provider.mjs --test --test-concurrency=1 --test-reporter=tap apps/demo/tests/hwp5-pie-create-dialog.test.ts apps/demo/tests/inline-object-chart-kinds.test.ts apps/demo/tests/inline-object-insert-data-grid.test.ts apps/demo/tests/hwp5-chart-create-wired.test.mjs
+      - name: Existing HWP5 equation script Core and Worker source contracts
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          node node_modules/typescript/bin/tsc --noEmit -p apps/demo/tests/tsconfig.hwp5-equation-script.json
+          node --experimental-transform-types --import ./tools/tests/hwp5-equation-script-source-provider.mjs --test --test-concurrency=1 --test-reporter=tap apps/demo/tests/hwp5-equation-script.test.mjs 2>&1 | tee "$RUNNER_TEMP/hwp5-equation-script-source.tap"
+          grep -Eq '^# tests 13$' "$RUNNER_TEMP/hwp5-equation-script-source.tap"
+          grep -Eq '^# pass 13$' "$RUNNER_TEMP/hwp5-equation-script-source.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/hwp5-equation-script-source.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/hwp5-equation-script-source.tap"
+      - name: Existing HWP5 and HWPX picture crop source contracts
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun test --no-install --tsconfig-override ./tools/tests/tsconfig.picture-crop.json ./packages/core/tests/commands/picture-crop.test.ts ./packages/core/tests/commands/picture-crop-bridge.test.mjs ./packages/core/tests/transport/picture-crop-admission.test.ts ./apps/demo/tests/picture-crop-port.test.ts ./apps/demo/tests/picture-crop-form.test.ts ./apps/demo/tests/picture-crop-tool.test.ts
+          node node_modules/typescript/bin/tsc --noEmit -p tools/tests/tsconfig.picture-crop.json
+      - name: Existing PAGE restart Core and UI source contracts
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          node node_modules/typescript/bin/tsc --noEmit -p tools/tests/tsconfig.page-restart.json
+          node --experimental-transform-types --import ./tools/tests/page-restart-source-provider.mjs --test --test-concurrency=1 --test-reporter=tap apps/demo/tests/page-restart.test.mjs 2>&1 | tee "$RUNNER_TEMP/page-restart-source.tap"
+          grep -Eq '^# tests 14$' "$RUNNER_TEMP/page-restart-source.tap"
+          grep -Eq '^# pass 14$' "$RUNNER_TEMP/page-restart-source.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/page-restart-source.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/page-restart-source.tap"
+      - name: HWP5 chart literal edit source contracts
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          node node_modules/typescript/bin/tsc --noEmit -p tools/tests/tsconfig.hwp5-chart-data.json
+          node --experimental-transform-types --import ./tools/tests/hwp5-chart-data-source-provider.mjs --test --test-concurrency=1 --test-reporter=tap tests/own-chart-create/literal-edit-api.test.mjs tests/own-chart-create/preview-payload.test.mjs apps/demo/tests/hwp5-chart-data.test.mjs apps/demo/tests/chart-data-controller.test.mjs apps/demo/tests/chart-data-view.test.mjs apps/demo/tests/chart-data-port.test.mjs apps/demo/tests/hwp5-chart-properties.test.mjs packages/core/tests/state/native-read-source-lifecycle.test.ts 2>&1 | tee "$RUNNER_TEMP/hwp5-chart-literal-source.tap"
+          grep -Eq '^# tests 124$' "$RUNNER_TEMP/hwp5-chart-literal-source.tap"
+          grep -Eq '^# pass 124$' "$RUNNER_TEMP/hwp5-chart-literal-source.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/hwp5-chart-literal-source.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/hwp5-chart-literal-source.tap"
+      - name: HWP5 chart anchor source and current owner boundaries
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --experimental-transform-types --import ./tools/tests/hwp5-chart-data-source-provider.mjs --test --test-concurrency=1 --test-reporter=tap tests/canvas/hwp5-chart-anchor-current.test.mjs apps/demo/tests/hwp5-chart-properties.test.mjs 2>&1 | tee "$RUNNER_TEMP/hwp5-chart-anchor.tap"
+          grep -Eq '^# tests 33$' "$RUNNER_TEMP/hwp5-chart-anchor.tap"
+          grep -Eq '^# pass 33$' "$RUNNER_TEMP/hwp5-chart-anchor.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/hwp5-chart-anchor.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/hwp5-chart-anchor.tap"
+      - name: Test selected object P source contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          export HWPJS_TEST_CORE_DIST="$PWD/packages/core/dist"
+          node --experimental-transform-types --import ./tools/renderer-test-core-provider.mjs --test --test-concurrency=1 --test-reporter=tap packages/vanilla/tests/object-selection.test.ts tests/canvas/object-selection-paint.test.mjs tests/canvas/object-selection-direct-input.test.mjs 2>&1 | tee "$RUNNER_TEMP/object-selection-p.tap"
+          grep -Eq '^# tests 39$' "$RUNNER_TEMP/object-selection-p.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/object-selection-p.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/object-selection-p.tap"
+          node --experimental-transform-types --import ./tools/renderer-test-core-provider.mjs --test --test-concurrency=1 --test-reporter=tap tests/canvas/object-selection-frame-currentness.test.mjs tests/canvas/picture-resize-completed-paint.test.mjs 2>&1 | tee "$RUNNER_TEMP/object-selection-frame10.tap"
+          grep -Eq '^# tests 14$' "$RUNNER_TEMP/object-selection-frame10.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/object-selection-frame10.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/object-selection-frame10.tap"
+      - name: Test selected object property commands and focus boundaries
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          export HWPJS_TEST_CORE_DIST="$PWD/packages/core/dist"
+          node --experimental-transform-types --import ./tools/renderer-test-core-provider.mjs --test --test-concurrency=1 --test-reporter=tap packages/vanilla/tests/object-properties-command.test.ts apps/demo/tests/object-properties-command.test.mjs 2>&1 | tee "$RUNNER_TEMP/object-properties-command.tap"
+          grep -Eq '^# tests 15$' "$RUNNER_TEMP/object-properties-command.tap"
+          grep -Eq '^# pass 15$' "$RUNNER_TEMP/object-properties-command.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/object-properties-command.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/object-properties-command.tap"
+          bunx --no-install tsc --noEmit -p tools/tests/tsconfig.object-properties-command.json
+      - name: Test object selection window and descendant blur boundaries
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --experimental-transform-types --test --test-concurrency=1 --test-reporter=tap tests/canvas/object-selection-window-blur.test.mjs 2>&1 | tee "$RUNNER_TEMP/object-selection-window-blur.tap"
+          grep -Eq '^# tests 14$' "$RUNNER_TEMP/object-selection-window-blur.tap"
+          grep -Eq '^# pass 14$' "$RUNNER_TEMP/object-selection-window-blur.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/object-selection-window-blur.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/object-selection-window-blur.tap"
+      - name: Test object selection viewport and textarea scroll boundaries
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --experimental-transform-types --test --test-concurrency=1 --test-reporter=tap tests/canvas/object-selection-viewport-scroll.test.mjs 2>&1 | tee "$RUNNER_TEMP/object-selection-viewport-scroll.tap"
+          grep -Eq '^# tests 14$' "$RUNNER_TEMP/object-selection-viewport-scroll.tap"
+          grep -Eq '^# pass 14$' "$RUNNER_TEMP/object-selection-viewport-scroll.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/object-selection-viewport-scroll.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/object-selection-viewport-scroll.tap"
+      - name: Test generated-cell semantic ACK before queued input
+        shell: bash
+        run: |
+          set -euo pipefail
+          export HWPJS_TEST_CORE_DIST="$PWD/packages/core/dist"
+          node --experimental-transform-types --import ./tools/renderer-test-core-provider.mjs --test --test-concurrency=1 --test-reporter=tap tests/canvas/created-cell-burst-ack.test.mjs | tee "$RUNNER_TEMP/created-cell-burst-ack.tap"
+          grep -Eq '^# tests 24$' "$RUNNER_TEMP/created-cell-burst-ack.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/created-cell-burst-ack.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/created-cell-burst-ack.tap"
+      - name: Test ordinary plain ACK draft settlement
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          export HWPJS_TEST_CORE_DIST="$PWD/packages/core/dist"
+          node --experimental-transform-types --import ./tools/renderer-test-core-provider.mjs --test --test-concurrency=1 --test-reporter=tap tests/canvas/plain-ack-draft-settlement.test.mjs 2>&1 | tee "$RUNNER_TEMP/plain-ack-settlement.tap"
+          grep -Eq '^# tests 15$' "$RUNNER_TEMP/plain-ack-settlement.tap"
+          grep -Eq '^# pass 15$' "$RUNNER_TEMP/plain-ack-settlement.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/plain-ack-settlement.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/plain-ack-settlement.tap"
+      - name: Test chart16 JS source regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          NO_COLOR=1 FORCE_COLOR=0 bun test --no-install ./apps/demo/tests/chart-integration-tool.test.ts ./apps/demo/tests/inline-object-chart-kinds.test.ts ./packages/core/tests/commands/inline-object-chart-kinds.test.ts 2>&1 | tee "$RUNNER_TEMP/chart16-source-bun.log"
+          grep -Eq '^[[:space:]]*17 pass$' "$RUNNER_TEMP/chart16-source-bun.log"
+          grep -Eq '^[[:space:]]*0 fail$' "$RUNNER_TEMP/chart16-source-bun.log"
+          ! grep -Eq '[1-9][0-9]* skip' "$RUNNER_TEMP/chart16-source-bun.log"
+          node --test --test-concurrency=1 --test-reporter=tap tests/hwpx/chart-capability-runtime.test.mjs tests/hwpx/chart-create-decimal.test.mjs tests/hwpx/chart-family-completion.test.mjs tests/hwpx/chart-family-display-contract.test.mjs tests/hwpx/chart-kinds-js-contract.test.mjs tests/hwpx/chart-native-family-bridge.test.mjs tests/hwpx/chart-profile-abi.test.mjs tests/hwpx/chart-scatter-none.test.mjs tests/hwpx/chart-family-3d-linear.test.mjs 2>&1 | tee "$RUNNER_TEMP/chart16-source-node.tap"
+          grep -Eq '^# tests 84$' "$RUNNER_TEMP/chart16-source-node.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/chart16-source-node.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/chart16-source-node.tap"
+
+      - name: Test chart typing display continuity
+        run: node --test tests/hwpx/chart-display-continuity.test.mjs
+      - name: Test HWPX picture source crop rendering contract
+        run: node --test --test-concurrency=1 tests/image/hwpx-source-crop-rendering.test.mjs
+      - name: Test HWP5 picture source crop rendering contract
+        run: node --test --test-concurrency=1 tests/image/source-crop-rendering.test.mjs
+      - name: Test live image insertion transport and Core guards
+        run: node --experimental-transform-types --test --test-concurrency=1 tests/image/live-image-insertion.test.mjs
+      - name: Test synthetic HWPX chart and equation creation
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          NO_COLOR=1 FORCE_COLOR=0 bun test --no-install ./tests/hwpx/inline-object-js-core-queued.test.ts ./tests/hwpx/inline-object-js-facade.test.mjs ./tests/hwpx/inline-object-insert-sdk-newonly.test.mjs ./tests/hwpx/inline-object-js-core-guards.test.mjs 2>&1 | tee "$RUNNER_TEMP/inline-object-synthetic.log"
+          grep -Eq '^[[:space:]]*27 pass$' "$RUNNER_TEMP/inline-object-synthetic.log"
+          grep -Eq '^[[:space:]]*0 fail$' "$RUNNER_TEMP/inline-object-synthetic.log"
+          ! grep -Eq '[1-9][0-9]* skip' "$RUNNER_TEMP/inline-object-synthetic.log"
+          bunx --no-install tsc --noEmit -p ./tools/tests/tsconfig.inline-object-creation.json
+          bunx --no-install tsc --noEmit -p ./tools/tests/tsconfig.inline-object-ui.json
+      - name: Test shared caret and creation-only empty anchors
+        timeout-minutes: 2
+        run: |
+          bun test --no-install ./packages/core/tests/commands/current-caret.test.ts ./packages/core/tests/commands/inline-object-empty-anchor-caret.test.ts
+          bunx --no-install tsc --noEmit -p ./tools/tests/tsconfig.inline-object-caret.json
+      - name: Test normal SDK HWPX creation and old879 refusals
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin 680dbdee61ca51804104e050395301bb528f3faa
+          git show 680dbdee61ca51804104e050395301bb528f3faa:apps/docs/docs/public/editor/hwpjs/hwpjs.wasm > "$RUNNER_TEMP/inline-object-old879.wasm"
+          export HWPJS_TEST_WASM="$PWD/apps/docs/docs/public/editor/hwpjs/hwpjs.wasm"
+          export HWPJS_TEST_WASM_EXPECTED_SHA256="$(node tools/tests/helpers/native-wasm-pin.mjs --manifest ./packages/core/dist/build-manifest.json)"
+          export HWPJS_TEST_OLD_WASM="$RUNNER_TEMP/inline-object-old879.wasm"
+          export HWPJS_TEST_EVIDENCE_DIR="$RUNNER_TEMP/inline-object-creation"
+          node tools/tests/run-inline-object-creation-native.mjs
+          export HWPJS_TEST_EVIDENCE_DIR="$RUNNER_TEMP/inline-object-creation/caret-r9"
+          node tools/tests/run-inline-object-creation-native.mjs --caret
+      - name: Preserve new chart and equation SDK evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: inline-object-creation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/inline-object-creation
+          retention-days: 7
+          if-no-files-found: warn
+      - name: Test save consent guidance and owned cell focus paint
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          for path in ./apps/demo/tests/save-layout-consent-guidance.test.mjs ./tests/hwp5/save-failure-guidance.test.mjs ./tests/canvas/cell-copy-focus-visual.test.mjs; do test -f "$path"; done
+          node --experimental-transform-types --max-old-space-size=512 --test --test-concurrency=1 --test-timeout=30000 --test-reporter=tap \
+            ./apps/demo/tests/save-layout-consent-guidance.test.mjs \
+            ./tests/hwp5/save-failure-guidance.test.mjs \
+            ./tests/canvas/cell-copy-focus-visual.test.mjs | tee "$RUNNER_TEMP/hwpjs-save-cell-focus.tap"
+          grep -Eq '^# tests 56$' "$RUNNER_TEMP/hwpjs-save-cell-focus.tap"
+          grep -Eq '^# pass 56$' "$RUNNER_TEMP/hwpjs-save-cell-focus.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/hwpjs-save-cell-focus.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/hwpjs-save-cell-focus.tap"
+      - name: Test ShapeCopy normal SDK Native and controlled DOM contracts
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f ./packages/core/dist/build-manifest.json
+          test -f ./packages/vanilla/dist/build-manifest.json
+          node --test --test-concurrency=1 ./tools/tests/shape-copy-test-inputs.test.mjs ./tools/tests/shape-copy-cell-test-inputs.test.mjs
+          export HWPJS_SHAPE_COPY_INPUTS="$RUNNER_TEMP/hwpjs-shape-copy-inputs.json"
+          export HWPJS_SHAPE_COPY_OUTPUT="$RUNNER_TEMP/hwpjs-shape-copy-cases"
+          test ! -e "$HWPJS_SHAPE_COPY_INPUTS"
+          test ! -e "$HWPJS_SHAPE_COPY_OUTPUT"
+          node ./tools/shape-copy-test-inputs.mjs \
+            --wasm "$PWD/apps/docs/docs/public/editor/hwpjs/hwpjs.wasm" \
+            --out "$HWPJS_SHAPE_COPY_INPUTS"
+          export HWPJS_CELL_FIXTURE_INPUTS="$RUNNER_TEMP/hwpjs-shape-cell/cells.json"
+          export HWPJS_CELL_FOLLOWUP_FIXTURES="$RUNNER_TEMP/hwpjs-shape-cell/followup.json"
+          export HWPJS_CELL_OWNER_INPUTS="$RUNNER_TEMP/hwpjs-shape-cell/owner.json"
+          node --experimental-transform-types --max-old-space-size=512 \
+            --import ./tools/object-properties-test-css.mjs \
+            ./tools/shape-copy-cell-test-inputs.mjs --out "$RUNNER_TEMP/hwpjs-shape-cell"
+          set -- \
+            ./apps/demo/tests/shape-copy-native.test.mjs \
+            ./apps/demo/tests/shape-copy-ui.test.mjs \
+            ./apps/demo/tests/shape-copy-followup.test.mjs \
+            ./apps/demo/tests/shape-copy-followup-ui.test.mjs \
+            ./apps/demo/tests/shape-copy-routing.test.mjs \
+            ./apps/demo/tests/shape-copy-cell.test.mjs \
+            ./apps/demo/tests/shape-copy-cell-ui.test.mjs \
+            ./apps/demo/tests/shape-copy-cell-observer.test.mjs \
+            ./apps/demo/tests/shape-copy-cell-observer-owner.test.mjs \
+            ./apps/demo/tests/shape-copy-cell-atomic-followup.test.mjs \
+            ./apps/demo/tests/shape-copy-cell-menu-focus.test.mjs \
+            ./tools/tests/table-cell-appearance-observation.test.mjs \
+            ./apps/demo/tests/table-cell-appearance-port.test.mjs
+          for path in "$@" ./apps/demo/tests/shape-copy-native-fixture.mjs ./apps/demo/tests/shape-copy-followup-dom.mjs; do test -f "$path"; done
+          node --experimental-transform-types --max-old-space-size=512 \
+            --import ./tools/object-properties-test-css.mjs \
+            --test --test-concurrency=1 --test-timeout=60000 --test-reporter=tap "$@" \
+            | tee "$RUNNER_TEMP/hwpjs-shape-copy-node.tap"
+          grep -Eq '^# tests 275$' "$RUNNER_TEMP/hwpjs-shape-copy-node.tap"
+          grep -Eq '^# pass 275$' "$RUNNER_TEMP/hwpjs-shape-copy-node.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/hwpjs-shape-copy-node.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/hwpjs-shape-copy-node.tap"
+      - name: Preserve ShapeCopy focused evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shape-copy-node-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/hwpjs-shape-copy-node.tap
+            ${{ runner.temp }}/hwpjs-shape-copy-inputs.json
+            ${{ runner.temp }}/hwpjs-shape-copy-cases
+            ${{ runner.temp }}/hwpjs-shape-cell
+            packages/core/dist/build-manifest.json
+            packages/core/dist/wasm-artifact.json
+          retention-days: 7
+          if-no-files-found: warn
+      - name: Test form layout requested-owner indexing
+        env:
+          HWPJS_TEST_CORE_DIST: packages/core/dist
+        run: |
+          test -f ./tools/renderer-test-core-provider.mjs || exit 1
+          node --max-old-space-size=384 --import ./tools/renderer-test-core-provider.mjs \
+            --test --test-concurrency=1 ./tools/tests/form-observation-linear-r7.test.mjs
+      - name: Test caret formatting and terminal focus source regressions
+        timeout-minutes: 2
+        run: |
+          test -f ./packages/core/dist/build-manifest.json || exit 1
+          export HWPJS_TEST_CORE_DIST=packages/core/dist
+          set -- \
+            ./packages/core/tests/caret-formatting.test.mjs \
+            ./packages/core/tests/state/formatting-readonly-source.test.mjs \
+            ./packages/core/tests/state/formatting-state.test.ts \
+            ./packages/core/tests/commands/formatting.test.ts \
+            ./apps/demo/tests/caret-core-readonly-integration.test.mjs \
+            ./apps/demo/tests/caret-formatting-app.test.mjs \
+            ./apps/demo/tests/caret-formatting-typing.test.mjs \
+            ./apps/demo/tests/caret-font-name-tool.test.mjs \
+            ./apps/demo/tests/caret-noop-focus.test.mjs \
+            ./apps/demo/tests/core-single-terminal-focus.test.mjs \
+            ./packages/vanilla/tests/caret-formatting.test.mjs \
+            ./packages/vanilla/tests/caret-pointer-presentation.test.mjs \
+            ./packages/vanilla/tests/new-document-initial-selection.test.mjs
+          for path in "$@"; do test -f "$path" || exit 1; done
+          node --experimental-transform-types --max-old-space-size=512 \
+            --import ./tools/renderer-test-core-provider.mjs \
+            --import ./packages/vanilla/tests/non-text-history-renderer-hook.mjs \
+            --test --test-concurrency=1 --test-timeout=50000 "$@"
+      - name: Test HWP5 equation projection and source-owner caret formatting
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          export HWPJS_TEST_CORE_DIST="$PWD/packages/core/dist"
+          set -- \
+            ./tests/hwp5/equation-snapshot.test.mjs \
+            ./tests/hwp5/equation-content.test.mjs \
+            ./tests/canvas/caret-rich-owner-admission.test.mjs \
+            ./packages/vanilla/tests/caret-rich-source-owner.test.mjs \
+            ./packages/vanilla/tests/caret-eof-history-inheritance.test.mjs
+          for path in "$@"; do test -f "$path" || exit 1; done
+          node --experimental-transform-types --max-old-space-size=512 \
+            --import ./tools/renderer-test-core-provider.mjs \
+            --import ./packages/vanilla/tests/non-text-history-renderer-hook.mjs \
+            --test --test-concurrency=1 --test-timeout=50000 \
+            --test-reporter=tap "$@" 2>&1 | tee "$RUNNER_TEMP/equation-source-owner.tap"
+          grep -Eq '^# tests 35$' "$RUNNER_TEMP/equation-source-owner.tap"
+          grep -Eq '^# pass 35$' "$RUNNER_TEMP/equation-source-owner.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/equation-source-owner.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/equation-source-owner.tap"
+      - name: Test Native EOF caret reference through the controlled Canvas route
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          export HWPJS_TEST_CORE_DIST="$PWD/packages/core/dist"
+          export HWPJS_TEST_WASM="$PWD/apps/docs/docs/public/editor/hwpjs/hwpjs.wasm"
+          export HWPJS_TEST_WASM_SHA256="$(node --input-type=module -e 'import{readFileSync}from"node:fs";import{createHash}from"node:crypto";console.log(createHash("sha256").update(readFileSync(process.env.HWPJS_TEST_WASM)).digest("hex"))')"
+          unset HWPJS_EXPECT_CR_EOF_DEFECT
+          test -f ./packages/vanilla/tests/caret-eof-current-reference-route.test.mjs
+          node --experimental-transform-types --max-old-space-size=512 \
+            --import ./tools/renderer-test-core-provider.mjs \
+            --import ./packages/vanilla/tests/non-text-history-renderer-hook.mjs \
+            --test --test-concurrency=1 --test-reporter=tap \
+            ./packages/vanilla/tests/caret-eof-current-reference-route.test.mjs \
+            2>&1 | tee "$RUNNER_TEMP/caret-eof-native-route.tap"
+          grep -Eq '^# tests 1$' "$RUNNER_TEMP/caret-eof-native-route.tap"
+          grep -Eq '^# pass 1$' "$RUNNER_TEMP/caret-eof-native-route.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/caret-eof-native-route.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/caret-eof-native-route.tap"
+      - name: Test generated table grid commands and actual surface selection
+        timeout-minutes: 2
+        run: |
+          bun test --no-install ./packages/core/tests/commands/created-table-grid.test.ts
+          HWPJS_TEST_CORE_DIST=packages/core/dist node --max-old-space-size=512 \
+            --import ./tools/renderer-test-core-provider.mjs \
+            --import ./packages/vanilla/tests/non-text-history-renderer-hook.mjs \
+            --test --test-concurrency=1 \
+            ./packages/vanilla/tests/generated-table-grid-selection.test.mjs \
+            ./apps/demo/tests/generated-table-grid-port.test.mjs \
+            ./apps/demo/tests/generated-table-grid-ui.test.mjs \
+            ./tools/tests/created-table-grid-sdk.test.mjs \
+            ./tools/tests/public-demo-fixtures.test.mjs
+      - name: Test source table live grid SDK, Core, selection and UI
+        timeout-minutes: 2
+        run: |
+          bun test --no-install ./packages/core/tests/commands/source-table-grid.test.ts
+          test -f ./tests/hwpx/inline-table-paper-preview.test.mjs || exit 1
+          test -f ./packages/vanilla/tests/preview-edit-policy.test.mjs || exit 1
+          test -f ./tests/hwpx/visible-overflow-cell-edit.test.mjs || exit 1
+          test -f ./tests/hwpx/overflow-preview-barrier.test.mjs || exit 1
+          test -f ./packages/vanilla/tests/preview-visible-cell-policy.test.mjs || exit 1
+          test -f ./packages/vanilla/tests/preview-visible-cell-pointer.test.mjs || exit 1
+          HWPJS_TEST_CORE_DIST=packages/core/dist node --experimental-transform-types --max-old-space-size=512 \
+            --import ./tools/renderer-test-core-provider.mjs \
+            --test ./packages/vanilla/tests/table-grid-view-surface.test.ts
+          HWPJS_TEST_CORE_DIST=packages/core/dist node --experimental-transform-types --max-old-space-size=512 \
+            --import ./tools/renderer-test-core-provider.mjs \
+            --import ./packages/vanilla/tests/non-text-history-renderer-hook.mjs \
+            --test --test-concurrency=1 \
+            ./tools/tests/source-table-grid-sdk.test.mjs \
+            ./packages/vanilla/tests/source-table-grid-selection.test.mjs \
+            ./packages/vanilla/tests/source-table-grid-history.test.mjs \
+            ./packages/vanilla/tests/source-table-grid-multipara-history.test.mjs \
+            ./tests/hwpx/inline-table-fit-rejection.test.mjs \
+            ./tests/hwpx/inline-table-paper-preview.test.mjs \
+            ./tests/hwpx/visible-overflow-cell-edit.test.mjs \
+            ./tests/hwpx/overflow-preview-barrier.test.mjs \
+            ./packages/vanilla/tests/preview-visible-cell-policy.test.mjs \
+            ./packages/vanilla/tests/preview-visible-cell-pointer.test.mjs \
+            ./packages/vanilla/tests/preview-edit-policy.test.mjs \
+            ./apps/demo/tests/source-table-grid-port.test.mjs \
+            ./apps/demo/tests/source-table-grid-ui.test.mjs \
+            ./apps/demo/tests/table-grid-port.test.mjs \
+            ./tests/hwpx/table-grid-view.test.mjs \
+            ./packages/core/tests/internal/owner-window-source-grid-capability.test.mjs
+      - name: Test expanded source grids and plain captions with independent file oracles
+        timeout-minutes: 3
+        run: |
+          bun tools/run-source-grid-regressions.mjs --wasm "$PWD/apps/docs/docs/public/editor/hwpjs/hwpjs.wasm" --out "$RUNNER_TEMP/hwpjs-source-grid-current"
+
+      - name: Test immutable source table file facade and shared reference resolution
+        timeout-minutes: 2
+        run: |
+          set -- \
+            ./tools/tests/table-file-grid-sdk.test.mjs \
+            ./packages/cli/tests/edit-table-grid-service.test.mjs \
+            ./packages/cli/tests/table-reference-resolution.test.mjs \
+            ./packages/cli/tests/delete-table-service.test.mjs
+          for path in "$@"; do test -f "$path" || exit 1; done
+          node --max-old-space-size=512 --test --test-concurrency=1 "$@"
+      - name: Test paragraph marker layout and caret geometry
+        timeout-minutes: 2
+        run: |
+          node --test tests/wasm/paragraph-marker-paint.test.mjs tests/wasm/paragraph-numbering.test.mjs tests/wasm/caret-paragraph-heading.test.mjs tests/hwpx/number-prefix-paint.test.mjs tests/hwp5/table-cell-block.test.mjs
+
+      - name: Test source table cell splitting and dimension equalization
+        timeout-minutes: 2
+        env:
+          HWPJS_TEST_WASM: ${{ github.workspace }}/apps/docs/docs/public/editor/hwpjs/hwpjs.wasm
+        run: |
+          bun test --no-install ./tests/hwpx/source-table-cell-split.test.mjs ./tests/hwpx/source-table-cell-width.test.mjs ./tests/hwpx/source-table-cell-height.test.mjs ./tests/hwpx/source-table-rectangular-grid.test.mjs ./tests/hwp5/source-table-cell-width.test.mjs ./tests/hwp5/source-table-cell-height.test.mjs
+          node --test tests/hwpx/source-table-row-horizontals.test.mjs apps/demo/tests/table-cell-height-menu-label.test.mjs
+
+      - name: Test paragraph bullet editing with a pinned previous engine
+        timeout-minutes: 3
+        env:
+          HWPJS_TEST_WASM: ${{ github.workspace }}/apps/docs/docs/public/editor/hwpjs/hwpjs.wasm
+          HWPJS_TEST_OLD_WASM: ${{ runner.temp }}/hwpjs-before-bullet.wasm
+          HWPJS_BULLET_EVIDENCE_DIR: ${{ runner.temp }}/hwpjs-bullet-evidence
+        run: |
+          previous_engine=f2c3075a972d353c1a51661153e9e9a1d5ee767e
+          if ! git cat-file -e "$previous_engine^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=1 origin "$previous_engine"
+          fi
+          git show "$previous_engine:apps/docs/docs/public/editor/hwpjs/hwpjs.wasm" > "$HWPJS_TEST_OLD_WASM"
+          printf '%s  %s\n' '585c80637a1cad6edecb503fe4b3fa1694d2d2ef4610ee6cbcb3b21728d0c5c6' "$HWPJS_TEST_OLD_WASM" | sha256sum --check
+          bun test --no-install ./tests/hwpx/paragraph-bullet-write.test.ts
+
+      - name: Test complete paragraph bullet inventory and UI admission
+        timeout-minutes: 3
+        env:
+          HWPJS_TEST_WASM: ${{ github.workspace }}/apps/docs/docs/public/editor/hwpjs/hwpjs.wasm
+          HWPJS_TEST_OLD_WASM: ${{ runner.temp }}/hwpjs-before-bullet.wasm
+          HWPJS_TEST_UNUSED_BULLETS: ${{ runner.temp }}/hwpjs-unused-bullets.hwpx
+        run: |
+          python3 tests/helpers/unused-bullet-definitions-fixture.py --input apps/docs/docs/public/editor/fixtures/lists-bullet.hwpx --output "$HWPJS_TEST_UNUSED_BULLETS"
+          bun test --no-install tests/wasm/paragraph-bullet-definitions.test.mjs packages/core/tests/editor/paragraph-bullet-definitions.test.ts apps/demo/tests/paragraph-bullet-inventory.test.ts
+
+      - name: Test paragraph bullet definition writes and independent XML preservation
+        timeout-minutes: 3
+        env:
+          HWPJS_TEST_WASM: ${{ github.workspace }}/apps/docs/docs/public/editor/hwpjs/hwpjs.wasm
+          HWPJS_TEST_OLD_WASM: ${{ runner.temp }}/hwpjs-before-bullet-definition.wasm
+          HWPJS_TEST_EVIDENCE: ${{ runner.temp }}/hwpjs-bullet-definition-evidence
+        run: |
+          inventory_engine=77eae1cb82e05c980071910228e1189ac5c2222d
+          if ! git cat-file -e "$inventory_engine^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=1 origin "$inventory_engine"
+          fi
+          git show "$inventory_engine:apps/docs/docs/public/editor/hwpjs/hwpjs.wasm" > "$HWPJS_TEST_OLD_WASM"
+          printf '%s  %s\n' 'a3be6777229dbe1ec895f4850168809f70d9cf52b14b85996a670a5577e865f1' "$HWPJS_TEST_OLD_WASM" | sha256sum --check
+          bun test --no-install tests/wasm/paragraph-bullet-definition-write.test.mjs packages/core/tests/editor/paragraph-bullet-definition-write.test.ts
+
+      - name: Test HWP5 original cell split with independent CFB preservation
+        timeout-minutes: 3
+        env:
+          HWPJS_TEST_WASM: ${{ github.workspace }}/apps/docs/docs/public/editor/hwpjs/hwpjs.wasm
+          HWPJS_TEST_OLD_WASM: ${{ runner.temp }}/hwpjs-before-h5-cell-split.wasm
+          HWPJS_TEST_EVIDENCE: ${{ runner.temp }}/hwpjs-h5-cell-split-evidence
+        run: |
+          previous_engine=687255a5fefac1cac249c1afb59459389f35889f
+          if ! git cat-file -e "$previous_engine^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=1 origin "$previous_engine"
+          fi
+          git show "$previous_engine:apps/docs/docs/public/editor/hwpjs/hwpjs.wasm" > "$HWPJS_TEST_OLD_WASM"
+          printf '%s  %s\n' '5ece4c0a551716239c37af0e1ff40db7b2a642e1baf75bb27782bcf237bd1621' "$HWPJS_TEST_OLD_WASM" | sha256sum --check
+          bun test --timeout=30000 --no-install tests/hwp5/source-table-cell-split.test.mjs
+
+      - name: Test merged HWP5 cells and empty caret source formatting
+        timeout-minutes: 3
+        env:
+          HWPJS_TEST_WASM: ${{ github.workspace }}/apps/docs/docs/public/editor/hwpjs/hwpjs.wasm
+          HWPJS_TEST_NARROW_SPLIT_WASM: ${{ runner.temp }}/hwpjs-before-merged-cell-split.wasm
+          HWPJS_TEST_EVIDENCE: ${{ runner.temp }}/hwpjs-merged-empty-caret
+        run: |
+          previous_engine=9dc8b89433da1926b1db72fc7be45081b063f45e
+          if ! git cat-file -e "$previous_engine^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=1 origin "$previous_engine"
+          fi
+          git show "$previous_engine:apps/docs/docs/public/editor/hwpjs/hwpjs.wasm" > "$HWPJS_TEST_NARROW_SPLIT_WASM"
+          printf '%s  %s\n' '8ab4d335f7fba4aa764ed3e1191c390f17ee80f053b9ada89748a490547d1980' "$HWPJS_TEST_NARROW_SPLIT_WASM" | sha256sum --check
+          bun test --timeout=30000 --no-install tests/hwp5/source-table-merged-cell-split.test.mjs tests/hwp5/empty-caret-formatting.test.mjs tests/empty-insertion-wire.test.mjs packages/core/tests/state/empty-caret-formatting.test.ts
+
+      - name: Test bullet definition API, CLI and MCP against Native
+        timeout-minutes: 3
+        env:
+          HWPJS_TEST_WASM: ${{ github.workspace }}/apps/docs/docs/public/editor/hwpjs/hwpjs.wasm
+          HWPJS_TEST_OLD_WASM: ${{ runner.temp }}/hwpjs-before-bullet-definition.wasm
+          HWPJS_TEST_EVIDENCE: ${{ runner.temp }}/hwpjs-bullet-bridge-evidence
+          HWPJS_TEST_HWPX: ${{ github.workspace }}/apps/docs/docs/public/editor/fixtures/page.hwpx
+          HWPJS_TEST_HWP5: ${{ github.workspace }}/apps/docs/docs/public/editor/fixtures/lists.hwp
+        run: |
+          test -f "$HWPJS_TEST_OLD_WASM" || exit 1
+          export HWPJS_TEST_WASM_EXPECTED_SHA256="$(sha256sum "$HWPJS_TEST_WASM" | cut -d ' ' -f 1)"
+          node --experimental-transform-types --max-old-space-size=512 --test --test-concurrency=1 apps/demo/tests/api-playground-bullet-definition.test.mjs packages/cli/tests/paragraph-bullet-definition-bridges.test.mjs
+
+      - name: Test HWP5 bullet resources and independent CFB preservation
+        timeout-minutes: 3
+        env:
+          HWPJS_TEST_WASM: ${{ github.workspace }}/apps/docs/docs/public/editor/hwpjs/hwpjs.wasm
+          HWPJS_TEST_OLD_WASM: ${{ runner.temp }}/hwpjs-before-h5-bullet.wasm
+          HWPJS_TEST_EVIDENCE: ${{ runner.temp }}/hwpjs-h5-bullet-evidence
+        run: |
+          previous_engine=cce7ead1fc1ca17b73bebd01ea3d72945272e1da
+          if ! git cat-file -e "$previous_engine^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=1 origin "$previous_engine"
+          fi
+          git show "$previous_engine:apps/docs/docs/public/editor/hwpjs/hwpjs.wasm" > "$HWPJS_TEST_OLD_WASM"
+          printf '%s  %s\n' 'afd903edc5658543b768491efb6ee6fbdbe185a8f393334a363acbd2eb5510ae' "$HWPJS_TEST_OLD_WASM" | sha256sum --check
+          bun test --timeout=30000 --no-install tests/wasm/hwp5-bullet-write.test.mjs packages/core/tests/editor/hwp5-bullet-definition-write.test.ts
+
+      - name: Test named field creation, value changes and renaming
+        timeout-minutes: 2
+        env:
+          HWPJS_TEST_WASM: ${{ github.workspace }}/apps/docs/docs/public/editor/hwpjs/hwpjs.wasm
+        run: |
+          bun build packages/core/src/worker.ts --target browser --format esm --outfile packages/core/src/worker.js
+          bun test --no-install ./packages/core/tests/editor/named-fields-runtime.test.ts ./packages/core/tests/editor/identity.test.ts ./packages/core/tests/editor/selection-version.test.ts ./packages/core/tests/editor/named-field-bullet-history.test.ts ./packages/core/tests/runtime/native-module-profiles.test.ts
+      - name: Test new document and table appearance contracts
+        timeout-minutes: 2
+        run: |
+          bun test --no-install \
+            ./packages/core/tests/editor/new-document.test.ts \
+            ./packages/core/tests/editor/new-document-selection.test.ts \
+            ./apps/demo/tests/new-document.test.ts \
+            ./apps/demo/tests/new-document-shortcut.test.ts
+          node --max-old-space-size=256 --test --test-concurrency=1 \
+            ./tests/cell-border-batch.test.mjs \
+            ./tests/cell-appearance-command.test.mjs \
+            ./tests/cell-fill-command.test.mjs \
+            ./tests/cell-diagonal-command.test.mjs \
+            ./tests/hwp5/table-diagonal-paint-plan.test.mjs \
+            ./tests/hwpx/table-diagonal-paint.test.mjs \
+            ./tests/hwpx/table-border-paint.test.mjs \
+            ./tests/hwpx/table-semantic-face-fill.test.mjs \
+            ./tests/hwpx/table-semantic-fill-source.test.mjs \
+            ./tests/canvas/table-authored-minimal-fill.test.mjs \
+            ./tools/tests/hwpx-table-border-raw-fields.test.mjs \
+            ./tests/hwp5/table-border-fill-plan.test.mjs \
+            ./tests/hwp5/table-variant-fill-plan.test.mjs \
+            ./tools/tests/table-cell-appearance-observation.test.mjs \
+            ./tools/tests/table-cell-appearance-official-hatch.test.mjs \
+            ./tests/table-border-plan.test.mjs
+      - name: Test integrated table appearance dialog
+        timeout-minutes: 2
+        run: |
+          node --experimental-transform-types --max-old-space-size=256 \
+            --import ./tools/object-properties-test-css.mjs \
+            --import ./apps/demo/tests/table-cell-appearance-style-preload.mjs \
+            --test --test-isolation=none --test-concurrency=1 \
+            ./apps/demo/tests/table-cell-appearance-port.test.mjs \
+            ./apps/demo/tests/table-cell-appearance-view.test.mjs \
+            ./apps/demo/tests/table-cell-preview-eligibility.test.mjs \
+            ./apps/demo/tests/table-cell-appearance-tool.test.mjs
+      - name: Test symbol catalog and six-alignment quick actions
+        timeout-minutes: 2
+        run: |
+          set -- \
+            ./apps/demo/tests/symbol-buffer.test.ts \
+            ./apps/demo/tests/symbol-category-data.test.ts \
+            ./apps/demo/tests/symbol-dialog.test.ts \
+            ./apps/demo/tests/symbol-insertion-boundary.test.ts \
+            ./apps/demo/tests/quick-alignment-six.test.mjs
+          for path in "$@"; do test -f "$path" || exit 1; done
+          bun test --no-install "$@"
+      - name: Share official Native WASM input pin
+        run: |
+          test -f ./packages/core/dist/build-manifest.json || exit 1
+          HWPJS_TEST_WASM_EXPECTED_SHA256="$(node ./tools/tests/helpers/native-wasm-pin.mjs --manifest ./packages/core/dist/build-manifest.json)" || exit 1
+          printf 'HWPJS_TEST_WASM_EXPECTED_SHA256=%s\n' "$HWPJS_TEST_WASM_EXPECTED_SHA256" >> "$GITHUB_ENV"
+      - name: Test Native form read scope preservation
+        timeout-minutes: 2
+        env:
+          HWPJS_TEST_WASM: ${{ github.workspace }}/apps/docs/docs/public/editor/hwpjs/hwpjs.wasm
+        run: |
+          export HWPJS_TEST_WASM_SHA256="$HWPJS_TEST_WASM_EXPECTED_SHA256"
+          node --max-old-space-size=384 --test --test-concurrency=1 \
+            ./tools/tests/hwpx-form-read-scope-native.test.mjs
+      - name: Test original Noori rows and opaque cache ownership
+        timeout-minutes: 2
+        env:
+          HWPJS_TEST_WASM: ${{ github.workspace }}/apps/docs/docs/public/editor/hwpjs/hwpjs.wasm
+          HWPJS_TEST_NOORI: ${{ github.workspace }}/apps/docs/docs/public/editor/fixtures/noori.hwp
+          HWPJS_TEST_NOORI_HWPX: ${{ github.workspace }}/apps/docs/docs/public/editor/fixtures/noori.hwpx
+          HWPJS_NOORI_ROW_EVIDENCE: ${{ runner.temp }}/hwpjs-noori-rows
+        run: |
+          export HWPJS_TEST_WASM_SHA256="$HWPJS_TEST_WASM_EXPECTED_SHA256"
+          node --max-old-space-size=512 --test --test-concurrency=1 tools/tests/noori-row-native.test.mjs
+      - name: Test page settings SDK and independent saved-file oracles
+        timeout-minutes: 3
+        env:
+          HWPJS_TEST_WASM: ${{ github.workspace }}/apps/docs/docs/public/editor/hwpjs/hwpjs.wasm
+          HWPJS_PAGE_REGRESSION_OUT: ${{ runner.temp }}/hwpjs-page-settings-sdk
+        run: |
+          export HWPJS_TEST_WASM_SHA256="$HWPJS_TEST_WASM_EXPECTED_SHA256"
+          node --max-old-space-size=512 tools/run-page-settings-regressions.mjs sdk
+      - name: Preserve page settings SDK evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: page-settings-sdk-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hwpjs-page-settings-sdk
+          retention-days: 7
+          if-no-files-found: warn
+      - name: Test generated paragraph extended formatting Core admission
+        timeout-minutes: 2
+        run: |
+          test -f ./packages/core/tests/commands/generated-extended-formatting.test.ts || exit 1
+          test -f ./packages/core/tests/state/formatting-state.test.ts || exit 1
+          bun test --no-install \
+            ./packages/core/tests/commands/generated-extended-formatting.test.ts \
+            ./packages/core/tests/state/formatting-state.test.ts
+      - name: Test generated paragraph extended formatting actual Native binding
+        timeout-minutes: 2
+        env:
+          HWPJS_TEST_WASM: ${{ github.workspace }}/apps/docs/docs/public/editor/hwpjs/hwpjs.wasm
+          HWPJS_TEST_ORACLE_ROOT: ${{ github.workspace }}
+        run: |
+          test -f ./tools/tests/hwp5-generated-extended-formatting.test.mjs || exit 1
+          test -n "$HWPJS_TEST_WASM_EXPECTED_SHA256" || exit 1
+          export HWPJS_TEST_WASM_SHA256="$HWPJS_TEST_WASM_EXPECTED_SHA256"
+          node --max-old-space-size=512 --test --test-concurrency=1 --test-timeout=45000 \
+            ./tools/tests/hwp5-generated-extended-formatting.test.mjs
+      - name: Test generated paragraph atomic formatting admission
+        timeout-minutes: 2
+        run: |
+          test -f ./packages/core/tests/commands/generated-atomic-formatting.test.ts || exit 1
+          test -f ./packages/core/tests/commands/generated-atomic-runtime.test.mjs || exit 1
+          bun test --no-install \
+            ./packages/core/tests/commands/generated-atomic-formatting.test.ts \
+            ./packages/core/tests/commands/generated-atomic-runtime.test.mjs
+      - name: Test generated paragraph atomic formatting actual Native save and history
+        timeout-minutes: 2
+        env:
+          HWPJS_TEST_WASM: ${{ github.workspace }}/apps/docs/docs/public/editor/hwpjs/hwpjs.wasm
+          HWPJS_TEST_ORACLE_ROOT: ${{ github.workspace }}
+        run: |
+          test -f ./tools/tests/hwp5-generated-atomic-formatting.test.mjs || exit 1
+          test -n "$HWPJS_TEST_WASM_EXPECTED_SHA256" || exit 1
+          export HWPJS_TEST_WASM_SHA256="$HWPJS_TEST_WASM_EXPECTED_SHA256"
+          node --max-old-space-size=512 --test --test-concurrency=1 --test-timeout=45000 \
+            ./tools/tests/hwp5-generated-atomic-formatting.test.mjs
+      - name: Test generated HWPX atomic formatting actual Native save and history
+        timeout-minutes: 2
+        env:
+          HWPJS_TEST_WASM: ${{ github.workspace }}/apps/docs/docs/public/editor/hwpjs/hwpjs.wasm
+        run: |
+          test -f ./tools/tests/hwpx-generated-atomic-formatting.test.mjs || exit 1
+          test -n "$HWPJS_TEST_WASM_EXPECTED_SHA256" || exit 1
+          export HWPJS_TEST_WASM_SHA256="$HWPJS_TEST_WASM_EXPECTED_SHA256"
+          node --max-old-space-size=512 --test --test-concurrency=1 --test-timeout=45000 \
+            ./tools/tests/hwpx-generated-atomic-formatting.test.mjs
+      - name: Test original table style and fill Native transactions
+        timeout-minutes: 2
+        env:
+          HWPJS_TEST_WASM: ${{ github.workspace }}/apps/docs/docs/public/editor/hwpjs/hwpjs.wasm
+          HWPJS_TEST_NOORI: ${{ github.workspace }}/apps/docs/docs/public/editor/fixtures/noori.hwp
+          HWPJS_TEST_NOORI_HWPX: ${{ github.workspace }}/apps/docs/docs/public/editor/fixtures/noori.hwpx
+        run: |
+          export HWPJS_TEST_WASM_SHA256="$HWPJS_TEST_WASM_EXPECTED_SHA256"
+          node --max-old-space-size=512 --test --test-concurrency=1 \
+            --test-timeout=45000 ./tests/cell-style-fill-native.test.mjs \
+            ./tests/cell-diagonal-native.test.mjs \
+            ./tools/tests/cell-diagonal-runtime.test.mjs \
+            ./tools/tests/hwpx-border-source-raw-native.test.mjs
+      - name: Test public package JSX runtime compatibility
+        run: bun test ./tests/public-package-jsx-runtime.test.mjs
+      - name: Test owned observation freeze boundaries
+        run: |
+          test -f ./packages/core/tests/state/owned.test.ts || exit 1
+          test -f ./packages/core/tests/state/owned-freeze-observation.test.ts || exit 1
+          bun test --no-install ./packages/core/tests/state/owned.test.ts ./packages/core/tests/state/owned-freeze-observation.test.ts
+      - name: Check demo shell icon and command types
+        run: |
+          test -f ./tools/tsconfig.demo-shell.json || exit 1
+          bunx --no-install tsc --noEmit -p ./tools/tsconfig.demo-shell.json
+      - name: Test table insertion target availability and resource defaults
+        run: |
+          test -f ./packages/core/tests/commands/table-insert-availability.test.ts || exit 1
+          test -f ./apps/demo/tests/table-insert-target-availability.test.ts || exit 1
+          bun test --no-install ./packages/core/tests/commands/table-insert.test.ts ./packages/core/tests/commands/table-insert-availability.test.ts ./apps/demo/tests/table-insert.test.ts ./apps/demo/tests/table-insert-uncertain.test.ts ./apps/demo/tests/table-insert-target-availability.test.ts
+      - name: Test HWP5 current source binding before table insertion
+        timeout-minutes: 2
+        run: |
+          test -f ./tools/tests/hwp5-current-table-insertion.test.mjs || exit 1
+          node --max-old-space-size=256 --test ./tools/tests/hwp5-current-table-insertion.test.mjs
+      - name: Test API playground canonical targets and table availability
+        run: |
+          test -f ./apps/demo/tests/api-playground-selection-owner.test.mjs || exit 1
+          bun test --no-install ./apps/demo/tests/api-playground-selection-owner.test.mjs
+      - name: Test contextual table row shortcut
+        run: |
+          test -f ./apps/demo/tests/contextual-table-row-shortcut.test.ts || exit 1
+          bun test --no-install ./apps/demo/tests/contextual-table-row-shortcut.test.ts
+      - name: Test demo toolbar and find dialog
+        run: |
+          bun test --no-install ./apps/demo/tests/shell.test.mjs ./apps/demo/tests/shell-fixture-availability.test.mjs ./apps/demo/tests/toolbox.test.mjs ./apps/demo/tests/text-tools-dialog-density.test.ts ./apps/demo/tests/file-open-direct.test.mjs ./apps/demo/tests/existing-object-tools-shell.test.mjs ./apps/demo/tests/inline-object-insert-data-grid.test.ts
+      - name: Test exclusive text snapshot reuse boundaries
+        run: |
+          node --test --test-concurrency=1 \
+            ./packages/core/tests/runtime/full-snapshot-text-delta.test.mjs \
+            ./packages/core/tests/internal/private-history-edges.test.ts \
+            ./packages/core/tests/internal/private-history-edges-reentrancy.test.ts \
+            ./packages/core/tests/internal/private-history-owner-hints.test.ts \
+            ./packages/core/tests/internal/history-owner-window-controller.test.mjs \
+            ./packages/core/tests/editor/capabilities-observation.test.mjs \
+            ./tests/hwpx/host-epoch-readers.test.mjs \
+            ./tests/hwpx/native-picture-refresh-gate.test.mjs \
+            ./tests/hwpx/picture-resources-settled.test.mjs \
+            ./apps/demo/tests/surface-environment.test.ts
+      - name: Test real HWP5 text reuse and history
+        timeout-minutes: 2
+        env:
+          HWPJS_TEST_WASM: ${{ github.workspace }}/apps/docs/docs/public/editor/hwpjs/hwpjs.wasm
+          HWPJS_TEST_NOORI: ${{ github.workspace }}/apps/docs/docs/public/editor/fixtures/noori.hwp
+        run: |
+          node --max-old-space-size=512 --test --test-concurrency=1 --test-timeout=50000 \
+            ./tools/tests/native-wasm-pin.test.mjs \
+            ./tools/tests/hwp5-native-text-reuse.test.mjs \
+            ./tools/tests/owner-window-cell-size-capabilities.test.mjs \
+            ./tools/tests/hwp5-worker-cow-regression.test.mjs \
+            ./tools/tests/hwp5-worker-public-full.test.mjs \
+            ./tools/tests/hwp5-worker-history-window.test.mjs \
+            ./tools/tests/hwp5-runtime-reply-shape.test.mjs \
+            ./tools/tests/worker-cow-source-contract.test.mjs
+      - name: Check private projection companion types
+        run: bunx --no-install tsc --noEmit -p ./tools/tests/tsconfig.history-owner-window.json
+      - name: Test WASM loader buffer ownership
+        run: node --test ./packages/core/tests/runtime/wasm-module-loader-owned-input.test.ts ./packages/core/tests/runtime/native-module-profiles.test.ts
+      - name: Test versioned demo Worker assets
+        run: |
+          test -f ./tools/tests/worker-assets.test.mjs || exit 1
+          node --test ./tools/tests/worker-assets.test.mjs
+      - name: Test published demo runtime asset paths
+        run: |
+          test -f ./apps/demo/tests/runtime-assets.test.ts || exit 1
+          test -f ./tests/hwpx/pages-runtime-asset-paths.test.mjs || exit 1
+          bun test ./apps/demo/tests/runtime-assets.test.ts ./tests/hwpx/pages-runtime-asset-paths.test.mjs
+      - name: Test explicit demo bundle policies and routes
+        env:
+          HWPJS_TEST_PUBLIC_FIXTURE_POLICY: tools/pages-demo/public-gallery-fixtures.json
+        run: |
+          test -f ./tests/hwpx/demo-server-fixture-policy.test.mjs || exit 1
+          test -f ./tests/hwpx/demo-server-bundle.test.mjs || exit 1
+          test -f ./tests/hwpx/demo-fixture-provider-root.test.mjs || exit 1
+          test -f ./tools/pages-demo/public-gallery-fixtures.json || exit 1
+          node --test --test-concurrency=1 ./tests/hwpx/demo-fixture-provider-root.test.mjs ./tests/hwpx/demo-server-fixture-policy.test.mjs ./tests/hwpx/demo-server-bundle.test.mjs
+      - name: Test public picture resize Surface contracts
+        timeout-minutes: 2
+        run: |
+          test -f ./packages/vanilla/src/picture-resize-controls.ts || exit 1
+          test -f ./packages/vanilla/tests/picture-resize-controls.test.mjs || exit 1
+          node --experimental-transform-types --max-old-space-size=384 \
+            --import ./tools/tests/picture-resize-source-provider.mjs \
+            --test --test-concurrency=1 \
+            ./packages/vanilla/tests/picture-resize-controls.test.mjs \
+            ./packages/vanilla/tests/picture-anchored-resize-controls.test.mjs \
+            ./tests/canvas/picture-fixed-anchor-geometry.test.mjs \
+            ./tests/canvas/picture-fixed-anchor-renderer.test.mjs \
+            ./packages/vanilla/tests/surface.test.ts \
+            ./packages/vanilla/tests/undo-onset-surface-integration.test.mjs
+          node --experimental-transform-types --max-old-space-size=384 \
+            --import ./tools/tests/picture-resize-source-provider.mjs \
+            --import ./packages/vanilla/tests/non-text-history-renderer-hook.mjs \
+            --test --test-concurrency=1 \
+            ./packages/vanilla/tests/non-text-history-surface.test.mjs \
+            ./packages/vanilla/tests/non-text-history-rejected-picture.test.mjs \
+            ./packages/vanilla/tests/non-text-history-rejected-picture-negative.test.mjs
+          node node_modules/typescript/lib/tsc.js --noEmit -p ./tools/tests/tsconfig.picture-resize.json
+          bun test ./packages/core/tests/commands/picture-anchored-resize.test.ts ./packages/core/tests/transport/picture-anchored-resize-admission.test.ts
+      - name: Test selected picture replacement
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --experimental-transform-types --max-old-space-size=384 \
+            --import ./tools/tests/picture-resize-source-provider.mjs \
+            --import ./tools/object-properties-test-css.mjs \
+            --test --test-concurrency=1 --test-reporter=tap \
+            ./apps/demo/tests/picture-replacement-input-lane.test.mjs \
+            ./apps/demo/tests/picture-replacement-controller.test.mjs \
+            ./apps/demo/tests/picture-replacement-port.test.mjs \
+            ./apps/demo/tests/picture-replacement-view.test.mjs \
+            ./apps/demo/tests/picture-selection-capture.test.mjs \
+            ./packages/core/tests/commands/picture-replacement.test.ts \
+            ./packages/core/tests/transport/picture-replacement-admission.test.ts \
+            ./tools/tests/live-picture-replacement.test.mjs \
+            2>&1 | tee "$RUNNER_TEMP/picture-replacement.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/picture-replacement.tap"
+          node node_modules/typescript/lib/tsc.js --noEmit -p ./tools/tests/tsconfig.picture-replacement.json
+      - name: Test created table cell properties
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --experimental-transform-types --max-old-space-size=384 \
+            --import ./tools/tests/picture-resize-source-provider.mjs \
+            --import ./apps/demo/tests/table-cell-properties-style-preload.mjs \
+            --test --test-concurrency=1 --test-reporter=tap \
+            ./apps/demo/tests/created-cell-properties-surface-admission.test.mjs \
+            ./apps/demo/tests/created-cell-properties-contract.test.mjs \
+            ./apps/demo/tests/created-cell-properties-view.test.mjs \
+            ./tests/created-cell-projection.test.mjs \
+            ./tests/created-cell-properties-wire.test.mjs \
+            ./tests/hwpx/created-table-layout.test.mjs \
+            2>&1 | tee "$RUNNER_TEMP/created-cell-properties.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/created-cell-properties.tap"
+      - name: Test object outer margins and saved table fill
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --experimental-transform-types --max-old-space-size=384 \
+            --import ./tools/tests/picture-resize-source-provider.mjs \
+            --import ./apps/demo/tests/object-outer-margins-style-preload.mjs \
+            --test --test-concurrency=1 --test-reporter=tap \
+            ./apps/demo/tests/object-outer-margins-{form,input,port,wrap}.test.mjs \
+            ./apps/demo/tests/outer-margins-three-decimal.test.mjs \
+            ./apps/demo/tests/hwp5-picture-canonical-tool.test.mjs \
+            ./apps/demo/tests/hwp5-picture-margins-selection.test.mjs \
+            ./apps/demo/tests/hwp5-margins-core-ui.test.mjs \
+            ./apps/demo/tests/hwp5-vertical-margins-ui.test.mjs \
+            ./apps/demo/tests/object-properties-edit-gate.test.mjs \
+            ./tools/tests/object-outer-margins{,-abi}.test.mjs \
+            ./tests/js/object-outer-margins-top-bottom.test.mjs \
+            ./tests/hwp5/observed-vertical-margins-reflow.test.mjs \
+            ./tools/tests/hwp5-vertical-outer-margins.test.mjs \
+            ./tools/tests/object-body-flow-abi.test.mjs \
+            ./tests/hwpx/fixed-textbox-wrap.test.mjs \
+            ./tests/canvas/behind-textbox-renderer.test.mjs \
+            ./tests/canvas/behind-textbox-scene.test.mjs \
+            ./tests/canvas/table-existing-minimal-fill.test.mjs \
+            ./tests/hwpx/inline-table-empty-cell-hit.test.mjs \
+            ./tests/hwpx/inline-table-host-run.test.mjs \
+            ./tests/hwpx/inline-table-host-projection.test.mjs \
+            ./tests/hwpx/inline-table-cell-box-hit.test.mjs \
+            ./tests/hwpx/inline-table-host-point-cost.test.mjs \
+            ./tests/hwpx/table-boundary-cell-interior.test.mjs \
+            2>&1 | tee "$RUNNER_TEMP/object-outer-margins.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/object-outer-margins.tap"
+          bun test ./packages/core/tests/commands/object-outer-margins.test.ts ./packages/core/tests/transport/object-outer-margins-admission.test.ts
+          bun test ./packages/core/tests/commands/hwp5-object-outer-margins.test.ts ./packages/core/tests/runtime/hwp5-outer-margins-profile.test.ts ./tools/tests/hwp5-object-outer-margins.test.mjs
+          bun test ./packages/core/tests/commands/hwp5-vertical-margins.test.ts ./packages/core/tests/commands/hwp5-vertical-margins-worker.test.mjs ./packages/core/tests/transport/hwp5-vertical-margins-admission.test.ts ./packages/core/tests/transport/hwp5-vertical-margins-activation.test.ts
+          node node_modules/typescript/lib/tsc.js --noEmit -p ./tools/tests/tsconfig.object-outer-margins.json
+      - name: Test textbox body flow command and property controls
+        timeout-minutes: 2
+        run: |
+          node --experimental-transform-types --import ./apps/demo/tests/body-flow-core-preload.mjs --test ./tests/js/object-body-flow.test.mjs ./apps/demo/tests/object-body-flow-{form,input,port}.test.mjs
+          bun test ./packages/core/tests/commands/object-body-flow.test.ts ./packages/core/tests/transport/object-body-flow-admission.test.ts
+          node node_modules/typescript/lib/tsc.js --noEmit -p ./apps/demo/tests/tsconfig.object-body-flow.json
+      - name: Test selected table object and formatting command regressions
+        timeout-minutes: 2
+        run: |
+          test -f ./packages/core/dist/build-manifest.json || exit 1
+          test -f ./tools/object-properties-test-css.mjs || exit 1
+          test -f ./apps/demo/tests/table-cell-properties-style-preload.mjs || exit 1
+          set -- \
+            ./apps/demo/tests/table-cell-size-units.test.mjs \
+            ./apps/demo/tests/table-cell-properties-port.test.mjs \
+            ./apps/demo/tests/table-cell-properties-view.test.mjs \
+            ./apps/demo/tests/table-cell-properties-tool.test.mjs \
+            ./apps/demo/tests/table-cell-properties-appearance-handoff.test.mjs \
+            ./apps/demo/tests/table-cell-properties-vertical-alignment.test.mjs \
+            ./packages/core/tests/commands/original-cell-alignment-block.test.mjs \
+            ./tests/original-cell-block/handshake.test.mjs \
+            ./apps/demo/tests/object-properties-port.test.mjs \
+            ./apps/demo/tests/object-properties-controller.test.mjs \
+            ./apps/demo/tests/object-properties-view.test.mjs \
+            ./apps/demo/tests/object-properties-reentry.test.mjs \
+            ./apps/demo/tests/object-properties-size-integration.test.mjs \
+            ./apps/demo/tests/context-menu-target.test.ts \
+            ./apps/demo/tests/command-support.test.ts \
+            ./tests/hwpx/canvas-display-options.test.mjs \
+            ./tests/hwpx/formatting-marks.test.mjs \
+            ./tests/hwpx/formatting-marks-original-cells.test.mjs
+          for path in "$@"; do test -f "$path" || exit 1; done
+          node --experimental-transform-types --max-old-space-size=256 \
+            --import ./tools/object-properties-test-css.mjs \
+            --import ./apps/demo/tests/table-cell-properties-style-preload.mjs \
+            --test --test-isolation=none --test-concurrency=1 "$@"
+      - name: Test original cell insets source contracts
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          node node_modules/typescript/bin/tsc --noEmit -p apps/demo/tests/tsconfig.cell-insets.json
+          bun test --no-install --tsconfig-override=apps/demo/tests/tsconfig.cell-insets.json \
+            ./packages/core/tests/commands/original-cell-insets.test.ts \
+            ./packages/core/tests/commands/original-cell-insets-lease.test.mjs \
+            ./packages/core/tests/commands/original-cell-insets-wire.test.mjs \
+            ./apps/demo/tests/table-cell-insets.test.mjs 2>&1 | tee "$RUNNER_TEMP/original-cell-insets-source.log"
+          grep -Eq '^ 50 pass$' "$RUNNER_TEMP/original-cell-insets-source.log"
+          grep -Eq '^ 0 fail$' "$RUNNER_TEMP/original-cell-insets-source.log"
+      - name: Test original cell vertical alignment source contracts
+        timeout-minutes: 2
+        run: |
+          bun test --no-install \
+            ./tests/original-cell-vertical-alignment-source.test.mjs \
+            ./tests/original-cell-vertical-alignment-core-source.test.ts \
+            ./tests/original-cell-vertical-alignment-admission-source.test.ts \
+            ./apps/demo/tests/original-cell-vertical-alignment-properties-source.test.ts \
+            ./packages/core/tests/commands/original-cell-vertical-alignment-generic-gate.test.ts
+      - name: Test original font and size observation display
+        timeout-minutes: 2
+        run: |
+          test -f ./packages/core/dist/build-manifest.json || exit 1
+          set -- \
+            ./apps/demo/tests/formatting-observation-display.test.mjs \
+            ./apps/demo/tests/formatting-observation-shell.test.mjs \
+            ./apps/demo/tests/formatting-observation-bridge.test.mjs
+          for path in "$@"; do test -f "$path" || exit 1; done
+          node --experimental-transform-types --max-old-space-size=256 \
+            --test --test-concurrency=1 "$@"
+      - name: Test multi-paragraph formatting app port regressions
+        timeout-minutes: 2
+        env:
+          HWPJS_TEST_CORE_DIST: packages/core/dist
+        run: |
+          test -f ./packages/core/dist/build-manifest.json || exit 1
+          test -f ./tools/renderer-test-core-provider.mjs || exit 1
+          test -f ./apps/demo/tests/formatting-style-preload.mjs || exit 1
+          set -- \
+            ./apps/demo/tests/selection-decoration-bridge.test.mjs \
+            ./apps/demo/tests/surface-selection-command-support.test.mjs \
+            ./apps/demo/tests/mac-surface-selection-shortcuts.test.mjs \
+            ./apps/demo/tests/multiblock-formatting-app.test.mjs \
+            ./apps/demo/tests/formatting-language-controls.test.mjs
+          for path in "$@"; do test -f "$path" || exit 1; done
+          node --experimental-transform-types --max-old-space-size=512 \
+            --import ./tools/renderer-test-core-provider.mjs \
+            --test --test-concurrency=1 --test-timeout=50000 "$@"
+      - name: Test multi-paragraph clipboard capture surface regressions
+        timeout-minutes: 2
+        env:
+          HWPJS_TEST_CORE_DIST: packages/core/dist
+        run: |
+          test -f ./packages/core/dist/build-manifest.json || exit 1
+          test -f ./tools/renderer-test-core-provider.mjs || exit 1
+          test -f ./packages/vanilla/tests/non-text-history-renderer-hook.mjs || exit 1
+          test -f ./packages/vanilla/tests/non-text-history-fixture.mjs || exit 1
+          test -f ./packages/vanilla/tests/multiblock-clipboard-fixture.mjs || exit 1
+          set -- \
+            ./packages/vanilla/tests/multiblock-clipboard-capture.test.mjs \
+            ./packages/vanilla/tests/multiblock-clipboard-safety.test.mjs
+          for path in "$@"; do test -f "$path" || exit 1; done
+          node --experimental-transform-types --max-old-space-size=256 \
+            --import ./tools/renderer-test-core-provider.mjs \
+            --import ./packages/vanilla/tests/non-text-history-renderer-hook.mjs \
+            --test --test-concurrency=1 "$@"
+      - name: Test historical HWPX corpus restoration helper
+        run: python3 -B -m unittest discover -s tools/tests -p 'test_restore_hwpx_package_corpus.py' -v
+      - name: Test generated-cell clipboard capture and command lifecycle
+        timeout-minutes: 2
+        env:
+          HWPJS_TEST_CORE_DIST: packages/core/dist
+        run: |
+          test -f ./packages/core/dist/build-manifest.json || exit 1
+          log="$(mktemp "$RUNNER_TEMP/generated-cell-clipboard.XXXXXX")"
+          if ! node --experimental-transform-types --max-old-space-size=256 \
+            --import ./tools/renderer-test-core-provider.mjs \
+            --import ./packages/vanilla/tests/non-text-history-renderer-hook.mjs \
+            --test --test-reporter=tap --test-concurrency=1 \
+            ./apps/demo/tests/clipboard-surface-report.test.mjs \
+            ./apps/demo/tests/clipboard-selection-presentation.test.mjs \
+            ./packages/vanilla/tests/created-cell-clipboard-source.test.mjs \
+            ./packages/vanilla/tests/created-cell-clipboard-command.test.mjs \
+            ./packages/vanilla/tests/created-cell-clipboard-surface.test.mjs \
+            ./packages/vanilla/tests/created-cell-clipboard-caret.test.mjs \
+            ./packages/vanilla/tests/readonly-cell-navigation.test.mjs > "$log" 2>&1; then
+            cat "$log"
+            exit 1
+          fi
+          cat "$log"
+          grep -qx '# tests 70' "$log"
+          grep -qx '# pass 70' "$log"
+          grep -qx '# fail 0' "$log"
+          grep -qx '# skipped 0' "$log"
+      - name: Test multi-paragraph formatting history selection lifecycle
+        timeout-minutes: 2
+        env:
+          HWPJS_TEST_CORE_DIST: packages/core/dist
+        run: |
+          test -f ./tools/renderer-test-core-provider.mjs || exit 1
+          test -f ./packages/core/dist/build-manifest.json || exit 1
+          test -f ./packages/vanilla/tests/non-text-history-renderer-hook.mjs || exit 1
+          test -f ./packages/vanilla/tests/non-text-history-fixture.mjs || exit 1
+          test -f ./packages/vanilla/tests/multiblock-clipboard-fixture.mjs || exit 1
+          test -f ./packages/vanilla/tests/multiblock-format-history-selection.test.mjs || exit 1
+          node --experimental-transform-types --max-old-space-size=256 \
+            --import ./tools/renderer-test-core-provider.mjs \
+            --import ./packages/vanilla/tests/non-text-history-renderer-hook.mjs \
+            --test --test-concurrency=1 \
+            ./packages/vanilla/tests/multiblock-format-history-selection.test.mjs
+      - name: Test multi-paragraph formatting surface regressions
+        timeout-minutes: 2
+        env:
+          HWPJS_TEST_CORE_DIST: packages/core/dist
+        run: |
+          test -f ./packages/core/dist/build-manifest.json || exit 1
+          test -f ./tools/renderer-test-core-provider.mjs || exit 1
+          test -f ./packages/vanilla/tests/non-text-history-renderer-hook.mjs || exit 1
+          test -f ./packages/vanilla/tests/multirange-formatting-fixture.mjs || exit 1
+          set -- \
+            ./packages/vanilla/tests/multirange-formatting-surface.test.mjs \
+            ./packages/vanilla/tests/multirange-formatting-observation.test.mjs \
+            ./packages/vanilla/tests/formatting-patch-lease.test.mjs \
+            ./packages/vanilla/tests/formatting-patch-batch.test.mjs \
+            ./packages/vanilla/tests/formatting-patch-surface.test.mjs \
+            ./packages/vanilla/tests/formatting-patch-core.test.mjs \
+            ./packages/vanilla/tests/formatting-capability-reason.test.mjs \
+            ./packages/vanilla/tests/formatting-settled-current.test.mjs
+          for path in "$@"; do test -f "$path" || exit 1; done
+          node --experimental-transform-types --max-old-space-size=512 \
+            --import ./tools/renderer-test-core-provider.mjs \
+            --import ./packages/vanilla/tests/non-text-history-renderer-hook.mjs \
+            --test --test-concurrency=1 --test-timeout=50000 "$@"
+      - name: Test non-text selection history surface lifecycle
+        timeout-minutes: 2
+        env:
+          HWPJS_TEST_CORE_DIST: packages/core/dist
+        run: |
+          test -f ./tools/renderer-test-core-provider.mjs || exit 1
+          test -f ./packages/core/dist/build-manifest.json || exit 1
+          test -f ./packages/vanilla/tests/non-text-history-surface.test.mjs || exit 1
+          test -f ./packages/vanilla/tests/non-text-history-rejected-picture.test.mjs || exit 1
+          test -f ./packages/vanilla/tests/non-text-history-rejected-picture-negative.test.mjs || exit 1
+          test -f ./packages/vanilla/tests/non-text-history-fixture.mjs || exit 1
+          test -f ./packages/vanilla/tests/non-text-history-renderer-hook.mjs || exit 1
+          node --max-old-space-size=256 --experimental-transform-types \
+            --import ./tools/renderer-test-core-provider.mjs \
+            --import ./packages/vanilla/tests/non-text-history-renderer-hook.mjs \
+            --test --test-concurrency=1 \
+            ./packages/vanilla/tests/non-text-history-surface.test.mjs \
+            ./packages/vanilla/tests/non-text-history-rejected-picture.test.mjs \
+            ./packages/vanilla/tests/non-text-history-rejected-picture-negative.test.mjs
+      - name: Test renderer measurements and queued input frames
+        env:
+          HWPJS_TEST_CORE_DIST: packages/core/dist
+        run: |
+          set -- \
+            ./tests/hwpx/renderer-glyph-metrics.test.mjs \
+            ./tests/hwpx/renderer-projection-measure.test.mjs \
+            ./packages/vanilla/tests/native-geometry-renderer.test.mjs \
+            ./packages/vanilla/tests/native-geometry-deps.test.mjs \
+            ./tests/hwpx/undo-onset-candidate.test.mjs \
+            ./packages/vanilla/tests/undo-onset-surface-integration.test.mjs \
+            ./packages/vanilla/tests/undo-onset-held-renderer.test.mjs \
+            ./packages/vanilla/tests/renderer-ack-projection.test.mjs
+          for path in "$@"; do test -f "$path" || exit 1; done
+          node --import ./tools/renderer-test-core-provider.mjs --test "$@"
+          node --import ./tools/renderer-test-core-provider.mjs --test --test-concurrency=1 ./tests/text-selection-paint.test.mjs ./tests/hwp5/canvas-edit.test.mjs
+      - name: 데모 표 만들기 공개 API 모델 검사
+        run: |
+          set -- \
+            ./apps/demo/tests/table-insert.test.ts \
+            ./apps/demo/tests/table-insert-uncertain.test.ts
+          for path in "$@"; do test -f "$path" || exit 1; done
+          bun test --no-install "$@"
+      - name: 표 삽입 공개 명령 모델 검사
+        run: |
+          test -f ./packages/core/tests/commands/table-insert.test.ts || exit 1
+          test -f ./packages/core/tests/state/paragraph-selection-facade.test.ts || exit 1
+          bun test --no-install ./packages/core/tests/commands/table-insert.test.ts ./packages/core/tests/state/paragraph-selection-facade.test.ts
+      - name: 표 삽입 명시 Native 통합 검사
+        run: |
+          test -f ./packages/core/integration/commands/table-insert.test.ts || exit 1
+          test -f ./packages/core/dist/build-manifest.json || exit 1
+          export HWPJS_TEST_WASM="$PWD/apps/docs/docs/public/editor/hwpjs/hwpjs.wasm"
+          test -f "$HWPJS_TEST_WASM" || exit 1
+          export TABLE_FIXTURE_ROOT="$PWD/legacy/rust/crates/hwp-core/tests/fixtures"
+          export TABLE_INSERT_OUTPUT="$RUNNER_TEMP/table-insert-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          test ! -e "$TABLE_INSERT_OUTPUT" || exit 1
+          mkdir "$TABLE_INSERT_OUTPUT"
+          bun test --no-install ./packages/core/integration/commands/table-insert.test.ts
+      - name: Test paragraph formatting dialogs
+        run: |
+          set -- \
+            ./apps/demo/tests/paragraph-resource-input.test.ts \
+            ./apps/demo/tests/paragraph-resource-view.test.ts \
+            ./apps/demo/tests/paragraph-background-replacement.test.ts \
+            ./apps/demo/tests/paragraph-shape-fallback.test.ts \
+            ./apps/demo/tests/paragraph-shape-number.test.ts \
+            ./apps/demo/tests/paragraph-shape-tool.test.ts \
+            ./apps/demo/tests/paragraph-shape-ui.test.ts \
+            ./apps/demo/tests/paragraph-spacing-kind.test.ts
+          for path in "$@"; do test -f "$path" || exit 1; done
+          bun test --no-install "$@"
+      - name: Test existing note paragraph selection from source
+        env:
+          HWPJS_TEST_WASM: ${{ github.workspace }}/apps/docs/docs/public/editor/hwpjs/hwpjs.wasm
+        run: |
+          test -f "$HWPJS_TEST_WASM" || exit 1
+          test -f ./legacy/rust/crates/hwp-core/tests/fixtures/footnote-endnote.hwp || exit 1
+          set -- \
+            ./tools/tests/existing-note-selection.test.ts \
+            ./tests/hwp5/note-selection-owner.test.mjs \
+            ./tests/hwpx/note-selection-owner.test.mjs
+          for path in "$@"; do test -f "$path" || exit 1; done
+          bun test --no-install "$@"
+      - name: Test delegated context menu composition lifetime
+        run: |
+          test -f ./tests/hwpx/document-context-menu-composition.test.mjs || exit 1
+          node --test ./tests/hwpx/document-context-menu-composition.test.mjs
+      - name: Test footnote continuation and ordering
+        run: |
+          set -- \
+            ./tests/hwp5/plain-footnote-continuation.test.mjs \
+            ./tests/hwp5/plain-footnote-stable-order.test.mjs \
+            ./tests/hwp5/plain-footnote-lock-audit.test.mjs \
+            ./tests/hwp5/footnote-allocation-index.test.mjs \
+            ./tests/hwp5/mixed-note-table-continuation.test.mjs \
+            ./tests/hwp5/recorded-mixed-note-continuation.test.mjs \
+            ./tests/hwp5/source-note-projection-optin.test.mjs \
+            ./tests/hwp5/footnote-trial-projection.test.mjs
+          for path in "$@"; do test -f "$path" || exit 1; done
+          bun test --no-install "$@"
+      - name: 이력 모델과 paint 준비 검사
+        run: |
+          set -- \
+            ./tests/hwpx/history-model-presentation.test.mjs \
+            ./tests/hwpx/history-paint-authority.test.mjs \
+            ./tests/hwp5/history-selection-canvas.test.mjs \
+            ./tests/hwp5/history-input-intent-queue.test.mjs \
+            ./tests/hwp5/history-input-intent-readiness.test.mjs
+          for path in "$@"; do test -f "$path" || exit 1; done
+          bun test --no-install "$@"
+      - name: Test Canvas history after external Native revisions
+        env:
+          HWPJS_TEST_CORE_DIST: packages/core/dist
+        run: |
+          test -f ./tools/renderer-test-core-provider.mjs || exit 1
+          test -f ./packages/vanilla/tests/external-revision-caret.test.ts || exit 1
+          test -f ./packages/vanilla/tests/undo-onset-surface-integration.test.mjs || exit 1
+          node --experimental-transform-types --max-old-space-size=512 \
+            --import ./tools/renderer-test-core-provider.mjs \
+            --test --test-isolation=none --test-concurrency=1 \
+            ./packages/vanilla/tests/external-revision-caret.test.ts \
+            ./packages/vanilla/tests/undo-onset-surface-integration.test.mjs
+      - name: 공개 예제 정책 정규 회귀
+        run: |
+          test -f ./tests/tools/pages-demo-fixture-policy.test.mjs || exit 1
+          test -f ./tools/pages-demo/gallery-policy-activation.test.mjs || exit 1
+          node --test --test-concurrency=1 ./tests/tools/pages-demo-fixture-policy.test.mjs ./tools/pages-demo/fixture-extension.test.mjs ./tools/pages-demo/gallery-policy-activation.test.mjs
+      - name: 문단 측정과 배치 분리 source 회귀
+        run: |
+          node --test --test-concurrency=1 \
+            ./tests/hwp5/measurement-placement.test.mjs \
+            ./tests/hwpx/renderer-projection-measure.test.mjs \
+            ./tests/hwp5/line-spacing-compat.test.mjs
+      - name: Test composition newline ordering
+        timeout-minutes: 1
+        run: node --max-old-space-size=256 --test --test-concurrency=1 tests/hwpx/composition-newline.test.mjs
+      - name: Test AI document CLI and independent save oracles
+        timeout-minutes: 3
+        run: |
+          export HWPJS_CLI_NATIVE=1
+          export HWPJS_READ_MANY_NATIVE=1
+          export HWPJS_TEST_WASM="$PWD/apps/docs/docs/public/editor/hwpjs/hwpjs.wasm"
+          export HWPJS_TEST_WASM_SHA256="$HWPJS_TEST_WASM_EXPECTED_SHA256"
+          export HWPJS_TEST_NOORI="$PWD/apps/docs/docs/public/editor/fixtures/noori.hwp"
+          export HWPJS_TEST_NOORI_HWPX="$PWD/apps/docs/docs/public/editor/fixtures/noori.hwpx"
+          export HWPJS_TEST_HEADERFOOTER="$PWD/apps/docs/docs/public/editor/fixtures/headerfooter.hwp"
+          export HWPJS_TEST_HEADERFOOTER_HWPX="$PWD/apps/docs/docs/public/editor/fixtures/headerfooter.hwpx"
+          export HWPJS_TEST_CLI_ENTRY="$PWD/packages/cli/src/bin.ts"
+          export HWPJS_TEST_CLI_ENTRY_SHA256="$(node --input-type=module -e 'import{readFileSync}from"node:fs";import{createHash}from"node:crypto";console.log(createHash("sha256").update(readFileSync(process.env.HWPJS_TEST_CLI_ENTRY)).digest("hex"))')"
+          node --max-old-space-size=512 --test --test-concurrency=1 --test-timeout=60000 \
+            packages/cli/tests/host-arguments.test.mjs \
+            packages/cli/tests/host-files.test.mjs \
+            packages/cli/tests/host-main.test.mjs \
+            packages/cli/tests/host-adversarial.test.mjs \
+            packages/cli/tests/document-model.test.mjs \
+            packages/cli/tests/hwpx-control-aware-read.test.mjs \
+            packages/cli/tests/hwpx-control-aware-witness.test.mjs \
+            packages/cli/tests/hwpx-incomplete-read-content.test.mjs \
+            packages/cli/tests/hwpx-partial-read-summary.test.mjs \
+            packages/cli/tests/hwpx-consumed-axis-snapshot.test.mjs \
+            tools/tests/hwpx-control-text-batch.test.mjs \
+            packages/cli/tests/render-document.test.mjs \
+            packages/cli/tests/read-operation.test.mjs \
+            packages/cli/tests/engine.test.mjs \
+            tools/tests/cli-document-e2e.test.mjs
+      - name: Test metadata, image extraction and MCP tools
+        timeout-minutes: 3
+        run: |
+          export HWPJS_CLI_NATIVE=1
+          export HWPJS_MCP_NATIVE=1
+          export HWPJS_READ_MANY_NATIVE=1
+          export HWPJS_TEST_WASM="$PWD/apps/docs/docs/public/editor/hwpjs/hwpjs.wasm"
+          export HWPJS_TEST_WASM_SHA256="$HWPJS_TEST_WASM_EXPECTED_SHA256"
+          export HWPJS_TEST_NOORI="$PWD/apps/docs/docs/public/editor/fixtures/noori.hwp"
+          export HWPJS_TEST_NOORI_HWPX="$PWD/apps/docs/docs/public/editor/fixtures/noori.hwpx"
+          node --max-old-space-size=512 --test --test-concurrency=1 --test-timeout=60000 \
+            packages/cli/tests/inspect-document.test.mjs \
+            packages/cli/tests/batch-read.test.mjs \
+            packages/cli/tests/document-images.test.mjs \
+            packages/cli/tests/mcp.test.mjs \
+            packages/hwpjs/tests/declaration-inputs.test.mjs \
+            tools/tests/public-package-notices.test.mjs \
+            tools/tests/build-agent-skill.test.mjs \
+            tools/tests/hwpjs-skill-launcher.test.mjs
+      - name: Verify generated Skill assets against the package build
+        timeout-minutes: 3
+        run: |
+          bun tools/build-public-package.mjs --js-only --wasm=apps/docs/docs/public/editor/hwpjs/hwpjs.wasm
+          node tools/build-agent-skill.mjs --package-dir packages/hwpjs --out zig-out/verification/ci-agent-skill
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { readFile, readdir } from 'node:fs/promises';
+          const names = ['LICENSE', 'THIRD_PARTY_NOTICES.md', 'cli.mjs', 'hwpjs.wasm', 'manifest.json', 'mcp.mjs'];
+          const shipped = 'skills/hwpjs/assets/hwpjs';
+          const entries = await readdir(shipped, { withFileTypes: true });
+          assert(entries.every((entry) => entry.isFile()), 'SkillAssetsMustBeRegularFiles');
+          assert.deepEqual(entries.map((entry) => entry.name).sort(), [...names].sort());
+          for (const name of names) {
+            assert((await readFile(`${shipped}/${name}`)).equals(await readFile(`zig-out/verification/ci-agent-skill/${name}`)), `SkillAssetOutOfDate:${name}`);
+          }
+          JS
+      - name: Test public SDK picture editing and HWP5 vertical margins
+        timeout-minutes: 2
+        run: node --test --test-concurrency=1 tests/image/public-image-insertion.test.mjs tests/image/public-hwp5-vertical-margins.test.mjs tests/image/public-picture-anchored-resize.test.mjs
+      - name: Test public SDK HWP5 horizontal chart creation
+        timeout-minutes: 2
+        run: node --test --test-concurrency=1 tests/own-chart-create/public-horizontal-create.test.mjs
+      - name: Test portable fixture author and independent oracle
+        run: |
+          python3 -B tools/testing/portable_five/test_portable_five.py
+          python3 -B -O tools/testing/portable_five/test_portable_five.py
+          python3 -B tools/testing/portable_five/author_fixtures.py --check
+          python3 -B tools/testing/portable_five/oracle.py
+      - name: Check derived quality configuration
+        run: bun run quality:config
+      - name: Test quality scope and safety contracts
+        run: bun test ./tools/quality.test.mjs
+      - name: Lint tracked JavaScript and TypeScript
+        run: bun run lint
+      - name: Check tracked source formatting
+        run: bun run format:check

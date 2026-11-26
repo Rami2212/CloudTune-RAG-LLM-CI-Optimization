@@ -1,0 +1,91 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [HIGH] Switch "ios" from macOS to ubuntu runner
+# - [LOW] Use shallow clone in "linux" job
+# Estimated savings: ~0 min/run
+#
+# Workflow: save the Gradle caches on main that pull request jobs restore.
+#
+# Dependencies use setup-java's build-file key. Task outputs use a key per commit,
+# so source-only changes also refresh what pull requests restore from main.
+# The twice-weekly run refills caches GitHub removed after 7 days without use.
+name: Warm Gradle Cache
+on:
+  push:
+    branches: [main]
+    # Sources and resources affect task outputs even when build files stay the same.
+    paths:
+      - '**/src/**'
+      - 'buildSrc/**'
+      - '**/*.gradle*'
+      - '**/gradle.properties'
+      - '**/gradle-wrapper.properties'
+      - '**/versions.properties'
+      - 'gradle/**'
+      - 'gradlew'
+      - 'gradlew.bat'
+      - '.github/workflows/warm-gradle-cache.yml'
+      - '.github/actions/setup-jdk/action.yml'
+  schedule:
+    # Sundays and Wednesdays at 03:00 UTC.
+    - cron: "0 3 * * 0,3"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: warm-gradle-cache
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Warm Linux Gradle Cache
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-26.04
+    steps:
+      # Full history: the API compatibility baseline builds from the latest release tag.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Set up JDK 17
+        id: java
+        uses: ./.github/actions/setup-jdk
+
+      - name: Build Linux CI targets
+        if: ${{ steps.java.outputs.cache-hit != 'true' || steps.java.outputs.build-cache-hit != 'true' }}
+        run: ./gradlew ciWarmCacheLinux --no-daemon
+
+      - name: Save Gradle task outputs
+        if: ${{ steps.java.outputs.build-cache-hit != 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.gradle/caches/build-cache-1
+          key: ${{ steps.java.outputs.build-cache-key }}
+
+  ios:
+    name: Warm iOS Gradle Cache
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Set up JDK 17
+        id: java
+        uses: ./.github/actions/setup-jdk
+        with:
+          kotlin-native: true
+
+      - name: Link iOS test binaries
+        if: ${{ steps.java.outputs.cache-hit != 'true' || steps.java.outputs.build-cache-hit != 'true' }}
+        run: ./gradlew ciWarmCacheIos --no-daemon
+
+      - name: Save Gradle task outputs
+        if: ${{ steps.java.outputs.build-cache-hit != 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.gradle/caches/build-cache-1
+          key: ${{ steps.java.outputs.build-cache-key }}

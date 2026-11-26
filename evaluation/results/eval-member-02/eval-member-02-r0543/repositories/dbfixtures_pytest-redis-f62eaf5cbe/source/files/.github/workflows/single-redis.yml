@@ -1,0 +1,69 @@
+name: Run pytest tests
+
+on:
+  workflow_call:
+    inputs:
+      python-versions:
+        description: 'Supported python versions'
+        default: '["3.11", "3.12", "3.13", "3.14", "3.15", "pypy-3.11"]'
+        required: false
+        type: string
+      redis-versions:
+        description: 'Redis versions'
+        required: true
+        type: string
+      os:
+        description: 'Operating system to run tests on'
+        default: 'ubuntu-latest'
+        required: false
+        type: string
+    secrets:
+      codecov_token:
+        description: 'Codecov token'
+        required: false
+
+
+jobs:
+  redis:
+    runs-on: ${{ inputs.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJSON(inputs.python-versions) }}
+        redis-version: ${{ fromJSON(inputs.redis-versions) }}
+    env:
+      OS: ${{ inputs.os }}
+      PYTHON: ${{ matrix.python-version }}
+      REDIS_VERSION: ${{ matrix.redis-version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Cache Redis builds
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/redis
+          key: redis-${{ hashFiles('.download-redis.sh') }}
+      - name: Set up uv with python ${{ matrix.python-version }}
+        uses: fizyk/actions-reuse/.github/actions/uv-setup@87d3ad31f48a10d47052242b0217dd49ddbfbc16 # v5.12.1
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: fizyk/actions-reuse/.github/actions/uv-pytest-coverage@87d3ad31f48a10d47052242b0217dd49ddbfbc16 # v5.12.1
+        with:
+          pytest-opts: -p no:xdist --redis-exec=$HOME/redis/redis-${{ matrix.redis-version }}/src/redis-server
+          data-file: .coverage.serial
+          output-file: coverage-serial.xml
+      - uses: fizyk/actions-reuse/.github/actions/uv-pytest-coverage@87d3ad31f48a10d47052242b0217dd49ddbfbc16 # v5.12.1
+        with:
+          pytest-opts: -n auto --max-worker-restart=0 --redis-exec=$HOME/redis/redis-${{ matrix.redis-version }}/src/redis-server
+          coverage-config: .coveragerc
+          data-file: .coverage.xdist
+          output-file: coverage-xdist.xml
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          flags: linux,redis-${{ matrix.redis-version }}
+          env_vars: OS,PYTHON,REDIS_VERSION
+          files: coverage.xml,coverage-xdist.xml
+          fail_ci_if_error: false
+          token: ${{ secrets.codecov_token }}

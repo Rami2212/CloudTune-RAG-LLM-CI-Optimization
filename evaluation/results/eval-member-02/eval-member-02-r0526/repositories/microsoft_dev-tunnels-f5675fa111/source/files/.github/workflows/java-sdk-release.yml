@@ -1,0 +1,28 @@
+name: Publish package to GitHub Packages
+
+on:
+  release:
+    types: [created]
+
+defaults:
+  run:
+    working-directory: java
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          java-version: "11"
+          distribution: "adopt"
+      - name: Set java release version env variable
+        run: echo "JAVA_RELEASE_VERSION=$(echo ${{github.ref_name}} | cut -c 7-)" >> $GITHUB_ENV
+      - name: Publish package
+        run: mvn --batch-mode deploy --file pom.xml -Drevision=$JAVA_RELEASE_VERSION -Dmaven.test.skip=true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
@@ -24,7 +25,7 @@ class OpenRouterPaused(RuntimeError):
         self.http_status = http_status
 
 
-def request_openrouter_json(request, *, opener=None, deadline_seconds: float = OPENROUTER_REQUEST_SECONDS):
+def _request_openrouter_once(request, *, opener=None, deadline_seconds: float = OPENROUTER_REQUEST_SECONDS):
     """Read one entire JSON response with a hard caller deadline and no retries.
 
     Work occurs in a daemon thread so a blocked SSL read cannot prevent the
@@ -78,5 +79,25 @@ def request_openrouter_json(request, *, opener=None, deadline_seconds: float = O
     if reply.get("error"):
         # Provider-level errors can arrive with HTTP 200. Do not archive the
         # response as a completed candidate; permit explicit manual resume.
+        detail = str(reply.get("error", ""))
+        if "rate limit" in detail.lower() or "too many requests" in detail.lower():
+            raise OpenRouterPaused("OpenRouter provider rate limit", http_status=429)
         raise OpenRouterPaused("OpenRouter returned a provider error; request retained")
     return reply
+
+
+def request_openrouter_json(request, *, opener=None, deadline_seconds: float = OPENROUTER_REQUEST_SECONDS):
+    """Try a free-provider request at most three times; stop immediately on 429."""
+    last_error = None
+    for attempt in range(3):
+        try:
+            return _request_openrouter_once(
+                request, opener=opener, deadline_seconds=deadline_seconds)
+        except OpenRouterPaused as exc:
+            if exc.http_status == 429:
+                raise
+            last_error = exc
+            if attempt == 2:
+                raise
+            time.sleep(0.5 * (2 ** attempt))
+    raise last_error or OpenRouterPaused("OpenRouter request failed")

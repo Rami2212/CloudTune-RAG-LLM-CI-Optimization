@@ -1,0 +1,37 @@
+---
+name: Compat Tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+jobs:
+  compat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Ruby (harness driver)
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+          bundler-cache: false
+
+      - name: Install harness Ruby deps
+        run: gem install --no-document toml-rb
+
+      - name: Set up Crystal
+        uses: crystal-lang/install-crystal@v1
+
+      - name: Install cmake (for lexbor)
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
+      - name: Build Crystal binary
+        run: |
+          shards install
+          crystal build src/cli_main.cr -o deadfinder --release
+
+      - name: Compat — Crystal implementation
+        env:
+          BIN: ./deadfinder
+        run: ruby spec/compat/run.rb

@@ -1,0 +1,123 @@
+name: .NET Build and Publish Nuget
+
+permissions:
+  contents: write  # required to create releases/tags
+  id-token: write  # lets the job ask GitHub for the OIDC token nuget.org trusts (trusted publishing)
+
+env:
+  # One entry per package, in publish order. Optional "|extra-restore-args" suffix
+  # is appended to the `dotnet restore` call for that project only.
+  PACK_PROJECTS: |
+    src/Stride.CommunityToolkit/Stride.CommunityToolkit.csproj
+    src/Stride.CommunityToolkit.Windows/Stride.CommunityToolkit.Windows.csproj|--runtime win-x64
+    src/Stride.CommunityToolkit.Linux/Stride.CommunityToolkit.Linux.csproj
+    src/Stride.CommunityToolkit.Skyboxes/Stride.CommunityToolkit.Skyboxes.csproj
+    src/Stride.CommunityToolkit.Bepu/Stride.CommunityToolkit.Bepu.csproj
+    src/Stride.CommunityToolkit.Bullet/Stride.CommunityToolkit.Bullet.csproj
+    src/Stride.CommunityToolkit.DebugShapes/Stride.CommunityToolkit.DebugShapes.csproj
+    src/Stride.CommunityToolkit.Shapes/Stride.CommunityToolkit.Shapes.csproj
+    src/Stride.CommunityToolkit.ImGui/Stride.CommunityToolkit.ImGui.csproj
+    src/Stride.CommunityToolkit.Effects/Stride.CommunityToolkit.Effects.csproj
+  TEST_PROJECT: tests/Stride.CommunityToolkit.Tests/Stride.CommunityToolkit.Tests.csproj
+  COMMON_SETTINGS_PATH: src/CommonSettings.props
+  # Typed at dispatch; the run number used to be the version, until a failed run burned one
+  VERSION: ${{ inputs.version }}
+  NUGET_SOURCE: "https://api.nuget.org/v3/index.json"
+  NUPKG_ROOT: nupkgs
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "The package version, for example 1.0.0.0-preview.69; the tag and the release take the same name"
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout Stride Community Toolkit
+      uses: actions/checkout@v7
+
+    - name: .NET Setup
+      uses: actions/setup-dotnet@v6
+      with:
+        dotnet-version: 10.0.x
+
+    # A typo here would publish under a name nothing points at, so the shape is checked first
+    - name: Check the version
+      shell: bash
+      run: |
+        if [[ ! "$VERSION" =~ ^1\.0\.0\.0-preview\.[0-9]+$ ]]; then
+          echo "::error::'$VERSION' is not of the form 1.0.0.0-preview.N"
+          exit 1
+        fi
+        if git ls-remote --exit-code --tags origin "refs/tags/$VERSION" > /dev/null; then
+          echo "::error::The tag $VERSION already exists; this version has been released"
+          exit 1
+        fi
+
+    - name: Set Version in csproj
+      run: |
+        $settingsContent = Get-Content -Path "${{ env.COMMON_SETTINGS_PATH }}" -Raw
+        $updatedCsprojContent = $settingsContent -replace '<Version>.*?</Version>', "<Version>${{ env.VERSION }}</Version>"
+        Set-Content -Path "${{ env.COMMON_SETTINGS_PATH }}" -Value $updatedCsprojContent
+
+    # Not needed as Directory.Build.props added a condition to this target
+    # - name: Create .sarif Directory
+    #   run: New-Item -ItemType Directory -Force -Path D:\.sarif
+    #   shell: pwsh
+
+    # Run the tests before anything is packed, so a failure costs nothing
+    - name: Test
+      run: dotnet test ${{ env.TEST_PROJECT }} -c Release --verbosity normal
+
+    # Everything is packed first and pushed afterwards: a build failure half-way
+    # through must not leave a partially published version on nuget.org
+    - name: Build and pack all packages
+      shell: bash
+      run: |
+        set -eo pipefail
+        while IFS= read -r entry; do
+          entry="${entry//$'\r'/}"
+          if [ -z "$entry" ]; then
+            continue
+          fi
+
+          project="${entry%%|*}"
+          restore_args=""
+          if [ "$entry" != "$project" ]; then
+            restore_args="${entry#*|}"
+          fi
+
+          echo "::group::$project"
+          dotnet restore "$project" $restore_args
+          dotnet build "$project" --no-restore -c Release
+          dotnet pack "$project" --no-build -c Release -o "$NUPKG_ROOT"
+          echo "::endgroup::"
+        done <<< "$PACK_PROJECTS"
+
+    - name: List packages
+      shell: bash
+      run: ls -l "$NUPKG_ROOT"
+
+    # Trusted publishing: the job's OIDC token is exchanged for an API key that lives one hour, against
+    # the policy on nuget.org (owner StrideCommunity, this repository and this workflow file). No stored
+    # key; NUGET_USER is the nuget.org profile name of the policy's creator, not an email address
+    - name: NuGet login
+      id: login
+      uses: NuGet/login@v1
+      with:
+        user: ${{ secrets.NUGET_USER }}
+
+    - name: Publish all packages
+      run: dotnet nuget push "${{ env.NUPKG_ROOT }}\*.nupkg" --source "${{ env.NUGET_SOURCE }}" --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" --skip-duplicate
+
+    # Create release
+    - name: Create GitHub Release
+      run: |
+        gh release create ${{ env.VERSION }} --title "v${{ env.VERSION }}" --notes "Release notes for ${{ env.VERSION }}" --draft
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,49 @@
+plugins {
+    id 'buildlogic.java-common-conventions'
+}
+
+dependencies {
+    implementation "tech.kwik:agent15:$agent15_version"
+
+    // https://mvnrepository.com/artifact/at.favre.lib/hkdf
+    implementation 'at.favre.lib:hkdf:2.0.0'
+
+    implementation 'com.io7m.repackage.io.whitfin:io.whitfin.siphash:2.0.1'
+}
+
+// Expose the test output (e.g. MockPacket, TestUtils) so other modules can reuse it as test utilities.
+configurations {
+    testArtifacts
+}
+
+tasks.register('testJar', Jar) {
+    archiveClassifier = 'tests'
+    from sourceSets.test.output
+}
+
+artifacts {
+    testArtifacts testJar
+}
+
+def projectVersion = project.version.toString()
+def generatedResourcesDir = layout.buildDirectory.dir("generated")
+
+def includeVersion = tasks.register('includeVersion') {
+    outputs.dir(generatedResourcesDir)
+    doLast {
+        def versionDir = new File(generatedResourcesDir.get().asFile, "tech/kwik/core")
+        versionDir.mkdirs()
+        new File(versionDir, "version.properties").text = projectVersion
+    }
+}
+
+// Register the generated dir as a resource source via the task itself, so every consumer
+// (processResources, sourcesJar, ...) automatically depends on includeVersion.
+sourceSets {
+    main {
+        resources {
+            srcDir includeVersion
+            exclude 'sources/**'
+        }
+    }
+}

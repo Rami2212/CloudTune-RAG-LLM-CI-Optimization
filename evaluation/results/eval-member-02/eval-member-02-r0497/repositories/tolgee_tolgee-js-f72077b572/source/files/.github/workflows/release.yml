@@ -1,0 +1,110 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: ['Test']
+    branches: ['main']
+    types:
+      - completed
+  push:
+    tags:
+      - 'prerelease'
+
+# Trusted Publishers for npm via GitHub Actions OIDC
+permissions:
+  id-token: write
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  main:
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: '${{ secrets.TOLGEE_MACHINE_PAT }}'
+          # fetch full history for lerna version to work
+          fetch-depth: 0
+
+      - name: Setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: 'https://registry.npmjs.org'
+
+      - uses: pnpm/action-setup@v3
+        name: Install pnpm
+        id: pnpm-install
+        with:
+          version: 8.15.9
+          run_install: false
+
+      - name: Set git globals
+        run: |
+          git config --local user.email "machine@tolgee.io"
+          git config --local user.name "Tolgee Machine"
+
+      - name: Create prerelease branch
+        if: ${{ github.event_name == 'push' }}
+        run: git checkout -b prerelease.$(git rev-parse --short HEAD)
+
+      - name: Install
+        run: pnpm i
+
+      - name: Get next version by semantic-release
+        if: ${{ github.event_name != 'push' }}
+        id: version
+        run: npx semantic-release --dry-run && echo "VERSION=$(cat .VERSION)" >> $GITHUB_OUTPUT
+
+      - name: Update version locally (release)
+        if: ${{ github.event_name != 'push' && steps.version.outputs.VERSION != '' }}
+        run: |
+          lerna version ${{ steps.version.outputs.VERSION }} --yes --exact --force-publish \
+            --no-push --no-git-tag-version
+
+      - name: Update version locally (prerelease)
+        if: ${{ github.event_name == 'push' }}
+        run: |
+          lerna version prerelease --yes --conventional-prerelease --preid prerelease.$(git rev-parse --short HEAD) \
+            --force-publish --no-push --no-git-tag-version --exact
+
+      - name: Build all packages
+        if: ${{ github.event_name == 'push' || steps.version.outputs.VERSION != '' }}
+        run: pnpm build || pnpm build
+
+      - name: Recreate release with push (release)
+        if: ${{ github.event_name != 'push' && steps.version.outputs.VERSION != '' }}
+        run: |
+          git stash
+          lerna version ${{ steps.version.outputs.VERSION }} --yes --exact --force-publish \
+            --create-release github
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Recreate release with push (prerelease)
+        if: ${{ github.event_name == 'push' }}
+        run: |
+          git stash
+          git push --follow-tags -u origin $(git rev-parse --abbrev-ref HEAD)
+          lerna version prerelease --yes --conventional-prerelease --preid prerelease.$(git rev-parse --short HEAD) \
+            --force-publish --exact --create-release github
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish (release)
+        if: ${{ github.event_name != 'push' && steps.version.outputs.VERSION != '' }}
+        run: lerna publish from-package --yes
+
+      - name: Publish (prerelease)
+        if: ${{ github.event_name == 'push' }}
+        run: lerna publish from-package --yes --dist-tag prerelease
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cypress
+          path: |
+            cypress/videos/**/*
+            cypress/screenshots/**/*

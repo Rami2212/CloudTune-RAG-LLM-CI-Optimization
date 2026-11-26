@@ -1,0 +1,504 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 6 optimizations:
+# - [HIGH] Add pip dependency cache to "format-check" job
+# - [MEDIUM] 5 jobs clone the repo — consider artifact sharing
+# - [LOW] Use shallow clone in "linux-tests" job
+# - [LOW] Use shallow clone in "linux-pgbouncer" job
+# - [LOW] Use shallow clone in "linux-sanitized" job
+# - [LOW] Use shallow clone in "windows-tests" job
+# Estimated savings: ~4 min/run
+#
+name: Integration Tests
+on: 
+  push:
+    paths-ignore:
+      - '**.md'
+      - '.github/workflows/**'
+      - '!.github/workflows/IntegrationTests.yml'
+  pull_request:
+  repository_dispatch:
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+
+  format-check:
+    name: Format Check
+    runs-on: ${{ github.repository_owner == 'duckdb' && 'namespace-profile-linux-slim' || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: 'true'
+      - run: |
+          python -m pip install --user --break-system-packages \
+            black==25.1.0        \
+            clang_format==11.0.1 \
+            cmake-format==0.6.13
+          export PATH=~/.local/bin:$PATH
+          python -m pip show black
+          python -m pip show cmake_format
+          python -m pip show clang_format
+          which clang-format
+          clang-format --version
+          make format-check
+
+  linux-tests:
+    name: Linux (pg-17)
+    needs: format-check
+    runs-on: ${{ github.repository_owner == 'duckdb' && 'namespace-profile-linux-x64' || 'ubuntu-latest' }}
+
+    env:
+      GEN: ninja
+      CC: '/usr/lib/ccache/gcc'
+      CXX: '/usr/lib/ccache/g++'
+      CCACHE_DIR: ${{ github.workspace }}/ccache
+      VCPKG_TARGET_TRIPLET: x64-linux-release
+      VCPKG_HOST_TRIPLET: x64-linux-release
+      VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+        submodules: 'true'
+
+    - name: Install Dependencies
+      run: |
+        echo "set man-db/auto-update false" | sudo debconf-communicate || true
+        sudo dpkg-reconfigure man-db || true
+        sudo apt-get update -y -q -o=Dpkg::Use-Pty=0
+        sudo apt-get install -y -q -o=Dpkg::Use-Pty=0 \
+          build-essential \
+          ccache \
+          cmake \
+          ninja-build
+
+    - name: Cache Key
+      id: cache_key
+      working-directory: ./duckdb
+      run: |
+        DUCKDB_VERSION=$(git rev-parse --short=10 HEAD)
+        KEY="${{ runner.os }}-${{ runner.arch }}-$DUCKDB_VERSION"
+        echo "value=${KEY}" >> "${GITHUB_OUTPUT}"
+
+    - name: Restore Cache
+      uses: actions/cache/restore@v5
+      with:
+        path: ${{ github.workspace }}/ccache
+        key: ${{ steps.cache_key.outputs.value }}
+
+    - name: Setup vcpkg
+      uses: lukka/run-vcpkg@v11.1
+      with:
+        vcpkgGitCommitId: 9e593bb18ea69cc5095e012465dcd675a822ed0d # Release 2026.07.29
+
+    - name: Build extension
+      run: |
+        make release
+
+    - name: Save Cache
+      uses: actions/cache/save@v5
+      with:
+        path: ${{ github.workspace }}/ccache
+        key: ${{ steps.cache_key.outputs.value }}
+
+    - name: Setup Postgres
+      uses: ./.github/actions/setup-postgres
+      with:
+        postgres-version: 17
+        ssl: false
+
+    - name: Run tests
+      env:
+        PGHOST: localhost
+        PGPORT: 5432
+        PGUSER: postgres
+        PGPASSWORD: postgres
+        POSTGRES_TEST_DATABASE_AVAILABLE: 1
+        POSTGRES_CONNECTION_IS_DIRECT: 1
+        LOCAL_EXTENSION_REPO: 'build/release/repository'
+      run: |
+        source ./create-postgres-tables.sh
+        psql -d postgresscanner -c "SELECT 42"
+        ./build/release/test/unittest 'test/sql/*'
+
+  linux-pgbouncer:
+    name: Linux PgBouncer (${{ matrix.postgres.name }})
+    needs: linux-tests
+    runs-on: ${{ github.repository_owner == 'duckdb' && 'namespace-profile-linux-x64' || 'ubuntu-latest' }}
+
+    strategy:
+      matrix:
+        postgres:
+        - name: pg-14
+          version: 14
+        - name: pg-18
+          version: 18
+
+    env:
+      GEN: ninja
+      CC: '/usr/lib/ccache/gcc'
+      CXX: '/usr/lib/ccache/g++'
+      CCACHE_DIR: ${{ github.workspace }}/ccache
+      VCPKG_TARGET_TRIPLET: x64-linux-release
+      VCPKG_HOST_TRIPLET: x64-linux-release
+      VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+        submodules: 'true'
+
+    - name: Install Dependencies
+      run: |
+        echo "set man-db/auto-update false" | sudo debconf-communicate || true
+        sudo dpkg-reconfigure man-db || true
+        sudo apt-get update -y -q -o=Dpkg::Use-Pty=0
+        sudo apt-get install -y -q -o=Dpkg::Use-Pty=0 \
+          build-essential \
+          ccache \
+          cmake \
+          ninja-build 
+
+    - name: Cache Key
+      id: cache_key
+      working-directory: ./duckdb
+      run: |
+        DUCKDB_VERSION=$(git rev-parse --short=10 HEAD)
+        KEY="${{ runner.os }}-${{ runner.arch }}-$DUCKDB_VERSION"
+        echo "value=${KEY}" >> "${GITHUB_OUTPUT}"
+
+    - name: Restore Cache
+      uses: actions/cache/restore@v5
+      with:
+        path: ${{ github.workspace }}/ccache
+        key: ${{ steps.cache_key.outputs.value }}
+
+    - name: Setup vcpkg
+      uses: lukka/run-vcpkg@v11.1
+      with:
+        vcpkgGitCommitId: 9e593bb18ea69cc5095e012465dcd675a822ed0d # Release 2026.07.29
+
+    - name: Build extension
+      run: |
+        make release
+
+    - name: Setup Postgres
+      uses: ./.github/actions/setup-postgres
+      with:
+        postgres-version: ${{ matrix.postgres.version }}
+        ssl: true
+
+    - name: Setup PgBouncer
+      run: |
+        mkdir pgbouncer
+        openssl req -new -x509 -days 365 -nodes -text -subj "/CN=localhost" \
+          -out ./pgbouncer/pgbouncer.crt \
+          -keyout ./pgbouncer/pgbouncer.key
+        cat > ./pgbouncer/pgbouncer.ini <<'EOF'
+        [databases]
+        postgresscanner = host=localhost port=5432 dbname=postgresscanner
+
+        [pgbouncer]
+        logfile = /var/log/postgresql/pgbouncer.log
+        listen_addr = localhost
+        listen_port = 6432
+        unix_socket_dir =
+        auth_type = md5
+        auth_file = /etc/pgbouncer/userlist.txt
+        pool_mode = transaction
+        max_prepared_statements = 1024
+        client_tls_sslmode = require
+        client_tls_key_file = /etc/pgbouncer/pgbouncer.key
+        client_tls_cert_file = /etc/pgbouncer/pgbouncer.crt
+        EOF
+        echo '"postgres" "postgres"' > ./pgbouncer/userlist.txt
+        chmod 755 ./pgbouncer
+        chmod 644 ./pgbouncer/*
+        ls -la ./pgbouncer
+        cat ./pgbouncer/pgbouncer.ini
+        sudo mkdir -p /var/log/postgresql
+        sudo chmod 777 /var/log/postgresql
+        docker run -d --name pgbouncer --network host \
+          -v ${{ github.workspace }}/pgbouncer:/etc/pgbouncer:ro \
+          -v /var/log/postgresql:/var/log/postgresql \
+          edoburu/pgbouncer:latest \
+          /usr/bin/pgbouncer /etc/pgbouncer/pgbouncer.ini
+        for i in $(seq 1 30); do
+          if pg_isready -h localhost -p 6432; then
+            break
+          fi
+          sleep 1
+        done
+        docker logs pgbouncer
+        pg_isready -h localhost -p 6432
+
+    - name: Setup test data
+      env:
+        PGHOST: localhost
+        PGPORT: 5432
+        PGUSER: postgres
+        PGPASSWORD: postgres
+      run: |
+        source ./create-postgres-tables.sh
+
+    - name: Run tests with PgBouncer
+      env:
+        PGHOST: localhost
+        PGPORT: 6432
+        PGUSER: postgres
+        PGPASSWORD: postgres
+        PGSSLMODE: require
+        POSTGRES_TEST_DATABASE_AVAILABLE: 1
+        LOCAL_EXTENSION_REPO: 'build/release/repository'
+      run: |
+        psql -d postgresscanner -c "SELECT * FROM pg_stat_ssl WHERE pid = pg_backend_pid()"
+        ./build/release/test/unittest 'test/sql/*'
+
+    - name: Run tests directly
+      env:
+        PGHOST: localhost
+        PGPORT: 5432
+        PGUSER: postgres
+        PGPASSWORD: postgres
+        PGSSLMODE: require
+        POSTGRES_TEST_DATABASE_AVAILABLE: 1
+        LOCAL_EXTENSION_REPO: 'build/release/repository'
+      run: |
+        psql -d postgresscanner -c "SELECT * FROM pg_stat_ssl WHERE pid = pg_backend_pid()"
+        ./build/release/test/unittest 'test/sql/*'
+
+    - name: Upload log
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: pgbouncer_${{ matrix.pg_version }}_log
+        path: |
+          /var/log/postgresql/pgbouncer.log
+
+  linux-sanitized:
+    name: Linux ${{ matrix.sanitizer.name }} (pg-17)
+    needs: linux-tests
+    runs-on: ${{ github.repository_owner == 'duckdb' && 'namespace-profile-linux-x64' || 'ubuntu-latest' }}
+
+    strategy:
+      matrix:
+        sanitizer:
+        - name: ASan
+          threadsan_enabled: 0
+        - name: TSan
+          threadsan_enabled: 1
+
+    env:
+      GEN: ninja
+      CC: '/usr/lib/ccache/gcc'
+      CXX: '/usr/lib/ccache/g++'
+      CCACHE_DIR: ${{ github.workspace }}/ccache
+      VCPKG_TARGET_TRIPLET: x64-linux-release
+      VCPKG_HOST_TRIPLET: x64-linux-release
+      VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+        submodules: 'true'
+
+    - name: Install Dependencies
+      run: |
+        echo "set man-db/auto-update false" | sudo debconf-communicate || true
+        sudo dpkg-reconfigure man-db || true
+        sudo apt-get update -y -q -o=Dpkg::Use-Pty=0
+        sudo apt-get install -y -q -o=Dpkg::Use-Pty=0 \
+          build-essential \
+          ccache \
+          cmake \
+          mold \
+          ninja-build
+
+    - name: Cache Key
+      id: cache_key
+      working-directory: ./duckdb
+      run: |
+        DUCKDB_VERSION=$(git rev-parse --short=10 HEAD)
+        KEY="${{ runner.os }}-${{ runner.arch }}-$DUCKDB_VERSION"-relassert-${{ matrix.sanitizer.name }}
+        echo "value=${KEY}" >> "${GITHUB_OUTPUT}"
+
+    - name: Restore Cache
+      uses: actions/cache/restore@v5
+      with:
+        path: ${{ github.workspace }}/ccache
+        key: ${{ steps.cache_key.outputs.value }}
+
+    - name: Setup vcpkg
+      uses: lukka/run-vcpkg@v11.1
+      with:
+        vcpkgGitCommitId: 9e593bb18ea69cc5095e012465dcd675a822ed0d # Release 2026.07.29
+
+    - name: Build extension
+      env:
+        THREADSAN: ${{ matrix.sanitizer.threadsan_enabled }}
+      run: |
+        make relassert
+        cd build
+        ln -s relassert release
+
+    - name: Save Cache
+      uses: actions/cache/save@v5
+      with:
+        path: ${{ github.workspace }}/ccache
+        key: ${{ steps.cache_key.outputs.value }}
+
+    - name: Setup Postgres
+      uses: ./.github/actions/setup-postgres
+      with:
+        postgres-version: 17
+        ssl: true
+
+    - name: Run tests
+      env:
+        PGHOST: localhost
+        PGPORT: 5432
+        PGUSER: postgres
+        PGPASSWORD: postgres
+        PGSSLMODE: require
+        POSTGRES_TEST_DATABASE_AVAILABLE: 1
+        POSTGRES_CONNECTION_IS_DIRECT: 1
+        SANITIZER_BUILD: 1
+        LOCAL_EXTENSION_REPO: 'build/relassert/repository'
+      run: |
+        source ./create-postgres-tables.sh
+        psql -d postgresscanner -c "SELECT * FROM pg_stat_ssl WHERE pid = pg_backend_pid()"
+        ./build/relassert/test/unittest
+
+  windows-tests:
+    name: Windows (pg-17)
+    needs: linux-tests
+    runs-on: windows-latest
+
+    env:
+      GEN: ninja
+      CC: 'ccache cl'
+      CXX: 'ccache cl'
+      CCACHE_DIR: ${{ github.workspace }}/ccache
+      VCPKG_TARGET_TRIPLET: x64-windows-static-release
+      VCPKG_HOST_TRIPLET: x64-windows-static-release
+      VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+        submodules: 'true'
+
+    - name: Dependencies
+      shell: bash
+      run: |
+        choco install \
+          ccache \
+          make \
+          ninja \
+          -y --force --no-progress
+
+    - name: Build Environment
+      shell: bash
+      run: |
+        # bash from Git
+        echo 'C:/Program Files/Git/bin' >> "${GITHUB_PATH}"
+        # make, ninja and ccache from Chocolatey
+        echo 'C:/ProgramData/Chocolatey/bin' >> "${GITHUB_PATH}"
+
+    - name: Build Environment Check
+      shell: cmd
+      run: |
+        where bash
+        bash --version
+        where make
+        make --version
+        where ninja
+        ninja --version
+        where ccache
+        ccache --version
+        echo %PATH%
+
+    - name: Cache Key
+      id: cache_key
+      working-directory: ./duckdb
+      shell: bash
+      run: |
+        DUCKDB_VERSION=$(git rev-parse --short=10 HEAD)
+        KEY="${{ runner.os }}-${{ runner.arch }}-$DUCKDB_VERSION"
+        echo "value=${KEY}" >> "${GITHUB_OUTPUT}"
+
+    - name: Restore Cache
+      uses: actions/cache/restore@v5
+      with:
+        path: ${{ github.workspace }}/ccache
+        key: ${{ steps.cache_key.outputs.value }}
+
+    - name: Setup vcpkg
+      uses: lukka/run-vcpkg@v11.1
+      with:
+        vcpkgGitCommitId: 9e593bb18ea69cc5095e012465dcd675a822ed0d # Release 2026.07.29
+
+    - name: Prepare build tree
+      shell: bash
+      working-directory: duckdb
+      run: |
+        patch -p1 < ../scripts/win_resources.patch
+
+    - name: Build extension
+      shell: cmd
+      run: |
+          mv "C:\Program Files\Git\usr\bin\link.exe" "C:\Program Files\Git\usr\bin\link-git.exe"
+          call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          bash -c "make release"
+
+    - name: Save Cache
+      uses: actions/cache/save@v5
+      with:
+        path: ${{ github.workspace }}/ccache
+        key: ${{ steps.cache_key.outputs.value }}
+
+    - name: Setup Postgres
+      uses: ikalnytskyi/action-setup-postgres@v8
+      with:
+        postgres-version: '17'
+        username: 'postgres'
+        password: 'postgres'
+        database: 'postgres'
+        port: '5432'
+        ssl: true
+
+    - name: Setup test data
+      env:
+        PGHOST: localhost
+        PGPORT: 5432
+        PGUSER: postgres
+        PGPASSWORD: postgres
+        PGSCANNERTMP_ABS_DIR_PREFIX: ${{ github.workspace }}
+      shell: bash
+      run: |
+        source ./create-postgres-tables.sh
+
+    - name: Run tests
+      env:
+        PGHOST: localhost
+        PGPORT: 5432
+        PGUSER: postgres
+        PGPASSWORD: postgres
+        PGSSLMODE: require
+        POSTGRES_TEST_DATABASE_AVAILABLE: 1
+        POSTGRES_CONNECTION_IS_DIRECT: 1
+        LOCAL_EXTENSION_REPO: 'build/release/repository'
+      shell: bash
+      run: |
+        psql -d postgresscanner -c "SELECT * FROM pg_stat_ssl WHERE pid = pg_backend_pid()"
+        ./build/release/test/unittest

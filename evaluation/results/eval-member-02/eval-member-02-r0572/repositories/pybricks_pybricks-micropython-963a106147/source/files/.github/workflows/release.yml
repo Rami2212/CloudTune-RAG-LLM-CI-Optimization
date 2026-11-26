@@ -1,0 +1,104 @@
+on:
+  push:
+    tags:
+    - 'v3.*'
+    - 'v4.*'
+
+name: Upload Release Assets
+
+env:
+  MAKEOPTS: -j
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  upload_release:
+    name: Upload Release Assets
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          submodules: true
+          fetch-depth: 0
+      - name: Install cross-compiler
+        timeout-minutes: 5
+        uses: ./.github/actions/apt-install
+        with:
+          packages: gcc-arm-none-eabi libnewlib-arm-none-eabi
+          no-install-recommends: 'true'
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+        with:
+          version: "0.12.24"
+          # don't restore caches into a job that has access to release secrets
+          enable-cache: false
+      - run: uv sync --locked --only-group build
+      - name: Create credits file
+        run: |
+          echo "$PYBRICKS_EV3_CREDITS" > bricks/ev3/ci_credits.txt
+        env:
+          PYBRICKS_EV3_CREDITS: ${{ secrets.PYBRICKS_EV3_CREDITS }}
+      - name: Build firmware
+        run: |
+          export MICROPY_GIT_TAG=ci-release-${{ github.run_number }}-$(git describe --tags --dirty --always --exclude "@pybricks/*")
+          export MICROPY_GIT_HASH=$(echo ${{ github.sha }} | cut -c1-8)
+          uv run --no-sync make $MAKEOPTS -C micropython/mpy-cross
+          uv run --no-sync make $MAKEOPTS -C bricks/movehub
+          uv run --no-sync make $MAKEOPTS -C bricks/cityhub
+          uv run --no-sync make $MAKEOPTS -C bricks/technichub
+          uv run --no-sync make $MAKEOPTS -C bricks/primehub
+          uv run --no-sync make $MAKEOPTS -C bricks/essentialhub
+          uv run --no-sync make $MAKEOPTS -C bricks/nxt
+          uv run --no-sync make $MAKEOPTS -C bricks/ev3
+      - name: Get tag
+        run: |
+          TAG="${GITHUB_REF#*refs/tags/}"
+          NPM_VERSION=$(echo "${TAG#v}" | sed 's/\([0-9]\)a\([0-9]\)/\1-alpha.\2/;s/\([0-9]\)b\([0-9]\)/\1-beta.\2/;s/\([0-9]\)rc\([0-9]\)/\1-rc.\2/')
+          NPM_TAG=$(echo "$NPM_VERSION" | grep -q '-' && echo 'next' || echo 'latest')
+          echo "GITHUB_TAG=$TAG" >> $GITHUB_ENV
+          echo "NPM_VERSION=$NPM_VERSION" >> $GITHUB_ENV
+          echo "NPM_TAG=$NPM_TAG" >> $GITHUB_ENV
+      - name: Create Release and Upload Assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ github.ref_name }}
+        run: |
+          if [[ "${{ contains(env.GITHUB_TAG, 'a') || contains(env.GITHUB_TAG, 'b') || contains(env.GITHUB_TAG, 'c') }}" == "true" ]]; then
+            PRERELEASE_FLAG="--prerelease"
+          else
+            PRERELEASE_FLAG=""
+          fi
+          HUBS="movehub cityhub technichub primehub essentialhub nxt ev3"
+          mkdir -p npm/firmware/build
+          cp LICENSE npm/firmware/LICENSE
+          for HUB in $HUBS; do
+            NEW_FILENAME="./bricks/$HUB/build/pybricks-$HUB-${{ env.GITHUB_TAG }}.zip"
+            cp "./bricks/$HUB/build/firmware.zip" "npm/firmware/build/$HUB.zip"
+            mv "./bricks/$HUB/build/firmware.zip" "$NEW_FILENAME"
+            ASSETS="$ASSETS $NEW_FILENAME"
+          done
+          VERSION="${tag#v}"
+          if [[ -z "$PRERELEASE_FLAG" ]]; then
+            RELEASE_NOTES=$(awk -v ver="$VERSION" '/^## \[/{if ($0 ~ "^## \\[" ver "\\]") found=1; else if (found && $0 !~ /[0-9][abc][0-9]/) exit} found{print}' CHANGELOG.md)
+          else
+            RELEASE_NOTES=$(awk -v ver="$VERSION" '/^## \[/{if ($0 ~ "^## \\[" ver "\\]") found=1; else if (found && printed) exit} found{printed=1; print}' CHANGELOG.md)
+          fi
+          gh release create "$tag" \
+              --repo="$GITHUB_REPOSITORY" \
+              --title="${tag#v}" \
+              --notes "$RELEASE_NOTES" \
+              $PRERELEASE_FLAG \
+              $ASSETS
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Publish npm firmware package
+        working-directory: npm/firmware
+        run: |
+          npm version --no-git-tag-version "${{ env.NPM_VERSION }}"
+          npm publish --tag "${{ env.NPM_TAG }}"

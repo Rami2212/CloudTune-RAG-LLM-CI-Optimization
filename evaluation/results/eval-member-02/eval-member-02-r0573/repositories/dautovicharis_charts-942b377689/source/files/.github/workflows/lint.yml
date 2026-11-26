@@ -1,0 +1,44 @@
+# Reusable Kotlin lint check for pull request orchestration.
+name: Lint
+
+on:
+  workflow_call:
+    inputs:
+      should-run:
+        description: Whether Prepare PR selected the lint check.
+        required: true
+        type: boolean
+      source-sha:
+        description: Immutable merge revision being checked.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  skipped:
+    name: No-op
+    if: ${{ !inputs.should-run }}
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Report no-op
+        run: echo 'Prepare PR found no change that needs the lint check.'
+
+  lint:
+    name: Lint
+    if: ${{ inputs.should-run }}
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          ref: ${{ inputs.source-sha }}
+      - name: Set up JDK 17
+        uses: ./.github/actions/setup-jdk
+        with:
+          # Only warm-gradle-cache.yml writes caches; a write here scopes the entry to the PR.
+          cache-read-only: true
+      # ciCheckImpactGraph fails when the test selection in Prepare PR misses a project or dependency.
+      - name: Lint
+        run: ./gradlew ktlintCheck buildSrcKtlintCheck ciCheckImpactGraph

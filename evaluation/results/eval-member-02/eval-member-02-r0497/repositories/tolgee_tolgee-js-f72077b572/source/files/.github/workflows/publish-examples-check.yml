@@ -1,0 +1,71 @@
+name: Check examples
+
+on:
+  pull_request:
+    types:
+      - labeled
+
+jobs:
+  check:
+    if: ${{ github.event.label.name == 'check-examples' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        project:
+          [
+            'react',
+            'next',
+            'vue',
+            'next-app',
+            'next-app-intl',
+            'svelte',
+            'ngx',
+            'react-i18next',
+            'vue-i18next',
+            'vue-ssr',
+          ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: root
+
+      - name: Setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Read last commit
+        id: get-commit-message
+        run: echo "COMMIT=$(git show -s --format=%s)" >> $GITHUB_OUTPUT
+        working-directory: root
+
+      - run: mkdir -p testapps/${{ matrix.project }}
+
+      - uses: actions/checkout@v4
+        with:
+          token: '${{ secrets.TOLGEE_MACHINE_PAT }}'
+          repository: tolgee/${{ matrix.project }}-example
+          path: testapps/${{ matrix.project }}
+
+      - run: |
+          git rm -rf . && git clean -fxd
+        working-directory: testapps/${{ matrix.project }}
+
+      - run: |
+          rsync -av --progress root/testapps/${{ matrix.project }}/ \
+            testapps/${{ matrix.project }}/ \
+            --exclude 'package-lock.json'
+
+      - name: Recreate package-lock
+        run: |
+          npm install --package-lock-only --force
+          npm install --package-lock-only
+
+        working-directory: testapps/${{ matrix.project }}
+
+      - name: Update README
+        run: |
+          bash "$GITHUB_WORKSPACE/root/.github/scripts/update-readme.sh" "${{ matrix.project }}"
+
+      # NOT publishing here

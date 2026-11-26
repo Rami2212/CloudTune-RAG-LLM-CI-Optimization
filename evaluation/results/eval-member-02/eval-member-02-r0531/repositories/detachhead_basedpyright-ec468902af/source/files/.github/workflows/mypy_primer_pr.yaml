@@ -1,0 +1,114 @@
+# This workflow runs mypy_primer, a tool that runs pyright on a variety
+# of open-source Python projects that are known to type check with pyright.
+# It builds pyright from the latest PR commit and the merge base of the PR
+# and compares the output of both. It uploads the diffs as an artifact and
+# creates a PR comment with the results (with the help of the
+# mypy_primer_comment action).
+
+# This workflow definition borrows liberally from the mypy repo. The original
+# workflow was designed to work in a sharded manner where n copies of
+# mypy_primer are started in parallel. Each instance runs 1/n of the projects.
+# For now, we run only one instance because pyright is fast, and the number
+# of projects that use pyright for type checking is small. To change this in
+# the future, change the 'shard_index' matrix to [0, 1, ..., n-1] and set
+# 'num-shards' to n.
+
+name: Run mypy_primer on PR
+
+env:
+  PYRIGHT_DISABLE_GITHUB_ACTIONS_OUTPUT: true
+  GG_GITHUB_TOKEN: ${{ github.token }}
+
+on:
+  # Run on the creation or update of a PR.
+  pull_request:
+    paths:
+      - 'packages/pyright/**'
+      - 'packages/pyright-internal/src/**'
+      - '!packages/pyright-internal/src/localization/**' # first exclude localization data
+      - 'packages/pyright-internal/src/localization/*.ts' # then re-include *.ts
+      - 'packages/pyright-internal/src/localization/package.nls.en-us.json' # re-include en-us data
+      - 'packages/pyright-internal/typeshed-fallback/**'
+      - '.github/workflows/mypy_primer_*.yaml'
+      - 'mypy_primer/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  mypy_primer:
+    name: Run mypy_primer on PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        shard-index: [0, 1, 2, 3, 4, 5, 6, 7]
+      fail-fast: false
+    steps:
+      # this is gross, we need to checkout the repo twice because the primer can't be run from within the same repo it's being tested on.
+      # ideally we'd just cd out into the parent directory, but mypy_primer/uv is installed with gg which doesn't work when run from outside the project directory
+      - name: checkout repo with submodules (checkout to run mypy_primer from)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: true
+      - name: checkout repo without submodules (checkout to run primer against)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: pyright_to_test
+          fetch-depth: 0
+          persist-credentials: false
+      - name: add gg aliases to PATH
+        run: |
+          cd pyright_to_test
+          realpath ./gg >> $GITHUB_PATH
+      - name: Run mypy_primer
+        shell: bash
+        env:
+          shard_index: ${{ matrix.shard-index }}
+          GG_HIDE_DOWNLOAD_PROGRESS: 1
+        run: |
+          cd pyright_to_test
+          echo "new commit"
+          git rev-list --format=%s --max-count=1 $GITHUB_SHA
+
+          MERGE_BASE=$(git merge-base $GITHUB_SHA origin/$GITHUB_BASE_REF)
+          git checkout -b base_commit $MERGE_BASE
+          echo "base commit"
+          git rev-list --format=%s --max-count=1 base_commit
+
+          echo ''
+          cd ..
+          # fail action if exit code isn't zero or one
+          (
+            mypy_primer \
+            --repo pyright_to_test \
+            --type-checker pyright \
+            --new $GITHUB_SHA --old base_commit \
+            --num-shards 8 --shard-index $shard_index \
+            --debug \
+            --output concise \
+            | tee diff_$shard_index.txt
+          ) || [ $? -eq 1 ]
+      - name: Upload mypy_primer diff
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mypy_primer_diffs_${{ matrix.shard-index }}
+          path: diff_${{ matrix.shard-index }}.txt
+      - if: ${{ matrix.shard-index == 0 }}
+        name: Save PR number
+        env:
+          pr_number: ${{ github.event.pull_request.number }}
+        run: |
+          echo $pr_number | tee pr_number.txt
+      - if: ${{ matrix.shard-index == 0 }}
+        name: Upload PR number
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mypy_primer_diffs_pr_number
+          path: pr_number.txt

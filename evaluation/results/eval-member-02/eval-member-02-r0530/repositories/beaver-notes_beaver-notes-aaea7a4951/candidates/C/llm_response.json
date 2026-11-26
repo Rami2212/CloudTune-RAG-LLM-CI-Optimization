@@ -1,0 +1,54 @@
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "logprobs": null,
+      "message": {
+        "content": "{\n  \"decision\": \"APPLY\",\n  \"workflow_yaml\": \"name: CI\\n\\non:\\n  push:\\n    branches: [main]\\n  pull_request:\\n    branches: [main]\\n\\nenv:\\n  NODE_VERSION: '22'\\n\\n# Pushing often produces many concurrent runs; cancel superseded ones so CI\\n# minutes are not spent on stale commits.\\nconcurrency:\\n  group: ci-${{ github.ref }}\\n  cancel-in-progress: true\\n\\njobs:\\n  lint-test:\\n    name: Lint & Test\\n    runs-on: ubuntu-latest\\n    timeout-minutes: 5\\n\\n    steps:\\n      - name: Checkout\\n        uses: actions/checkout@v4\\n\\n      - name: Setup Node\\n        uses: actions/setup-node@v4\\n        with:\\n          node-version: ${{ env.NODE_VERSION }}\\n          cache: yarn\\n\\n      - name: Enable Corepack\\n        run: |\\n          corepack enable\\n          corepack prepare yarn@1.22.22 --activate\\n\\n      - name: Install dependencies\\n        run: yarn install --frozen-lockfile\\n\\n      - name: Lint\\n        run: yarn lint\\n\\n      - name: Typecheck\\n        run: yarn typecheck\\n\\n      - name: Unit tests\\n        run: yarn test\\n\\n  rust:\\n    name: Rust Checks\\n    runs-on: ubuntu-latest\\n    timeout-minutes: 5\\n\\n    steps:\\n      - name: Checkout\\n        uses: actions/checkout@v4\\n\\n      - name: Setup Rust toolchain\\n        uses: dtolnay/rust-toolchain@stable\\n\\n      - name: Install system dependencies\\n        run: |\\n          SUDO=\\\"\\\"\\n          if command -v sudo >/dev/null 2>&1 && [ \\\"$(id -u)\\\" -ne 0 ]; then\\n            SUDO=\\\"sudo\\\"\\n          fi\\n          $SUDO apt-get update\\n          $SUDO apt-get install -y \\\\\\n            libgtk-3-dev \\\\\\n            libwebkit2gtk-4.1-dev \\\\\\n            libayatana-appindicator3-dev \\\\\\n            librsvg2-dev \\\\\\n            libasound2-dev \\\\\\n            patchelf\\n\\n      - name: Rust cache\\n        uses: Swatinem/rust-cache@v2\\n        with:\\n          workspaces: src-tauri -> target\\n\\n      # Type-check the whole crate (lib, bin, and tests) without codegen/link.\\n      # Catches the same compile errors as `cargo test` at a fraction of the cost.\\n      - name: Run Rust checks\\n        run: cargo check --manifest-path src-tauri/Cargo.toml --locked --all-targets\\n\\n      - name: Run Rust unit tests\\n        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --lib\\n\",\n  \"rationale\": \"Add custom 5-minute timeouts to both jobs (lint-test and rust) to bound runaway execution. The repository's CI history shows 5 successful runs completing in 87-169 seconds (1.5-3 minutes), so a 5-minute limit provides ample headroom while catching hung or runaway jobs. This optimization is directly supported by experiment evidence (batch-interactive-three--fb8b16eb65a11508) which measured a 26.8% elapsed time reduction when adding timeout-minutes: 5 to a similar single-job workflow, and by pattern P-LIT-CUSTOM-TIMEOUT which reports 12.9% (free) / 8.1% (paid) VM time reduction. The workflow already has concurrency cancellation and dependency caching, so this is a minimal, safe addition that preserves all build and test coverage.\",\n  \"evidence_ids\": [\"experiment:batch-interactive-three--fb8b16eb65a11508\", \"pattern:P-LIT-CUSTOM-TIMEOUT\"]\n}",
+        "reasoning": "Let me analyze the workflow and the evidence to determine if there's a suitable CI optimization.\n\nThe workflow has two jobs:\n1. `lint-test` - runs lint, typecheck, and unit tests\n2. `rust` - runs Rust checks and unit tests\n\nBoth jobs run on `ubuntu-latest` and are independent (no `needs` between them).\n\nLooking at the evidence:\n1. P-LIT-CUSTOM-TIMEOUT - shows adding `timeout-minutes: 5` to a job reduced elapsed time by ~27%\n2. P-LIT-FAIL-FAST - shows setting `fail-fast: true` on matrix jobs\n3. P-LIT-CANCEL-STALE - the workflow already has `concurrency` with `cancel-in-progress: true`\n4. P-LIT-GHA-CACHE - caching dependencies\n\nLet me check what's applicable:\n\n1. **Custom timeout (P-LIT-CUSTOM-TIMEOUT)**: The evidence shows adding `timeout-minutes: 5` to a job. The workflow currently has no timeout on either job. The experiment showed 26.8% elapsed savings. This seems applicable - we could add a reasonable timeout to both jobs.\n\n2. **Fail-fast (P-LIT-FAIL-FAST)**: This applies to matrix jobs. The workflow doesn't use matrix strategy, so not applicable.\n\n3. **Cancel stale (P-LIT-CANCEL-STALE)**: Already implemented via concurrency.\n\n4. **Cache (P-LIT-GHA-CACHE)**: The workflow already uses `cache: yarn` for Node and `Swatinem/rust-cache@v2` for Rust. So caching is already in place.\n\n5. **Failed job first (P-LIT-FAILED-JOB-FIRST)**: This is about reordering jobs based on history. The workflow has two independent jobs. Could potentially run the more likely to fail job first, but we don't have history data.\n\nThe most applicable optimization from the evidence is **P-LIT-CUSTOM-TIMEOUT** - adding a custom timeout to bound job execution time. The experiment evidence (batch-interactive-three--fb8b16eb65a11508) shows a measured 26.8% elapsed savings when adding `timeout-minutes: 5` to a similar workflow.\n\nLet me check the workflow runtime from the CI history:\n- Run 31721500610: 16:36:04 to 16:38:00 = ~116 seconds\n- Run 31700274939: 12:29:33 to 12:32:22 = ~169 seconds\n- Run 31699979794: 12:25:49 to 12:27:16 = ~87 seconds\n- Run 31699500504: 12:19:43 to 12:21:26 = ~103 seconds\n- Run 31699214145: 12:15:52 to 12:17:35 = ~103 seconds\n\nTypical runtimes are 1.5-3 minutes. A 5-minute timeout (as in the experiment) would provide good headroom while catching runaway jobs.\n\nThe pattern P-LIT-CUSTOM-TIMEOUT has preconditions: \"Representative successful-duration history exists\" - we have 5 successful runs showing 1.5-3 minute durations.\n\nThe contraindication is \"Valid slow runs exceed the proposed limit\" - 5 minutes seems safe given the history.\n\nI'll propose adding `timeout-minutes: 5` to both jobs. This is supported by the experiment evidence (document_id: experiment:batch-interactive-three--fb8b16eb65a11508) and the pattern P-LIT-CUSTOM-TIMEOUT.\n\nLet me create the updated workflow.",
+        "reasoning_details": [
+          {
+            "format": "unknown",
+            "index": 0,
+            "text": "Let me analyze the workflow and the evidence to determine if there's a suitable CI optimization.\n\nThe workflow has two jobs:\n1. `lint-test` - runs lint, typecheck, and unit tests\n2. `rust` - runs Rust checks and unit tests\n\nBoth jobs run on `ubuntu-latest` and are independent (no `needs` between them).\n\nLooking at the evidence:\n1. P-LIT-CUSTOM-TIMEOUT - shows adding `timeout-minutes: 5` to a job reduced elapsed time by ~27%\n2. P-LIT-FAIL-FAST - shows setting `fail-fast: true` on matrix jobs\n3. P-LIT-CANCEL-STALE - the workflow already has `concurrency` with `cancel-in-progress: true`\n4. P-LIT-GHA-CACHE - caching dependencies\n\nLet me check what's applicable:\n\n1. **Custom timeout (P-LIT-CUSTOM-TIMEOUT)**: The evidence shows adding `timeout-minutes: 5` to a job. The workflow currently has no timeout on either job. The experiment showed 26.8% elapsed savings. This seems applicable - we could add a reasonable timeout to both jobs.\n\n2. **Fail-fast (P-LIT-FAIL-FAST)**: This applies to matrix jobs. The workflow doesn't use matrix strategy, so not applicable.\n\n3. **Cancel stale (P-LIT-CANCEL-STALE)**: Already implemented via concurrency.\n\n4. **Cache (P-LIT-GHA-CACHE)**: The workflow already uses `cache: yarn` for Node and `Swatinem/rust-cache@v2` for Rust. So caching is already in place.\n\n5. **Failed job first (P-LIT-FAILED-JOB-FIRST)**: This is about reordering jobs based on history. The workflow has two independent jobs. Could potentially run the more likely to fail job first, but we don't have history data.\n\nThe most applicable optimization from the evidence is **P-LIT-CUSTOM-TIMEOUT** - adding a custom timeout to bound job execution time. The experiment evidence (batch-interactive-three--fb8b16eb65a11508) shows a measured 26.8% elapsed savings when adding `timeout-minutes: 5` to a similar workflow.\n\nLet me check the workflow runtime from the CI history:\n- Run 31721500610: 16:36:04 to 16:38:00 = ~116 seconds\n- Run 31700274939: 12:29:33 to 12:32:22 = ~169 seconds\n- Run 31699979794: 12:25:49 to 12:27:16 = ~87 seconds\n- Run 31699500504: 12:19:43 to 12:21:26 = ~103 seconds\n- Run 31699214145: 12:15:52 to 12:17:35 = ~103 seconds\n\nTypical runtimes are 1.5-3 minutes. A 5-minute timeout (as in the experiment) would provide good headroom while catching runaway jobs.\n\nThe pattern P-LIT-CUSTOM-TIMEOUT has preconditions: \"Representative successful-duration history exists\" - we have 5 successful runs showing 1.5-3 minute durations.\n\nThe contraindication is \"Valid slow runs exceed the proposed limit\" - 5 minutes seems safe given the history.\n\nI'll propose adding `timeout-minutes: 5` to both jobs. This is supported by the experiment evidence (document_id: experiment:batch-interactive-three--fb8b16eb65a11508) and the pattern P-LIT-CUSTOM-TIMEOUT.\n\nLet me create the updated workflow.",
+            "type": "reasoning.text"
+          }
+        ],
+        "refusal": null,
+        "role": "assistant"
+      },
+      "native_finish_reason": "stop"
+    }
+  ],
+  "created": 1795584546,
+  "id": "gen-1795584546-RXYwpOGGVNklxbWVf68w",
+  "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+  "object": "chat.completion",
+  "provider": "Nvidia",
+  "service_tier": null,
+  "system_fingerprint": null,
+  "usage": {
+    "completion_tokens": 1758,
+    "completion_tokens_details": {
+      "audio_tokens": 0,
+      "image_tokens": 0,
+      "reasoning_tokens": 871
+    },
+    "cost": 0,
+    "cost_details": {
+      "upstream_inference_completions_cost": 0,
+      "upstream_inference_cost": 0,
+      "upstream_inference_prompt_cost": 0
+    },
+    "is_byok": false,
+    "prompt_tokens": 32529,
+    "prompt_tokens_details": {
+      "audio_tokens": 0,
+      "cache_write_tokens": 0,
+      "cached_tokens": 0,
+      "video_tokens": 0
+    },
+    "total_tokens": 34287
+  }
+}

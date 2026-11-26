@@ -1,0 +1,46 @@
+name: Run tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions: {}
+
+jobs:
+  download_redis:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Cache Download and build Redis
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/redis
+        key: redis-${{ hashFiles('.download-redis.sh') }}
+    - name: Download and build Redis
+      run: ./.download-redis.sh
+  tests:
+    needs: [download_redis]
+    uses: $/.github/workflows/single-redis.yml
+    with:
+      redis-versions: '["8.4", "8.6", "8.10", "8.8"]'
+    secrets:
+      codecov_token: ${{ secrets.CODECOV_TOKEN }}
+  tests_older:
+    needs: [download_redis]
+    uses: $/.github/workflows/single-redis.yml
+    with:
+      python-versions: '["3.13", "3.14", "3.15"]'
+      redis-versions: '["6.2", "7.2", "7.4", "8.2"]'
+    secrets:
+      codecov_token: ${{ secrets.CODECOV_TOKEN }}
+  tests_oldest:
+    needs: [download_redis]
+    uses: $/.github/workflows/single-redis-oldest.yml
+    with:
+      redis-versions: '["6.2", "7.2", "8.2"]'
+    secrets:
+      codecov_token: ${{ secrets.CODECOV_TOKEN }}

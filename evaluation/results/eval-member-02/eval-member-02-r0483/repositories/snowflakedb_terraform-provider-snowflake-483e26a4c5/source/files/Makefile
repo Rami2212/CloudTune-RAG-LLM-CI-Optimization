@@ -1,0 +1,344 @@
+export TEST_SF_TF_SKIP_SAML_INTEGRATION_TEST=true
+export TEST_SF_TF_SKIP_MANAGED_ACCOUNT_TEST=true
+export BASE_BINARY_NAME=terraform-provider-snowflake
+export TERRAFORM_PLUGINS_DIR=$(HOME)/.terraform.d/plugins
+export TERRAFORM_PLUGIN_LOCAL_INSTALL=$(TERRAFORM_PLUGINS_DIR)/$(BASE_BINARY_NAME)
+export LATEST_GIT_TAG=$(shell git tag --sort=-version:refname | head -n 1)
+export CURRENT_OS := $(shell uname -s)
+export CURRENT_ARCH := $(shell arch)
+
+ADDITIONAL_TEST_FLAGS ?=
+
+# Goroutines per genhelpers generator after filtering. The flag itself defaults to 1
+# (sequential) when omitted; these recipes pass this value. A --parallelism later in
+# SF_TF_GENERATOR_ARGS wins.
+GENERATOR_PARALLELISM ?= 5
+ifeq ($(strip $(SF_TF_GENERATOR_ARGS)),)
+GO_GENERATE_ARGS = --parallelism=$(GENERATOR_PARALLELISM)
+else
+GO_GENERATE_ARGS = --parallelism=$(GENERATOR_PARALLELISM) $(strip $(SF_TF_GENERATOR_ARGS))
+endif
+define GO_GENERATE
+SF_TF_GENERATOR_ARGS="$(GO_GENERATE_ARGS)" go generate $(1)
+endef
+
+UNIT_TESTS_EXCLUDE_PACKAGES=./pkg/testacc ./pkg/sdk/testint ./pkg/testfunctional ./pkg/manual_tests
+UNIT_TESTS_EXCLUDE_PATTERN=$(shell echo $(UNIT_TESTS_EXCLUDE_PACKAGES) | sed 's/ /|/g')
+
+# Usage: $(call GIT_DIFF_CHECK,path) — fails if path has uncommitted changes: modified tracked files or new untracked files.
+# On mismatch, reverts the tracked changes and/or removes the untracked files it found, then exits non-zero.
+GIT_DIFF_CHECK = diff_output=$$(git diff -- $(1)); \
+	untracked=$$(git ls-files --others --exclude-standard -- $(1)); \
+	if [ -n "$$diff_output" ] || [ -n "$$untracked" ]; then \
+		if [ -n "$$diff_output" ]; then echo "$$diff_output"; git restore -- $(1); fi; \
+		if [ -n "$$untracked" ]; then echo "Untracked files detected:"; echo "$$untracked"; echo "$$untracked" | xargs rm -f; fi; \
+		exit 1; \
+	fi
+
+default: help
+
+dev-setup: ## setup development dependencies
+	@which ./bin/golangci-lint || curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b ./bin v2.15.0
+	cd tools && mkdir -p bin/
+	cd tools && env GOBIN=$$PWD/bin go install github.com/hashicorp/terraform-plugin-docs/cmd/tfplugindocs
+	cd tools && env GOBIN=$$PWD/bin go install mvdan.cc/gofumpt
+
+dev-cleanup: ## cleanup development dependencies
+	rm -rf bin/*
+	rm -rf tools/bin/*
+
+docs: generate-docs-additional-files ## generate docs
+	tools/bin/tfplugindocs generate --provider-name=terraform-provider-snowflake
+
+docs-check: docs ## check that docs have been generated
+	$(call GIT_DIFF_CHECK,docs)
+
+fmt: terraform-fmt ## Run terraform fmt and gofumpt
+	tools/bin/gofumpt -l -w .
+
+fmt-check: terraform-fmt-check ## Run terraform fmt and gofumpt without modifying any files
+	tools/bin/gofumpt -d .
+
+terraform-fmt: ## Run terraform fmt
+	terraform fmt -recursive ./examples/
+	terraform fmt -recursive ./pkg/testacc/testdata/
+
+terraform-fmt-check: ## check if all Terraform configuration files are correctly formatted
+	# -check causes a non-zero exit status to be returned if the input is improperly formatted (source: https://developer.hashicorp.com/terraform/cli/commands/fmt#usage)
+	terraform fmt -check -diff -recursive ./examples/
+	terraform fmt -check -diff -recursive ./pkg/testacc/testdata/
+
+terraform-version-check: ## fail if the terraform binary is older than 1.11
+	version=$$(terraform version -json 2>/dev/null | sed -n 's/.*"terraform_version": *"\([^"]*\)".*/\1/p'); \
+	printf '1.11\n%s\n' "$$version" | sort -V -C || { echo "terraform 1.11 or later is required (found '$${version:-none}')"; exit 1; }
+
+help:
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-23s\033[0m %s\n", $$1, $$2}'
+
+install: ## install the binary
+	go install -v ./...
+
+lint: # Run linters and formatters. Fails if there are any findings. See https://golangci-lint.run/
+	./bin/golangci-lint run -v
+
+lint-fix: ## Run linters and formatters. If linters or formatters support autofix, try to fix findings.
+	./bin/golangci-lint run -v --fix
+
+mod: ## add missing and remove unused modules
+	go mod tidy -compat=1.27.3
+
+mod-check: ## check if there are any missing/unused modules
+	# -diff causes a non-zero exit status to be returned if changes to go.mod or go.sum are detected (source: https://go.dev/ref/mod#go-mod-tidy)
+	go mod tidy -compat=1.27.3 -diff
+
+pre-push: terraform-version-check check-compilation generate-all mod fmt generate-docs-additional-files generate-issue-labels docs lint-fix test-architecture ## Run a few checks and generators. It should be used only locally because it modifies or fixes the code.
+
+pre-push-check: terraform-version-check check-compilation generate-all-check mod-check fmt-check generate-docs-additional-files-check generate-issue-labels-check docs-check lint test-architecture ## Run checks before pushing a change (docs, fmt, mod, etc.)
+
+# Dependency graph: Makefile.pre-push-parallel.mk. Cap jobs with PRE_PUSH_JOBS=N.
+PRE_PUSH_JOBS ?=
+.PHONY: pre-push-parallel
+pre-push-parallel: ## Run pre-push steps in parallel, honoring the dependency graph.
+	$(MAKE) --no-print-directory -f Makefile.pre-push-parallel.mk -j$(PRE_PUSH_JOBS) pre-push-parallel-run
+
+sweep: ## destroy the whole architecture; USE ONLY FOR DEVELOPMENT ACCOUNTS
+	@echo "WARNING: This will destroy infrastructure. Use only in development accounts."
+	@echo "Are you sure? [y/n]" >&2
+	@read -r REPLY; \
+		if echo "$$REPLY" | grep -qG "^[yY]$$"; then \
+			TEST_SF_TF_ENABLE_SWEEP=1 go test -timeout=20m -run "^(TestSweepAll|Test_Sweeper_NukeStaleObjects)" ./pkg/sdk -v; \
+			else echo "Aborting..."; \
+		fi;
+
+sweep-after-tests: ## drop the objects created by the current test run and upload its test results
+	TEST_SF_TF_ENABLE_SWEEP=1 go test -timeout=20m -run "^TestSweepAll$$" ./pkg/sdk -v
+
+sweep-stale: ## destroy the objects left over by the previous test runs; USE ONLY FOR DEVELOPMENT ACCOUNTS
+	@echo "WARNING: This will destroy infrastructure. Use only in development accounts."
+	@echo "Are you sure? [y/n]" >&2
+	@read -r REPLY; \
+		if echo "$$REPLY" | grep -qG "^[yY]$$"; then \
+			TEST_SF_TF_ENABLE_SWEEP=1 go test -timeout=20m -run "^Test_Sweeper_NukeStaleObjects$$" ./pkg/sdk -v; \
+			else echo "Aborting..."; \
+		fi;
+
+test-unit: ## run unit tests
+	go test -v -cover $$(go list ./... | grep -v -E "$(UNIT_TESTS_EXCLUDE_PATTERN)") $(ADDITIONAL_TEST_FLAGS)
+
+test-acceptance: ## run acceptance tests
+	TF_ACC=1 TEST_SF_TF_REQUIRE_TEST_OBJECT_SUFFIX=1 TEST_SF_TF_REQUIRE_GENERATED_RANDOM_VALUE=1 SF_TF_ACC_TEST_ENABLE_ALL_PREVIEW_FEATURES=true go test --tags=non_account_level_tests -run "^TestAcc_" -v -cover -timeout=230m ./pkg/testacc $(ADDITIONAL_TEST_FLAGS)
+
+test-account-level: ## run integration and acceptance test modifying account
+	TF_ACC=1 TEST_SF_TF_REQUIRE_TEST_OBJECT_SUFFIX=1 TEST_SF_TF_REQUIRE_GENERATED_RANDOM_VALUE=1 SF_TF_ACC_TEST_ENABLE_ALL_PREVIEW_FEATURES=true go test -p=1 --tags=account_level_tests -run "^(TestAcc_|TestInt_)" -v -cover -timeout=150m ./pkg/testacc ./pkg/sdk/testint $(ADDITIONAL_TEST_FLAGS)
+
+# Alias kept for backward compatibility with the former target name.
+test-account-level-features: test-account-level
+
+test-integration: ## run SDK integration tests
+	TEST_SF_TF_REQUIRE_TEST_OBJECT_SUFFIX=1 TEST_SF_TF_REQUIRE_GENERATED_RANDOM_VALUE=1 go test --tags=non_account_level_tests -run "^TestInt_" -v -cover -timeout=100m ./pkg/sdk/testint $(ADDITIONAL_TEST_FLAGS)
+
+test-openflow: ## run Openflow acceptance and integration tests
+	TF_ACC=1 TEST_SF_TF_TEST_OPENFLOW=1 TEST_SF_TF_REQUIRE_TEST_OBJECT_SUFFIX=1 TEST_SF_TF_REQUIRE_GENERATED_RANDOM_VALUE=1 SF_TF_ACC_TEST_ENABLE_ALL_PREVIEW_FEATURES=true go test --tags=non_account_level_tests -run "Openflow" -v -cover -timeout=300m ./pkg/testacc ./pkg/sdk/testint $(ADDITIONAL_TEST_FLAGS)
+
+test-functional: ## run functional tests of the underlying terraform libraries (currently SDKv2)
+	TF_ACC=1 TEST_SF_TF_ENABLE_OBJECT_RENAMING=1 go test -v -cover -timeout=10m ./pkg/testfunctional $(ADDITIONAL_TEST_FLAGS)
+
+check-compilation: ## check that the project compiles for all build tag combinations (no tags, non_account_level_tests, account_level_tests)
+	go vet ./pkg/provider/... ./pkg/resources/... ./pkg/datasources/... ./pkg/sdk/... ./pkg/sdk/testint/... ./pkg/testacc/...
+	go vet --tags=non_account_level_tests ./pkg/sdk/testint/... ./pkg/testacc/...
+	go vet --tags=account_level_tests ./pkg/sdk/testint/... ./pkg/testacc/...
+
+test-architecture: ## check architecture constraints between packages
+	go test ./pkg/architests/...
+
+test-acceptance-%: ## run acceptance tests (both non-account and account level ones) for the given resource only, e.g. test-acceptance-Warehouse
+	TF_ACC=1 TF_LOG=DEBUG SNOWFLAKE_DRIVER_TRACING=debug SF_TF_ACC_TEST_ENABLE_ALL_PREVIEW_FEATURES=true go test --tags=non_account_level_tests,account_level_tests -run ^TestAcc_$* -v -timeout=20m ./pkg/testacc
+
+test-main-terraform-use-cases: ## run test for main terraform use cases
+	TF_ACC=1 TEST_SF_TF_REQUIRE_TEST_OBJECT_SUFFIX=1 TEST_SF_TF_REQUIRE_GENERATED_RANDOM_VALUE=1 SF_TF_ACC_TEST_ENABLE_ALL_PREVIEW_FEATURES=true go test -p=1 --tags=non_account_level_tests,account_level_tests -run "^(TestAcc_.*_BasicUseCase.*|TestAcc_.*_CompleteUseCase.*)$$" -v -cover -json -timeout=90m ./pkg/testacc
+
+test-main-terraform-use-cases-docker-compose: ## run main terraform use cases tests within docker environment
+	docker compose -f ./packaging/docker-compose.yml build --quiet 1>&2
+	docker compose -f ./packaging/docker-compose.yml run --quiet-pull --rm test-main-terraform-use-cases
+
+test-main-terraform-use-cases-docker-compose-pre-prod-gov: ## run main terraform use cases tests within docker environment for pre-prod gov environment
+	docker compose -f ./packaging/docker-compose.yml build --quiet 1>&2
+	TEST_SF_TF_SNOWFLAKE_TESTING_ENVIRONMENT=PRE_PROD_GOV docker compose -f ./packaging/docker-compose.yml run --quiet-pull --rm test-main-terraform-use-cases
+
+process-test-output-docker-compose: ## run test output processor within docker environment
+	docker compose -f ./packaging/docker-compose.yml run --quiet-pull --rm process-test-output
+
+save-test-results: ## Saves the output of test commands into temporary file
+	@FILENAME=$$(mktemp /tmp/test_results_XXXXXX.csv); \
+	go run ./pkg/scripts/test_output_processor/test_output_processor.go | \
+    CURRENT_TIMESTAMP=$$(date -u "+%Y-%m-%d %H:%M:%S") awk 'BEGIN {FS=OFS=","} {if (NR == 1) print "CREATED_ON","TEST_RUN_ID","TEST_TYPE",$$0; else if (NF > 0) print ENVIRON["CURRENT_TIMESTAMP"],ENVIRON["TEST_SF_TF_TEST_WORKFLOW_ID"],ENVIRON["TEST_SF_TF_TEST_TYPE"],$$0}' 1> \
+    $$FILENAME
+
+build-local: ## build the binary locally
+	go build -o $(BASE_BINARY_NAME) .
+
+install-tf: build-local ## installs plugin where terraform can find it
+	mkdir -p $(TERRAFORM_PLUGINS_DIR)
+	cp ./$(BASE_BINARY_NAME) $(TERRAFORM_PLUGIN_LOCAL_INSTALL)
+
+release-local: ## use GoReleaser to build the binary locally for the current OS and ARCH
+	goreleaser build --clean --skip=validate --single-target
+
+release-local-all: ## use GoReleaser to build the binary locally
+	goreleaser build --clean --skip=validate
+
+install-locally-released-tf: release-local ## installs plugin (built by the GoReleaser) where terraform can find it
+	mkdir -p $(TERRAFORM_PLUGINS_DIR)
+	cp ./dist/terraform-provider-snowflake_$(CURRENT_OS)_$(CURRENT_ARCH)/terraform-provider-snowflake_$(LATEST_GIT_TAG) $(TERRAFORM_PLUGIN_LOCAL_INSTALL)
+
+uninstall-tf: ## uninstalls plugin from where terraform can find it
+	rm -f $(TERRAFORM_PLUGIN_LOCAL_INSTALL)
+
+# TODO [SNOW-1501905]: decide its fate
+generate-all-dto: ## Generate all DTOs for SDK interfaces
+	go generate ./pkg/sdk/*_dto.go
+
+# TODO [SNOW-1501905]: decide its fate
+generate-dto-%: ./pkg/sdk/%_dto.go ## Generate DTO for given SDK interface
+	go generate $<
+
+generate-sdk: ## Generate all SDK objects
+	$(call GO_GENERATE,./pkg/sdk/generate.go)
+
+generate-sdk-check: generate-sdk ## Check that all generated SDK files are up-to-date
+	$(call GIT_DIFF_CHECK,pkg/sdk/*_gen.go pkg/sdk/*_dto_gen.go pkg/sdk/*_dto_builders_gen.go pkg/sdk/*_impl_gen.go pkg/sdk/*_validations_gen.go pkg/sdk/*_gen_test.go)
+
+clean-generated-sdk: ## Clean all generated SDK objects
+	rm -f ./pkg/sdk/*_gen.go
+	rm -f ./pkg/sdk/*_gen_test.go
+
+generate-sdk-examples: ## Generate all SDK generation examples
+	$(call GO_GENERATE,./pkg/sdk/generator/example/generate.go)
+
+generate-sdk-examples-check: generate-sdk-examples ## Check that SDK example files are up-to-date
+	$(call GIT_DIFF_CHECK,pkg/sdk/generator/example/*_gen.go pkg/sdk/generator/example/*_gen_test.go)
+
+clean-generated-sdk-examples: ## Clean all generated SDK generation examples
+	rm -f ./pkg/sdk/generator/example/*_gen.go
+	rm -f ./pkg/sdk/generator/example/*_gen_test.go
+
+generate-docs-additional-files: ## generate docs additional files
+	go run ./pkg/internal/tools/doc-gen-helper/ $$PWD
+
+generate-docs-additional-files-check: generate-docs-additional-files ## check that docs additional files have been generated
+	$(call GIT_DIFF_CHECK,examples/additional)
+
+generate-issue-labels: ## generate GitHub issue labels for resources and data sources
+	REPO_ROOT=$$PWD go generate ./pkg/internal/tools/label-gen-helper/generate.go
+
+generate-issue-labels-check: generate-issue-labels ## check that issue labels have been generated
+	$(call GIT_DIFF_CHECK,.github/ISSUE_TEMPLATE pkg/scripts/issues/labels_gen.go)
+
+generate-show-output-schemas: ## Generate show output schemas with mappers
+	$(call GO_GENERATE,./pkg/schemas/generate.go)
+
+generate-show-output-schemas-check: generate-show-output-schemas ## Check that generated show output schemas are up-to-date
+	$(call GIT_DIFF_CHECK,pkg/schemas/*_gen.go)
+
+clean-show-output-schemas: ## Clean generated show output schemas
+	rm -f ./pkg/schemas/*_gen.go
+
+generate-resource: ## Generate resource lifecycle, schema, and parameters skeletons
+	$(call GO_GENERATE,./pkg/resources/generate.go)
+
+generate-resource-check: generate-resource ## Check that generated resource files are up-to-date
+	$(call GIT_DIFF_CHECK,pkg/resources/*_gen.go)
+
+clean-resource: ## Clean generated resource files
+	rm -f ./pkg/resources/*_gen.go
+
+generate-snowflake-object-assertions: ## Generate snowflake object assertions
+	$(call GO_GENERATE,./pkg/acceptance/bettertestspoc/assert/objectassert/generate.go)
+
+clean-snowflake-object-assertions: ## Clean snowflake object assertions
+	rm -f ./pkg/acceptance/bettertestspoc/assert/objectassert/*_gen.go
+
+generate-snowflake-object-assertions-check: clean-snowflake-object-assertions generate-snowflake-object-assertions ## check that generated snowflake object assertions are up-to-date
+	$(call GIT_DIFF_CHECK,pkg/acceptance/bettertestspoc/assert/objectassert)
+
+generate-snowflake-object-parameters-assertions: ## Generate snowflake object parameters assertions
+	$(call GO_GENERATE,./pkg/acceptance/bettertestspoc/assert/objectparametersassert/generate.go)
+
+generate-snowflake-object-parameters-assertions-check: clean-snowflake-object-parameters-assertions generate-snowflake-object-parameters-assertions ## check that generated snowflake object parameters assertions are up-to-date
+	$(call GIT_DIFF_CHECK,pkg/acceptance/bettertestspoc/assert/objectparametersassert)
+
+clean-snowflake-object-parameters-assertions: ## Clean snowflake object parameters assertions
+	rm -f ./pkg/acceptance/bettertestspoc/assert/objectparametersassert/*_gen.go
+
+generate-resource-assertions: ## Generate resource assertions
+	$(call GO_GENERATE,./pkg/acceptance/bettertestspoc/assert/resourceassert/generate.go)
+
+generate-resource-assertions-check: clean-resource-assertions generate-resource-assertions ## check that generated config model builders are up-to-date
+	$(call GIT_DIFF_CHECK,pkg/acceptance/bettertestspoc/assert/resourceassert)
+
+clean-resource-assertions: ## Clean resource assertions
+	rm -f ./pkg/acceptance/bettertestspoc/assert/resourceassert/*_gen.go
+
+generate-resource-parameters-assertions: ## Generate resource parameters assertions
+	$(call GO_GENERATE,./pkg/acceptance/bettertestspoc/assert/resourceparametersassert/generate.go)
+
+generate-resource-parameters-assertions-check: clean-resource-parameters-assertions generate-resource-parameters-assertions ## check that generated resource parameters assertions are up-to-date
+	$(call GIT_DIFF_CHECK,pkg/acceptance/bettertestspoc/assert/resourceparametersassert)
+
+clean-resource-parameters-assertions: ## Clean resource parameters assertions
+	rm -f ./pkg/acceptance/bettertestspoc/assert/resourceparametersassert/*_gen.go
+
+generate-resource-show-output-assertions: ## Generate resource show output assertions
+	$(call GO_GENERATE,./pkg/acceptance/bettertestspoc/assert/resourceshowoutputassert/generate.go)
+
+generate-resource-show-output-assertions-check: clean-resource-show-output-assertions generate-resource-show-output-assertions ## check that generated resource show output assertions are up-to-date
+	$(call GIT_DIFF_CHECK,pkg/acceptance/bettertestspoc/assert/resourceshowoutputassert)
+
+clean-resource-show-output-assertions: ## Clean resource show output assertions
+	rm -f ./pkg/acceptance/bettertestspoc/assert/resourceshowoutputassert/*_gen.go
+
+generate-resource-model-builders: ## Generate resource model builders
+	$(call GO_GENERATE,./pkg/acceptance/bettertestspoc/config/model/generate.go)
+
+clean-resource-model-builders: ## Clean resource model builders
+	rm -f ./pkg/acceptance/bettertestspoc/config/model/*_gen.go
+
+generate-provider-model-builders: ## Generate provider model builders
+	$(call GO_GENERATE,./pkg/acceptance/bettertestspoc/config/providermodel/generate.go)
+
+clean-provider-model-builders: ## Clean provider model builders
+	rm -f ./pkg/acceptance/bettertestspoc/config/providermodel/*_gen.go
+
+generate-toml-model-builders: ## Generate toml model builders
+	go generate ./pkg/sdk/config_dto.go ./pkg/sdk/legacy_config_dto.go
+
+generate-datasource-model-builders: ## Generate datasource model builders
+	$(call GO_GENERATE,./pkg/acceptance/bettertestspoc/config/datasourcemodel/generate.go)
+
+clean-datasource-model-builders: ## Clean datasource model builders
+	rm -f ./pkg/acceptance/bettertestspoc/config/datasourcemodel/*_gen.go
+
+clean-all-config-model-builders: clean-resource-model-builders clean-datasource-model-builders clean-provider-model-builders ## clean all generated config model builders
+
+generate-all-config-model-builders: generate-resource-model-builders generate-datasource-model-builders generate-provider-model-builders ## generate all config model builders
+
+generate-all-config-model-builders-check: clean-all-config-model-builders generate-all-config-model-builders ## check that generated config model builders are up-to-date
+	$(call GIT_DIFF_CHECK,pkg/acceptance/bettertestspoc/config/model)
+	$(call GIT_DIFF_CHECK,pkg/acceptance/bettertestspoc/config/datasourcemodel)
+	$(call GIT_DIFF_CHECK,pkg/acceptance/bettertestspoc/config/providermodel)
+
+generate-all: generate-all-config-model-builders generate-sdk generate-sdk-examples generate-snowflake-object-assertions generate-snowflake-object-parameters-assertions generate-resource-assertions generate-resource-parameters-assertions generate-resource-show-output-assertions generate-show-output-schemas generate-resource ## generate every generator used by pre-push
+
+generate-all-check: generate-all-config-model-builders-check generate-sdk-check generate-sdk-examples-check generate-snowflake-object-assertions-check generate-snowflake-object-parameters-assertions-check generate-resource-assertions-check generate-resource-parameters-assertions-check generate-resource-show-output-assertions-check generate-show-output-schemas-check generate-resource-check ## check every generator used by pre-push-check
+
+clean-all-assertions-and-config-models: clean-snowflake-object-assertions clean-snowflake-object-parameters-assertions clean-resource-assertions clean-resource-parameters-assertions clean-resource-show-output-assertions clean-resource-model-builders clean-provider-model-builders clean-datasource-model-builders ## clean all generated assertions and config models
+
+generate-all-assertions-and-config-models: generate-snowflake-object-assertions generate-snowflake-object-parameters-assertions generate-resource-assertions generate-resource-parameters-assertions generate-resource-show-output-assertions generate-resource-model-builders generate-provider-model-builders generate-datasource-model-builders ## generate all assertions and config models
+
+generate-poc-provider-plugin-framework-model-and-schema: ## Generate model and schema for Plugin Framework PoC
+	go generate ./pkg/testacc/13_generate_poc_provider_model_and_schema.go
+
+clean-poc-provider-plugin-framework-model-and-schema: ## Clean generated model and schema for Plugin Framework PoC
+	rm -f ./pkg/testacc/13_plugin_framework_model_and_schema_gen.go
+
+.PHONY: build-local check-compilation terraform-version-check dev-setup dev-cleanup docs docs-check fmt fmt-check fumpt help install lint lint-fix mod mod-check pre-push pre-push-check sweep sweep-after-tests sweep-stale terraform-fmt terraform-fmt-check test test-acceptance uninstall-tf generate-all generate-all-check generate-sdk-check generate-sdk-examples-check generate-snowflake-object-assertions-check generate-snowflake-object-parameters-assertions-check generate-resource-assertions-check generate-resource-parameters-assertions-check generate-resource-show-output-assertions-check generate-show-output-schemas-check generate-resource-check

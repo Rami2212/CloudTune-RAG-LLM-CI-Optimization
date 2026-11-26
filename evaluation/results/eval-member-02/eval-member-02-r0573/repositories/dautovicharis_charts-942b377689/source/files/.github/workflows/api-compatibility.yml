@@ -1,0 +1,142 @@
+# Reusable public API compatibility check for pull request orchestration.
+name: API Compatibility
+
+on:
+  workflow_call:
+    inputs:
+      should-run:
+        description: Whether Prepare PR selected the API compatibility check.
+        required: true
+        type: boolean
+      source-sha:
+        description: Immutable merge revision being checked.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  skipped:
+    name: No-op
+    if: ${{ !inputs.should-run }}
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Report no-op
+        run: echo 'Prepare PR found no change that needs the API compatibility check.'
+
+  api-compatibility:
+    name: Compare Public API Against Baseline
+    if: ${{ inputs.should-run }}
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.source-sha }}
+
+      - name: Test API compatibility diagnostics
+        shell: bash
+        run: python3 .github/scripts/test-api-compatibility-workflow.py
+
+      - name: Set up JDK 17
+        uses: ./.github/actions/setup-jdk
+        with:
+          # Only warm-gradle-cache.yml writes caches; a write here scopes the entry to the PR.
+          cache-read-only: true
+
+      - name: Run API compatibility check
+        id: compatibility
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+
+          ./gradlew apiCompatibilityCheck --no-daemon --console=plain 2>&1 | tee api-compatibility.log
+          exit_code=${PIPESTATUS[0]}
+          set -e
+          echo "exit_code=${exit_code}" >> "$GITHUB_OUTPUT"
+
+      - name: API compatibility summary
+        id: summary
+        if: always()
+        shell: bash
+        env:
+          EXIT_CODE: ${{ steps.compatibility.outputs.exit_code }}
+        run: |
+          set -euo pipefail
+
+          result="compatible"
+          any_change_detected="false"
+          instruction=""
+
+          if [[ -f api-compatibility.log ]] && grep -Eq "Unacknowledged breaking API change\(s\) detected" api-compatibility.log; then
+            any_change_detected="true"
+          fi
+
+          if [[ -z "${EXIT_CODE}" ]]; then
+            result="check did not run (missing exit code)"
+          elif [[ "${EXIT_CODE}" != "0" ]]; then
+            if [[ "${any_change_detected}" == "true" ]]; then
+              result="incompatible (breaking API change detected)"
+              instruction="Run ./gradlew apiCompatibilityAcknowledgeBreaks and commit the updated API-COMPATIBILITY-BREAKS.txt in this pull request."
+            else
+              result="failed (compatibility check errored without detecting a break)"
+            fi
+          fi
+
+          {
+            echo "## API compatibility"
+            echo "- Result: ${result}"
+            if [[ -n "${instruction}" ]]; then
+              echo ""
+              echo "${instruction}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "any_change_detected=${any_change_detected}" >> "$GITHUB_OUTPUT"
+          echo "instruction=${instruction}" >> "$GITHUB_OUTPUT"
+
+      - name: Annotate breaking API change on the workflow run
+        if: always()
+        shell: bash
+        env:
+          ANY_CHANGE_DETECTED: ${{ steps.summary.outputs.any_change_detected }}
+          INSTRUCTION: ${{ steps.summary.outputs.instruction }}
+        run: |
+          set -euo pipefail
+          if [[ "${ANY_CHANGE_DETECTED}" != "true" ]]; then
+            exit 0
+          fi
+          echo "::error title=Breaking API change detected::${INSTRUCTION}"
+
+      - name: Enforce API compatibility policy
+        if: always()
+        shell: bash
+        env:
+          EXIT_CODE: ${{ steps.compatibility.outputs.exit_code }}
+          ANY_CHANGE_DETECTED: ${{ steps.summary.outputs.any_change_detected }}
+          INSTRUCTION: ${{ steps.summary.outputs.instruction }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${EXIT_CODE}" ]]; then
+            echo "API compatibility check did not run or did not report an exit code."
+            exit 1
+          fi
+
+          if [[ "${EXIT_CODE}" == "0" ]]; then
+            exit 0
+          fi
+
+          if [[ "${ANY_CHANGE_DETECTED}" == "true" ]]; then
+            echo "API compatibility check failed; run apiCompatibilityAcknowledgeBreaks in this pull request to acknowledge intentional breaking changes."
+            if [[ -n "${INSTRUCTION}" ]]; then
+              echo "${INSTRUCTION}"
+            fi
+            exit 1
+          fi
+
+          echo "API compatibility check failed during the Gradle build or check. API compatibility was not established. See api-compatibility.log for the Gradle error."
+          exit 1

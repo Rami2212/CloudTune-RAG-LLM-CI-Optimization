@@ -1,0 +1,334 @@
+name: CLI TypeScript 검증
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'packages/**'
+      - 'js/**'
+      - 'web/preview/**'
+      - 'tools/build-public-package.mjs'
+      - 'tools/public-package-notices.mjs'
+      - 'tools/tests/forms-known-profile.test.mjs'
+      - 'packages/cli/e2e/installed.test.mjs'
+      - 'apps/docs/docs/public/editor/manifest.json'
+      - 'apps/docs/docs/public/editor/hwpjs/hwpjs.wasm'
+      - 'apps/docs/docs/public/editor/fixtures/noori.hwp'
+      - 'apps/docs/docs/public/editor/fixtures/noori.hwpx'
+      - 'docs/third-party-notices.md'
+      - 'LICENSE'
+      - 'package.json'
+      - 'bun.lock'
+      - '.github/workflows/cli-typescript.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'packages/**'
+      - 'js/**'
+      - 'web/preview/**'
+      - 'tools/build-public-package.mjs'
+      - 'tools/public-package-notices.mjs'
+      - 'tools/tests/forms-known-profile.test.mjs'
+      - 'packages/cli/e2e/installed.test.mjs'
+      - 'apps/docs/docs/public/editor/manifest.json'
+      - 'apps/docs/docs/public/editor/hwpjs/hwpjs.wasm'
+      - 'apps/docs/docs/public/editor/fixtures/noori.hwp'
+      - 'apps/docs/docs/public/editor/fixtures/noori.hwpx'
+      - 'docs/third-party-notices.md'
+      - 'LICENSE'
+      - 'package.json'
+      - 'bun.lock'
+      - '.github/workflows/cli-typescript.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cli-typescript-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cli-typescript:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      HWPJS_TEST_WASM: ${{ github.workspace }}/apps/docs/docs/public/editor/hwpjs/hwpjs.wasm
+      HWPJS_TEST_NOORI: ${{ github.workspace }}/apps/docs/docs/public/editor/fixtures/noori.hwp
+      HWPJS_TEST_NOORI_HWPX: ${{ github.workspace }}/apps/docs/docs/public/editor/fixtures/noori.hwpx
+      HWPJS_CLI_NATIVE: '1'
+      HWPJS_MCP_NATIVE: '1'
+      HWPJS_READ_MANY_NATIVE: '1'
+      HWPJS_CREATE_CONVERT_NATIVE: '1'
+      HWPJS_EXTENDED_E2E_PACKAGE: ${{ github.workspace }}/packages/hwpjs
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.4'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.20.0'
+      - name: 검사 증거 경로 등록
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "HWPJS_CREATE_EVIDENCE=$RUNNER_TEMP/hwpjs-cli-ts-create-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+          echo "HWPJS_MCP_EVIDENCE_DIR=$RUNNER_TEMP/hwpjs-cli-ts-mcp-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+          echo "HWPJS_EXTENDED_E2E_EVIDENCE=$RUNNER_TEMP/hwpjs-cli-ts-canonical-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+      - name: 동결 의존성 설치
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: 공개 데모 Native WASM 기대 핀 공유
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="$(node ./packages/cli/tests/native-artifact-pin.mjs --manifest ./apps/docs/docs/public/editor/manifest.json)"
+          printf 'HWPJS_TEST_WASM_EXPECTED_SHA256=%s\nHWPJS_TEST_WASM_SHA256=%s\nHWPJS_EXTENDED_E2E_WASM_SHA256=%s\n' "$expected" "$expected" "$expected" >> "$GITHUB_ENV"
+      - name: 실행 도구와 원본 입력 핀 확인
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module -e "import assert from 'node:assert/strict'; import { version } from 'tsdown'; assert.equal(process.version, 'v24.20.0'); assert.equal(version, '0.23.7');"
+          printf '%s  %s\n' \
+            "$HWPJS_TEST_WASM_SHA256" "$HWPJS_TEST_WASM" \
+            'b18be0217a5d9f81e587705edc0c514cdd11e6314bbe434f17d256aa21b75a7f' "$HWPJS_TEST_NOORI" \
+            '6ee9014f23650987803481e7aa51b3b2201f91f549dccfe34880469621d62aab' "$HWPJS_TEST_NOORI_HWPX" \
+            | sha256sum --check --strict
+          mkdir -p "$HWPJS_CREATE_EVIDENCE" "$HWPJS_MCP_EVIDENCE_DIR"
+      - name: CLI strict 타입 검사
+        run: bun run cli:typecheck
+      - name: 단독 CLI와 MCP JavaScript 빌드
+        run: |
+          bun run --cwd packages/cli build
+          test -f ./packages/cli/dist/cli.mjs
+          test -f ./packages/cli/dist/mcp.mjs
+          node --check ./packages/cli/dist/cli.mjs
+          node --check ./packages/cli/dist/mcp.mjs
+      - name: 글머리표 호환 검사 과거 엔진 준비
+        shell: bash
+        run: |
+          set -euo pipefail
+          inventory_engine=77eae1cb82e05c980071910228e1189ac5c2222d
+          if ! git cat-file -e "$inventory_engine^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=1 origin "$inventory_engine"
+          fi
+          git show "$inventory_engine:apps/docs/docs/public/editor/hwpjs/hwpjs.wasm" > "$RUNNER_TEMP/hwpjs-cli-before-bullet-definition.wasm"
+          printf '%s  %s\n' 'a3be6777229dbe1ec895f4850168809f70d9cf52b14b85996a670a5577e865f1' "$RUNNER_TEMP/hwpjs-cli-before-bullet-definition.wasm" | sha256sum --check --strict
+      - name: CLI 소스와 Native opt-in 검사
+        timeout-minutes: 3
+        env:
+          HWPJS_TEST_OLD_WASM: ${{ runner.temp }}/hwpjs-cli-before-bullet-definition.wasm
+          HWPJS_TEST_HWPX: ${{ github.workspace }}/apps/docs/docs/public/editor/fixtures/page.hwpx
+          HWPJS_TEST_HWP5: ${{ github.workspace }}/apps/docs/docs/public/editor/fixtures/lists.hwp
+          HWPJS_TEST_EVIDENCE: ${{ runner.temp }}/hwpjs-cli-bullet-definition-evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          tests=(
+            packages/cli/tests/*.test.mjs
+            tools/tests/picture-replacement-sdk.test.mjs
+            tools/tests/picture-replacement-service.test.mjs
+            tools/tests/table-deletion-sdk.test.mjs
+            tools/tests/image-insertion-sdk.test.mjs
+            tools/tests/structural-host-review.test.mjs
+            tools/tests/html-export-review.test.mjs
+            tools/tests/public-cli-entry.test.mjs
+            tools/tests/hwpx-read-scope.test.mjs
+          )
+          test -f "${tests[0]}"
+          node --max-old-space-size=512 --test --test-concurrency=1 --test-timeout=60000 --test-reporter=tap "${tests[@]}" | tee "$RUNNER_TEMP/hwpjs-cli-ts-source.tap"
+          grep -Eq '^# tests [1-9][0-9]*$' "$RUNNER_TEMP/hwpjs-cli-ts-source.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/hwpjs-cli-ts-source.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/hwpjs-cli-ts-source.tap"
+      - name: 원본 셀 나누기 명시 E2E와 portable 합성 입력
+        timeout-minutes: 3
+        env:
+          HWPJS_TEST_OLD_WASM: ${{ runner.temp }}/hwpjs-cli-split-old.wasm
+          HWPJS_TEST_OLD_SPLIT_WASM_SHA256: '5ece4c0a551716239c37af0e1ff40db7b2a642e1baf75bb27782bcf237bd1621'
+          HWPJS_TEST_HWP5_EXTENT_EXPECTATION: accept
+          HWPJS_TEST_HWP5_EXTENT_ORACLE: ${{ github.workspace }}/packages/cli/e2e/helpers/source-cell-split-extent-oracle.py
+          HWPJS_TEST_HWP5_EXTENT_ORACLE_SHA256: 1ca5c1d89d44de4b889765ad62c2aa22490d9d292aae7aee9238e8c857758a43
+          HWPJS_TEST_EVIDENCE: ${{ runner.temp }}/hwpjs-cli-split-portable
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Split old ABI is F495, independent of the a3be bullet inventory ABI.
+          previous_engine=687255a5fefac1cac249c1afb59459389f35889f
+          git fetch --no-tags --depth=1 origin "$previous_engine"
+          git show "$previous_engine:apps/docs/docs/public/editor/hwpjs/hwpjs.wasm" > "$HWPJS_TEST_OLD_WASM"
+          printf '%s  %s\n' "$HWPJS_TEST_OLD_SPLIT_WASM_SHA256" "$HWPJS_TEST_OLD_WASM" | sha256sum --check --strict
+          test -n "$HWPJS_TEST_WASM_SHA256"
+          # No HWPJS_TEST_FIXTURES sidecar: the test constructs six documents.
+          env -u HWPJS_TEST_FIXTURES node --max-old-space-size=512 --test --test-concurrency=1 --test-timeout=90000 --test-reporter=tap packages/cli/e2e/source-cell-split-bridges.test.mjs | tee "$RUNNER_TEMP/hwpjs-cli-split-portable.tap"
+          grep -Eq '^# tests 12$' "$RUNNER_TEMP/hwpjs-cli-split-portable.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/hwpjs-cli-split-portable.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/hwpjs-cli-split-portable.tap"
+      - name: HWP5 merged source-cell CLI and MCP
+        timeout-minutes: 3
+        env:
+          HWPJS_MERGED_CLI_OLD_WASM: ${{ runner.temp }}/hwpjs-before-merged-cli.wasm
+          HWPJS_MERGED_CLI_OLD_WASM_SHA256: 8ab4d335f7fba4aa764ed3e1191c390f17ee80f053b9ada89748a490547d1980
+          HWPJS_MERGED_CLI_EVIDENCE: ${{ runner.temp }}/hwpjs-merged-cli
+        shell: bash
+        run: |
+          set -euo pipefail
+          previous_engine=9dc8b89433da1926b1db72fc7be45081b063f45e
+          git fetch --no-tags --depth=1 origin "$previous_engine"
+          git show "$previous_engine:apps/docs/docs/public/editor/hwpjs/hwpjs.wasm" > "$HWPJS_MERGED_CLI_OLD_WASM"
+          printf '%s  %s\n' "$HWPJS_MERGED_CLI_OLD_WASM_SHA256" "$HWPJS_MERGED_CLI_OLD_WASM" | sha256sum --check --strict
+          node --max-old-space-size=512 --test --test-concurrency=1 --test-timeout=90000 --test-reporter=tap packages/cli/e2e/merged-source-cell-split.test.mjs | tee "$RUNNER_TEMP/hwpjs-merged-cli.tap"
+          grep -Eq '^# tests 7$' "$RUNNER_TEMP/hwpjs-merged-cli.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/hwpjs-merged-cli.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/hwpjs-merged-cli.tap"
+
+      - name: HWP5 글머리표 CLI와 MCP 명시 E2E
+        timeout-minutes: 3
+        env:
+          HWPJS_H5_BULLET_TEST_OLD_WASM: ${{ runner.temp }}/hwpjs-cli-before-h5-bullet.wasm
+          HWPJS_H5_BULLET_TEST_OLD_WASM_SHA256: afd903edc5658543b768491efb6ee6fbdbe185a8f393334a363acbd2eb5510ae
+          HWPJS_H5_BULLET_TEST_EVIDENCE: ${{ runner.temp }}/hwpjs-cli-h5-bullet
+        shell: bash
+        run: |
+          set -euo pipefail
+          previous_engine=cce7ead1fc1ca17b73bebd01ea3d72945272e1da
+          git fetch --no-tags --depth=1 origin "$previous_engine"
+          git show "$previous_engine:apps/docs/docs/public/editor/hwpjs/hwpjs.wasm" > "$HWPJS_H5_BULLET_TEST_OLD_WASM"
+          printf '%s  %s\n' "$HWPJS_H5_BULLET_TEST_OLD_WASM_SHA256" "$HWPJS_H5_BULLET_TEST_OLD_WASM" | sha256sum --check --strict
+          node --max-old-space-size=512 --test --test-concurrency=1 --test-timeout=90000 --test-reporter=tap packages/cli/e2e/hwp5-bullet-definition-bridges.test.mjs | tee "$RUNNER_TEMP/hwpjs-cli-h5-bullet.tap"
+          grep -Eq '^# tests 6$' "$RUNNER_TEMP/hwpjs-cli-h5-bullet.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/hwpjs-cli-h5-bullet.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/hwpjs-cli-h5-bullet.tap"
+      - name: HWP5 and HWPX page settings CLI and MCP E2E
+        timeout-minutes: 3
+        env:
+          HWPJS_PAGE_TEST_OLD_WASM: ${{ runner.temp }}/hwpjs-before-page-settings.wasm
+          HWPJS_PAGE_TEST_OLD_WASM_SHA256: 3723d2fe39a73dedd1f994c6c4cff8e8f75014761df8f0561a3be6a8362957dc
+          HWPJS_PAGE_REGRESSION_OUT: ${{ runner.temp }}/hwpjs-page-settings-cli
+        shell: bash
+        run: |
+          set -euo pipefail
+          previous_engine=693995fa24cd0f3a0ec17a67316f845257d89d93
+          git fetch --no-tags --depth=1 origin "$previous_engine"
+          git show "$previous_engine:apps/docs/docs/public/editor/hwpjs/hwpjs.wasm" > "$HWPJS_PAGE_TEST_OLD_WASM"
+          printf '%s  %s\n' "$HWPJS_PAGE_TEST_OLD_WASM_SHA256" "$HWPJS_PAGE_TEST_OLD_WASM" | sha256sum --check --strict
+          node --max-old-space-size=512 tools/run-page-settings-regressions.mjs cli
+      - name: 문자 확장 서식 CLI와 MCP 명시 E2E
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Negative ABI fixture removes only optional formatting exports from this pinned engine.
+          HWPJS_CHARACTER_TEST_OLD_WASM="$HWPJS_TEST_WASM" \
+          HWPJS_CHARACTER_TEST_OLD_WASM_SHA256="$HWPJS_TEST_WASM_SHA256" \
+          HWPJS_CHARACTER_TEST_EVIDENCE="$RUNNER_TEMP/hwpjs-cli-character-extensions" \
+          node --max-old-space-size=512 --test --test-concurrency=1 --test-timeout=90000 --test-reporter=tap packages/cli/e2e/character-extensions.test.mjs | tee "$RUNNER_TEMP/hwpjs-cli-character-extensions.tap"
+          grep -Eq '^# tests 10$' "$RUNNER_TEMP/hwpjs-cli-character-extensions.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/hwpjs-cli-character-extensions.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/hwpjs-cli-character-extensions.tap"
+      - name: 문자 확장 요청 계획 비용과 Native lineage 명시 E2E
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          HWPJS_CHARACTER_NATIVE_SCALE_EVIDENCE="$RUNNER_TEMP/hwpjs-cli-character-plan-native" \
+          node --max-old-space-size=512 --test --test-concurrency=1 --test-timeout=90000 --test-reporter=tap packages/cli/e2e/character-plan-native-scale.test.mjs | tee "$RUNNER_TEMP/hwpjs-cli-character-plan-native.tap"
+          grep -Eq '^# tests 10$' "$RUNNER_TEMP/hwpjs-cli-character-plan-native.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/hwpjs-cli-character-plan-native.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/hwpjs-cli-character-plan-native.tap"
+      - name: 폼 통합 Native의 제품 known profile 직접 검사
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test --test-reporter=tap tools/tests/forms-known-profile.test.mjs | tee "$RUNNER_TEMP/hwpjs-forms-known-profile.tap"
+          grep -Eq '^# tests 2$' "$RUNNER_TEMP/hwpjs-forms-known-profile.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/hwpjs-forms-known-profile.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/hwpjs-forms-known-profile.tap"
+      - name: 폼 상태 CLI와 MCP 명시 E2E
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          HWPJS_FORM_EVIDENCE="$RUNNER_TEMP/hwpjs-cli-form-state" \
+          node --max-old-space-size=512 --test --test-concurrency=1 --test-timeout=90000 --test-reporter=tap packages/cli/e2e/form-state-bridges.test.mjs | tee "$RUNNER_TEMP/hwpjs-cli-form-state.tap"
+          grep -Eq '^# tests 23$' "$RUNNER_TEMP/hwpjs-cli-form-state.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/hwpjs-cli-form-state.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/hwpjs-cli-form-state.tap"
+      - name: 정규 공개 JavaScript 산출물 빌드
+        timeout-minutes: 3
+        run: bun tools/build-public-package.mjs --js-only --wasm="$HWPJS_TEST_WASM"
+      - name: Form text CRLF and LF canonical CLI and MCP regression
+        timeout-minutes: 2
+        env:
+          HWPJS_FORM_EVIDENCE: ${{ runner.temp }}/hwpjs-form-text-eol-cli-${{ github.run_id }}-${{ github.run_attempt }}
+          HWPJS_FORM_CLI_ENTRY: ${{ github.workspace }}/packages/hwpjs/dist/cli.mjs
+          HWPJS_FORM_MCP_ENTRY: ${{ github.workspace }}/packages/hwpjs/dist/mcp.mjs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$HWPJS_TEST_WASM_SHA256"
+          test -f "$HWPJS_FORM_CLI_ENTRY"
+          test -f "$HWPJS_FORM_MCP_ENTRY"
+          test -f "$GITHUB_WORKSPACE/packages/hwpjs/dist/hwpjs.wasm"
+          node --expose-gc --max-old-space-size=512 --test --test-concurrency=1 --test-timeout=90000 --test-reporter=tap packages/cli/e2e/form-multiline-values.test.mjs | tee "$RUNNER_TEMP/hwpjs-form-text-eol-cli.tap"
+          grep -Eq '^# tests 2$' "$RUNNER_TEMP/hwpjs-form-text-eol-cli.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/hwpjs-form-text-eol-cli.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/hwpjs-form-text-eol-cli.tap"
+      - name: Mixed pending forms and source-row exact Native regression
+        timeout-minutes: 2
+        env:
+          HWPJS_FORM_ROW_EVIDENCE: ${{ runner.temp }}/hwpjs-form-source-row
+          HWPJS_FORM_ROW_PACKAGE: ${{ github.workspace }}/packages/hwpjs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$HWPJS_TEST_WASM"
+          test -n "$HWPJS_TEST_WASM_SHA256"
+          # Same manifest-pinned current engine; fixture originals were produced by ac652.
+          # python3 -B normal/-O oracles execute inside the Node gate; no Native/browser build.
+          node --expose-gc --max-old-space-size=384 --test --test-concurrency=1 --test-timeout=90000 --test-reporter=tap packages/cli/e2e/form-source-row-mixed.test.mjs | tee "$RUNNER_TEMP/hwpjs-form-source-row.tap"
+          grep -Eq '^# tests 30$' "$RUNNER_TEMP/hwpjs-form-source-row.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/hwpjs-form-source-row.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/hwpjs-form-source-row.tap"
+      - name: 정규 독립 실행 산출물 CLI와 MCP 검사
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$HWPJS_EXTENDED_E2E_PACKAGE/dist/cli.mjs"
+          test -f "$HWPJS_EXTENDED_E2E_PACKAGE/dist/mcp.mjs"
+          test -f "$HWPJS_EXTENDED_E2E_PACKAGE/dist/hwpjs.wasm"
+          test -f ./legacy/cfb.js
+          test -f ./packages/cli/e2e/installed.test.mjs
+          node --max-old-space-size=512 --test --test-concurrency=1 --test-timeout=90000 --test-reporter=tap ./packages/cli/e2e/installed.test.mjs | tee "$RUNNER_TEMP/hwpjs-cli-ts-canonical.tap"
+          grep -Eq '^# tests [1-9][0-9]*$' "$RUNNER_TEMP/hwpjs-cli-ts-canonical.tap"
+          grep -Eq '^# fail 0$' "$RUNNER_TEMP/hwpjs-cli-ts-canonical.tap"
+          grep -Eq '^# skipped 0$' "$RUNNER_TEMP/hwpjs-cli-ts-canonical.tap"
+      - name: 검사 증거 보존
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-typescript-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/hwpjs-page-settings-cli
+            ${{ runner.temp }}/hwpjs-forms-known-profile.tap
+            ${{ runner.temp }}/hwpjs-cli-form-state.tap
+            ${{ runner.temp }}/hwpjs-cli-form-state
+            ${{ runner.temp }}/hwpjs-form-text-eol-cli.tap
+            ${{ runner.temp }}/hwpjs-form-text-eol-cli-${{ github.run_id }}-${{ github.run_attempt }}
+            ${{ runner.temp }}/hwpjs-form-source-row.tap
+            ${{ runner.temp }}/hwpjs-form-source-row
+            ${{ runner.temp }}/hwpjs-cli-character-plan-native.tap
+            ${{ runner.temp }}/hwpjs-cli-character-plan-native
+            ${{ runner.temp }}/hwpjs-cli-character-extensions.tap
+            ${{ runner.temp }}/hwpjs-cli-character-extensions
+            ${{ runner.temp }}/hwpjs-cli-split-portable.tap
+            ${{ runner.temp }}/hwpjs-cli-split-portable
+            ${{ runner.temp }}/hwpjs-cli-ts-source.tap
+            ${{ runner.temp }}/hwpjs-cli-ts-canonical.tap
+            ${{ env.HWPJS_CREATE_EVIDENCE }}
+            ${{ env.HWPJS_MCP_EVIDENCE_DIR }}
+            ${{ env.HWPJS_EXTENDED_E2E_EVIDENCE }}

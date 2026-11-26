@@ -1,0 +1,83 @@
+name: Release Awesome Azd
+
+# This pipeline is manually started only as part of releasing Awesome AZD
+on:
+  workflow_dispatch:
+    inputs:
+      skip_website_testing:
+        description: Skip website testing before deployment
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+  pages: write
+  deployments: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    name: Enforce main-only dispatch
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Verify ref is refs/heads/main
+        run: |
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "::error::Release can only be dispatched from 'main' (got ${{ github.ref }})."
+            exit 1
+          fi
+
+  test-website:
+    name: Website Testing
+    needs: guard
+    if: ${{ !inputs.skip_website_testing }}
+    uses: ./.github/workflows/website-test.yml
+    permissions:
+      contents: read
+
+  deploy:
+    name: Deploy Site To GitHub Pages
+    needs:
+      - guard
+      - test-website
+    if: >-
+      always() &&
+      needs.guard.result == 'success' &&
+      (inputs.skip_website_testing || needs.test-website.result == 'success')
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - name: Install website dependencies
+        working-directory: website
+        run: npm ci
+      - name: Prepare repository metrics
+        working-directory: website
+        env:
+          REPOSITORY_METRICS_URL: ${{ vars.AWESOME_AZD_REPOSITORY_METRICS_URL }}
+          REPOSITORY_METRICS_MAX_AGE_HOURS: "48"
+        run: node scripts/prepare-repository-metrics.js
+      - name: Build website
+        working-directory: website
+        run: npm run build
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9  # v5.0.0
+        with:
+          path: ./website/build
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346  # v5.0.1

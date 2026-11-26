@@ -1,0 +1,112 @@
+/*
+ * Copyright (C) 2016-2024 HERE Europe B.V.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ * License-Filename: LICENSE
+ */
+
+plugins {
+    alias libs.plugins.lazan.dependency.export
+}
+dependencies {
+    api project(":lime-runtime")
+    implementation project(":lime-loader")
+
+    compileOnly libs.android.annotations
+    implementation libs.guava
+    implementation libs.natpryce.konfig
+    implementation libs.bundles.flexmark
+    implementation libs.commons.cli
+    implementation libs.apache.log4j.core
+    implementation libs.bundles.kotlin
+    implementation libs.jetbrains.annotations
+    implementation libs.slf4j.api
+    implementation libs.slf4j.log4j12
+    implementation libs.trimou.core
+    implementation libs.kotlinx.serialization.json
+
+    testImplementation files({ project(":lime-runtime").sourceSets.test.output })
+    testImplementation libs.bundles.mockk
+    testImplementation libs.junit
+}
+
+apply plugin: 'application'
+mainClassName = 'com.here.gluecodium.Gluecodium'
+
+jar {
+    manifest {
+        attributes('Main-Class': 'com.here.gluecodium.Gluecodium',
+                   'Class-Path': configurations.runtimeClasspath.files.collect { it.getName() }.join(' '))
+    }
+}
+
+apply plugin: 'jacoco'
+jacoco {
+    toolVersion = libs.versions.jacoco.get()
+}
+jacocoTestCoverageVerification {
+    violationRules {
+        rule {
+            enabled = true
+            limit {
+                counter = 'LINE'
+                minimum = 0.90
+            }
+        }
+    }
+}
+jacocoTestReport {
+    reports {
+        csv.required = true
+        html.required = true
+        xml.required = true
+
+        csv.destination file("${buildDir}/reports/coverage/coverageReport.csv")
+        html.destination file("${buildDir}/reports/coverage/html")
+        xml.destination file("${buildDir}/reports/coverage/coverageReport.xml")
+    }
+}
+
+apply from: "$rootDir/gradle/spotless.gradle"
+spotless {
+    format 'cpp', {
+        target project.fileTree(project.projectDir) {
+            include '**/*.h', '**/*.cpp'
+            exclude '**/build', '**/test/resources'
+        }
+        licenseHeaderFile rootProject.file('config/spotless/here_cpp.license'),
+                '(#pragma|#include)'
+        trimTrailingWhitespace()
+        endWithNewline()
+    }
+    format 'swift', {
+        target project.fileTree(project.projectDir) {
+            include '**/*.swift'
+            exclude '**/build', '**/test/resources'
+        }
+        licenseHeaderFile rootProject.file('config/spotless/here_cpp.license'),
+                '(import|class|public class|protocol|///)'
+        trimTrailingWhitespace()
+        endWithNewline()
+    }
+}
+
+project.ext.longName = 'Gluecodium command-line tool'
+apply from: "$rootDir/gradle/publishing.gradle"
+
+apply plugin: "com.lazan.dependency-export"
+mavenDependencyExport {
+    configuration 'testImplementation'
+}

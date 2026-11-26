@@ -1,0 +1,238 @@
+/*
+ * Copyright (C) 2016-2024 HERE Europe B.V.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ * License-Filename: LICENSE
+ */
+
+import org.jetbrains.dokka.gradle.AbstractDokkaTask
+
+plugins {
+    id 'org.jetbrains.dokka' version '2.0.0' apply false
+}
+
+if (rootProject.isAndroidKotlinBuild()) {
+    apply plugin: 'org.jetbrains.dokka'
+}
+
+apply plugin: 'com.android.library'
+apply plugin: 'org.jetbrains.kotlin.android'
+
+project.buildDir = "${rootProject.buildDir}"
+
+def getCMakeCommonParameters() {
+    def params = ['-Wno-dev',
+        "-DGLUECODIUM_BASE_OUTPUT_DIR_DEFAULT=${rootProject.generatedDir}",
+        "-DGLUECODIUM_VERSION_DEFAULT=${rootProject.useGluecodiumVersion()}",
+        '-DGLUECODIUM_ENABLE_INTERNAL_DEBUG_CHECKS_DEFAULT=ON']
+
+    if (rootProject.isAndroidKotlinBuild() && rootProject.forceJavaGeneratedJniForKotlin()) {
+        params.add("-DGLUECODIUM_GENERATORS_DEFAULT=android;android-kotlin;cpp")
+        params.add('-DGLUECODIUM_FORCE_USAGE_OF_JNI_FROM_JAVA_GENERATOR_DEFAULT=ON')
+    } else {
+        params.add("-DGLUECODIUM_GENERATORS_DEFAULT=${rootProject.getAndroidBuildVariant()};cpp")
+    }
+
+    return params
+}
+
+def getAndroidKotlinGeneratedFilesDirectory() {
+    if (rootProject.forceJavaGeneratedJniForKotlin()) {
+        return "android-android-kotlin-cpp"
+    } else {
+        return "android-kotlin-cpp"
+    }
+}
+
+android {
+    ndkVersion rootProject.ndkVersion
+    compileSdkVersion rootProject.compileSdkVersion
+
+    namespace 'com.here.gluecodium.test.functional'
+
+    defaultConfig {
+        minSdkVersion rootProject.minSdkVersion
+        targetSdkVersion rootProject.targetSdkVersion
+        versionCode 150001
+        versionName '0.0.1'
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
+
+        externalNativeBuild {
+            cmake {
+                arguments (*getCMakeCommonParameters())
+                targets 'functional'
+            }
+        }
+    }
+
+    if (!rootProject.isHostOnly()) {
+        externalNativeBuild {
+            cmake {
+                path "${rootProject.projectDir}/CMakeLists.txt"
+                buildStagingDirectory "${rootProject.buildNativeRoot}/functional"
+                version '3.19.0+'
+            }
+        }
+    }
+
+    sourceSets {
+        if (rootProject.isAndroidKotlinBuild()) {
+            main {
+                manifest.srcFile "${project.projectDir}/input/src/android/AndroidManifest.xml"
+
+                kotlin.srcDirs += [
+                        "${project.projectDir}/input/src/android-kotlin/kotlin",
+                        "${rootProject.generatedDir}/functional_bindings/${getAndroidKotlinGeneratedFilesDirectory()}/common/android-kotlin",
+                        "${rootProject.generatedDir}/functional_bindings/${getAndroidKotlinGeneratedFilesDirectory()}/main/android-kotlin"]
+            }
+
+            if (rootProject.forceJavaTestSources()) {
+                test {
+                    java.srcDirs += ["${project.projectDir}/android/src/test/java",
+                                     "${project.projectDir}/android-kotlin/src/test/java"]
+                }
+            } else {
+                test {
+                    kotlin.srcDirs += ["${project.projectDir}/android-kotlin/src/test/kotlin"]
+                }
+            }
+        } else {
+            main {
+                manifest.srcFile "${project.projectDir}/input/src/android/AndroidManifest.xml"
+
+                java.srcDirs += [
+                        "${project.projectDir}/input/src/android/java",
+                        "${rootProject.generatedDir}/functional_bindings/android-cpp/common/android",
+                        "${rootProject.generatedDir}/functional_bindings/android-cpp/main/android"]
+            }
+
+            test {
+                java.srcDirs += ["${project.projectDir}/android/src/test/java",
+                                 "${project.projectDir}/android/src/test/java-only"]
+            }
+        }
+    }
+
+    if (rootProject.isAndroidKotlinBuild()) {
+        compileOptions {
+            sourceCompatibility JavaVersion.VERSION_17
+            targetCompatibility JavaVersion.VERSION_17
+        }
+
+        kotlinOptions {
+            jvmTarget = JavaVersion.VERSION_17.toString()
+        }
+    } else {
+        compileOptions {
+            sourceCompatibility JavaVersion.VERSION_1_8
+            targetCompatibility JavaVersion.VERSION_1_8
+        }
+    }
+
+    testOptions {
+        unitTests.all {
+            environment 'MALLOC_CONF', 'prof_leak:true,lg_prof_sample:0,prof_final:true'
+        }
+    }
+
+    libraryVariants.all { variant ->
+        def typeName = variant.name
+        def typeCapitalised = typeName.capitalize()
+
+        tasks.register("build${typeCapitalised}NativeHost", BuildCMakeNativeHost) {
+            projectDir = rootProject.projectDir
+            buildDir = file(buildNativeHostDir('functional', typeName))
+            cmakeParameters = getCMakeCommonParameters()
+            target = 'functional'
+            buildType = variant.buildType.name
+            dependsOn("generate${typeCapitalised}BuildConfig")
+        }
+
+        buildConfigField "String", "NATIVE_LIB_HOST_DIR", "\"${buildNativeHostDir('functional', typeName)}/functional\""
+    }
+}
+
+if (rootProject.isAndroidKotlinBuild()) {
+    // By default Dokka engine for documentation tries to execute generator on all source sets
+    // for Kotlin. This would cause execution of both debug/release when any 'Dokka' task is run.
+    tasks.withType(AbstractDokkaTask.class).configureEach {
+        // Therefore, we firstly disable generation for all source sets.
+        dokkaSourceSets.configureEach {
+            suppress.set(true)
+        }
+
+        // And then enable only the desired one.
+        dokkaSourceSets {
+            named("release") {
+                suppress.set(false)
+
+                sourceRoots.setFrom([
+                        "${project.projectDir}/input/src/android-kotlin/kotlin",
+                        "${rootProject.generatedDir}/functional_bindings/android-kotlin-cpp/common/android-kotlin",
+                        "${rootProject.generatedDir}/functional_bindings/android-kotlin-cpp/main/android-kotlin"])
+            }
+        }
+    }
+
+    dokkaHtml {
+        outputDirectory.set(file("${buildRoot}/documentation/html"))
+    }
+}
+
+tasks.register('generateJavadoc', Javadoc) {
+    source = android.sourceSets.main.java.srcDirs
+    classpath += files(android.getBootClasspath().join(File.pathSeparator))
+    exclude '**/jni/**', '**.xml'
+    options.encoding='UTF-8'
+
+    doFirst {
+        generateJavadoc.classpath += files(android.libraryVariants.collect { variant ->
+            variant.getJavaCompileProvider().get().classpath.files
+        })
+    }
+}
+
+dependJavaTasksOnNativeBuild(tasks, rootProject.isHostOnly())
+
+tasks.configureEach { task ->
+    if (task.name == 'generateJavadoc') {
+        task.mustRunAfter 'buildDebugNativeHost', 'buildReleaseNativeHost', 'externalNativeBuildDebug', 'externalNativeBuildRelease'
+    }
+}
+
+dependencies {
+    implementation libs.androidx.annotation
+    implementation libs.kotlinx.coroutines.android
+
+    testImplementation libs.junit
+    testImplementation libs.powermock.reflect
+    testImplementation libs.robolectric
+    testImplementation libs.bundles.hamcrest
+}
+
+apply plugin: 'com.diffplug.spotless'
+
+spotless {
+    java {
+        target project.fileTree(project.projectDir) {
+            include '**/*.java'
+        }
+
+        googleJavaFormat()
+        licenseHeaderFile rootProject.file('functional/android/config/here_java.license')
+        trimTrailingWhitespace()
+        endWithNewline()
+    }
+}

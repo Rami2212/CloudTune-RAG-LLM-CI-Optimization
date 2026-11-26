@@ -1,0 +1,184 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  typecheck:
+    name: Typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup pnpm
+        uses: ./.github/actions/setup-pnpm
+
+      - name: Generate build info
+        run: node scripts/generate-build-info.mjs
+
+      - name: Build content
+        run: pnpm run build:content-collections
+
+      - name: Typecheck
+        run: pnpm run typecheck:ci
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup pnpm
+        uses: ./.github/actions/setup-pnpm
+
+      - name: Generate build info
+        run: node scripts/generate-build-info.mjs
+
+      - name: Build content
+        run: pnpm run build:content-collections
+
+      - name: Generate feeds
+        run: pnpm run generate-feeds
+
+      - name: Upload generated assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: generated-assets
+          path: |
+            .content-collections/
+            public/rss/
+            src/build-info.json
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 1
+
+      - name: Lint
+        run: pnpm lint
+
+  unit-tests:
+    name: Unit/API Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [typecheck, lint]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup pnpm
+        uses: ./.github/actions/setup-pnpm
+
+      - name: Download generated assets
+        uses: actions/download-artifact@v8
+        with:
+          name: generated-assets
+          path: .
+
+      - name: Run unit/api tests
+        run: pnpm test:unit
+
+  worker-tests:
+    name: Worker Runtime Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [typecheck, lint]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup pnpm
+        uses: ./.github/actions/setup-pnpm
+
+      - name: Run worker runtime tests
+        run: pnpm test:workers
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [typecheck, lint]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup pnpm
+        uses: ./.github/actions/setup-pnpm
+
+      - name: Download generated assets
+        uses: actions/download-artifact@v8
+        with:
+          name: generated-assets
+          path: .
+
+      - name: Build
+        run: pnpm run build:ci
+        env:
+          VITE_CI: "1"
+          VITE_SITE_URL: "http://127.0.0.1:5045"
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-output
+          path: |
+            dist/
+            .wrangler/deploy/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 1
+
+      - name: Upload build artifacts on failure
+        uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: build-output-failed
+          path: dist/
+
+  e2e:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [build, unit-tests, worker-tests]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup pnpm
+        uses: ./.github/actions/setup-pnpm
+
+      - name: Download build output
+        uses: actions/download-artifact@v8
+        with:
+          name: build-output
+          path: .
+
+      - name: Install Playwright
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Run E2E tests
+        run: pnpm test:e2e
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: playwright-results
+          path: |
+            playwright-report/
+            test-results/

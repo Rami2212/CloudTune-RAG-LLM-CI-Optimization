@@ -1,0 +1,68 @@
+# Coordinates opt-in GIF baseline validation for pull requests.
+name: Pull Request GIF Validation
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: pr-gif-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check-label:
+    name: Check GIF Validation Label
+    runs-on: ubuntu-26.04
+    outputs:
+      should_run: ${{ steps.labels.outputs.should_run }}
+    steps:
+      - name: Fetch current PR labels
+        id: labels
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          should_run="$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels?per_page=100" |
+            jq -s 'any(.[][]; .name == "run-gif-validation")')"
+          echo "should_run=${should_run}" >> "$GITHUB_OUTPUT"
+
+  gif-validation:
+    name: GIF Baseline Validation
+    needs: check-label
+    if: ${{ needs.check-label.outputs.should_run == 'true' }}
+    uses: ./.github/workflows/validate-gifs.yml
+    with:
+      source-sha: ${{ github.sha }}
+
+  gif-result:
+    name: PR GIF Baseline Validation
+    if: ${{ always() }}
+    needs:
+      - check-label
+      - gif-validation
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Verify GIF baseline validation
+        env:
+          CHECK_LABEL_RESULT: ${{ needs.check-label.result }}
+          SHOULD_RUN: ${{ needs.check-label.outputs.should_run }}
+          GIF_RESULT: ${{ needs.gif-validation.result }}
+        run: |
+          if [ "$CHECK_LABEL_RESULT" != "success" ]; then
+            echo "GIF validation label check did not succeed: $CHECK_LABEL_RESULT"
+            exit 1
+          fi
+
+          if [ "$SHOULD_RUN" = "true" ] && [ "$GIF_RESULT" != "success" ]; then
+            echo "GIF baseline validation did not succeed: $GIF_RESULT"
+            exit 1
+          fi

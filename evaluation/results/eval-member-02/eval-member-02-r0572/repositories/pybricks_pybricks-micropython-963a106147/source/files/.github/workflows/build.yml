@@ -1,0 +1,252 @@
+name: Build
+
+on:
+  push:
+    branches:
+    - '**'
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MAKEOPTS: -j2
+
+jobs:
+  upload_pr_number:
+    name: upload pull request number
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Save PR number
+        env:
+          PR_NUMBER: ${{ github.event.number }}
+        run: |
+          mkdir -p ./pr
+          echo $PR_NUMBER > ./pr/pr_number
+      - uses: actions/upload-artifact@v7
+        with:
+          name: pr_number
+          path: pr/
+
+  mpy_cross:
+    name: mpy-cross
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v7
+      with:
+        submodules: true
+    - name: Build mpy-cross
+      run: make $MAKEOPTS -C micropython/mpy-cross
+    - name: Upload mpy-cross
+      if: ${{ success() }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: mpy-cross
+        path: micropython/mpy-cross/build/mpy-cross
+
+  unix_coverage:
+    name: unix coverage
+    needs: mpy_cross
+    runs-on: ubuntu-24.04
+    env:
+      PYBRICKS_NO_REDIRECT_STDOUT: 1
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v7
+      with:
+        submodules: true
+    - name: Download mpy-cross
+      uses: actions/download-artifact@v8
+      with:
+        name: mpy-cross
+        path: micropython/mpy-cross/build
+    - name: Fix file permission
+      run: chmod +x micropython/mpy-cross/build/mpy-cross
+    - name: Build
+      run: |
+        cd micropython
+        make ${MAKEOPTS} -C ports/unix VARIANT=coverage submodules
+        make ${MAKEOPTS} -C ports/unix VARIANT=coverage deplibs
+        make ${MAKEOPTS} -C ports/unix VARIANT=coverage
+    - name: Test
+      if: ${{ success() }}
+      run: |
+        ulimit -n 1024 # needed for micropython/tests/extmod/select_poll_fd.py
+        cd micropython
+        make -C ports/unix VARIANT=coverage test_full -j
+        (cd tests && MICROPY_CPYTHON3=python3 MICROPY_MICROPYTHON=../ports/unix/build-coverage/micropython ./run-multitests.py multi_net/*.py)
+    - name: List failed tests
+      if: failure()
+      run: micropython/tests/run-tests.py --print-failures
+
+  arm_toolchain_cache:
+    name: warm ARM toolchain cache
+    strategy:
+      matrix:
+        packages:
+        - gcc-arm-none-eabi libnewlib-arm-none-eabi
+        # buildhat (Pico SDK) has a C++ source, so it needs the large libstdc++
+        - gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v7
+    - name: Warm toolchain cache
+      timeout-minutes: 10
+      uses: ./.github/actions/apt-install
+      with:
+        packages: ${{ matrix.packages }}
+        no-install-recommends: 'true'
+        warm-cache-only: 'true'
+
+  firmware:
+    name: firmware
+    strategy:
+      # off master, one broken commit means the branch has to be fixed up, so
+      # cancel the other hubs instead of building commits that get new hashes
+      fail-fast: ${{ github.ref != 'refs/heads/master' }}
+      matrix:
+        hub: [cityhub, essentialhub, movehub, nxt, primehub, technichub, ev3, buildhat]
+    needs: [mpy_cross, arm_toolchain_cache]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v7
+      with:
+        submodules: true
+        fetch-depth: 0
+        # never expose the token to makefiles of built commits
+        persist-credentials: false
+    - name: Install cross-compiler
+      timeout-minutes: 10
+      uses: ./.github/actions/apt-install
+      with:
+        # only buildhat needs the large libstdc++, so the other hubs restore a
+        # much smaller cache
+        packages: >-
+          gcc-arm-none-eabi libnewlib-arm-none-eabi
+          ${{ matrix.hub == 'buildhat' && 'libstdc++-arm-none-eabi-newlib' || '' }}
+        no-install-recommends: 'true'
+    - name: Download mpy-cross
+      uses: actions/download-artifact@v8
+      with:
+        name: mpy-cross
+        path: micropython/mpy-cross/build
+    - name: Fix file permission
+      run: chmod +x micropython/mpy-cross/build/mpy-cross
+    - name: Install uv
+      uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+      with:
+        version: "0.12.24"
+    - run: uv sync --locked --only-group build
+    - name: Checkout size data
+      uses: actions/checkout@v7
+      with:
+        ref: size-data
+        path: size-data
+        # only publishing (push events) needs a writable token
+        persist-credentials: ${{ github.event_name == 'push' }}
+    - name: Configure size data git identity
+      run: |
+        git -C size-data config user.name "CI"
+        git -C size-data config user.email "team@pybricks.com"
+    - name: Build commits and publish size data (push)
+      if: github.event_name == 'push'
+      env:
+        # master cannot be force pushed, so an accidental bad commit is recorded
+        # as a gap and only HEAD still has to build
+        KEEP_GOING: ${{ github.ref == 'refs/heads/master' && '--keep-going' || '' }}
+      run: uv run --no-sync .github/build-commits.py ${{ matrix.hub }} --publish $KEEP_GOING
+    - name: Build commits without publishing size data (pull request)
+      if: github.event_name == 'pull_request'
+      run: uv run --no-sync .github/build-commits.py ${{ matrix.hub }}
+    - name: Build firmware for upload
+      run: |
+        if [ ! -f bricks/${{ matrix.hub }}/build/firmware.zip ] || [ "$(git rev-parse HEAD)" != "${{ github.sha }}" ]; then
+          git checkout ${{ github.sha }}
+          git submodule update --init micropython
+          git -C micropython submodule update --init lib/micropython-lib lib/stm32lib lib/CMSIS_6
+          export MICROPY_GIT_TAG=ci-build-${{ github.run_number }}-$(git describe --tags --dirty --always --exclude "@pybricks/*")
+          export MICROPY_GIT_HASH=$(echo ${{ github.sha }} | cut -c1-8)
+          [ "${{ matrix.hub }}" = "buildhat" ] && make -C bricks/${{ matrix.hub }} submodules
+          uv run --no-sync make -C bricks/${{ matrix.hub }} -j
+        fi
+    - name: Extract firmware.zip for upload
+      if: ${{ success()}}
+      working-directory: bricks/${{ matrix.hub }}/build
+      run: unzip firmware.zip -d upload
+    - name: Short hash
+      id: vars
+      run: echo "short_sha=$(echo ${{ github.sha }} | cut -c1-8)" >> $GITHUB_OUTPUT
+    - name: Upload firmware
+      if: ${{ success()}}
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ matrix.hub }}-firmware-build-${{ github.run_number }}-git${{ steps.vars.outputs.short_sha }}
+        path: bricks/${{ matrix.hub }}/build/upload/*
+
+  virtualhub:
+    name: virtual hub
+    needs: [mpy_cross]
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v7
+      with:
+        submodules: true
+        fetch-depth: 0
+    - name: Checkout submodules
+      run: |
+        cd micropython
+        git submodule update --init --depth 0 lib/axtls
+        git submodule update --init --depth 0 lib/berkeley-db-1.xx
+        git submodule update --init --depth 0 lib/libffi
+    - name: Download mpy-cross
+      uses: actions/download-artifact@v8
+      with:
+        name: mpy-cross
+        path: micropython/mpy-cross/build
+    - name: Fix file permission
+      run: chmod +x micropython/mpy-cross/build/mpy-cross
+    - name: Install uv
+      uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+      with:
+        version: "0.12.24"
+    - run: uv sync --locked --only-group build
+    - name: Build and test
+      run: uv run --no-sync ./test-virtualhub.sh
+
+  pbio:
+    name: pbio tests
+    runs-on: ubuntu-24.04
+    env:
+      PBIO_TEST_RESULTS_DIR: lib/pbio/test/results
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v7
+      with:
+        submodules: true
+    - name: Install prerequisites
+      timeout-minutes: 10
+      uses: ./.github/actions/apt-install
+      with:
+        packages: doxygen graphviz
+    - name: Install uv
+      uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+      with:
+        version: "0.12.24"
+    - run: uv sync --locked --only-group build
+    - name: Build
+      run: |
+        uv run --no-sync make $MAKEOPTS -C lib/pbio/test
+    - name: Build docs
+      run: |
+        make $MAKEOPTS -C lib/pbio/doc -j
+    - name: Run tests
+      run: |
+        uv run --no-sync ./test-pbio.sh

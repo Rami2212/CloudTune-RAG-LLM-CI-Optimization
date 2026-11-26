@@ -1,0 +1,704 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 3 optimizations:
+# - [HIGH] Add npm dependency cache to "QuickChecks" job
+# - [HIGH] Add npm dependency cache to "Documentation" job
+# - [MEDIUM] 7 jobs clone the repo — consider artifact sharing
+# Estimated savings: ~9 min/run
+#
+name: Cesium for Unity
+on: [push]
+env:
+  VCPKG_BINARY_SOURCES: 'clear;x-aws,s3://cesium-builds/vcpkg/cesium-native-cache/,readwrite'
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_INTERNAL_SERVICES_VCPKG_ACCESS_KEY }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_INTERNAL_SERVICES_VCPKG_SECRET_KEY }}
+  AWS_REGION: us-east-1
+jobs:
+  QuickChecks:
+    name: "Quick Checks"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+      - name: Check source formatting
+        run: |
+          cd native~
+          npm ci
+          npm run format -- --dry-run -Werror
+  Documentation:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Doxygen
+        run: |
+          cd ~
+          wget https://github.com/doxygen/doxygen/releases/download/Release_1_13_2/doxygen-1.13.2.linux.bin.tar.gz
+          tar xzf doxygen-1.13.2.linux.bin.tar.gz
+          export PATH=$PWD/doxygen-1.13.2/bin:$PATH
+          echo "PATH=$PATH" >> "$GITHUB_ENV"
+          doxygen --version
+      - name: Check out repository code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Generate Documentation
+        run: |
+          npm run doxygen
+      - name: Publish Documentation Artifact
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReferenceDocumentation
+          path: Documentation~/Reference
+  Windows:
+    needs: [QuickChecks]
+    runs-on: windows-latest
+    # Only allow a single Windows build at a time, for Unity licensing reasons
+    concurrency: windows
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.103"
+      - name: Cache vcpkg artifacts
+        uses: actions/cache@v4
+        with:
+          path: "d:/.ezvcpkg"
+          key: vcpkg-windows-${{ hashFiles('native~/vcpkg/ports/**/vcpkg.json', 'native~/vcpkg/triplets/**/*', 'native~/extern/*toolchain.cmake') }}-${{ hashFiles('native~/extern/cesium-native/CMakeLists.txt', 'native~/CMakeLists.txt') }}
+          restore-keys: |
+            vcpkg-windows-${{ hashFiles('native~/vcpkg/ports/**/vcpkg.json', 'native~/vcpkg/triplets/**/*', 'native~/extern/*toolchain.cmake') }}-
+      - name: Install latest ninja and cmake
+        uses: lukka/get-cmake@latest
+      - name: Install nasm
+        uses: ilammy/setup-nasm@v1.5.1
+      - name: Install wget
+        run: |
+          choco install -y wget
+      - name: Install Unity CLI
+        run: |
+          irm https://unity.com/install.ps1 | iex
+          # Add the Unity CLI to the GITHUB_PATH so it persists for the rest of the workflow steps
+          $unityCliPath = Get-Content $env:AppData/UnityHub/cli-install.json | ConvertFrom-Json | select -expand path | Split-Path
+          echo $unityCliPath
+          Add-Content -Path $env:GITHUB_PATH -Value "$unityCliPath"
+      - name: Install Unity
+        run: |
+          unity install 2022.3.41f1 --changeset 0f988161febf --accept-eula
+          unity install-modules -e 2022.3.41f1 -m universal-windows-platform --accept-eula
+      - name: Create SSH tunnel to Unity License Server
+        env:
+          UNITY_LICENSE_SERVER_SSH_KEY: ${{ secrets.UNITY_LICENSE_SERVER_SSH_KEY }}
+        run: |
+          $ENV:UNITY_LICENSE_SERVER_SSH_KEY | Set-Content ~/unity-client-ssh-key
+          # Without StrictHostKeyChecking, OpenSSH will sit forever waiting for local input to confirm the server key is ok.
+          # We don't really care if the server is authentic, because we're not sending anything sensitive to it.
+          # The license server VM's sshd_config also needed to be modified with the following options, in order to prevent
+          # the tunnel from being closed between here and when we're ready to use it.
+          #   TCPKeepAlive yes
+          #   ClientAliveInterval 30
+          #   ClientAliveCountMax 9999
+          start -FilePath ssh -ArgumentList "-o StrictHostKeyChecking=no -i ~/unity-client-ssh-key -L 127.0.0.1:12331:127.0.0.1:8080 unity-client@ec2-44-204-244-196.compute-1.amazonaws.com"
+          sleep 5
+      - name: Test Connection to Unity License Server
+        run: |
+          wget.exe http://127.0.0.1:12331/v1/admin/status
+          cat status
+          rm status
+      - name: Configure Unity to Use the License Server
+        run: |
+          mkdir -p $ENV:PROGRAMDATA/Unity/config
+          $filename="$ENV:PROGRAMDATA/Unity/config/services-config.json"
+          $text='{"licensingServiceBaseUrl":"http://localhost:12331","enableEntitlementLicensing":true,"clientConnectTimeoutSec":120,"clientHandshakeTimeoutSec":60,"toolset":"UnityLicenseServer_16768262570522_9"}'
+          [IO.File]::WriteAllLines($filename,$text)
+      - name: Update the version in Cesium.cpp
+        run: |
+          $VERSION = (Get-Content -path package.json | ConvertFrom-Json).version
+          $COMMIT = $(git rev-parse --short HEAD)
+          ((Get-Content -path native~/src/Runtime/Cesium.cpp -Raw) -replace 'Cesium::version = "Development Build"',"Cesium::version = ""$VERSION""") | Set-Content -Path native~/src/Runtime/Cesium.cpp
+          ((Get-Content -path native~/src/Runtime/Cesium.cpp -Raw) -replace 'Cesium::commit = "Unknown"',"Cesium::commit = ""$COMMIT""") | Set-Content -Path native~/src/Runtime/Cesium.cpp
+          # Sanity check that the replacements happened
+          if (-Not ((Get-Content -path native~/src/Runtime/Cesium.cpp -Raw) -match "$COMMIT")) { throw "Commit does not exist in file after replacement" }
+          if (-Not ((Get-Content -path native~/src/Runtime/Cesium.cpp -Raw) -match "$VERSION")) { throw "Version does not exist in file after replacement" }
+      - name: Move cesium-unity Repo Under Empty Project
+        run: |
+          mkdir -p d:\cesium\CesiumForUnityBuildProject\Packages\com.cesium.unity
+          mv $ENV:GITHUB_WORKSPACE/* d:\cesium\CesiumForUnityBuildProject\Packages\com.cesium.unity
+          # Disable Unity audio
+          mkdir -p d:\cesium\CesiumForUnityBuildProject\Packages\com.cesium.unity\ProjectSettings
+          $text="%YAML 1.1`n%TAG !u! tag:unity3d.com,2011:`n--- !u!11 &1`nAudioManager:`n  m_DisableAudio: 1`n"
+          [IO.File]::WriteAllLines("d:/cesium/CesiumForUnityBuildProject/Packages/com.cesium.unity/ProjectSettings/AudioManager.asset",$text)
+      - name: Build Reinterop
+        run: |
+          cd d:\cesium\CesiumForUnityBuildProject\Packages\com.cesium.unity
+          dotnet publish Reinterop~ -o .
+      - name: Print disk space 1
+        if: success() || failure()    # run this step even if previous step failed
+        run: |
+          get-psdrive
+      - name: Build Package
+        run: |
+          cd d:\cesium\CesiumForUnityBuildProject\Packages\com.cesium.unity
+          mkdir -p d:\cesium\temp
+          # Store temp files on the D drive, which is much faster than the EBS-backed C drive.
+          $ENV:TEMP="d:\cesium\temp"
+          # We only need a release build of vcpkg dependencies
+          $ENV:CESIUM_VCPKG_RELEASE_ONLY="TRUE"
+          # Explicitly set the ezvcpkg path. Otherwise it will be `/.ezvcpkg` and the drive letter is ambiguous.
+          $ENV:EZVCPKG_BASEDIR="D:/.ezvcpkg"
+          # Run the build
+          dotnet run --project Build~ package --platform Editor --platform Windows --platform UWP
+      - name: Print disk space 2
+        if: success() || failure()    # run this step even if previous step failed
+        run: |
+          get-psdrive
+      - name: Publish Logs
+        if: success() || failure()    # run this step even if previous step failed
+        uses: actions/upload-artifact@v4
+        with:
+          name: Native Build Logs - Windows
+          path: d:/cesium/CesiumForUnityBuildProject/Packages/com.cesium.unity/native~/build-*/build.log
+      - name: Publish package artifact
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Windows Package
+          path: d:\cesium\CesiumForUnityBuildProject\*.tgz
+      - name: Run Tests
+        env:
+          CESIUM_ION_TOKEN_FOR_TESTS: ${{ secrets.CESIUM_ION_TOKEN_FOR_TESTS }}
+        run: |
+          start -FilePath "C:\Program Files\Unity\Hub\Editor\2022.3.41f1\Editor\Unity.exe" -ArgumentList "-runTests -batchmode -projectPath d:\cesium\CesiumForUnityBuildProject -testResults d:\cesium\temp\TestResults.xml -testPlatform PlayMode -logFile d:\cesium\temp\test-log.txt" -Wait
+          cat d:\cesium\temp\test-log.txt
+      - name: Test Report
+        uses: kring/test-reporter@v1.6.2-kring
+        if: success() || failure()    # run this step even if previous step failed
+        with:
+          name: Tests - Windows
+          path: d:/cesium/temp/TestResults.xml
+          reporter: dotnet-nunit
+  MacOS:
+    needs: [QuickChecks]
+    runs-on: macos-15
+    # Only allow a single macOS build at a time, for Unity licensing reasons
+    concurrency: mac
+    steps:
+      - name: Make some more disk space
+        run: |
+          df -h
+          ls /Applications
+          brew uninstall google-chrome
+          sudo rm -rf /Users/runner/Library/Android
+          sudo rm -rf /Applications/Xcode_14.3.1.app
+          sudo rm -rf /Applications/Xcode_14.3.app
+          sudo rm -rf /Applications/Xcode_15.0.1.app
+          sudo rm -rf /Applications/Xcode_15.0.app
+          sudo rm -rf /Applications/Xcode_15.1.0.app
+          sudo rm -rf /Applications/Xcode_15.1.app
+          sudo rm -rf /Applications/Xcode_15.2.0.app
+          sudo rm -rf /Applications/Xcode_15.2.app
+          sudo rm -rf /Applications/Xcode_15.3.0.app
+          sudo rm -rf /Applications/Xcode_15.3.app
+          sudo rm -rf /Applications/Xcode_16.0.0.app
+          sudo rm -rf /Applications/Xcode_16.0.app
+          sudo rm -rf /Applications/Xcode_16.1.0.app
+          sudo rm -rf /Applications/Xcode_16.1.app
+          sudo rm -rf /Applications/Xcode_16.1_beta.app
+          sudo rm -rf /Applications/Xcode_16_beta_6.app
+          ls /Applications
+          df -h
+      - name: Set XCode version
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "16.4"
+      - name: Print XCode version
+        run: |
+          xcode-select --print-path
+      - name: Check out repository code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.103"
+      - name: Cache vcpkg artifacts
+        uses: actions/cache@v4
+        with:
+          path: "~/.ezvcpkg"
+          key: vcpkg-mac-${{ hashFiles('native~/vcpkg/ports/**/vcpkg.json', 'native~/vcpkg/triplets/**/*', 'native~/extern/*toolchain.cmake') }}-${{ hashFiles('native~/extern/cesium-native/CMakeLists.txt', 'native~/CMakeLists.txt') }}
+          restore-keys: |
+            vcpkg-mac-${{ hashFiles('native~/vcpkg/ports/**/vcpkg.json', 'native~/vcpkg/triplets/**/*', 'native~/extern/*toolchain.cmake') }}-
+      - name: Install nasm
+        uses: ilammy/setup-nasm@v1.5.1
+      - name: Install Unity CLI
+        shell: bash
+        run: |
+          curl -fsSL https://unity.com/install.sh | bash
+          source ~/.bashrc
+          dirname $(which unity) >> $GITHUB_PATH
+      - name: Install Unity 2022.3.41f1
+        # This command sometimes returns exit code 130, despite actually succeeding.
+        continue-on-error: true
+        run: |
+          unity install 2022.3.41f1 --changeset 0f988161febf --accept-eula
+      - name: Install Unity iOS Support 
+        run: |
+          unity install-modules -e 2022.3.41f1 -m ios --accept-eula
+      - name: Configure Unity to Use the License Server
+        run: |
+          sudo mkdir -p "/Library/Application Support/Unity/config"
+          sudo chmod g+w "/Library/Application Support/Unity"
+          sudo chmod g+w "/Library/Application Support/Unity/config"
+          sudo echo '{"licensingServiceBaseUrl": "http://localhost:12331","enableEntitlementLicensing": true,"clientConnectTimeoutSec": 60,"clientHandshakeTimeoutSec": 120,"toolset":"UnityLicenseServer_16768262570522_9"}' > "/Library/Application Support/Unity/config/services-config.json"
+      - name: Create SSH tunnel to Unity License Server
+        env:
+          UNITY_LICENSE_SERVER_SSH_KEY: ${{ secrets.UNITY_LICENSE_SERVER_SSH_KEY }}
+        run: |
+          echo "$UNITY_LICENSE_SERVER_SSH_KEY" > ~/unity-client-ssh-key
+          chmod 600 ~/unity-client-ssh-key
+          # Without StrictHostKeyChecking, OpenSSH will sit forever waiting for local input to confirm the server key is ok.
+          # We don't really care if the server is authentic, because we're not sending anything sensitive to it.
+          # The license server VM's sshd_config also needed to be modified with the following options, in order to prevent
+          # the tunnel from being closed between here and when we're ready to use it.
+          #   TCPKeepAlive yes
+          #   ClientAliveInterval 30
+          #   ClientAliveCountMax 9999
+          ssh -fNT -o StrictHostKeyChecking=no -i ~/unity-client-ssh-key -L 127.0.0.1:12331:127.0.0.1:8080 unity-client@ec2-44-204-244-196.compute-1.amazonaws.com
+          sleep 5
+      - name: Test Connection to Unity License Server
+        run: |
+          wget http://127.0.0.1:12331/v1/admin/status
+          cat status
+          rm status
+      - name: Update the version in Cesium.cpp
+        run: |
+          export VERSION=$(jq -r ".version" package.json)
+          export COMMIT=$(git rev-parse --short HEAD)
+          sed -i '' 's/Cesium::version = "Development Build"/Cesium::version = "'$VERSION'"/g' native~/src/Runtime/Cesium.cpp
+          sed -i '' 's/Cesium::commit = "Unknown"/Cesium::commit = "'$COMMIT'"/g' native~/src/Runtime/Cesium.cpp
+          # Sanity check that the replacements happened
+          grep $VERSION native~/src/Runtime/Cesium.cpp
+          grep $COMMIT native~/src/Runtime/Cesium.cpp
+      - name: Move cesium-unity Repo Under Empty Project
+        run: |
+          mkdir -p ~/cesium/CesiumForUnityBuildProject/Packages/com.cesium.unity
+          mv $GITHUB_WORKSPACE/* ~/cesium/CesiumForUnityBuildProject/Packages/com.cesium.unity
+          # Disable Unity audio
+          mkdir -p ~/cesium/CesiumForUnityBuildProject/Packages/com.cesium.unity/ProjectSettings
+          echo '%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!11 &1\nAudioManager:\n  m_DisableAudio: 1\n' > ~/cesium/CesiumForUnityBuildProject/Packages/com.cesium.unity/ProjectSettings/AudioManager.asset
+      - name: Build Reinterop
+        run: |
+          cd ~/cesium/CesiumForUnityBuildProject/Packages/com.cesium.unity
+          dotnet publish Reinterop~ -o .
+      - name: Verify Reinterop analyzer inputs
+        run: |
+          cd ~/cesium/CesiumForUnityBuildProject/Packages/com.cesium.unity
+          echo "dotnet version: $(dotnet --version)"
+          ls -l Reinterop.dll Reinterop.dll.meta Source/csc.rsp
+          shasum -a 256 Reinterop.dll
+
+          if [ ! -f Reinterop.dll ]; then
+            echo "Reinterop.dll is missing before Build Package"
+            exit 1
+          fi
+
+          if ! grep -q "RoslynAnalyzer" Reinterop.dll.meta; then
+            echo "Reinterop.dll.meta is missing the RoslynAnalyzer label"
+            echo "Current Reinterop.dll.meta:"
+            cat Reinterop.dll.meta
+            exit 1
+          fi
+      - name: Build Package
+        run: |
+          # We only need a release build of vcpkg dependencies
+          export CESIUM_VCPKG_RELEASE_ONLY="TRUE"
+          cd ~/cesium/CesiumForUnityBuildProject/Packages/com.cesium.unity
+          dotnet run --project Build~ package --platform Editor --platform macOS --platform iOS
+          ls -l ~/cesium/CesiumForUnityBuildProject
+      - name: Publish Logs
+        if: success() || failure()    # run this step even if previous step failed
+        uses: actions/upload-artifact@v4
+        with:
+          name: Native Build Logs - macOS
+          path: ~/cesium/CesiumForUnityBuildProject/Packages/com.cesium.unity/native~/build-*/build.log
+      - name: Publish package artifact
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: macOS Package
+          path: ~/cesium/CesiumForUnityBuildProject/*.tgz
+      - name: Run Tests
+        env:
+          CESIUM_ION_TOKEN_FOR_TESTS: ${{ secrets.CESIUM_ION_TOKEN_FOR_TESTS }}
+        run: |
+          /Applications/Unity/Hub/Editor/2022.3.41f1/Unity.app/Contents/MacOS/Unity -runTests -batchmode -projectPath ~/cesium/CesiumForUnityBuildProject -testResults ~/cesium/CesiumForUnityBuildProject/TestResults.xml -testPlatform PlayMode -logFile ~/cesium/CesiumForUnityBuildProject/test-log.txt
+          cat ~/cesium/CesiumForUnityBuildProject/test-log.txt
+          ls /Users/runner/cesium/CesiumForUnityBuildProject/TestResults.xml
+      - name: Test Report
+        uses: kring/test-reporter@v1.6.2-kring
+        if: success() || failure()    # run this step even if previous step failed
+        with:
+          name: Tests - macOS
+          path: /Users/runner/cesium/CesiumForUnityBuildProject/TestResults.xml
+          reporter: dotnet-nunit
+  Linux:
+    needs: [QuickChecks]
+    runs-on: ubuntu-24.04
+    # Only allow a single Linux build at a time, for Unity licensing reasons
+    concurrency: linux
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.103"
+      - name: Debug build problem
+        run: |
+          ls -la /home/runner
+          df -h
+          echo "EZVCPKG_BASEDIR=/home/runner/ezvcpkg" >> $GITHUB_ENV
+          mkdir ~/ezvcpkg
+      - name: Cache vcpkg artifacts
+        uses: actions/cache@v4
+        with:
+          path: "~/ezvcpkg"
+          key: vcpkg-linux-alma-${{ hashFiles('native~/vcpkg/ports/**/vcpkg.json', 'native~/vcpkg/triplets/**/*', 'native~/extern/*toolchain.cmake') }}-${{ hashFiles('native~/extern/cesium-native/CMakeLists.txt', 'native~/CMakeLists.txt') }}
+          restore-keys: |
+            vcpkg-linux-alma-${{ hashFiles('native~/vcpkg/ports/**/vcpkg.json', 'native~/vcpkg/triplets/**/*', 'native~/extern/*toolchain.cmake') }}-
+      - name: Install nasm
+        uses: ilammy/setup-nasm@v1.5.1
+      - name: Install Unity CLI
+        run: |
+          curl -fsSL https://unity.com/install.sh | bash
+      - name: Install Unity 2022.3.41f1
+        # This command sometimes returns exit code 130, despite actually succeeding.
+        continue-on-error: true
+        run: |
+          unity install 2022.3.41f1 --changeset 0f988161febf --accept-eula
+      - name: Install Unity Android Support
+        run: |
+          # --child-modules avoids an interactive prompt asking to confirm installing the NDK submodule
+          unity install-modules -e 2022.3.41f1 -m android android-sdk-ndk-tools android-open-jdk-11.0.14.1+1 --child-modules --accept-eula
+      - name: Configure Unity to Use the License Server
+        run: |
+          sudo mkdir -p /usr/share/unity3d/config
+          sudo bash -c 'echo "{\"licensingServiceBaseUrl\": \"http://localhost:12331\",\"enableEntitlementLicensing\": true,\"clientConnectTimeoutSec\": 60,\"clientHandshakeTimeoutSec\": 120,\"toolset\":\"UnityLicenseServer_16768262570522_9\"}" > /usr/share/unity3d/config/services-config.json'
+      - name: Create SSH tunnel to Unity License Server
+        env:
+          UNITY_LICENSE_SERVER_SSH_KEY: ${{ secrets.UNITY_LICENSE_SERVER_SSH_KEY }}
+        run: |
+          echo "$UNITY_LICENSE_SERVER_SSH_KEY" > ~/unity-client-ssh-key
+          chmod 600 ~/unity-client-ssh-key
+          # Without StrictHostKeyChecking, OpenSSH will sit forever waiting for local input to confirm the server key is ok.
+          # We don't really care if the server is authentic, because we're not sending anything sensitive to it.
+          # The license server VM's sshd_config also needed to be modified with the following options, in order to prevent
+          # the tunnel from being closed between here and when we're ready to use it.
+          #   TCPKeepAlive yes
+          #   ClientAliveInterval 30
+          #   ClientAliveCountMax 9999
+          ssh -fNT -o StrictHostKeyChecking=no -i ~/unity-client-ssh-key -L 127.0.0.1:12331:127.0.0.1:8080 unity-client@ec2-44-204-244-196.compute-1.amazonaws.com
+          sleep 5
+      - name: Test Connection to Unity License Server
+        run: |
+          wget http://127.0.0.1:12331/v1/admin/status
+          cat status
+          rm status
+      - name: Update the version in Cesium.cpp
+        run: |
+          export VERSION=$(jq -r ".version" package.json)
+          export COMMIT=$(git rev-parse --short HEAD)
+          sed -i 's/Cesium::version = "Development Build"/Cesium::version = "'$VERSION'"/g' native~/src/Runtime/Cesium.cpp
+          sed -i 's/Cesium::commit = "Unknown"/Cesium::commit = "'$COMMIT'"/g' native~/src/Runtime/Cesium.cpp
+          # Sanity check that the replacements happened
+          grep $VERSION native~/src/Runtime/Cesium.cpp
+          grep $COMMIT native~/src/Runtime/Cesium.cpp
+      - name: Move cesium-unity Repo Under Empty Project
+        run: |
+          mkdir -p ~/cesium/CesiumForUnityBuildProject/Packages/com.cesium.unity
+          mv $GITHUB_WORKSPACE/* ~/cesium/CesiumForUnityBuildProject/Packages/com.cesium.unity
+          # Disable Unity audio
+          mkdir -p ~/cesium/CesiumForUnityBuildProject/Packages/com.cesium.unity/ProjectSettings
+          echo '%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!11 &1\nAudioManager:\n  m_DisableAudio: 1\n' > ~/cesium/CesiumForUnityBuildProject/Packages/com.cesium.unity/ProjectSettings/AudioManager.asset
+      - name: Build Reinterop
+        run: |
+          cd ~/cesium/CesiumForUnityBuildProject/Packages/com.cesium.unity
+          dotnet publish Reinterop~ -o .
+      - name: Build Package
+        env:
+          CESIUM_NATIVE_BUILD_CONTAINER: almalinux:8
+        run: |
+          # We only need a release build of vcpkg dependencies
+          export CESIUM_VCPKG_RELEASE_ONLY="TRUE"
+          # Clear ANDROID_NDK_ROOT so that we use Unity's version
+          unset ANDROID_NDK_ROOT
+          cd ~/cesium/CesiumForUnityBuildProject/Packages/com.cesium.unity
+          dotnet run --project Build~ package --platform Editor --platform Linux --platform Android
+          ls -l ~/cesium/CesiumForUnityBuildProject
+      - name: Publish Logs
+        if: success() || failure()    # run this step even if previous step failed
+        uses: actions/upload-artifact@v4
+        with:
+          name: Native Build Logs - Linux
+          path: ~/cesium/CesiumForUnityBuildProject/Packages/com.cesium.unity/native~/build-*/build.log
+      - name: Publish package artifact
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Linux Package
+          path: ~/cesium/CesiumForUnityBuildProject/*.tgz
+      - name: Run Tests
+        env:
+          CESIUM_ION_TOKEN_FOR_TESTS: ${{ secrets.CESIUM_ION_TOKEN_FOR_TESTS }}
+        run: |
+          xvfb-run -a ~/Unity/Hub/Editor/2022.3.41f1/Editor/Unity -runTests -batchmode -projectPath ~/cesium/CesiumForUnityBuildProject -testResults ~/cesium/CesiumForUnityBuildProject/TestResults.xml -testPlatform PlayMode -logFile ~/cesium/CesiumForUnityBuildProject/test-log.txt
+          cat ~/cesium/CesiumForUnityBuildProject/test-log.txt
+      - name: Test Report
+        uses: kring/test-reporter@v1.6.2-kring
+        if: success() || failure()    # run this step even if previous step failed
+        with:
+          name: Tests - Linux
+          path: /home/runner/cesium/CesiumForUnityBuildProject/TestResults.xml
+          reporter: dotnet-nunit
+  Emscripten:
+    needs: [QuickChecks]
+    runs-on: windows-latest
+    # Only allow a single Emscripten build at a time, for Unity licensing reasons
+    concurrency: emscripten
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.103"
+      - name: Cache vcpkg artifacts
+        uses: actions/cache@v4
+        with:
+          path: "d:/.ezvcpkg"
+          key: vcpkg-windows-${{ hashFiles('native~/vcpkg/ports/**/vcpkg.json', 'native~/vcpkg/triplets/**/*', 'native~/extern/*toolchain.cmake') }}-${{ hashFiles('native~/extern/cesium-native/CMakeLists.txt', 'native~/CMakeLists.txt') }}
+          restore-keys: |
+            vcpkg-windows-${{ hashFiles('native~/vcpkg/ports/**/vcpkg.json', 'native~/vcpkg/triplets/**/*', 'native~/extern/*toolchain.cmake') }}-
+      - name: Install latest ninja and cmake
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: "3.31.6"
+      - name: Install nasm
+        uses: ilammy/setup-nasm@v1.5.1
+      - name: Install wget
+        run: |
+          choco install -y wget
+      - name: Install Unity CLI
+        run: |
+          irm https://unity.com/install.ps1 | iex
+          # Add the Unity CLI to the GITHUB_PATH so it persists for the rest of the workflow steps
+          $unityCliPath = Get-Content $env:AppData/UnityHub/cli-install.json | ConvertFrom-Json | select -expand path | Split-Path
+          echo $unityCliPath
+          Add-Content -Path $env:GITHUB_PATH -Value "$unityCliPath"
+      - name: Install Unity
+        run: |
+          # We must use Unity 6+ because the Emscripten version in older releases is too old.
+          unity install 6000.0.62f1 --changeset f99f05b3e950 --accept-eula
+          unity install-modules -e 6000.0.62f1 -m webgl --accept-eula
+      - name: Create SSH tunnel to Unity License Server
+        env:
+          UNITY_LICENSE_SERVER_SSH_KEY: ${{ secrets.UNITY_LICENSE_SERVER_SSH_KEY }}
+        run: |
+          $ENV:UNITY_LICENSE_SERVER_SSH_KEY | Set-Content ~/unity-client-ssh-key
+          # Without StrictHostKeyChecking, OpenSSH will sit forever waiting for local input to confirm the server key is ok.
+          # We don't really care if the server is authentic, because we're not sending anything sensitive to it.
+          # The license server VM's sshd_config also needed to be modified with the following options, in order to prevent
+          # the tunnel from being closed between here and when we're ready to use it.
+          #   TCPKeepAlive yes
+          #   ClientAliveInterval 30
+          #   ClientAliveCountMax 9999
+          start -FilePath ssh -ArgumentList "-o StrictHostKeyChecking=no -i ~/unity-client-ssh-key -L 127.0.0.1:12331:127.0.0.1:8080 unity-client@ec2-44-204-244-196.compute-1.amazonaws.com"
+          sleep 5
+      - name: Test Connection to Unity License Server
+        run: |
+          wget.exe http://127.0.0.1:12331/v1/admin/status
+          cat status
+          rm status
+      - name: Configure Unity to Use the License Server
+        run: |
+          mkdir -p $ENV:PROGRAMDATA/Unity/config
+          $filename="$ENV:PROGRAMDATA/Unity/config/services-config.json"
+          $text='{"licensingServiceBaseUrl":"http://localhost:12331","enableEntitlementLicensing":true,"clientConnectTimeoutSec":120,"clientHandshakeTimeoutSec":60,"toolset":"UnityLicenseServer_16768335856821_1"}'
+          [IO.File]::WriteAllLines($filename,$text)
+      - name: Update the version in Cesium.cpp
+        run: |
+          $VERSION = (Get-Content -path package.json | ConvertFrom-Json).version
+          $COMMIT = $(git rev-parse --short HEAD)
+          ((Get-Content -path native~/src/Runtime/Cesium.cpp -Raw) -replace 'Cesium::version = "Development Build"',"Cesium::version = ""$VERSION""") | Set-Content -Path native~/src/Runtime/Cesium.cpp
+          ((Get-Content -path native~/src/Runtime/Cesium.cpp -Raw) -replace 'Cesium::commit = "Unknown"',"Cesium::commit = ""$COMMIT""") | Set-Content -Path native~/src/Runtime/Cesium.cpp
+          # Sanity check that the replacements happened
+          if (-Not ((Get-Content -path native~/src/Runtime/Cesium.cpp -Raw) -match "$COMMIT")) { throw "Commit does not exist in file after replacement" }
+          if (-Not ((Get-Content -path native~/src/Runtime/Cesium.cpp -Raw) -match "$VERSION")) { throw "Version does not exist in file after replacement" }
+      - name: Move cesium-unity Repo Under Empty Project
+        run: |
+          mkdir -p d:\cesium\CesiumForUnityBuildProject\Packages\com.cesium.unity
+          mv $ENV:GITHUB_WORKSPACE/* d:\cesium\CesiumForUnityBuildProject\Packages\com.cesium.unity
+          # Disable Unity audio
+          mkdir -p d:\cesium\CesiumForUnityBuildProject\Packages\com.cesium.unity\ProjectSettings
+          $text="%YAML 1.1`n%TAG !u! tag:unity3d.com,2011:`n--- !u!11 &1`nAudioManager:`n  m_DisableAudio: 1`n"
+          [IO.File]::WriteAllLines("d:/cesium/CesiumForUnityBuildProject/Packages/com.cesium.unity/ProjectSettings/AudioManager.asset",$text)
+      - name: Build Reinterop
+        run: |
+          cd d:\cesium\CesiumForUnityBuildProject\Packages\com.cesium.unity
+          dotnet publish Reinterop~ -o .
+      - name: Print disk space 1
+        if: success() || failure()    # run this step even if previous step failed
+        run: |
+          get-psdrive
+      - name: Delete ccache
+        run: |
+          # To prevent the ada-url build from trying (and failing) to use it.
+          rm C:/Strawberry/c/bin/ccache.exe
+      - name: Build Package
+        run: |
+          cd d:\cesium\CesiumForUnityBuildProject\Packages\com.cesium.unity
+          mkdir -p d:\cesium\temp
+          # Store temp files on the D drive, which is much faster than the EBS-backed C drive.
+          $ENV:TEMP="d:\cesium\temp"
+          # We only need a release build of vcpkg dependencies
+          $ENV:CESIUM_VCPKG_RELEASE_ONLY="TRUE"
+          # Clear ANDROID_NDK_ROOT so that we use Unity's version
+          Remove-Item Env:ANDROID_NDK_ROOT
+          # Explicitly set the ezvcpkg path. Otherwise it will be `/.ezvcpkg` and the drive letter is ambiguous.
+          $ENV:EZVCPKG_BASEDIR="D:/.ezvcpkg"
+          # Run the build
+          dotnet run --project Build~ package --platform Web
+      - name: Print disk space 2
+        if: success() || failure()    # run this step even if previous step failed
+        run: |
+          get-psdrive
+      - name: Publish Logs
+        if: success() || failure()    # run this step even if previous step failed
+        uses: actions/upload-artifact@v4
+        with:
+          name: Native Build Logs - Emscripten
+          path: d:/cesium/CesiumForUnityBuildProject/Packages/com.cesium.unity/native~/build-*/build.log
+      - name: Publish package artifact
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Emscripten Package
+          path: d:\cesium\CesiumForUnityBuildProject\*.tgz
+  Combine:
+    runs-on: ubuntu-latest
+    needs: [Windows, MacOS, Linux, Emscripten]
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+      - name: Install jq
+        run: sudo apt install jq
+      - name: Download macOS build
+        uses: actions/download-artifact@v4
+        with:
+          name: macOS Package
+          path: combine/macos
+      - name: Extract macOS build
+        run: |
+          cd combine/macos
+          tar xzf *.tgz
+          rm *.tgz
+      - name: Download Emscripten build
+        uses: actions/download-artifact@v4
+        with:
+          name: Emscripten Package
+          path: combine/emscripten
+      - name: Extract Emscripten build
+        run: |
+          cd combine/emscripten
+          tar xzf *.tgz
+          rm *.tgz
+      - name: Download Linux build
+        uses: actions/download-artifact@v4
+        with:
+          name: Linux Package
+          path: combine/linux
+      - name: Extract Linux build
+        run: |
+          cd combine/linux
+          tar xzf *.tgz
+          rm *.tgz
+      - name: Download Windows build
+        uses: actions/download-artifact@v4
+        with:
+          name: Windows Package
+          path: combine/windows
+      - name: Extract Windows build
+        run: |
+          cd combine/windows
+          tar xzf *.tgz
+          rm *.tgz
+      - name: Create combined package
+        run: |
+          mkdir -p combine/merged
+          cd combine/merged
+          
+          # Copy the everything. For files that exist in multiple packages, the Windows one will win.
+          cp -r ../macos/* .
+          cp -r ../emscripten/* .
+          cp -r ../linux/* .
+          cp -r ../windows/* .
+          
+          # Remove the generated C# files
+          for file in $(find package/Source/generated -name '*.cs');
+          do
+            rm $file
+          done;
+          
+          # Merge the generated files by concatentation
+          cd ../macos
+          for file in $(find package/Source/generated -name '*.cs');
+          do
+            mkdir -p $(dirname "../merged/$file")
+            cp "$file" "../merged/$file"
+          done;
+
+          cd ../emscripten
+          for file in $(find package/Source/generated -name '*.cs');
+          do
+            echo Merging $file
+            mkdir -p $(dirname "../merged/$file")
+            cat "$file" >> "../merged/$file"
+          done;
+
+          cd ../linux
+          for file in $(find package/Source/generated -name '*.cs');
+          do
+            echo Merging $file
+            mkdir -p $(dirname "../merged/$file")
+            cat "$file" >> "../merged/$file"
+          done;
+
+          cd ../windows
+          for file in $(find package/Source/generated -name '*.cs');
+          do
+            echo Merging $file
+            mkdir -p $(dirname "../merged/$file")
+            cat "$file" >> "../merged/$file"
+          done;
+          
+          # Create the package
+          cd ../merged
+          export NAME=$(jq -r ".name" $GITHUB_WORKSPACE/package.json)
+          export VERSION=$(jq -r ".version" $GITHUB_WORKSPACE/package.json)
+          tar czf $NAME-$VERSION.tgz package
+      - name: Print SHA256 of combined package
+        run: |
+          cd combine/merged
+          sha256sum *.tgz
+      - name: Publish combined package
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Combined Package
+          path: combine/merged/*.tgz

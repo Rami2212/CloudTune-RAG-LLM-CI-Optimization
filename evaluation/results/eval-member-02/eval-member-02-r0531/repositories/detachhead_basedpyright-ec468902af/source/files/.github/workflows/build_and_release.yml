@@ -1,0 +1,216 @@
+name: 'build and release'
+
+permissions: {}
+
+env:
+  ARTIFACT_NAME_VSIX: vsix
+  VSIX_NAME: vscode-pyright.vsix
+  VSIX_DIR: packages/vscode-pyright
+  NPM_PACKAGE_DIR: packages/pyright
+  BROWSER_NPM_PACKAGE_DIR: packages/browser-pyright
+  # prevent uv from constantly reinstalling the project and overwriting docstubs
+  UV_NO_SYNC: true
+  GG_GITHUB_TOKEN: ${{ github.token }}
+
+on: push
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  generate-docstubs-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: generate docstubs for each python version
+        run: ./build/generateAllDocstubs.sh
+        shell: bash
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: docstubs-linux
+          path: docstubs
+  generate-docstubs-macos:
+    needs: generate-docstubs-linux
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: docstubs-linux
+          path: docstubs
+      - name: generate docstubs for each python version
+        run: ./build/generateAllDocstubs.sh
+        shell: bash
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: docstubs-linux-and-macos
+          path: docstubs
+
+  generate-docstubs-windows:
+    needs: generate-docstubs-macos
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: docstubs-linux-and-macos
+          path: docstubs
+      - name: generate docstubs for each python version
+        run: ./build/generateAllDocstubs.sh
+        shell: bash
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: docstubs
+          path: docstubs
+
+  build-and-release:
+    needs: generate-docstubs-windows
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write # for pypi trusted publishing
+      contents: write # to create github releases
+      packages: write # TODO: maybe this isnt needed?
+      pull-requests: read # TODO: maybe this isnt needed?
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        name: download docstubs
+        with:
+          name: docstubs
+          path: docstubs
+
+      - run: ./gg.cmd uv sync --config-setting regenerate_docstubs=false
+
+      - name: add gg and npm scripts to PATH
+        # using both relative and absolute path for npm scripts because some binaries are in package-specific node_modules/.bin
+        # directories and some are in the root one, and both need to work when the cwd is a package directory
+        run: |
+          realpath ./gg >> $GITHUB_PATH
+          realpath ./node_modules/.bin >> $GITHUB_PATH
+          echo ./node_modules/.bin >> $GITHUB_PATH
+
+      # ideally this should be run with the rest of the pytest tests in the validation workflow,
+      # but they depend on the docstubs generated in the previous job
+      - name: validate docstubs
+        run: uv run pnpm run test-python -m needs_all_docstubs
+
+      - id: current-version
+        # https://github.com/astral-sh/uv/issues/6298
+        run: |
+          echo ::set-output name=CURRENT_VERSION::$(uv run python -c "from build.py_old.version import get;print(get())")
+          echo ::set-output name=CURRENT_UPSTREAM_VERSION::$(uv run node -p "require(\"./package.json\").version")
+        working-directory: ${{ env.NPM_PACKAGE_DIR }}
+
+      - name: get currently published npm package version
+        if: github.ref == 'refs/heads/main'
+        run: uv run pnpm view $(node -p "require(\"./package.json\").name")@${{ steps.current-version.outputs.CURRENT_VERSION }}
+        continue-on-error: true
+        id: version-exists
+        working-directory: ${{ env.NPM_PACKAGE_DIR }}
+
+      - name: set version for npm packages
+        if: github.ref == 'refs/heads/main'
+        run: uv run pnpm version ${{ steps.current-version.outputs.CURRENT_VERSION }} --recursive --no-git-tag-version
+
+      - name: Build VSIX
+        working-directory: ${{ env.VSIX_DIR }}
+        run: |
+          uv run pnpm run package
+          mv basedpyright-*.vsix ${{ env.VSIX_NAME }}
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ${{ env.ARTIFACT_NAME_VSIX }}
+          path: ${{ env.VSIX_DIR }}/${{ env.VSIX_NAME }}
+
+      - name: Configure npm auth
+        run: echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" > ~/.npmrc
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # publish npm canary version on every push to every branch except main
+      - name: set version for npm canary
+        if: github.ref != 'refs/heads/main'
+        run: uv run pnpm --filter basedpyright version ${{ steps.current-version.outputs.CURRENT_VERSION }}-$GITHUB_SHA --no-git-tag-version --no-git-checks
+      - name: publish package - npm canary
+        if: github.ref != 'refs/heads/main'
+        run: uv run pnpm publish --tag canary --no-git-checks
+        working-directory: ${{ env.NPM_PACKAGE_DIR }}
+      - name: set version for npm canary (browser)
+        if: github.ref != 'refs/heads/main'
+        run: uv run pnpm --filter browser-basedpyright version ${{ steps.current-version.outputs.CURRENT_VERSION }}-$GITHUB_SHA --no-git-tag-version --no-git-checks
+      - name: publish package - npm canary (browser)
+        if: github.ref != 'refs/heads/main'
+        run: uv run pnpm publish --tag canary --no-git-checks
+        working-directory: ${{ env.BROWSER_NPM_PACKAGE_DIR }}
+
+      - name: publish package - npm
+        # publish npm & pypi packages, vscode extension and github release if the version in package.json was changed:
+        if: github.ref == 'refs/heads/main' && steps.version-exists.outcome == 'failure'
+        run: uv run pnpm publish --no-git-checks
+        working-directory: ${{ env.NPM_PACKAGE_DIR }}
+      - name: publish package - npm (browser)
+        # publish npm & pypi packages, vscode extension and github release if the version in package.json was changed:
+        if: github.ref == 'refs/heads/main' && steps.version-exists.outcome == 'failure'
+        run: uv run pnpm publish --no-git-checks
+        working-directory: ${{ env.BROWSER_NPM_PACKAGE_DIR }}
+
+      # this isn't ideal, but it's required becayse uv publish re-builds the npm packages even tho they were already built earlier.
+      # i think to fix that i need to rewrite pdm_build.py to use the build hooks so we can control it more easily, but i can't get that to work soooo
+      - name: set npm package versions back to upstream so pypi package can use it in --version output
+        if: github.ref == 'refs/heads/main'
+        run: uv run pnpm version ${{ steps.current-version.outputs.CURRENT_UPSTREAM_VERSION }} --recursive --no-git-tag-version --no-git-checks
+
+      - name: build package - pypi
+        run: uv build --config-setting regenerate_docstubs=false
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: dist
+          path: dist
+
+      - name: publish package - pypi
+        if: github.ref == 'refs/heads/main' && steps.version-exists.outcome == 'failure'
+        run: uv publish
+
+      # https://code.visualstudio.com/api/working-with-extensions/publishing-extension#get-a-personal-access-token
+      - name: publish VSIX - visual studio marketplace
+        if: github.ref == 'refs/heads/main' && steps.version-exists.outcome == 'failure'
+        run: vsce publish --packagePath ${{ env.VSIX_NAME }} --pat ${{ secrets.VSCE_TOKEN }} --noVerify
+        working-directory: ${{ env.VSIX_DIR }}
+
+      - name: publish VSIX - open VSX
+        if: github.ref == 'refs/heads/main' && steps.version-exists.outcome == 'failure'
+        run: ovsx publish --packagePath ${{ env.VSIX_NAME }} --pat ${{ secrets.OPEN_VSX_TOKEN }}
+        working-directory: ${{ env.VSIX_DIR }}
+
+      - uses:
+          # the maintainer said they archived this action because "there are much better alternatives these days"
+          # but i have yet to find a single alternative that works the way i want (automatically creates the tag)
+          # zizmor: ignore[archived-uses]
+          marvinpinto/action-automatic-releases@919008cf3f741b179569b7a6fb4d8860689ab7f0
+        if: github.ref == 'refs/heads/main' && steps.version-exists.outcome == 'failure'
+        with:
+          title: v${{ steps.current-version.outputs.CURRENT_VERSION }} (pyright ${{ steps.current-version.outputs.CURRENT_UPSTREAM_VERSION }})
+          draft: true # so i can write the release notes manually before publishing it
+          repo_token: ${{ secrets.GH_TOKEN }}
+          prerelease: false
+          files: |
+            dist/*
+            ${{ env.VSIX_DIR }}/${{ env.VSIX_NAME }}
+          automatic_release_tag: v${{ steps.current-version.outputs.CURRENT_VERSION }}

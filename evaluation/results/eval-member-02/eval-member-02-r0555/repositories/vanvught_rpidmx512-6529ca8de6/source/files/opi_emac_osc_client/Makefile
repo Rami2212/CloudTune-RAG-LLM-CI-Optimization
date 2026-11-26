@@ -1,0 +1,18 @@
+PLATFORM=ORANGE_PI
+
+DEFINES =NODE_OSC_CLIENT 
+
+DEFINES+=ENABLE_HTTPD
+
+DEFINES+=DISABLE_RTC 
+
+DEFINES+=DEBUG_OSCCLIENT
+DEFINES+=NDEBUG
+
+LIBS=
+
+SRCDIR=firmware lib
+
+include ../firmware-template-h3/Rules.mk
+
+prerequisites:

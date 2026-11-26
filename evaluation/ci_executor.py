@@ -13,6 +13,7 @@ import json
 import os
 import re
 import time
+import urllib.error
 from pathlib import Path
 from statistics import median
 from urllib.error import HTTPError, URLError
@@ -73,9 +74,14 @@ class RunExecutionTimeout(RuntimeError):
 
 
 class GitHubError(RuntimeError):
-    def __init__(self, code: int, path: str):
+    def __init__(self, code: int, path: str, *, rate_limited: bool = False):
         super().__init__(f"GitHub HTTP {code} for {path}")
         self.code = code
+        self.rate_limited = rate_limited
+
+
+class GitHubRateLimit(GitHubError):
+    """GitHub explicitly throttled this account; stop the batch for now."""
 
 
 def automatic_fork_deletion_enabled() -> bool:
@@ -107,14 +113,35 @@ class GitHub:
                                "Accept": "application/vnd.github+json",
                                "X-GitHub-Api-Version": "2022-11-28",
                                "Content-Type": "application/json", "User-Agent": "CloudTune-Evaluation/1"})
-        try:
-            with urlopen(req, timeout=60) as response:
-                raw = response.read()
-                return json.loads(raw) if raw else None
-        except HTTPError as exc:
-            raise GitHubError(exc.code, path.split("?")[0]) from None
-        except (URLError, TimeoutError):
-            raise RuntimeError(f"GitHub request outcome uncertain: {method} {path.split('?')[0]}") from None
+        safe_to_retry = method.upper() == "GET"
+        last_error = None
+        for attempt in range(3 if safe_to_retry else 1):
+            try:
+                with urlopen(req, timeout=60) as response:
+                    raw = response.read()
+                    return json.loads(raw) if raw else None
+            except HTTPError as exc:
+                response_body = exc.read(2048).decode("utf-8", errors="replace").lower()
+                remaining = exc.headers.get("X-RateLimit-Remaining", "")
+                throttled = (exc.code == 429 or
+                             (exc.code == 403 and (remaining == "0" or "rate limit" in response_body)))
+                if throttled:
+                    raise GitHubRateLimit(exc.code, path.split("?")[0], rate_limited=True) from None
+                last_error = GitHubError(exc.code, path.split("?")[0])
+                if not safe_to_retry or attempt == 2:
+                    raise last_error from None
+            except (URLError, TimeoutError, OSError, urllib.error.IncompleteRead,
+                    json.JSONDecodeError) as exc:
+                if not safe_to_retry:
+                    raise RuntimeError(
+                        f"GitHub request outcome uncertain: {method} {path.split('?')[0]}") from None
+                last_error = RuntimeError(
+                    f"GitHub request failed ({type(exc).__name__}): {method} {path.split('?')[0]}")
+                if attempt == 2:
+                    raise last_error from None
+            if attempt < 2:
+                time.sleep(0.5 * (2 ** attempt))
+        raise last_error or RuntimeError("GitHub request failed")
 
     def all(self, path: str, key: str) -> list[dict]:
         data = []

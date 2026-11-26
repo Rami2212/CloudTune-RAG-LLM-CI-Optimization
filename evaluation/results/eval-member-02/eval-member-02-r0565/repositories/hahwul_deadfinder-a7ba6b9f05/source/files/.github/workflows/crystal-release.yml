@@ -1,0 +1,162 @@
+---
+name: Crystal Release Builds
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CRYSTAL_BUILD_IMAGE: crystallang/crystal:1.22.0-alpine
+
+jobs:
+  build-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runs-on: ubuntu-latest
+          - arch: aarch64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build static binary (Alpine / musl)
+        run: |
+          docker run --rm -v "$PWD":/workspace -w /workspace \
+            ${{ env.CRYSTAL_BUILD_IMAGE }} \
+            sh -c 'apk add --no-cache cmake make g++ \
+                   && shards install \
+                   && crystal build src/cli_main.cr -o deadfinder --release --static --no-debug'
+
+      - name: Package
+        run: |
+          # Docker container ran as root, so the binary lands as root-owned.
+          # Reclaim ownership before chmod, otherwise it fails with EPERM.
+          sudo chown "$(id -u):$(id -g)" deadfinder
+          chmod +x deadfinder
+          tar czf deadfinder-linux-${{ matrix.arch }}.tar.gz deadfinder
+          sha256sum deadfinder-linux-${{ matrix.arch }}.tar.gz > deadfinder-linux-${{ matrix.arch }}.tar.gz.sha256
+
+      - name: Upload to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            deadfinder-linux-${{ matrix.arch }}.tar.gz
+            deadfinder-linux-${{ matrix.arch }}.tar.gz.sha256
+
+      - name: Upload as workflow artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v7
+        with:
+          name: deadfinder-linux-${{ matrix.arch }}
+          path: |
+            deadfinder-linux-${{ matrix.arch }}.tar.gz
+            deadfinder-linux-${{ matrix.arch }}.tar.gz.sha256
+
+  build-macos:
+    # macOS x86_64 (macos-13) is no longer built — Apple's Intel transition
+    # has shrunk GitHub's macos-13 runner pool to the point where releases
+    # routinely sit in the queue indefinitely. Apple Silicon binaries cover
+    # current macOS users; Intel users can `brew install` from source or run
+    # the Apple Silicon binary under Rosetta.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runs-on: macos-latest
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Crystal, cmake, and OpenSSL
+        run: brew install crystal cmake openssl@3 pkg-config
+
+      - name: Build release binary
+        run: |
+          shards install
+          OPENSSL_PREFIX="$(brew --prefix openssl@3)"
+          export PKG_CONFIG_PATH="${OPENSSL_PREFIX}/lib/pkgconfig"
+          crystal build src/cli_main.cr -o deadfinder --release --no-debug
+
+      - name: Package
+        run: |
+          chmod +x scripts/package-macos.sh
+          scripts/package-macos.sh deadfinder "deadfinder-macos-${{ matrix.arch }}.tar.gz" deadfinder
+          shasum -a 256 deadfinder-macos-${{ matrix.arch }}.tar.gz > deadfinder-macos-${{ matrix.arch }}.tar.gz.sha256
+
+      - name: Upload to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            deadfinder-macos-${{ matrix.arch }}.tar.gz
+            deadfinder-macos-${{ matrix.arch }}.tar.gz.sha256
+
+      - name: Upload as workflow artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v7
+        with:
+          name: deadfinder-macos-${{ matrix.arch }}
+          path: |
+            deadfinder-macos-${{ matrix.arch }}.tar.gz
+            deadfinder-macos-${{ matrix.arch }}.tar.gz.sha256
+
+  build-windows:
+    runs-on: windows-latest
+    # A Windows build failure must not fail the workflow: the AUR, deb, rpm,
+    # apk and Chocolatey publishers only run after it succeeds. Chocolatey
+    # then stops on the missing .sha256 instead.
+    continue-on-error: true
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: crystal-lang/install-crystal@v1
+        with:
+          crystal: 1.22.0
+
+      # lexbor's postinstall builds its C library with cmake + NMake.
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      # lexbor links as a static lib and --static links the static CRT, so the
+      # .exe needs no DLL and no Visual C++ redistributable.
+      - name: Build release binary
+        run: |
+          shards install --production
+          crystal build src/cli_main.cr -o deadfinder.exe --release --static --no-debug
+
+      - name: Package
+        run: |
+          ./deadfinder.exe version
+          7z a deadfinder-windows-x86_64.zip deadfinder.exe
+          sha256sum deadfinder-windows-x86_64.zip > deadfinder-windows-x86_64.zip.sha256
+
+      - name: Upload to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            deadfinder-windows-x86_64.zip
+            deadfinder-windows-x86_64.zip.sha256
+
+      - name: Upload as workflow artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v7
+        with:
+          name: deadfinder-windows-x86_64
+          path: |
+            deadfinder-windows-x86_64.zip
+            deadfinder-windows-x86_64.zip.sha256
+
+      - if: failure()
+        name: Report the missing Windows binary
+        run: echo "::warning::The Windows .zip was not built or uploaded; this release may ship without it."

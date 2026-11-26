@@ -1,0 +1,59 @@
+# Workflow: run CodeQL security analysis for the charts repo.
+# It scans actions, Java/Kotlin, and JavaScript/TypeScript code.
+#
+# This reusable security scan is called by the monthly workflow.
+name: CodeQL
+on:
+  workflow_call:
+
+permissions:
+  security-events: write
+  actions: read
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-26.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: actions
+            build-mode: none
+          - language: java-kotlin
+            build-mode: manual
+          - language: javascript-typescript
+            build-mode: none
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Set up JDK 17
+        if: matrix.language == 'java-kotlin'
+        uses: ./.github/actions/setup-jdk
+        with:
+          cache-read-only: true
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4.39.1
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - name: Manual build (Java/Kotlin)
+        if: matrix.language == 'java-kotlin'
+        run: ./gradlew assemble --no-daemon
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4.39.1
+        with:
+          category: "/language:${{ matrix.language }}"
