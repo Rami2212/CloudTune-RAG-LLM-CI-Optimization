@@ -1,0 +1,31 @@
+name: Build and Test
+
+on: [push, pull_request]
+
+jobs:
+  build-test:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        racket-variant: ["CS"]
+
+    steps:
+    - uses: actions/checkout@v7
+    - uses: Bogdanp/setup-racket@v1.15
+      with:
+        architecture: 'x64'
+        distribution: 'full'
+        variant: ${{ matrix.racket-variant }}
+        version: current
+        sudo: never
+        dest: '${HOME}/racket'
+        local_catalogs: $GITHUB_WORKSPACE
+    - run: raco pkg update -i --no-setup htdp-lib htdp-doc htdp
+    - name: Install htdp-test and htdp-drracket-test (depends on htdp-lib)
+      run: raco pkg install --auto -i --skip-installed --no-setup htdp-test htdp-drracket-test
+    - run: raco setup --check-pkg-deps --pkgs htdp-lib htdp-doc htdp-test htdp-drracket-test
+    - name: Run tests
+      run: xvfb-run raco test htdp-test
+    - name: Run DrRacket integration tests
+      run: xvfb-run raco test -p htdp-drracket-test

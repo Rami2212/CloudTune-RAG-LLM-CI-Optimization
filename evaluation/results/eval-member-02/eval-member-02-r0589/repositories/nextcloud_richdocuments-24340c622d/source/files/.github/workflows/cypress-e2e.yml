@@ -1,0 +1,255 @@
+# SPDX-FileCopyrightText: 2021 Nextcloud GmbH and Nextcloud contributors
+# SPDX-License-Identifier: MIT
+name: Cypress
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - stable*
+
+concurrency:
+  group: '${{ github.workflow }} @ ${{ github.event.pull_request.head.label || github.head_ref || github.ref }}'
+  cancel-in-progress: true
+
+env:
+  APP_NAME: richdocuments
+  CYPRESS_baseUrl: http://172.17.0.1:8081/index.php
+  CYPRESS_collaboraUrl: http://172.17.0.1:9980
+
+permissions:
+  contents: read
+
+jobs:
+  cypress:
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # Skip nightly Collabora image until the upstream nightly container issue is resolved
+        # https://github.com/CollaboraOnline/online/issues/16175
+        code-image: [ 'release' ]
+        node-version: [16.x]
+        containers: [1, 2, 3]
+        php-versions: [ '8.3' ]
+        databases: [ 'sqlite' ]
+        server-versions: [ 'master' ]
+
+    name: runner ${{ matrix.code-image}}-${{ matrix.containers }}
+
+    services:
+      collabora:
+        image: ${{ matrix.code-image == 'release' && 'collabora/code:latest' || 'juliushaertl/nc-code-nightly:latest' }} # zizmor: ignore[unpinned-images]
+        env:
+          extra_params: '--o:ssl.enable=false --o:home_mode.enable=true'
+          aliasgroup1: 'http://172.17.0.1:8081'
+        ports:
+          - "9980:9980"
+        options: --cap-add SYS_ADMIN --cap-add SYS_CHROOT
+
+    steps:
+      - name: Checkout server
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          submodules: true
+          repository: nextcloud/server
+          ref: ${{ matrix.server-versions }}
+
+      - name: Register main git reference
+        run: |
+          main_app_ref="$(if [ "${{ matrix.server-versions }}" = "master" ]; then echo -n "main"; else echo -n "${{ matrix.server-versions }}"; fi)"
+          echo "main_app_ref=$main_app_ref" >> $GITHUB_ENV
+
+      - name: Checkout viewer
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          repository: nextcloud/viewer
+          ref: ${{ env.main_app_ref }}
+          path: apps/viewer
+
+      - name: Checkout spreed
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          repository: nextcloud/spreed
+          ref: ${{ env.main_app_ref }}
+          path: apps/spreed
+
+      - name: Checkout files_pdfviewer
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          repository: nextcloud/files_pdfviewer
+          ref: ${{ matrix.server-versions }}
+          path: apps/files_pdfviewer
+
+      - name: Checkout the activity app
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          repository: nextcloud/activity
+          ref: ${{ env.main_app_ref }}
+          path: apps/activity
+
+      - name: Checkout ${{ env.APP_NAME }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          path: apps/${{ env.APP_NAME }}
+
+      - name: Read package.json node and npm engines version
+        uses: skjnldsv/read-package-engines-version-actions@06d6baf7d8f41934ab630e97d9e6c0bc9c9ac5e4 # v3
+        id: versions
+        with:
+          fallbackNode: "^20"
+          fallbackNpm: "^10"
+
+      - name: Set up node ${{ steps.versions.outputs.nodeVersion }}
+        uses: actions/setup-node@1e60f620b9541d16bece96c5465dc8ee9832be0b # v4.0.3
+        with:
+          node-version: ${{ steps.versions.outputs.nodeVersion }}
+
+      - name: Set up npm ${{ steps.versions.outputs.npmVersion }}
+        run: npm i -g 'npm@${{ steps.versions.outputs.npmVersion }}'
+
+      - name: Set up php ${{ matrix.php-versions }}
+        uses: shivammathur/setup-php@c541c155eee45413f5b09a52248675b1a2575231 # v2.31.1
+        with:
+          php-version: ${{ matrix.php-versions }}
+          extensions: mbstring, iconv, fileinfo, intl, sqlite, pdo_sqlite, zip, gd, apcu
+          ini-values:
+            apc.enable_cli=on
+          coverage: none
+
+      - name: Install composer dependencies
+        working-directory: apps/richdocuments
+        run: |
+          composer install --no-dev
+
+      - name: Build talk
+        working-directory: apps/spreed
+        run: |
+          composer install --no-dev
+          npm ci
+          npm run dev
+
+      - name: Set up Nextcloud
+        env:
+          DB_PORT: 4444
+          PHP_CLI_SERVER_WORKERS: 10
+        run: |
+          mkdir data
+          echo '<?php $CONFIG=["memcache.local"=>"\OC\Memcache\APCu","hashing_default_password"=>true];' > config/config.php
+          php occ maintenance:install --verbose --database=${{ matrix.databases }} --database-name=nextcloud --database-host=127.0.0.1 --database-port=$DB_PORT --database-user=root --database-pass=rootpassword --admin-user admin --admin-pass admin
+          php occ config:system:set memcache.local --value="\\OC\\Memcache\\APCu"
+          php -f index.php
+          PHP_CLI_SERVER_WORKERS=20 php -S 0.0.0.0:8081 &
+          export OC_PASS=1234561
+          php occ user:add --password-from-env user1
+          php occ user:add --password-from-env user2
+          php occ config:system:set force_language --value en
+          php occ app:enable --force testing
+          php occ app:enable --force viewer
+          php occ app:enable --force files_pdfviewer
+          php occ app:enable --force richdocuments
+          php occ app:enable --force spreed
+          php occ app:enable --force activity
+          php occ app:list
+          php occ config:system:set trusted_domains 1 --value="172.17.0.1"
+          php occ config:system:set overwrite.cli.url --value="http://172.17.0.1:8081"
+
+          php occ config:system:set allow_local_remote_servers --value true --type bool
+          php occ richdocuments:activate-config --wopi-url="http://localhost:9980" --callback-url="http://172.17.0.1:8081"
+
+          curl http://admin:admin@localhost:8081/ocs/v1.php/cloud/capabilities\?format\=json -H 'OCS-APIRequest: true'
+
+          curl -v http://localhost:9980/ --output -
+          curl -v http://localhost:9980/hosting/discovery --output -
+          curl -v http://localhost:9980/hosting/capabilities --output -
+
+          cat data/nextcloud.log
+
+      - name: Cache node modules
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        env:
+          cache-name: cache-node-modules
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-build-${{ env.cache-name }}-
+            ${{ runner.os }}-build-
+            ${{ runner.os }}-
+
+      - name: npm install, build richdocuments in testing mode
+        working-directory: apps/richdocuments
+        run: |
+          npm ci
+          npm run dev
+
+      - name: Register index for cypress-split
+        env:
+          container: "${{ matrix.containers }}"
+        run: |
+          echo "container_index: $(($container - 1))"
+          echo "container_index=$(($container - 1))" >> $GITHUB_ENV
+
+      - name: Cypress run
+        uses: cypress-io/github-action@496e7dc0edc421a9de8a36a31c793340e00c61bf # v6.7.5
+        with:
+          record: false
+          parallel: false
+          browser: chromium
+          wait-on: '${{ env.CYPRESS_baseUrl }}'
+          working-directory: 'apps/${{ env.APP_NAME }}'
+          config: defaultCommandTimeout=10000,video=false
+          tag: ${{ false && github.event_name }}
+        env:
+          # https://github.com/cypress-io/github-action/issues/524
+          npm_package_name: ${{ env.APP_NAME }}
+          # https://github.com/cypress-io/github-action/issues/124
+          COMMIT_INFO_MESSAGE: ${{ github.event.pull_request.title }}
+          COMMIT_INFO_SHA: ${{ github.event.pull_request.head.sha }}
+          CYPRESS_RECORD_KEY: ${{ secrets.CYPRESS_RECORD_KEY }}
+          SPLIT: 3
+          SPLIT_INDEX: ${{ env.container_index }}
+          CODE_RELEASE: ${{ matrix.code-image }}
+
+      - name: Upload test failure screenshots
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874 # v4.4.0
+        if: failure()
+        with:
+          name: screenshots-${{ matrix.code-image }}-${{ matrix.containers }}
+          path: apps/${{ env.APP_NAME }}/cypress/screenshots/
+          retention-days: 5
+
+      - name: Upload nextcloud logs
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874 # v4.4.0
+        if: failure()
+        with:
+          name: nextcloud-log-${{ matrix.code-image }}-${{ matrix.containers }}
+          path: data/nextcloud.log
+          retention-days: 5
+
+      - name: Dump docker logs on failure
+        if: failure()
+        uses: jwalton/gh-docker-logs@2741064ab9d7af54b0b1ffb6076cf64c16f0220e # v2.2.2
+
+  summary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [ cypress ]
+
+    if: always()
+
+    name: cypress-summary
+
+    steps:
+      - name: Summary status
+        run: if ${{ ( needs.cypress.result != 'success' && needs.cypress.result != 'skipped' ) }}; then exit 1; fi

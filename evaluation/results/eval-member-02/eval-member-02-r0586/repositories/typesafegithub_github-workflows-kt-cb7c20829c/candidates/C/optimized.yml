@@ -1,0 +1,153 @@
+# This file was generated using Kotlin DSL (.github/workflows/bindings-server.main.kts).
+# If you want to modify the workflow, please change the Kotlin file and regenerate this YAML file.
+# Generated with https://github.com/typesafegithub/github-workflows-kt
+
+name: 'Bindings server'
+on:
+  push:
+    branches:
+    - 'main'
+  pull_request: {}
+  schedule:
+  - cron: '0 0 * * SUN'
+  workflow_dispatch: {}
+jobs:
+  check_yaml_consistency:
+    name: 'Check YAML consistency'
+    runs-on: 'ubuntu-latest'
+    timeout-minutes: 5
+    steps:
+    - id: 'step-0'
+      name: 'Check out'
+      uses: 'actions/checkout@v7'
+    - id: 'step-1'
+      name: 'Downgrade Kotlin'
+      uses: 'fwilhe2/setup-kotlin@v2'
+      with:
+        version: '2.3.21'
+    - id: 'step-2'
+      name: 'Execute script'
+      continue-on-error: true
+      run: 'rm ''.github/workflows/bindings-server.yaml'' && ''.github/workflows/bindings-server.main.kts'''
+    - id: 'step-3'
+      name: '[Fallback] Start the local server'
+      run: 'docker run -p 8080:8080 krzema12/github-workflows-kt-jit-binding-server &'
+      if: '${{ steps.step-2.outcome != ''success'' }}'
+    - id: 'step-4'
+      name: '[Fallback] Wait for the server'
+      run: 'curl --head -X GET --retry 60 --retry-all-errors --retry-delay 1 http://localhost:8080/status'
+      if: '${{ steps.step-2.outcome != ''success'' }}'
+    - id: 'step-5'
+      name: '[Fallback] Replace server URL in script'
+      run: 'sed -i -e ''s/https:\/\/bindings.krzeminski.it/http:\/\/localhost:8080/g'' .github/workflows/bindings-server.main.kts'
+      if: '${{ steps.step-2.outcome != ''success'' }}'
+    - id: 'step-6'
+      name: '[Fallback] Execute script again'
+      run: 'rm -f ''.github/workflows/bindings-server.yaml'' && ''.github/workflows/bindings-server.main.kts'''
+      if: '${{ steps.step-2.outcome != ''success'' }}'
+    - id: 'step-7'
+      name: 'Consistency check'
+      run: 'git diff --exit-code ''.github/workflows/bindings-server.yaml'''
+  end-to-end-test:
+    name: 'End-to-end test'
+    runs-on: 'ubuntu-latest'
+    timeout-minutes: 15
+    needs:
+    - 'check_yaml_consistency'
+    env:
+      GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+      APP_PRIVATE_KEY: '${{ secrets.APP_PRIVATE_KEY }}'
+      APP_INSTALLATION_ID: '62885502'
+      APP_CLIENT_ID: 'Iv23liIZ17VJKUpjacBs'
+    steps:
+    - id: 'step-0'
+      uses: 'actions/checkout@v7'
+    - id: 'step-1'
+      uses: 'gradle/actions/setup-gradle@v6'
+    - id: 'step-2'
+      name: 'Start the server'
+      run: './gradlew :jit-binding-server:run &'
+    - id: 'step-3'
+      name: 'Wait for the server to respond'
+      env:
+        GHWKT_GITHUB_CONTEXT_JSON: '${{ toJSON(github) }}'
+      run: 'GHWKT_RUN_STEP=''bindings-server.yaml:end-to-end-test:step-3'' ''.github/workflows/bindings-server.main.kts'''
+    - id: 'step-4'
+      name: 'Clean Maven Local to fetch required POMs again'
+      run: 'rm -rf ~/.m2/repository/'
+    - id: 'step-5'
+      name: 'Execute the script using the bindings from the server'
+      run: |-
+        mv .github/workflows/test-script-consuming-jit-bindings.main.do-not-compile.kts .github/workflows/test-script-consuming-jit-bindings.main.kts
+        .github/workflows/test-script-consuming-jit-bindings.main.kts
+    - id: 'step-6'
+      name: 'Clean Maven Local to fetch required POMs again'
+      run: 'rm -rf ~/.m2/repository/'
+    - id: 'step-7'
+      name: 'Execute the script using bindings but without dependency on library'
+      run: |-
+        mv .github/workflows/test-served-bindings-depend-on-library.main.do-not-compile.kts .github/workflows/test-served-bindings-depend-on-library.main.kts
+        .github/workflows/test-served-bindings-depend-on-library.main.kts
+    - id: 'step-8'
+      name: 'Install Kotlin 1.9.0'
+      uses: 'fwilhe2/setup-kotlin@v2'
+      with:
+        version: '1.9.0'
+    - id: 'step-9'
+      name: 'Clean Maven Local to fetch required POMs again'
+      run: 'rm -rf ~/.m2/repository/'
+    - id: 'step-10'
+      name: 'Execute the script using the bindings from the server, using older Kotlin (1.9.0) as consumer'
+      run: |2-
+                        cp .github/workflows/test-script-consuming-jit-bindings.main.kts .github/workflows/test-script-consuming-jit-bindings-too-old-kotlin.main.kts
+                        (.github/workflows/test-script-consuming-jit-bindings-too-old-kotlin.main.kts || true) >> output.txt 2>&1
+        grep "was compiled with an incompatible version of Kotlin" output.txt
+    - id: 'step-11'
+      name: 'Install Kotlin 2.0.0'
+      uses: 'fwilhe2/setup-kotlin@v2'
+      with:
+        version: '2.0.0'
+    - id: 'step-12'
+      name: 'Clean Maven Local to fetch required POMs again'
+      run: 'rm -rf ~/.m2/repository/'
+    - id: 'step-13'
+      name: 'Execute the script using the bindings from the server, using older Kotlin (2.0.0) as consumer'
+      run: |-
+        cp .github/workflows/test-script-consuming-jit-bindings.main.kts .github/workflows/test-script-consuming-jit-bindings-older-kotlin.main.kts
+        .github/workflows/test-script-consuming-jit-bindings-older-kotlin.main.kts
+    - id: 'step-14'
+      name: 'Compile a Gradle project using the bindings from the server'
+      run: |-
+        cd .github/workflows/test-gradle-project-using-bindings-server
+        ./gradlew build --refresh-dependencies
+    - id: 'step-15'
+      name: 'Fetch maven-metadata.xml for top-level action'
+      run: 'curl --fail http://localhost:8080/actions/checkout/maven-metadata.xml | grep ''<version>v4</version>'''
+    - id: 'step-16'
+      name: 'Fetch maven-metadata.xml for nested action'
+      run: 'curl --fail http://localhost:8080/actions/cache__save/maven-metadata.xml | grep ''<version>v4</version>'''
+    - id: 'step-17'
+      name: 'Print server logs'
+      run: 'cat jit-binding-server/logs/server.log'
+      if: '${{ always() }}'
+  deploy:
+    name: 'Deploy to DockerHub'
+    runs-on: 'ubuntu-latest'
+    timeout-minutes: 15
+    needs:
+    - 'end-to-end-test'
+    - 'check_yaml_consistency'
+    env:
+      DOCKERHUB_USERNAME: '${{ secrets.DOCKERHUB_USERNAME }}'
+      DOCKERHUB_PASSWORD: '${{ secrets.DOCKERHUB_PASSWORD }}'
+    if: '${{ github.event_name == ''workflow_dispatch'' || github.event_name == ''schedule'' }}'
+    environment:
+      name: 'DockerHub'
+    steps:
+    - id: 'step-0'
+      uses: 'actions/checkout@v7'
+    - id: 'step-1'
+      uses: 'gradle/actions/setup-gradle@v6'
+    - id: 'step-2'
+      name: 'Build and publish image'
+      run: './gradlew :jit-binding-server:publishImage'

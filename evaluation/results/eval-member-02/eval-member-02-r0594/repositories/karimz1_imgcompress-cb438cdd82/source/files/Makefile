@@ -1,0 +1,77 @@
+REGISTRY ?= docker.io/karimz1
+IMAGE ?= imgcompress
+TAG ?= local-dev
+IMAGE_REF ?= $(REGISTRY)/$(IMAGE):$(TAG)
+LOCAL_PLATFORM ?= linux/amd64
+BUILDX_BUILDER ?= imgcompress-builder
+
+.PHONY: build build-local scan trivy lint unit integration e2e feature-flags local simci ensure-builder release-draft release-tests
+
+ensure-builder:
+	@./scripts/ensureBuildxBuilder.sh $(BUILDX_BUILDER)
+
+# Multi-arch build used for release validation. The CI deployment workflow is
+# responsible for pushing published images.
+build: lint ensure-builder
+	docker buildx build \
+		--builder $(BUILDX_BUILDER) \
+		--platform linux/amd64,linux/arm64 \
+		--sbom="generator=docker/buildkit-syft-scanner:latest" \
+		--provenance="mode=max" \
+		-t $(IMAGE_REF) \
+		.
+
+# Single-platform build loaded into the local Docker daemon, used by scan/local testing.
+build-local: lint ensure-builder
+	docker buildx build \
+		--builder $(BUILDX_BUILDER) \
+		--platform $(LOCAL_PLATFORM) \
+		--load \
+		-t $(IMAGE_REF) \
+		.
+
+scan: build-local
+	IMAGE_REF="$(IMAGE_REF)" ./scripts/runTrivyImageScan.sh
+
+deploy-local: lint
+	PORT_HOST=8080 NO_CACHE=true ./scripts/runLocalDockerBuildTester.sh
+
+deploy-local-dev-mode: 
+	PORT_HOST=8080 \
+	NO_CACHE=false \
+	DEV_MODE=true \
+	./scripts/runLocalDockerBuildTester.sh
+
+trivy: scan
+
+lint:
+	./scripts/runPythonLint.sh
+
+unit: lint
+	./scripts/runUnitTests.sh
+
+integration: lint
+	./scripts/runIntegrationTests.sh
+
+e2e: lint
+	./scripts/run-e2e.sh
+
+feature-flags: lint
+	./scripts/runFeatureFlagsDockerE2E.sh
+
+local: lint
+	./scripts/runLocalDockerBuildTester.sh
+
+# Simulate the full GitHub Actions CI locally: builds the devcontainer,
+# runs lint + tests inside it, builds the app image, runs E2E.
+simci: lint
+	./scripts/simulateCiTests.sh
+
+# Normally a tag push builds the version image and then prepares the draft.
+# This reruns both for an unpublished tag; reviewed drafts are never overwritten.
+release-draft:
+	@test -n "$(RELEASE_TAG)" || (echo "Usage: make release-draft RELEASE_TAG=release_1.0.0-rc.1" >&2; exit 1)
+	gh workflow run deploy-docker-image.yml --ref main -f tag="$(RELEASE_TAG)"
+
+release-tests:
+	node --test tests/releases/*.test.mjs

@@ -1,0 +1,686 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 3 optimizations:
+# - [HIGH] Add pip dependency cache to "lint-python" job
+# - [MEDIUM] 6 jobs clone the repo — consider artifact sharing
+# - [LOW] Explicitly set fail-fast for large matrix job "test-feature-flags-matrix" (6 combinations)
+# Estimated savings: ~6 min/run
+#
+name: CI and Auto Merge for imgcompress
+
+on:
+  # Feature branches run through pull_request only. Pushing them here as well
+  # started every PR run twice.
+  push:
+    branches:
+      - main
+      - next_rc
+      - release/*
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      upload_feature_flags_artifacts:
+        description: "Upload feature-flags matrix screenshots / videos artifact? (default on)"
+        required: false
+        default: "true"
+      deploy_nightly:
+        description: "After E2E tests succeed, trigger the nightly deployment workflow"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same PR / branch so we don't waste minutes
+# building stale commits and so auto-merge always acts on the latest CI.
+# Every commit on main keeps its run.
+concurrency:
+  group: ci-auto-merge-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  # Job names below are what shows up as checks on a PR. `ci-status` at the end
+  # needs every test job, so it is the one check to require for merging.
+  #
+  # Cache: each GHA cache scope has exactly one writer (test-e2e for the app
+  # image, test-backend for the dev container). Every other job only reads it.
+  # Seven jobs exporting the same scope at once mostly raced each other.
+  #
+  # QEMU is only set up where an arm64 image is built. The amd64 jobs don't need
+  # it, and eight jobs saving the same binfmt cache key produced the
+  # "Unable to reserve cache ... another job may be creating this cache" noise.
+
+  lint-python:
+    name: lint Python
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.11"
+
+      - name: Install Ruff
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ruff==0.15.14
+
+      - name: Run Ruff
+        run: ruff check backend tests healthcheck.py update_dockerhub_description.py
+
+  scan-image:
+    name: scan local image
+    needs: lint-python
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Authenticate to dhi.io for DHI base images
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          REGISTRY_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUBACTIONS_DOCKERHUB_PULL_TOKEN || secrets.DOCKERHUB_TOKEN }}
+        run: ./scripts/dockerLoginWithRetry.sh dhi.io
+
+      - name: Build local application image
+        uses: ./.github/actions/docker-build
+        with:
+          context: .
+          platform: linux/amd64
+          tags: karimz1/imgcompress:local-scan
+          cache-scope: app-linux/amd64
+
+      - name: Run Trivy image scan
+        continue-on-error: true
+        env:
+          IMAGE_REF: karimz1/imgcompress:local-scan
+          SCAN_OUTPUT: scan-result.log
+        run: ./scripts/runTrivyImageScan.sh
+
+      - name: Upload Trivy scan result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: trivy-scan-result
+          path: scan-result.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+  test-backend:
+    name: test-backend (${{ matrix.platform }})
+    needs: lint-python
+    runs-on: ubuntu-latest
+    # arm64 runs under QEMU and takes ~12 min warm; a cold cache roughly triples that.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+          - platform: linux/arm64
+            arch: arm64
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU (arm64 only)
+        if: matrix.arch != 'amd64'
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+        with:
+          platforms: ${{ matrix.arch }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Authenticate to dhi.io for DHI base images
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          REGISTRY_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUBACTIONS_DOCKERHUB_PULL_TOKEN || secrets.DOCKERHUB_TOKEN }}
+        run: ./scripts/dockerLoginWithRetry.sh dhi.io
+
+      - name: Build Dev Container for ${{ matrix.platform }}
+        uses: ./.github/actions/docker-build
+        with:
+          context: .devcontainer/
+          platform: ${{ matrix.platform }}
+          tags: devcontainer:local-test
+          cache-scope: devcontainer-${{ matrix.platform }}
+          cache-write: "true"
+
+      - name: Run Backend Unit Tests on ${{ matrix.platform }}
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          docker run --rm \
+            --platform="$PLATFORM" \
+            --entrypoint /bin/sh \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.docker/config.json:/root/.docker/config.json:ro" \
+            -v "$(pwd):/app/" \
+            -e IS_RUNNING_IN_GITHUB_ACTIONS=true \
+            --name devcontainer \
+            devcontainer:local-test /app/scripts/runUnitTests.sh --junitxml=/app/test-reports/unit.xml
+
+      - name: Run Backend Integration (Docker) Tests on ${{ matrix.platform }}
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          docker run --rm \
+            --platform="$PLATFORM" \
+            --entrypoint /bin/sh \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.docker/config.json:/root/.docker/config.json:ro" \
+            -v "$(pwd):/app/" \
+            -e IS_RUNNING_IN_GITHUB_ACTIONS=true \
+            --name devcontainer \
+            devcontainer:local-test /app/scripts/runIntegrationTests.sh --junitxml=/app/test-reports/integration.xml
+
+      - name: Test summary
+        if: always()
+        run: python3 scripts/ciTestSummary.py "Backend tests (${{ matrix.platform }})" test-reports/unit.xml test-reports/integration.xml
+
+      - name: Upload backend test reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: backend-test-reports-${{ matrix.arch }}
+          path: test-reports/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  test-e2e:
+    name: test-e2e (${{ matrix.platform }})
+    needs: lint-python
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: # works only on amd64 for now; a fix for arm64 is in progress
+          - platform: linux/amd64
+            arch: amd64
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Authenticate to dhi.io for DHI base images
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          REGISTRY_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUBACTIONS_DOCKERHUB_PULL_TOKEN || secrets.DOCKERHUB_TOKEN }}
+        run: ./scripts/dockerLoginWithRetry.sh dhi.io
+
+      # The one writer of the app-linux/amd64 cache scope.
+      - name: Build Application Container for ${{ matrix.platform }}
+        uses: ./.github/actions/docker-build
+        with:
+          context: .
+          platform: ${{ matrix.platform }}
+          tags: karimz1/imgcompress:local-test
+          cache-scope: app-${{ matrix.platform }}
+          cache-write: "true"
+
+      - name: Run Application Container (Host Networking) for ${{ matrix.platform }}
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          docker run -d \
+            --platform "$PLATFORM" \
+            --network host \
+            --name app \
+            karimz1/imgcompress:local-test web
+
+      - name: Wait for the app to be ready
+        run: |
+          for attempt in $(seq 1 120); do
+            curl -fsS "http://localhost:5000" > /dev/null 2>&1 && { echo "App is up after ${attempt}s"; exit 0; }
+            sleep 1
+          done
+          echo "::error::App did not answer on :5000 within 120s"
+          docker logs --tail 200 app || true
+          exit 1
+
+      - name: Build Dev Container for ${{ matrix.platform }}
+        uses: ./.github/actions/docker-build
+        with:
+          context: .devcontainer/
+          platform: ${{ matrix.platform }}
+          tags: devcontainer:local-test
+          cache-scope: devcontainer-${{ matrix.platform }}
+
+      - name: Run E2E Tests in Dev Container (Host Networking)
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          chmod +x ./scripts/run-e2e.sh
+          docker run --rm \
+            --platform "$PLATFORM" \
+            --entrypoint /bin/sh \
+            --network host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$(pwd):/app/" \
+            -e IS_RUNNING_IN_GITHUB_ACTIONS=true \
+            -e PLAYWRIGHT_BASE_URL=http://localhost:5000 \
+            --name devcontainer_e2e \
+            devcontainer:local-test -c "/app/scripts/run-e2e.sh"
+
+      - name: Collect app log
+        if: always()
+        run: |
+          # Results dirs are written by root inside the dev container; keep the log apart.
+          mkdir -p ci-logs
+          docker logs app > ci-logs/app.log 2>&1 || true
+          docker rm -f app || true
+
+      - name: Test summary
+        if: always()
+        run: python3 scripts/ciTestSummary.py "E2E (${{ matrix.platform }})" frontend/e2e-test-results/junit.xml
+
+      # Always uploaded: videos of a green run are the reference when a later one fails.
+      - name: Upload E2E test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: e2e-test-results-${{ matrix.arch }}
+          path: |
+            frontend/e2e-test-results/
+            ci-logs/
+          retention-days: ${{ job.status == 'success' && 3 || 7 }}
+          if-no-files-found: warn
+
+  test-feature-flags-matrix:
+    # Job display name reads as the actual user-facing UI state instead of
+    # a confusing tuple of `disable_* = true/false` (double negative).
+    # Every entry also states its notify state: entries without NOTIFY_URL run
+    # notifyWhenDone_Test.spec.ts in its "switch is hidden" (notify OFF) mode,
+    # the notify ON entry runs the delivery and share-link tests.
+    name: feature-flags (${{ matrix.scenario }})
+    needs: lint-python
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # logo hidden + storage hidden  (DISABLE_LOGO=true, DISABLE_STORAGE_MANAGEMENT=true)
+          - disable_logo: "true"
+            disable_storage_management: "true"
+            scenario: "logo HIDDEN | storage HIDDEN | notify OFF"
+            label: "logo-hidden_storage-hidden"
+          # logo hidden + storage shown   (DISABLE_LOGO=true, DISABLE_STORAGE_MANAGEMENT=false)
+          - disable_logo: "true"
+            disable_storage_management: "false"
+            scenario: "logo HIDDEN | storage SHOWN | notify OFF"
+            label: "logo-hidden_storage-shown"
+          # logo shown  + storage hidden  (DISABLE_LOGO=false, DISABLE_STORAGE_MANAGEMENT=true)
+          - disable_logo: "false"
+            disable_storage_management: "true"
+            scenario: "logo SHOWN  | storage HIDDEN | notify OFF"
+            label: "logo-shown_storage-hidden"
+          # small upload limit           (MAX_UPLOAD_SIZE_MB=5; the other entries keep the 40 GB default)
+          # 5 MB sits between the 1.18 MB JPEG fixture (accepted) and the 37 MB PSD fixture (refused).
+          - disable_logo: "false"
+            disable_storage_management: "false"
+            max_upload_size_mb: "5"
+            scenario: "logo SHOWN  | storage SHOWN | upload limit 5 MB | notify OFF"
+            label: "upload-limit-5mb"
+          # update check off             (DISABLE_UPDATE_CHECK=true; the other entries keep the check on)
+          - disable_logo: "false"
+            disable_storage_management: "false"
+            disable_update_check: "true"
+            scenario: "logo SHOWN  | storage SHOWN | update check OFF | notify OFF"
+            label: "update-check-off"
+          # "Notify me when done" on (NOTIFY_URL set). json:// posts to the capture
+          # server that notifyWhenDone_Test.spec.ts starts on port 5199 (host network).
+          - disable_logo: "false"
+            disable_storage_management: "false"
+            notify_url: "json://127.0.0.1:5199/notify"
+            public_base_url: "https://imgcompress.example"
+            scenario: "logo SHOWN  | storage SHOWN | notify ON"
+            label: "notify-on"
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Authenticate to dhi.io for DHI base images
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          REGISTRY_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUBACTIONS_DOCKERHUB_PULL_TOKEN || secrets.DOCKERHUB_TOKEN }}
+        run: ./scripts/dockerLoginWithRetry.sh dhi.io
+
+      - name: Build Application Container
+        uses: ./.github/actions/docker-build
+        with:
+          context: .
+          platform: linux/amd64
+          tags: karimz1/imgcompress:local-test
+          cache-scope: app-linux/amd64
+
+      - name: Start app — ${{ matrix.scenario }}
+        run: |
+          echo "::group::Feature flag configuration for this matrix entry"
+          echo "Scenario:                    ${{ matrix.scenario }}"
+          echo "DISABLE_LOGO:                ${{ matrix.disable_logo }}   -> Logo $([ '${{ matrix.disable_logo }}' = 'true' ] && echo 'HIDDEN' || echo 'SHOWN')"
+          echo "DISABLE_STORAGE_MANAGEMENT:  ${{ matrix.disable_storage_management }}   -> Storage management button $([ '${{ matrix.disable_storage_management }}' = 'true' ] && echo 'HIDDEN' || echo 'SHOWN')"
+          echo "MAX_UPLOAD_SIZE_MB:          ${{ matrix.max_upload_size_mb || '(default 40960)' }}"
+          echo "DISABLE_UPDATE_CHECK:        ${{ matrix.disable_update_check || '(default false)' }}"
+          echo "NOTIFY_URL:                  ${{ matrix.notify_url && 'set (capture server) -> notify ON' || '(unset) -> notify OFF' }}"
+          echo "::endgroup::"
+          docker run -d \
+            --platform linux/amd64 \
+            --network host \
+            --name app \
+            -e DISABLE_LOGO=${{ matrix.disable_logo }} \
+            -e DISABLE_STORAGE_MANAGEMENT=${{ matrix.disable_storage_management }} \
+            -e MAX_UPLOAD_SIZE_MB=${{ matrix.max_upload_size_mb }} \
+            -e DISABLE_UPDATE_CHECK=${{ matrix.disable_update_check }} \
+            -e NOTIFY_URL=${{ matrix.notify_url }} \
+            -e PUBLIC_BASE_URL=${{ matrix.public_base_url }} \
+            karimz1/imgcompress:local-test web
+
+      - name: Wait for the app to be ready
+        run: |
+          for attempt in $(seq 1 120); do
+            curl -fsS "http://localhost:5000" > /dev/null 2>&1 && { echo "App is up after ${attempt}s"; exit 0; }
+            sleep 1
+          done
+          echo "::error::App did not answer on :5000 within 120s"
+          docker logs --tail 200 app || true
+          exit 1
+
+      - name: Build Dev Container
+        uses: ./.github/actions/docker-build
+        with:
+          context: .devcontainer/
+          platform: linux/amd64
+          tags: devcontainer:local-test
+          cache-scope: devcontainer-linux/amd64
+
+      - name: Run feature-flags spec — ${{ matrix.scenario }}
+        run: |
+          chmod +x ./scripts/run-e2e.sh
+          docker run --rm \
+            --platform linux/amd64 \
+            --entrypoint /bin/sh \
+            --network host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$(pwd):/app/" \
+            -e IS_RUNNING_IN_GITHUB_ACTIONS=true \
+            -e PLAYWRIGHT_BASE_URL=http://localhost:5000 \
+            --name devcontainer_flags \
+            devcontainer:local-test -c "/app/scripts/run-e2e.sh tests/e2e/featureFlagsRuntime_Test.spec.ts tests/e2e/uploadLimitRuntime_Test.spec.ts tests/e2e/notifyWhenDone_Test.spec.ts"
+
+      - name: Collect app log and stop the app
+        if: always()
+        run: |
+          # Results dirs are written by root inside the dev container; keep the log apart.
+          mkdir -p ci-logs
+          docker logs app > ci-logs/app.log 2>&1 || true
+          docker rm -f app || true
+
+      - name: Test summary
+        if: always()
+        run: python3 scripts/ciTestSummary.py "feature-flags (${{ matrix.scenario }})" frontend/e2e-test-results/junit.xml
+
+      - name: Upload feature-flags results — ${{ matrix.scenario }}
+        if: always() && github.event.inputs.upload_feature_flags_artifacts != 'false'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: feature-flags-${{ matrix.label }}
+          path: |
+            frontend/e2e-test-results/
+            ci-logs/
+          retention-days: ${{ job.status == 'success' && 3 || 7 }}
+          if-no-files-found: warn
+
+  test-unverified-formats-api:
+    # Reader test for the long tail of "Other possible formats" advertised
+    # by the UI. Brings up the app container, then for each unverified
+    # extension generates an input file with Pillow, POSTs it to
+    # /api/compress, downloads the resulting PNG, and asserts it is real
+    # and non-blank. Blocking — if a format the UI claims to support stops
+    # working through the public HTTP API in the running image, deploys
+    # are gated. Read-only formats (no Pillow writer) are skipped with a
+    # documented reason; skips are not failures.
+    name: unverified-formats API reader
+    needs: lint-python
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Authenticate to dhi.io for DHI base images
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          REGISTRY_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUBACTIONS_DOCKERHUB_PULL_TOKEN || secrets.DOCKERHUB_TOKEN }}
+        run: ./scripts/dockerLoginWithRetry.sh dhi.io
+
+      - name: Build Application Container
+        uses: ./.github/actions/docker-build
+        with:
+          context: .
+          platform: linux/amd64
+          tags: karimz1/imgcompress:local-test
+          cache-scope: app-linux/amd64
+
+      - name: Run Application Container (Host Networking)
+        run: |
+          docker run -d \
+            --platform linux/amd64 \
+            --network host \
+            --name app \
+            karimz1/imgcompress:local-test web
+
+      - name: Wait for the app to be ready
+        run: |
+          for attempt in $(seq 1 120); do
+            curl -fsS "http://localhost:5000/api/health/backend" > /dev/null 2>&1 && { echo "App is up after ${attempt}s"; exit 0; }
+            sleep 1
+          done
+          echo "::error::App did not answer on :5000/api/health/backend within 120s"
+          docker logs --tail 200 app || true
+          exit 1
+
+      - name: Build Dev Container
+        uses: ./.github/actions/docker-build
+        with:
+          context: .devcontainer/
+          platform: linux/amd64
+          tags: devcontainer:local-test
+          cache-scope: devcontainer-linux/amd64
+
+      - name: Run unverified-formats API reader test
+        run: |
+          docker run --rm \
+            --platform linux/amd64 \
+            --entrypoint /bin/sh \
+            --network host \
+            -v "$(pwd):/app/" \
+            -e IMGCOMPRESS_API_BASE=http://localhost:5000 \
+            -e IS_RUNNING_IN_GITHUB_ACTIONS=true \
+            --name devcontainer_unverified_api \
+            devcontainer:local-test \
+            -c ". /venv/bin/activate && pytest tests/integration/test_unverified_formats_api.py -s --tb=short -ra --junitxml=/app/test-reports/unverified-formats.xml"
+
+      - name: Collect app log and stop the app
+        if: always()
+        run: |
+          # Results dirs are written by root inside the dev container; keep the log apart.
+          mkdir -p ci-logs
+          docker logs app > ci-logs/app.log 2>&1 || true
+          docker rm -f app || true
+
+      - name: Test summary
+        if: always()
+        run: python3 scripts/ciTestSummary.py "Unverified formats via API" test-reports/unverified-formats.xml
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: unverified-formats-report
+          path: |
+            test-reports/
+            ci-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  ci-status:
+    # One check that is green only when every job above is. Require this one
+    # instead of each matrix entry, so renaming a scenario never blocks merges.
+    # Keep real permissions (not {}) so the job can register as a check, and make
+    # deploy-nightly / auto-merge need this job so the scheduler cannot drop it.
+    name: ci-status
+    needs:
+      - lint-python
+      - scan-image
+      - test-backend
+      - test-e2e
+      - test-feature-flags-matrix
+      - test-unverified-formats-api
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Summarize and gate
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          {
+            echo "### CI status"
+            echo
+            echo "| Job | Result |"
+            echo "|---|---|"
+            jq -r 'to_entries[] | "| \(.key) | \(if .value.result == "success" then "✅" else "❌" end) \(.value.result) |"' <<< "$NEEDS"
+            echo
+            echo "Matrix entries (backend per arch, feature-flags incl. notify ON / notify OFF) are rolled up per job; see each job's summary for test counts."
+          } >> "$GITHUB_STEP_SUMMARY"
+          bad=$(jq -r '[to_entries[] | select(.value.result != "success") | .key] | join(", ")' <<< "$NEEDS")
+          if [ -n "$bad" ]; then
+            echo "::error::Not green: $bad"
+            exit 1
+          fi
+          echo "All CI jobs passed."
+
+  deploy-nightly:
+    needs:
+      - ci-status
+      - test-backend
+      - test-e2e
+      - test-feature-flags-matrix
+      - test-unverified-formats-api
+    timeout-minutes: 10
+    if: >
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.deploy_nightly == true)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Trigger Deployment Workflow (nightly)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          DEPLOY_REF: ${{ github.sha }}
+        run: |
+          gh api \
+            --method POST \
+            "repos/${REPOSITORY}/dispatches" \
+            -f event_type=deploy \
+            -f "client_payload[ref]=${DEPLOY_REF}"
+
+  auto-merge-dependabot:
+    needs:
+      - ci-status
+      - test-backend
+      - test-e2e
+      - test-feature-flags-matrix
+      - test-unverified-formats-api
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    # Same-branch sibling job: gates on the PR's author (always
+    # `dependabot[bot]` for a Dependabot PR), so it stays correct even when
+    # `imgcompress-chan[bot]` is the actor of the most recent push after
+    # `/chan-fix` has repaired the branch. Also restricted to same-repo PRs
+    # so fork PRs can't trigger an auto-merge with the chan App token.
+    #
+    # Also auto-merges PRs opened by the chan App itself when they carry the
+    # `automated-digest-refresh` label — that label is only applied by the
+    # refresh-dockerfile-digests workflow, so chan can't sneak arbitrary
+    # PRs through this gate.
+    if: >
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (
+        github.event.pull_request.user.login == 'dependabot[bot]' ||
+        (
+          github.event.pull_request.user.login == 'imgcompress-chan[bot]' &&
+          contains(github.event.pull_request.labels.*.name, 'automated-digest-refresh')
+        )
+      )
+    steps:
+      - name: Mint imgcompress-chan token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+        with:
+          app-id: ${{ secrets.IMGCOMPRESS_CHAN_APP_ID }}
+          private-key: ${{ secrets.IMGCOMPRESS_CHAN_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Squash-merge Dependabot PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge --squash --delete-branch "$PR_URL"

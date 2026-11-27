@@ -1,0 +1,96 @@
+name: acceptance
+
+# SDK acceptance suite: runs the SDK under test against real, versioned OpenZiti
+# controllers/routers. See acceptance/README.md for local usage.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Compatibility matrix. Each entry is a selector resolved at run time, never a
+  # hardcoded version: active-lts, maint-lts and next are labels defined in the
+  # version manifest (acceptance/versions.yaml), latest is the highest published
+  # release, and main is ziti's mainline built from source. These jobs run
+  # adaptively: each probes ConnectV2 capability, expects the path the negotiation
+  # inputs dictate, and asserts compatibility. Together they guarantee V1
+  # compatibility across the matrix. The released selectors download a binary;
+  # main builds from source.
+  compat:
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - active-lts
+          - maint-lts
+          - latest
+          - next
+          - main
+    runs-on: ubuntu-latest
+    env:
+      ZITI_ACCEPTANCE_VERSION: ${{ matrix.version }}
+      # in-workspace so the binary cache below can persist it
+      ZITI_ACCEPTANCE_CACHE: ${{ github.workspace }}/.ziti-acceptance-cache
+      # authenticated release/clone API access avoids the 60/hr anonymous limit
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache-dependency-path: acceptance/go.sum
+
+      # Cached on the immutable id (release tag or source SHA) embedded in each
+      # binary's filename, so a moved selector misses rather than serving stale.
+      # versions.yaml is in the key so editing the matrix invalidates downloads.
+      - name: Cache ziti binaries
+        uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}/.ziti-acceptance-cache
+          key: ziti-acceptance-${{ runner.os }}-${{ matrix.version }}-${{ hashFiles('acceptance/versions.yaml') }}
+          restore-keys: |
+            ziti-acceptance-${{ runner.os }}-${{ matrix.version }}-
+
+      - name: Run acceptance suite
+        working-directory: acceptance
+        run: go test -tags acceptance -p 1 -timeout 30m ./...
+
+  # Designated V2-coverage job. The V1/V2 tests are runtime-adaptive, so the
+  # compat jobs can validly expect V1 and pass; nothing there guarantees the
+  # suite actually exercises V2 + OIDC. This job runs in required mode: it FAILS
+  # if ConnectV2 router capability or headless OIDC is absent, with no adaptive
+  # downgrade to a V1 pass. It builds ziti main against the SDK under test
+  # (co-development build), so the router's side of the shared xgress package is
+  # the code under test too, and an SDK change that breaks ziti's build fails
+  # here.
+  connect-v2:
+    runs-on: ubuntu-latest
+    env:
+      ZITI_ACCEPTANCE_VERSION: main
+      ZITI_ACCEPTANCE_BUILD_WITH_LOCAL_SDK: "true"
+      # require genuine V2 coverage: no silent fallback to a V1 pass
+      ZITI_ACCEPTANCE_REQUIRE_V2: "true"
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache-dependency-path: acceptance/go.sum
+
+      # No binary cache: the co-development binary is keyed on the SDK commit, so
+      # a saved one would only ever serve a re-run of the same commit.
+      - name: Run V2 coverage (required mode)
+        working-directory: acceptance
+        run: go test -tags acceptance -p 1 -timeout 30m ./...

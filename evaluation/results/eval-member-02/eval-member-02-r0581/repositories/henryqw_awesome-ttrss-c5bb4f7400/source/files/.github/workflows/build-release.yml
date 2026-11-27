@@ -1,0 +1,152 @@
+name: "[builder] CI for releases"
+
+on:
+  repository_dispatch:
+    types: build
+  workflow_dispatch:
+    inputs:
+      ignore-cache:
+        description: 'Force a build without reusing Docker layers'
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "0 0 * * *"
+  push:
+    branches:
+      - main
+      - dev
+    paths:
+      - "src/**"
+      - "Dockerfile"
+      - "docker-entrypoint.sh"
+      - ".github/workflows/build-release.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "Dockerfile"
+      - "docker-entrypoint.sh"
+      - ".github/workflows/build-release.yml"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ttrss
+
+jobs:
+  check:
+    runs-on: ubuntu-slim
+    outputs:
+      cache-hit: ${{ steps.cache.outputs.cache-hit }}
+      upstream-sha: ${{ steps.upstream_sha.outputs.sha }}
+    steps:
+      - name: Fetch upstream tt-rss SHA
+        id: upstream_sha
+        run: |
+          SHA=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/tt-rss/tt-rss/git/refs/heads/main | jq -r '.object.sha')
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+          echo "Upstream SHA: $SHA"
+
+      - name: Cache build check
+        id: cache
+        uses: actions/cache@v6
+        with:
+          path: .build-cache
+          key: ttrss-build-${{ steps.upstream_sha.outputs.sha }}
+          restore-keys: |
+            ttrss-build-
+
+      - name: Cache status
+        run: |
+          if [ "${{ steps.cache.outputs.cache-hit }}" == "true" ]; then
+            echo "✅ Upstream SHA already built; scheduled runs can skip this build"
+          else
+            echo "❌ Cache miss - build will proceed"
+          fi
+
+  build:
+    needs: check
+    if: github.event_name == 'pull_request' || github.event_name == 'push' || needs.check.outputs.cache-hit != 'true' || inputs.ignore-cache
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      attestations: write
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Dockerhub login
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ vars.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Login to Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set tag
+        id: tag
+        uses: docker/metadata-action@v6
+        with:
+          images: |
+            ${{ vars.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}
+            ${{ env.REGISTRY }}/${{ github.repository }}
+          tags: |
+            # latest
+            type=raw,value=latest,enable=${{ github.event_name != 'schedule' && github.ref_name == 'main' }}
+            type=raw,value=latest-{{ date 'YYYY-MM-DD' }},enable=${{ github.event_name != 'schedule' && github.ref_name == 'main' }}
+            # branch
+            type=ref,event=branch,enable=${{ github.event_name != 'schedule' && github.ref_name != 'main' }}
+            type=ref,event=branch,suffix=-{{ date 'YYYY-MM-DD' }},enable=${{ github.event_name != 'schedule' && github.ref_name != 'main' }}
+            # nightly
+            type=raw,value=nightly,enable=${{ (github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch') && github.ref_name == 'main' }}
+            type=raw,value=nightly-{{ date 'YYYY-MM-DD' }},enable=${{ (github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch') && github.ref_name == 'main' }}
+          flavor: latest=false
+
+      - name: Build dockerfile (with push)
+        uses: docker/build-push-action@v7
+        id: push
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.tag.outputs.tags }}
+          labels: ${{ steps.tag.outputs.labels }}
+          platforms: linux/amd64,linux/arm/v7,linux/arm64
+          no-cache: ${{ inputs.ignore-cache || false }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Attest
+        uses: actions/attest@v4
+        if: github.event_name != 'pull_request'
+        with:
+          subject-name: |
+            ${{ vars.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}
+            ${{ env.REGISTRY }}/${{ github.repository }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+
+      - name: Update build cache
+        run: |
+          mkdir -p .build-cache
+          echo "Build completed at $(date)" > .build-cache/last-build
+          echo "Upstream SHA: ${{ needs.check.outputs.upstream-sha }}" >> .build-cache/last-build
+
+      - name: Save build cache
+        if: github.event_name != 'pull_request' && needs.check.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: .build-cache
+          key: ttrss-build-${{ needs.check.outputs.upstream-sha }}
