@@ -1,0 +1,292 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [MEDIUM] 5 jobs clone the repo — consider artifact sharing
+# - [LOW] Explicitly set fail-fast for large matrix job "check-release" (27 combinations)
+# Estimated savings: ~3 min/run
+#
+name: Check Release
+
+on:
+  push:
+    branches:
+    - 'r/[0-9]+.[0-9]+.[0-9]+'
+    - 'r/[0-9]+.[0-9]+.[0-9]+-[0-9a-zA-Z]+'
+
+jobs:
+  check-version:
+    name: check-version
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Get the release version from the branch
+      if: env.VERSION == ''
+      run: |
+        VERSION=${{ github.ref_name }}
+        VERSION=${VERSION##r/}
+        echo "VERSION=$VERSION" >> $GITHUB_ENV
+    - name: Show the version
+      run: |
+        echo "version is: $VERSION"
+    - name: Check that tag version and Cargo.toml version are the same
+      shell: bash
+      run: |
+        if ! grep -q "version = \"$VERSION\"" Cargo.toml; then
+          echo "version does not match Cargo.toml" >&2
+          exit 1
+        fi
+    outputs:
+      version: ${{ env.VERSION }}
+
+  check-release:
+    name: check-release
+    needs: ['check-version']
+    runs-on: ${{ matrix.os }}
+    env:
+      # Emit backtraces on panics.
+      RUST_BACKTRACE: 1
+      SCCACHE_GHA_ENABLED: on
+      RUSTC_WRAPPER: sccache
+    strategy:
+      fail-fast: false
+      matrix:
+        tool: [arx, tar2arx, zip2arx]
+        build: [linux, macos, windows]
+        include:
+        - build: linux
+          os: ubuntu-latest
+        - build: macos
+          os: macos-latest
+        - build: windows
+          os: windows-latest
+
+    steps:
+    - name: Install dependencies
+      if: ${{ matrix.os == 'ubuntu-latest' }}
+      run: |
+        sudo apt-get install -y libfuse-dev
+
+    - name: Install dependencies
+      if: ${{ matrix.os == 'macos-latest'}}
+      run: |
+        brew install macfuse pkgconf
+
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup cache
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/.crates.toml
+          ~/.cargo/.crates2.json
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+        key: ${{ runner.os }}-cargo-stable-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Run sccache-cache
+      uses: mozilla-actions/sccache-action@v0.0.9
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Build release binary
+      shell: bash
+      run: |
+        cargo build --verbose --release -p ${{ matrix.tool }}
+        if [ "${{ matrix.os }}" = "windows-latest" ]; then
+          bin="target/release/${{ matrix.tool }}.exe"
+        else
+          bin="target/release/${{ matrix.tool }}"
+        fi
+        echo "BIN=$bin" >> $GITHUB_ENV
+
+    - name: Strip release binary (macos)
+      if: matrix.os == 'macos-latest'
+      shell: bash
+      run: strip "$BIN"
+
+    - name: Determine archive name
+      shell: bash
+      run: |
+        version="${{ needs.check-version.outputs.version }}"
+        echo "ARCHIVE=${{ matrix.tool }}-$version-${{ matrix.build }}" >> $GITHUB_ENV
+
+    - name: Creating directory for archive
+      shell: bash
+      run: |
+        mkdir -p "$ARCHIVE"/{complete,doc}
+        cp "$BIN" "$ARCHIVE"/
+        cp {README.md,LICENSE-MIT} "$ARCHIVE"/
+        cp Changelog.md "$ARCHIVE"/doc/
+
+    - name: Generate completions
+      shell: bash
+      run: |
+        "$BIN" --version
+        "$BIN" --generate-complete=bash > "$ARCHIVE/complete/${{ matrix.tool }}.bash"
+        "$BIN" --generate-complete=fish > "$ARCHIVE/complete/${{ matrix.tool }}.fish"
+        "$BIN" --generate-complete=powershell > "$ARCHIVE/complete/_${{ matrix.tool }}.ps1"
+        "$BIN" --generate-complete=zsh > "$ARCHIVE/complete/_${{ matrix.tool }}"
+
+    - name: Generate man page
+      shell: bash
+      if: matrix.tool != 'arx'
+      run: |
+        "$BIN" --generate-man-page > "$ARCHIVE/doc/${{ matrix.tool }}.1"
+
+    - name: Generate man page (arx)
+      shell: bash
+      if: matrix.tool == 'arx'
+      run: |
+        "$BIN" --generate-man-page > "$ARCHIVE/doc/${{ matrix.tool }}.1"
+        commands="create list dump extract"
+        if [[ "${{ matrix.build }}" != "windows" ]]; then
+          commands=$commands" mount"
+        fi
+        for command in $commands
+        do
+          "$BIN" --generate-man-page=$command > "$ARCHIVE/doc/${{ matrix.tool }}-$command.1"
+        done
+
+    - name: Build archive (Windows)
+      shell: bash
+      if: matrix.os == 'windows-latest'
+      run: |
+        7z a "$ARCHIVE.zip" "$ARCHIVE"
+        certutil -hashfile "$ARCHIVE.zip" SHA256 > "$ARCHIVE.zip.sha256"
+        echo "ASSET=$ARCHIVE.zip" >> $GITHUB_ENV
+        echo "ASSET_SUM=$ARCHIVE.zip.sha256" >> $GITHUB_ENV
+
+    - name: Build archive (Unix)
+      shell: bash
+      if: matrix.os != 'windows-latest'
+      run: |
+        tar czf "$ARCHIVE.tar.gz" "$ARCHIVE"
+        shasum -a 256 "$ARCHIVE.tar.gz" > "$ARCHIVE.tar.gz.sha256"
+        echo "ASSET=$ARCHIVE.tar.gz" >> $GITHUB_ENV
+        echo "ASSET_SUM=$ARCHIVE.tar.gz.sha256" >> $GITHUB_ENV
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: pre_release-${{ matrix.build }}-${{ matrix.tool }}
+        path: |
+          ${{ env.ASSET }}
+        compression-level: 0
+
+  python:
+    name: Python wrapping
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    env:
+      SCCACHE_GHA_ENABLED: on
+      RUSTC_WRAPPER: sccache
+    steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: Install dependencies
+      if: ${{ matrix.os == 'ubuntu-latest' }}
+      run: |
+        sudo apt-get install -y libfuse-dev
+
+    - name: Install dependencies
+      if: ${{ matrix.os == 'macos-latest'}}
+      run: |
+        brew install macfuse pkgconf
+
+    - name: Setup cache
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/.crates.toml
+          ~/.cargo/.crates2.json
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+        key: ${{ runner.os }}-maturin-stable-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Run sccache-cache
+      uses: mozilla-actions/sccache-action@v0.0.9
+
+    - name: Install Rust 
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Build wheels
+      uses: PyO3/maturin-action@v1
+      with:
+        args: --release --out dist --find-interpreter
+        sccache: 'true'
+        container: off
+        working-directory: python
+
+    - name: Upload wheels
+      uses: actions/upload-artifact@v4
+      with:
+        name: wheels-${{ matrix.os }}
+        path: python/dist
+        compression-level: 0
+
+  python-sdist:
+    name: Python sdist
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Build sdist
+      uses: PyO3/maturin-action@v1
+      with:
+        command: sdist
+        args: --out dist
+        working-directory: python
+    - name: Upload sdist
+      uses: actions/upload-artifact@v4
+      with:
+        name: wheels-sdist
+        path: python/dist
+
+  check-publication:
+    name: Check cargo publication
+    runs-on: ubuntu-latest
+    steps:
+    - name: Install dependencies
+      run: |
+        sudo apt-get install -y libfuse-dev
+
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Test Publish
+      env:
+        CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      run: |
+        cargo publish --dry-run --workspace --exclude python-libarx
+
+  python-check-publication:
+    name: Check pypi publication
+    runs-on: ubuntu-latest
+    needs: [python, python-sdist]
+    permissions:
+      id-token: write
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        pattern: wheels-*
+    - name: Publish to PyPI
+      uses: PyO3/maturin-action@v1
+      with:
+        command: upload
+        args: --non-interactive --repository=testpypi --skip-existing wheels-*/*

@@ -1,0 +1,401 @@
+name: Azure Deployment
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: azure-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AZURE_ACR_NAME: ${{ vars.AZURE_ACR_NAME }}
+  AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+  AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
+  AZURE_CONTAINER_ENV: ${{ vars.AZURE_CONTAINER_ENV }}
+  AZURE_BLOB_STORAGE_ACCOUNT_NAME: ${{ vars.AZURE_BLOB_STORAGE_ACCOUNT_NAME }}
+  AZURE_BLOB_STORAGE_CONTAINER_NAME: ${{ vars.AZURE_BLOB_STORAGE_CONTAINER_NAME }}
+  ENVIRONMENT: ${{ vars.ENVIRONMENT }}
+  BASIC_AUTH_USERNAME: ${{ vars.BASIC_AUTH_USERNAME }}
+  PUBLIC_API_KEY: ${{ secrets.PUBLIC_API_KEY }}
+  ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+  BASIC_AUTH_PASSWORD: ${{ secrets.BASIC_AUTH_PASSWORD }}
+  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+  REVALIDATE_SECRET: ${{ secrets.REVALIDATE_SECRET }}
+
+jobs:
+  deploy:
+    if: github.repository == 'digitaldemocracy2030/kouchou-ai'
+    runs-on: ubuntu-latest
+    environment: production
+    # OIDC (federated credential) ログインに id-token の発行権限が必要。
+    # checkout に contents:read のみ使い、他スコープは付与しない。
+    permissions:
+      id-token: write
+      contents: read
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure CLI ログイン
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Docker ログイン (ACR)
+        run: |
+          set -euo pipefail
+          az acr login --name ${{ env.AZURE_ACR_NAME }}
+
+      - name: Python環境のセットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Python依存関係のインストール
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests python-dotenv
+          pip install -r apps/api/requirements.lock
+
+      - name: 環境変数ファイルの準備
+        run: |
+          # .env.azureファイルの作成（Makefileで使用）
+          cat > .env.azure << EOF
+          AZURE_RESOURCE_GROUP=${{ env.AZURE_RESOURCE_GROUP }}
+          AZURE_LOCATION=${{ env.AZURE_LOCATION }}
+          AZURE_ACR_NAME=${{ env.AZURE_ACR_NAME }}
+          AZURE_CONTAINER_ENV=${{ env.AZURE_CONTAINER_ENV }}
+          AZURE_BLOB_STORAGE_ACCOUNT_NAME=${{ env.AZURE_BLOB_STORAGE_ACCOUNT_NAME }}
+          AZURE_BLOB_STORAGE_CONTAINER_NAME=${{ env.AZURE_BLOB_STORAGE_CONTAINER_NAME }}
+          EOF
+
+      - name: ドメイン情報の準備
+        run: |
+          # ドメイン情報を直接環境変数に設定
+          echo "API_DOMAIN=$(az containerapp show --name api \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --query properties.configuration.ingress.fqdn -o tsv)" >> $GITHUB_ENV
+          echo "PUBLIC_VIEWER_DOMAIN=$(az containerapp show --name public-viewer \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --query properties.configuration.ingress.fqdn -o tsv)" >> $GITHUB_ENV
+          echo "ADMIN_DOMAIN=$(az containerapp show --name admin \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --query properties.configuration.ingress.fqdn -o tsv)" >> $GITHUB_ENV
+          echo "STATIC_SITE_BUILDER_DOMAIN=$(az containerapp show --name static-site-builder \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --query properties.configuration.ingress.fqdn -o tsv)" >> $GITHUB_ENV
+
+      - name: Blob Storage health check
+        run: |
+          cd apps/api
+          python scripts/test_storage.py
+
+      - name: Azure環境のデプロイ
+        run: |
+          set -euo pipefail
+          # ルートコンテキスト化に伴い .env.azure を一時退避
+          ENV_AZURE_TMP="${RUNNER_TEMP}/.env.azure"
+          if [ -f .env.azure ]; then
+            mv .env.azure "$ENV_AZURE_TMP"
+          fi
+
+          # 全イメージを並列ビルド
+          build_pids=()
+          docker build --platform linux/amd64 \
+            -f ./apps/api/Dockerfile \
+            -t ${AZURE_ACR_NAME}.azurecr.io/api:latest \
+            . & build_pids+=("$!")
+          docker build --platform linux/amd64 \
+            -f ./apps/public-viewer/Dockerfile \
+            --build-arg NEXT_PUBLIC_API_BASEPATH="https://${API_DOMAIN}" \
+            --build-arg NEXT_PUBLIC_PUBLIC_API_KEY="${PUBLIC_API_KEY}" \
+            --build-arg API_BASEPATH="https://${API_DOMAIN}" \
+            -t ${AZURE_ACR_NAME}.azurecr.io/public-viewer:latest \
+            . & build_pids+=("$!")
+          docker build --platform linux/amd64 \
+            -f ./apps/admin/Dockerfile \
+            --build-arg NEXT_PUBLIC_CLIENT_BASEPATH="https://${PUBLIC_VIEWER_DOMAIN}" \
+            --build-arg NEXT_PUBLIC_ADMIN_API_KEY="${ADMIN_API_KEY}" \
+            --build-arg NEXT_PUBLIC_API_BASEPATH="https://${API_DOMAIN}" \
+            --build-arg CLIENT_STATIC_BUILD_BASEPATH="https://${STATIC_SITE_BUILDER_DOMAIN}" \
+            --build-arg API_BASEPATH="https://${API_DOMAIN}" \
+            -t ${AZURE_ACR_NAME}.azurecr.io/admin:latest \
+            . & build_pids+=("$!")
+          docker build --platform linux/amd64 \
+            --build-arg NEXT_PUBLIC_API_BASEPATH="https://${API_DOMAIN}" \
+            --build-arg NEXT_PUBLIC_PUBLIC_API_KEY="${PUBLIC_API_KEY}" \
+            --build-arg API_BASEPATH="https://${API_DOMAIN}" \
+            -f ./apps/static-site-builder/Dockerfile \
+            -t ${AZURE_ACR_NAME}.azurecr.io/static-site-builder:latest \
+            . & build_pids+=("$!")
+
+          # 全ビルドの完了を待機 (失敗を確実に検知)
+          for pid in "${build_pids[@]}"; do
+            wait "$pid"
+          done
+
+          # イメージを並列プッシュ
+          push_pids=()
+          docker push ${AZURE_ACR_NAME}.azurecr.io/api:latest & push_pids+=("$!")
+          docker push ${AZURE_ACR_NAME}.azurecr.io/public-viewer:latest & push_pids+=("$!")
+          docker push ${AZURE_ACR_NAME}.azurecr.io/admin:latest & push_pids+=("$!")
+          docker push ${AZURE_ACR_NAME}.azurecr.io/static-site-builder:latest & push_pids+=("$!")
+
+          # 全プッシュの完了を待機 (失敗を確実に検知)
+          for pid in "${push_pids[@]}"; do
+            wait "$pid"
+          done
+
+          # make 用に .env.azure を復元
+          if [ -f "$ENV_AZURE_TMP" ]; then
+            mv "$ENV_AZURE_TMP" .env.azure
+          fi
+
+          # ヘルスプローブとポリシーの適用
+          make azure-apply-policies || echo "ポリシー適用をスキップ"
+
+      - name: 全コンテナのシークレット登録
+        run: |
+          # APIコンテナのシークレット登録
+          az containerapp secret set \
+            --name api --resource-group ${AZURE_RESOURCE_GROUP} \
+            --secrets \
+              openai-api-key=${OPENAI_API_KEY} \
+              public-api-key=${PUBLIC_API_KEY} \
+              admin-api-key=${ADMIN_API_KEY} \
+              revalidate-secret=${REVALIDATE_SECRET} \
+              azure-blob-storage-account-name=${AZURE_BLOB_STORAGE_ACCOUNT_NAME} \
+              azure-blob-storage-container-name=${AZURE_BLOB_STORAGE_CONTAINER_NAME}
+
+          # Public-viewerコンテナのシークレット登録
+          az containerapp secret set \
+            --name public-viewer --resource-group ${AZURE_RESOURCE_GROUP} \
+            --secrets \
+              public-api-key=${PUBLIC_API_KEY} \
+              revalidate-secret=${REVALIDATE_SECRET}
+
+          # Adminコンテナのシークレット登録
+          az containerapp secret set \
+            --name admin --resource-group ${AZURE_RESOURCE_GROUP} \
+            --secrets \
+              admin-api-key=${ADMIN_API_KEY} \
+              basic-auth-username=${BASIC_AUTH_USERNAME} \
+              basic-auth-password=${BASIC_AUTH_PASSWORD}
+
+          # Static-site-builderコンテナのシークレット登録
+          az containerapp secret set \
+            --name static-site-builder --resource-group ${AZURE_RESOURCE_GROUP} \
+            --secrets \
+              public-api-key=${PUBLIC_API_KEY}
+
+      - name: コンテナ更新（イメージと環境変数を同時設定）
+        run: |
+          set -euo pipefail
+          # 全コンテナのイメージと環境変数を同時に更新
+          update_pids=()
+
+          # APIコンテナの更新（イメージ + 環境変数）
+          az containerapp update --name api --resource-group ${AZURE_RESOURCE_GROUP} \
+            --image ${AZURE_ACR_NAME}.azurecr.io/api:latest \
+            --set-env-vars \
+              "OPENAI_API_KEY=secretref:openai-api-key" \
+              "PUBLIC_API_KEY=secretref:public-api-key" \
+              "ADMIN_API_KEY=secretref:admin-api-key" \
+              "LOG_LEVEL=info" \
+              "AZURE_BLOB_STORAGE_ACCOUNT_NAME=secretref:azure-blob-storage-account-name" \
+              "AZURE_BLOB_STORAGE_CONTAINER_NAME=secretref:azure-blob-storage-container-name" \
+              "STORAGE_TYPE=azure_blob" \
+              "REVALIDATE_URL=https://${PUBLIC_VIEWER_DOMAIN}/api/revalidate" \
+              "REVALIDATE_SECRET=secretref:revalidate-secret" \
+              "ENVIRONMENT=${ENVIRONMENT}" & update_pids+=("$!")
+
+          # Public-viewerコンテナの更新（イメージ + 環境変数）
+          az containerapp update --name public-viewer --resource-group ${AZURE_RESOURCE_GROUP} \
+            --image ${AZURE_ACR_NAME}.azurecr.io/public-viewer:latest \
+            --set-env-vars \
+              "NEXT_PUBLIC_API_BASEPATH=https://${API_DOMAIN}" \
+              "API_BASEPATH=https://${API_DOMAIN}" \
+              "NEXT_PUBLIC_PUBLIC_API_KEY=secretref:public-api-key" \
+              "REVALIDATE_SECRET=secretref:revalidate-secret" & update_pids+=("$!")
+
+          # Adminコンテナの更新（イメージ + 環境変数）
+          az containerapp update --name admin --resource-group ${AZURE_RESOURCE_GROUP} \
+            --image ${AZURE_ACR_NAME}.azurecr.io/admin:latest \
+            --set-env-vars \
+              "NEXT_PUBLIC_API_BASEPATH=https://${API_DOMAIN}" \
+              "API_BASEPATH=https://${API_DOMAIN}" \
+              "NEXT_PUBLIC_ADMIN_API_KEY=secretref:admin-api-key" \
+              "ADMIN_API_KEY=secretref:admin-api-key" \
+              "CLIENT_STATIC_BUILD_BASEPATH=https://${STATIC_SITE_BUILDER_DOMAIN}" \
+              "BASIC_AUTH_USERNAME=secretref:basic-auth-username" \
+              "BASIC_AUTH_PASSWORD=secretref:basic-auth-password" & update_pids+=("$!")
+
+          # Static-site-builderコンテナの更新（イメージ + 環境変数）
+          az containerapp update --name static-site-builder --resource-group ${AZURE_RESOURCE_GROUP} \
+            --image ${AZURE_ACR_NAME}.azurecr.io/static-site-builder:latest \
+            --set-env-vars \
+              "NEXT_PUBLIC_API_BASEPATH=https://${API_DOMAIN}" \
+              "NEXT_PUBLIC_PUBLIC_API_KEY=secretref:public-api-key" & update_pids+=("$!")
+
+          # 全更新の完了を待機
+          for pid in "${update_pids[@]}"; do
+            wait "$pid"
+          done
+
+      - name: デプロイ確認
+        run: |
+          set -euo pipefail
+
+          if [ -z "$API_DOMAIN" ]; then
+            echo "❌ APIドメインが取得できませんでした"
+            exit 1
+          fi
+          if [ -z "$PUBLIC_VIEWER_DOMAIN" ]; then
+            echo "❌ Public-viewerドメインが取得できませんでした"
+            exit 1
+          fi
+
+          REVISION_READY_TIMEOUT_SECONDS=600
+          REVISION_READY_INTERVAL_SECONDS=20
+          SMOKE_RETRY_COUNT=12
+          SMOKE_RETRY_INTERVAL=10
+
+          print_revision_status() {
+            local app="$1"
+            echo "${app} revision status:"
+            az containerapp revision list --name "$app" --resource-group "${AZURE_RESOURCE_GROUP}" \
+              --query "sort_by(@,&properties.createdTime)[-5:].{name:name,created:properties.createdTime,active:properties.active,health:properties.healthState,running:properties.runningState,details:properties.runningStateDetails,trafficWeight:properties.trafficWeight,replicas:properties.replicas}" \
+              -o table || true
+          }
+
+          print_recent_logs() {
+            local app="$1"
+            echo "${app} recent logs:"
+            az containerapp logs show --name "$app" --resource-group "${AZURE_RESOURCE_GROUP}" \
+              --tail 80 || true
+          }
+
+          wait_for_latest_revisions() {
+            local apps=("$@")
+            local deadline=$((SECONDS + REVISION_READY_TIMEOUT_SECONDS))
+
+            while [ "$SECONDS" -lt "$deadline" ]; do
+              local all_ready=1
+
+              for app in "${apps[@]}"; do
+                local state latest ready provisioning
+                state="$(az containerapp show --name "$app" --resource-group "${AZURE_RESOURCE_GROUP}" \
+                  --query "[properties.latestRevisionName, properties.latestReadyRevisionName, properties.provisioningState]" \
+                  -o tsv)"
+                latest="$(printf '%s\n' "$state" | sed -n '1p')"
+                ready="$(printf '%s\n' "$state" | sed -n '2p')"
+                provisioning="$(printf '%s\n' "$state" | sed -n '3p')"
+
+                echo "${app}: latest=${latest:-<none>} ready=${ready:-<none>} provisioning=${provisioning:-<none>}"
+
+                if [ -z "$latest" ] || [ "$latest" != "$ready" ]; then
+                  all_ready=0
+                fi
+              done
+
+              if [ "$all_ready" -eq 1 ]; then
+                echo "✅ 全コンテナの latest revision が Ready になりました"
+                return 0
+              fi
+
+              sleep "$REVISION_READY_INTERVAL_SECONDS"
+            done
+
+            echo "❌ latest revision が Ready になる前に timeout しました"
+            for app in "${apps[@]}"; do
+              print_revision_status "$app"
+              print_recent_logs "$app"
+            done
+            exit 1
+          }
+
+          wait_for_latest_revisions api public-viewer admin static-site-builder
+
+          for i in $(seq 1 $SMOKE_RETRY_COUNT); do
+            echo "Smoke check 試行 $i/$SMOKE_RETRY_COUNT..."
+            api_code="$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "https://$API_DOMAIN/" || true)"
+            viewer_code="$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "https://$PUBLIC_VIEWER_DOMAIN/" || true)"
+            api_code="${api_code:-000}"
+            viewer_code="${viewer_code:-000}"
+            echo "  API=$api_code viewer=$viewer_code"
+
+            if [ "$api_code" -ge 200 ] && [ "$api_code" -lt 400 ] && [ "$viewer_code" -ge 200 ] && [ "$viewer_code" -lt 400 ]; then
+              echo "✅ Root smoke check 成功"
+              break
+            fi
+
+            if [ "$i" -eq "$SMOKE_RETRY_COUNT" ]; then
+              echo "❌ Root smoke check 失敗"
+              for app in api public-viewer; do
+                print_revision_status "$app"
+                print_recent_logs "$app"
+              done
+              exit 1
+            fi
+
+            sleep "$SMOKE_RETRY_INTERVAL"
+          done
+
+          python - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          api_domain = os.environ["API_DOMAIN"]
+          viewer_domain = os.environ["PUBLIC_VIEWER_DOMAIN"]
+          public_api_key = os.environ["PUBLIC_API_KEY"]
+
+          request = urllib.request.Request(
+              f"https://{api_domain}/reports",
+              headers={"x-api-key": public_api_key, "Content-Type": "application/json"},
+          )
+
+          with urllib.request.urlopen(request, timeout=15) as response:
+              if response.status < 200 or response.status >= 400:
+                  raise RuntimeError(f"reports API returned {response.status}")
+              reports = json.load(response)
+
+          report = next(
+              (
+                  item
+                  for item in reports
+                  if item.get("slug")
+                  and item.get("status") == "ready"
+                  and item.get("visibility", "public") == "public"
+              ),
+              None,
+          )
+          if report is None:
+              raise RuntimeError("representative public ready report was not found")
+
+          report_url = f"https://{viewer_domain}/{report['slug']}/"
+          try:
+              with urllib.request.urlopen(report_url, timeout=15) as response:
+                  body = response.read().decode("utf-8", errors="replace")
+                  status = response.status
+          except urllib.error.HTTPError as error:
+              status = error.code
+              body = error.read().decode("utf-8", errors="replace")
+
+          if status < 200 or status >= 400:
+              raise RuntimeError(f"representative report returned {status}")
+          if any(marker in body for marker in ("API接続エラー", "Internal Server Error", "no-webgl")):
+              raise RuntimeError("representative report rendered an error marker")
+
+          print("✅ Representative report smoke check 成功")
+          PY
+
+          echo "✅ デプロイ成功: https://$API_DOMAIN"
+          echo "✅ デプロイ成功: https://$PUBLIC_VIEWER_DOMAIN"

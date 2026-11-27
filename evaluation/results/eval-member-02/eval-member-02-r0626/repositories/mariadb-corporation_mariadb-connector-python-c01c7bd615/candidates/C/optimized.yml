@@ -1,0 +1,235 @@
+name: Release Packages
+
+# CONPY-317: build the release artifacts here instead of by hand.
+#
+# 1.1 ships a single distribution, 'mariadb', and it is the C extension: the
+# sdist and every binary wheel carry that same name. (2.0 splits the connector
+# into mariadb / mariadb-c / mariadb-pool / mariadb-binary and its workflow has
+# one build job per distribution; there is nothing to split here.)
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      connector_c_version:
+        description: 'MariaDB Connector/C version to build against'
+        required: false
+        default: '3.4.11'
+        type: string
+      publish_to:
+        description: 'Publish to'
+        required: true
+        default: 'testpypi'
+        type: choice
+        options:
+          - testpypi
+          - pypi
+          - none
+
+env:
+  MARIADB_CONNECTOR_C_VERSION: ${{ github.event.inputs.connector_c_version || '3.4.11' }}
+  MYSQL_TEST_HOST: mariadb.example.com
+  MYSQL_TEST_PORT: 3306
+  MYSQL_TEST_USER: root
+  MYSQL_TEST_PASSWD: "heyPassw-!*20oRd"
+  MYSQL_TEST_DB: testp
+
+jobs:
+  # Source distribution
+  build-sdist:
+    name: Build mariadb (sdist)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      # setup.py reads the Connector/C configuration through mariadb_config at
+      # import time, so the development files are needed even to pack an sdist.
+      - name: Install MariaDB Connector/C development files
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libmariadb-dev
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install build setuptools wheel packaging
+
+      - name: Build sdist
+        run: |
+          python -m build --sdist --outdir dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: mariadb-sdist
+          path: dist/
+
+  # Binary wheels - Windows
+  build-wheels-windows:
+    name: Build mariadb wheel (Windows ${{ matrix.arch }} ${{ matrix.pyver }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [win_amd64, win32]
+        pyver: [cp311, cp312, cp313, cp314, cp315]
+        # These entries only add keys to the combinations above: the
+        # cibuildwheel architecture and the cmake generator platform.
+        include:
+          - arch: win_amd64
+            cibw_arch: AMD64
+            cmake_arch: x64
+          - arch: win32
+            cibw_arch: x86
+            cmake_arch: Win32
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Add hosts entry
+        shell: bash
+        run: echo "127.0.0.1 mariadb.example.com" >> /c/Windows/System32/drivers/etc/hosts
+
+      - name: Setup MariaDB Server
+        id: setup-mariadb-windows
+        uses: rusher/action-setup-mariadb@master
+        with:
+          tag: '11.4'
+          root-password: ${{ env.MYSQL_TEST_PASSWD }}
+          user: ${{ env.MYSQL_TEST_USER }}
+          password: ${{ env.MYSQL_TEST_PASSWD }}
+          database: ${{ env.MYSQL_TEST_DB }}
+
+      - name: Cache MariaDB Connector/C build
+        uses: actions/cache@v6
+        with:
+          path: C:\mariadb-connector-c.build
+          key: mariadb-connector-c-${{ env.MARIADB_CONNECTOR_C_VERSION }}-windows-${{ matrix.cmake_arch }}
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v4.3.0
+        env:
+          TEST_DB_USER: 'root'
+          TEST_DB_HOST: ${{ env.MYSQL_TEST_HOST }}
+          TEST_DB_DATABASE: ${{ env.MYSQL_TEST_DB }}
+          TEST_DB_PORT: ${{ env.MYSQL_TEST_PORT }}
+          TEST_DB_PASSWORD: ${{ env.MYSQL_TEST_PASSWD }}
+          CIBW_BUILD: ${{matrix.pyver}}-${{matrix.arch}}
+          CIBW_ARCHS_WINDOWS: ${{ matrix.cibw_arch }}
+          # Read by build_connector_c_windows.bat, which cibuildwheel runs
+          # directly on the runner, so the job environment is visible to it.
+          CMAKE_ARCH: ${{ matrix.cmake_arch }}
+          CIBW_BEFORE_ALL_WINDOWS: >-
+            cmd /c "{project}\tools\ci\build_connector_c_windows.bat"
+          CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: >-
+            delvewheel repair -w {dest_dir} {wheel}
+          CIBW_TEST_REQUIRES: pytest
+          # -o addopts= : pyproject sets addopts "-ra -q --tb=short", whose -q
+          # cancels the -v below, so a crash is reported as an anonymous dot.
+          # -s : pytest captures stderr at the file-descriptor level, so an
+          # abort's message would otherwise die in the capture buffer.
+          CIBW_TEST_COMMAND: >-
+            pytest {project}/testing/test/integration --color yes -v -s -o addopts=
+          CIBW_ENVIRONMENT_PASS_WINDOWS: TEST_DB_USER TEST_DB_HOST TEST_DB_DATABASE TEST_DB_PORT TEST_DB_PASSWORD MARIADB_CC_INSTALL_DIR MARIADB_CONNECTOR_C_VERSION
+          CIBW_ENVIRONMENT_WINDOWS: >-
+            PYTHONFAULTHANDLER=1
+            LOCAL_DB=${{ steps.setup-mariadb-windows.outputs.database-type }}
+            MARIADB_CC_INSTALL_DIR=C:\\mariadb-connector-c.build
+            PATH="C:\\mariadb-connector-c.build\\bin;$PATH"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-${{matrix.pyver}}-${{matrix.arch}}
+          path: ./wheelhouse/*.whl
+
+  # Merge every wheel into one artifact
+  merge-wheels:
+    name: Merge mariadb wheels
+    runs-on: ubuntu-latest
+    needs: [build-wheels-windows]
+
+    steps:
+      - name: Merge artifacts
+        uses: actions/upload-artifact/merge@v7
+        with:
+          name: mariadb-wheels
+          pattern: "windows-*"
+          delete-merged: true
+
+  # Publish to TestPyPI (release candidate or manual trigger)
+  publish-testpypi:
+    name: Publish mariadb to TestPyPI
+    runs-on: ubuntu-latest
+    needs: [build-sdist, merge-wheels]
+    if: |
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_to == 'testpypi') ||
+      (github.event_name == 'release' && contains(github.event.release.tag_name, 'rc'))
+    environment: testpypi
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: mariadb-*
+          merge-multiple: true
+          path: dist/
+
+      - name: Publish mariadb to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist/
+          skip-existing: true
+          verbose: true
+
+  # Publish to PyPI (release only or manual trigger)
+  publish-pypi:
+    name: Publish mariadb to PyPI
+    runs-on: ubuntu-latest
+    needs: [build-sdist, merge-wheels]
+    if: |
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_to == 'pypi') ||
+      (github.event_name == 'release' && !contains(github.event.release.tag_name, 'rc'))
+    environment: pypi
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: mariadb-*
+          merge-multiple: true
+          path: dist/
+
+      - name: Publish mariadb to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          skip-existing: true
+          verbose: true

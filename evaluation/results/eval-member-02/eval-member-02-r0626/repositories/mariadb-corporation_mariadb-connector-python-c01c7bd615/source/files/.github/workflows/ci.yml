@@ -1,0 +1,273 @@
+---
+name: Run CI Tests
+
+on:
+  push:
+    branches: ['1.1*', '1.0', 'sqlalchemy']
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Run weekly on Sundays at 2 AM UTC
+    - cron: '0 2 * * 0'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  MYSQL_TEST_HOST: mariadb.example.com
+  MYSQL_TEST_PORT: 3306
+  MYSQL_TEST_USER: root
+  MYSQL_TEST_PASSWD: "heyPassw-!*20oRd"
+  MYSQL_TEST_DB: testp
+
+jobs:
+
+  setup:
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name != 'schedule' ||
+      github.ref == 'refs/heads/1.1' ||
+      github.ref == 'refs/heads/1.0' ||
+      github.ref == 'refs/heads/2.0'
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.final-matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: set-matrix
+        name: build matrix
+        uses: mariadb-corporation/connector-ci-build-matrix@main
+        with:
+          additional-matrix: '[{"name": "MariaDB 11.4", "os": "ubuntu-latest", "db-type": "community", "db-tag": "11.4", "python": "3.11"},{"name": "MariaDB 11.4", "os": "ubuntu-latest", "db-type": "community", "db-tag": "11.4", "python": "3.12"},{"name": "MariaDB 11.4", "os": "ubuntu-latest", "db-type": "community", "db-tag": "11.4", "python": "3.13"}, {"name": "MariaDB 11.4", "os": "windows-latest", "db-type": "community", "db-tag": "11.4", "python": "3.14"}, {"name": "MariaDB 11.4", "os": "ubuntu-latest", "db-type": "community", "db-tag": "11.4", "python": "pypy3.11", "continue-on-error": true},{"name": "MariaDB 11.4", "os": "ubuntu-latest", "db-type": "community", "db-tag": "11.4", "python": "3.15"}]'
+
+  bandit:
+    name: Security lint (bandit)
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name != 'schedule' ||
+      github.ref == 'refs/heads/1.1' ||
+      github.ref == 'refs/heads/1.0' ||
+      github.ref == 'refs/heads/2.0'
+    permissions:
+      contents: read
+      # Required to upload the SARIF report to the code-scanning API.
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install bandit
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install 'bandit[toml,sarif]'
+
+      - name: Run bandit (SARIF, all severities)
+        # Report every finding at every severity and confidence level.
+        # --exit-zero keeps this step green; findings are surfaced as
+        # code-scanning alerts (uploaded below).
+        run: |
+          bandit -c pyproject.toml -r mariadb \
+            --severity-level all --confidence-level all \
+            -f sarif -o bandit-results.sarif --exit-zero
+
+      - name: Upload bandit SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: ${{ !cancelled() }}
+        with:
+          sarif_file: bandit-results.sarif
+          category: bandit
+
+      - name: Fail on any finding (all severities)
+        # The 1.1 baseline is clean (auth/protocol crypto is in the C
+        # extension, not Python), so any new finding at any severity fails
+        # the build. The SARIF above still records everything in the
+        # Security tab.
+        run: |
+          bandit -c pyproject.toml -r mariadb \
+            --severity-level all --confidence-level all
+
+  ci:
+    name: ${{ matrix.name }} ${{ matrix.python != '' && format(' - python {0}', matrix.python) || '' }}
+    needs: setup
+    timeout-minutes: 50
+    strategy:
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.continue-on-error || false }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Test Environment
+        id: setup-env
+        uses: mariadb-corporation/connector-ci-setup@master
+        with:
+          node-version: ${{ matrix.node }}
+          db-type: ${{ matrix.db-type }}
+          db-tag: ${{ matrix.db-tag }}
+          test-db-password: ${{ env.MYSQL_TEST_PASSWD }}
+          test-db-database: ${{ env.MYSQL_TEST_DB }}
+          test-db-port: ${{ env.MYSQL_TEST_PORT }}
+          additional-conf: ${{ matrix.additional-conf || '' }}
+          registry-user: ${{ matrix.db-type == 'enterprise' && secrets.ENTERPRISE_USER || (secrets.DOCKER_TOKEN != '' && secrets.DOCKER_LOGIN || '') }}
+          registry-password: ${{ matrix.db-type == 'enterprise' && secrets.ENTERPRISE_TOKEN || secrets.DOCKER_TOKEN }}
+          os: ${{ matrix.os }}
+          maxscale-license-key: ${{ secrets.MAXSCALE_LICENSE_KEY }}
+          init-script-folder: ${{ format('{0}/.github/workflows/init', github.workspace) }}
+
+      - uses: actions/setup-python@v7
+        id: setup-python
+        with:
+          python-version: ${{ matrix.python || '3.13' }}
+          allow-prereleases: true
+
+      - name: Clone C/C
+        uses: GuillaumeFalourd/clone-github-repo-action@v2.3
+        with:
+          branch: '3.4'
+          owner: 'mariadb-corporation'
+          repository: 'mariadb-connector-c'
+
+      - name: c/c make ubuntu
+        if: ${{ startsWith(matrix.os, 'ubuntu') }}
+        run: |
+          cd ${{ github.workspace }}/mariadb-connector-c
+          cmake . -DCMAKE_BUILD_TYPE=Release -DWITH_EXTERNAL_ZLIB=On -DCMAKE_INSTALL_PREFIX=/usr
+          make -j4
+          sudo make install
+          echo "MARIADB_PLUGIN_DIR=`mariadb_config --plugindir`" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/mariadb" >> $GITHUB_ENV
+
+      - name: c/c make macos
+        if: ${{ startsWith(matrix.os, 'mac') }}
+        run: |
+          cd ${{ github.workspace }}/mariadb-connector-c
+          cmake . -DCMAKE_BUILD_TYPE=Release -DWITH_EXTERNAL_ZLIB=On
+          make -j4
+          sudo make install
+          ls -lrt /usr/local/lib/mariadb/plugin
+          echo "MARIADB_PLUGIN_DIR=`mariadb_config --plugindir`" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/mariadb" >> $GITHUB_ENV
+          echo "DYLD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib/mariadb:$DYLD_LIBRARY_PATH" >> $GITHUB_ENV
+          echo "DYLD_FALLBACK_LIBRARY_PATH=/usr/local/lib:/usr/local/lib/mariadb" >> $GITHUB_ENV
+
+      - name: c/c make windows
+        if: ${{ startsWith(matrix.os, 'windows') }}
+        shell: powershell
+        run: |
+          cd ${{ github.workspace }}/mariadb-connector-c
+          $MARIADB_CC_INSTALL_DIR = "$env:USERPROFILE/conc"
+          cmake . -DCMAKE_BUILD_TYPE=RelWithDebInfo -DWITH_CURL=ON -DCMAKE_INSTALL_PREFIX="$MARIADB_CC_INSTALL_DIR"
+          cmake --build . --config RelWithDebInfo
+          cmake --install . --config RelWithDebInfo
+          echo "MARIADB_CC_INSTALL_DIR=$MARIADB_CC_INSTALL_DIR" >> $env:GITHUB_ENV
+          echo "MARIADB_PLUGIN_DIR=$MARIADB_CC_INSTALL_DIR/lib/mariadb/plugin" >> $env:GITHUB_ENV
+
+      - name: Enable core dumps (Linux)
+        if: ${{ startsWith(matrix.os, 'ubuntu') }}
+        shell: bash
+        run: |
+          # Persistent kernel setting (carries across step shells)
+          sudo sysctl -w kernel.core_pattern="$GITHUB_WORKSPACE/core.%e.%p"
+          echo "Core pattern: $(cat /proc/sys/kernel/core_pattern)"
+          # gdb / python3-dbg are intentionally NOT installed here. They are only
+          # needed to read a core dump, which only exists when a test crashes.
+          # The "Analyze core dumps" step installs them on demand, so the ~85 MB
+          # apt download stays off the common (no-crash) path.
+
+      - name: Run SQLAlchemy tests
+        # On 1.1 the C extension IS the package: `pip install .` builds it and it
+        # is the only implementation, so there is no MARIADB_PYTHON_CONNECTOR
+        # selector to set (unlike 2.0) and there is no async connector to test.
+        # Gated to CPython 3.13 to keep 1.1's pre-existing convention; the
+        # mariadb+ dialect is MariaDB-only, hence the db-type guard.
+        if: ${{ startsWith(matrix.python, '3.13') && matrix.db-type != 'mysql' }}
+        shell: bash
+        run: |
+          # ulimit is per-shell; must be set in every step that should dump.
+          ulimit -c unlimited
+          git clone https://github.com/sqlalchemy/sqlalchemy.git
+          cd sqlalchemy
+          SQLA_TAG=$(git tag -l 'rel_2_0_*' --sort=-version:refname | head -1)
+          echo "Pinning SQLAlchemy to $SQLA_TAG"
+          git checkout "$SQLA_TAG"
+          python --version
+          cd "$GITHUB_WORKSPACE"
+          # Apply patches to SQLAlchemy for MariaDB Enterprise / MariaDB 12.3 compatibility
+          bash .github/scripts/apply-sqlalchemy-patches.sh "$GITHUB_WORKSPACE/sqlalchemy"
+          python -m pip install .
+          python -m pip install pytest typing_extensions
+          cd "$GITHUB_WORKSPACE/sqlalchemy"
+          python -m pip install -e .
+          # URL-encode password to handle special characters
+          ENCODED_PASSWORD=$(python -c "import urllib.parse; print(urllib.parse.quote('$TEST_DB_PASSWORD', safe=''))")
+          # SQLAlchemy doesn't test TLS; disable it (the dialect coerces ssl=false to a bool).
+          DBURI="mariadb+mariadbconnector://$TEST_DB_USER:${ENCODED_PASSWORD}@$TEST_DB_HOST:$TEST_DB_PORT/$TEST_DB?ssl=false"
+          echo "Testing with dburi: mariadb+mariadbconnector://$TEST_DB_USER:****@$TEST_DB_HOST:$TEST_DB_PORT/$TEST_DB?ssl=false"
+          # Skip problematic tests
+          # test/aaa_profiling/: SQLAlchemy's heap-growth tests run each case in a
+          # forked subprocess that shares the parent's DB socket — no DBAPI in
+          # the Python ecosystem (pymysql/mysqlclient/mysql-connector-python)
+          # supports this pattern.  These tests profile SQLAlchemy itself, not
+          # the connector, so they don't belong in connector CI.
+          # This step only ever runs on ubuntu (the only 3.13 matrix entry), so
+          # 2.0's extra windows/macos reflection exclusions are not needed here.
+          python -m pytest -xvs --dburi="$DBURI" --backend-only --ignore=test/aaa_profiling -k "not VersioningTest"
+        env:
+          TEST_DB_USER: ${{ env.MYSQL_TEST_USER }}
+          TEST_DB_HOST: ${{ env.MYSQL_TEST_HOST }}
+          TEST_DB_DATABASE: ${{ env.MYSQL_TEST_DB }}
+          TEST_DB_PORT: ${{ env.MYSQL_TEST_PORT }}
+          TEST_DB_PASSWORD: ${{ env.MYSQL_TEST_PASSWD }}
+          TEST_DB: ${{ env.MYSQL_TEST_DB }}
+
+      - name: Run test suite
+        shell: bash
+        run: |
+          ulimit -c unlimited 2>/dev/null || true
+          python --version
+          python -m pip install .
+          cd testing
+          python -m unittest discover -v
+        env:
+          TEST_DB_USER: ${{ env.MYSQL_TEST_USER }}
+          TEST_DB_HOST: ${{ env.MYSQL_TEST_HOST }}
+          TEST_DB_DATABASE: ${{ env.MYSQL_TEST_DB }}
+          TEST_DB_PORT: ${{ env.MYSQL_TEST_PORT }}
+          TEST_DB_PASSWORD: ${{ env.MYSQL_TEST_PASSWD }}
+          LOCAL_DB: ${{ steps.setup-env.outputs.database-type }}
+          PYTHON_VERSION: ${{ steps.setup-python.outputs.python-version }}
+
+      - name: Analyze core dumps (Linux)
+        if: ${{ always() && startsWith(matrix.os, 'ubuntu') }}
+        shell: bash
+        run: |
+          echo "=== Searching for core dumps ==="
+          # -type f so we don't pick up the sqlalchemy/doc/build/core directory.
+          mapfile -t cores < <(find . -type f \( -name "core" -o -name "core.*" \))
+          if [ ${#cores[@]} -eq 0 ]; then
+            echo "No core dump found under $(pwd)"
+          else
+            # A crash actually happened: only now pull in the ~85 MB of debug
+            # tooling (gdb + python3-dbg) needed to read the dump.
+            if ! command -v gdb >/dev/null 2>&1; then
+              sudo apt-get update && sudo apt-get install -y gdb python3-dbg || true
+            fi
+            for core_file in "${cores[@]}"; do
+              echo "Found core dump: $core_file"
+              echo "=== Core dump info ==="
+              file "$core_file"
+              echo "=== Backtrace from core dump ==="
+              gdb -batch -ex "thread apply all bt" -ex "quit" python3 "$core_file" 2>&1 || true
+              echo "=== Python-specific backtrace ==="
+              gdb -batch -ex "py-bt" -ex "quit" python3 "$core_file" 2>&1 || true
+            done
+          fi
+          # Also check system core dumps
+          if compgen -G "/var/crash/*" > /dev/null; then
+            echo "=== System crash dumps ==="
+            ls -lh /var/crash/
+          fi

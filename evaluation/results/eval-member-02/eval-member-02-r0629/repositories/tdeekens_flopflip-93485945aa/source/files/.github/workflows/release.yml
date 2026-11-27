@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: GitHub context
+        run: echo "$GITHUB_CONTEXT"
+        env:
+          GITHUB_CONTEXT: ${{ toJson(github) }}
+
+      - name: Checkout
+        if: github.ref == 'refs/heads/main'
+        uses: actions/checkout@v7
+
+      - name: Setup
+        uses: ./.github/actions/ci
+
+      - name: Fetch all tags (for releases)
+        run: git fetch --depth=1 origin +refs/tags/*:refs/tags/*
+
+      - name: Storing release version for changeset
+        id: release_version
+        run: ./scripts/echo-release-version.sh
+
+      - name: Output version
+        run: echo "The version is ${{ steps.release_version.outputs.VERSION }}"
+
+      - name: Building packages
+        run: pnpm build
+
+      - name: Create Release Pull Request or Publish to npm
+        id: changesets
+        uses: changesets/action@v2
+        with:
+          github-token: ${{ secrets.GH_TOKEN }}
+          publish-script: pnpm changeset publish
+          version-script: pnpm changeset:version-and-format
+          pr-title: 'ci(changesets): version packages'
+          commit-message: 'ci(changesets): version packages'
+          # One aggregate release per version is created below instead of one
+          # GitHub release per package.
+          create-github-releases: false
+
+      - name: Creating aggregate GitHub release
+        if: steps.changesets.outputs.published == 'true'
+        run: ./scripts/create-aggregate-release.sh
+        env:
+          VERSION: ${{ steps.release_version.outputs.VERSION }}
+          PUBLISHED_PACKAGES: ${{ steps.changesets.outputs.published-packages }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GH_REPO: ${{ github.repository }}

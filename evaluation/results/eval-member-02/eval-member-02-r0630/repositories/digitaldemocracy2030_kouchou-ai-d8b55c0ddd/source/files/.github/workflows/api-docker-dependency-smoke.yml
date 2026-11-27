@@ -1,0 +1,67 @@
+name: API Docker Dependency Smoke
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/api/Dockerfile"
+      - "apps/api/pyproject.toml"
+      - "apps/api/requirements*.lock"
+      - "packages/analysis-core/pyproject.toml"
+      - "packages/analysis-core/requirements*.lock"
+      - ".github/workflows/api-docker-dependency-smoke.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "apps/api/Dockerfile"
+      - "apps/api/pyproject.toml"
+      - "apps/api/requirements*.lock"
+      - "packages/analysis-core/pyproject.toml"
+      - "packages/analysis-core/requirements*.lock"
+      - ".github/workflows/api-docker-dependency-smoke.yml"
+  workflow_dispatch:
+
+jobs:
+  dependency-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build API Docker image
+        run: |
+          docker build --platform linux/amd64 \
+            -f ./apps/api/Dockerfile \
+            --build-arg ENVIRONMENT=production \
+            --build-arg WITH_GPU=false \
+            -t kouchou-api:dependency-smoke \
+            .
+
+      - name: Verify analysis-core runtime dependencies
+        run: |
+          docker run --rm kouchou-api:dependency-smoke python - <<'PY'
+          import importlib
+
+          required_modules = {
+              "analysis_core": "analysis-core package",
+              "analysis_core.steps.hierarchical_clustering": "hierarchical clustering step",
+              "google.genai": "analysis-core gemini extra",
+              "numba": "analysis-core clustering extra",
+              "scipy": "analysis-core clustering extra",
+              "sklearn": "analysis-core clustering extra",
+              "sentence_transformers": "analysis-core embeddings extra",
+              "torch": "analysis-core embeddings extra",
+              "umap": "analysis-core clustering extra",
+          }
+
+          missing = []
+          for module_name, reason in required_modules.items():
+              try:
+                  importlib.import_module(module_name)
+              except Exception as exc:
+                  missing.append(f"{module_name} ({reason}): {exc!r}")
+
+          if missing:
+              raise SystemExit("Missing API Docker runtime dependencies:\n" + "\n".join(missing))
+          PY

@@ -1,0 +1,346 @@
+name: documentation build
+
+# This workflow runs on all pull requests because branch protection requires it.
+# If no documentation files change, the build steps are skipped to save time.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: >-
+    ${{ github.workflow }}-${{ github.event_name }}-${{
+    github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build_docs:
+    runs-on: ${{ github.event.repository.private && (vars.RSYSLOG_CI_LINUX_RUNNER || 'private-runner-unconfigured') || 'ubuntu-latest' }}
+    outputs:
+      docs_changed: ${{steps.doc_changes.outputs.any_changed}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check for doc changes
+        id: doc_changes
+        uses: tj-actions/changed-files@9426d40962ed5378910ee2e21d5f8c6fcbf2dd96 # v47.0.6
+        with:
+          use_rest_api: ${{ github.event_name == 'pull_request' && github.event.repository.private }}
+          files: |
+            .github/workflows/doc_build.yml
+            doc/**/*.rst
+            doc/source/conf.py
+            doc/tools/check-html-links.py
+            doc/tools/fix-mermaid-offline.py
+            doc/tools/test_validate_doc_samples.py
+            doc/tools/validate-doc-samples.py
+
+      # we build from tarball to ensure no missing files!
+      - name: setup make dist build env
+        if: >-
+          ${{ github.event_name != 'pull_request' ||
+          steps.doc_changes.outputs.any_changed == 'true' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf-archive \
+            libestr-dev \
+            libglib2.0-dev \
+            libgnutls28-dev \
+            liblognorm-dev \
+            liblz4-dev \
+            libnet1-dev \
+            librelp-dev \
+            libssl-dev \
+            libsystemd-dev \
+            libtool \
+            libtool-bin \
+            libyaml-dev \
+            libzstd-dev \
+            lcov \
+            lsof \
+            make \
+            net-tools \
+            pkg-config \
+            python3-docutils  \
+            software-properties-common \
+            zstd
+
+      - name: create tarball
+        if: >-
+          ${{ github.event_name != 'pull_request' ||
+          steps.doc_changes.outputs.any_changed == 'true' }}
+        run: |
+          autoreconf -fvi
+          ./configure --enable-silent-rules --disable-testbench \
+             --disable-imdiag --disable-imdocker --disable-imfile \
+             --disable-default-tests --disable-impstats --disable-impstats-push --disable-imptcp \
+             --disable-mmanon --disable-mmaudit --disable-mmfields \
+             --disable-mmjsonparse --disable-mmpstrucdata \
+             --disable-mmsequence --disable-mmutf8fix --disable-mail \
+             --disable-omprog --disable-improg --disable-omruleset \
+             --disable-omstdout --disable-omuxsock \
+             --disable-pmaixforwardedfrom --disable-pmciscoios \
+             --disable-pmcisconames --disable-pmlastmsg --disable-pmsnare \
+             --disable-libgcrypt --disable-mmnormalize \
+             --disable-omudpspoof --disable-relp --disable-mmsnmptrapd \
+             --disable-gnutls --disable-usertools --disable-mysql \
+             --disable-valgrind --disable-omjournal --enable-libsystemd \
+             --disable-mmkubernetes --disable-imjournal \
+             --disable-omkafka --disable-imkafka --disable-ommongodb \
+             --disable-omrabbitmq --disable-journal-tests --disable-mmdarwin \
+             --disable-helgrind --disable-uuid --disable-fmhttp
+          make dist
+
+      - name: unpack tarball for build
+        if: >-
+          ${{ github.event_name != 'pull_request' ||
+          steps.doc_changes.outputs.any_changed == 'true' }}
+        run: |
+          mkdir doc-builder
+          cd doc-builder
+          tar -xf ../rsyslog-8*.tar.gz --strip-components=1
+          pwd
+          ls -l
+          cd ..
+
+      - name: Setup Python
+        if: >-
+          ${{ github.event_name != 'pull_request' ||
+          steps.doc_changes.outputs.any_changed == 'true' }}
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.x'
+
+      - name: Install Sphinx
+        if: >-
+          ${{ github.event_name != 'pull_request' ||
+          steps.doc_changes.outputs.any_changed == 'true' }}
+        run: python -m pip install -r doc/requirements.txt
+
+      - name: Build documentation
+        if: >-
+          ${{ github.event_name != 'pull_request' ||
+          steps.doc_changes.outputs.any_changed == 'true' }}
+        run: |
+          cd doc-builder
+          CFLAGS='-g -O0 --coverage -fprofile-update=atomic' \
+          LDFLAGS='--coverage' \
+          ./configure --enable-silent-rules --disable-testbench \
+             --disable-imdiag --disable-imdocker --disable-imfile \
+             --disable-default-tests --disable-impstats --disable-impstats-push --disable-imptcp \
+             --disable-mmanon --disable-mmaudit --disable-mmfields \
+             --disable-mmjsonparse --disable-mmpstrucdata \
+             --disable-mmsequence --disable-mmutf8fix --disable-mail \
+             --disable-omprog --disable-improg --disable-omruleset \
+             --disable-omstdout --disable-omuxsock \
+             --disable-pmaixforwardedfrom --disable-pmciscoios \
+             --disable-pmcisconames --disable-pmlastmsg --disable-pmsnare \
+             --disable-libgcrypt --disable-mmnormalize \
+             --disable-omudpspoof --disable-relp --disable-mmsnmptrapd \
+             --disable-gnutls --disable-usertools --disable-mysql \
+             --disable-valgrind --disable-omjournal --enable-libsystemd \
+             --disable-mmkubernetes --disable-imjournal \
+             --disable-omkafka --disable-imkafka --disable-ommongodb \
+             --disable-omrabbitmq --disable-journal-tests --disable-mmdarwin \
+             --disable-helgrind --disable-uuid --disable-fmhttp
+          make -j10
+          make -C doc html SPHINXOPTS="-j8 -W -q --keep-going"
+
+      - name: Validate documentation config samples
+        if: >-
+          ${{ github.event_name != 'pull_request' ||
+          steps.doc_changes.outputs.any_changed == 'true' }}
+        env:
+          # The oracle runs in the unpacked tree; the upload action runs at root.
+          RSYSLOG_FLAKE_EVIDENCE_ROOT: ${{ github.workspace }}/.ci/flake-evidence
+        run: |
+          cd doc-builder
+          ../devtools/ci-flake-phase.sh run doc-samples custom -- \
+            python3 doc/tools/validate-doc-samples.py \
+              --source-dir doc/source \
+              --build-dir . \
+              --work-dir doc/build/doc-sample-validation
+
+      - name: Upload documentation sample failure evidence
+        if: >-
+          ${{ failure() &&
+          (github.event_name != 'pull_request' ||
+          steps.doc_changes.outputs.any_changed == 'true') }}
+        uses: $/.github/actions/upload-flake-evidence
+        with:
+          job-name: documentation samples
+
+      - name: Generate documentation sample coverage
+        if: >-
+          ${{ github.event_name != 'pull_request' ||
+          steps.doc_changes.outputs.any_changed == 'true' }}
+        run: |
+          cd doc-builder
+          lcov --capture --directory . \
+               --rc geninfo_unexecuted_blocks=1 \
+               --ignore-errors mismatch,inconsistent \
+               --output-file coverage.raw.info
+          lcov --remove coverage.raw.info '/usr/*' '*/tests/*' '*/doc/tools/*' \
+               --ignore-errors unused,unused \
+               -o coverage.info
+          rm -f coverage.raw.info
+          lcov --list coverage.info | sed -n '1,60p' || true
+          [ -s coverage.info ] || { echo "coverage.info is empty"; exit 1; }
+          test "$(wc -c < coverage.info)" -le 33554432
+
+      # All PR reports cross the same unprivileged-artifact/trusted-upload
+      # boundary. Main/push coverage retains its existing authenticated route.
+      - name: Preserve documentation sample coverage for the trusted uploader
+        if: >-
+          ${{ !github.event.repository.private &&
+          github.event_name == 'pull_request' &&
+          steps.doc_changes.outputs.any_changed == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-docs-samples-pr-${{ github.run_id }}-${{ github.run_attempt }}
+          path: doc-builder/coverage.info
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload upstream documentation sample coverage to Codecov
+        if: >-
+          ${{ !github.event.repository.private &&
+          github.event_name != 'pull_request' }}
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: doc-builder/coverage.info
+          flags: docs-samples
+          # Coverage is informational; Codecov problems must not fail CI.
+          fail_ci_if_error: false
+
+      - name: Validate generated HTML links
+        if: >-
+          ${{ github.event_name != 'pull_request' ||
+          steps.doc_changes.outputs.any_changed == 'true' }}
+        run: |
+          python3 doc/tools/check-html-links.py \
+            doc-builder/doc/build \
+            --check-root-absolute \
+            --check-anchors
+
+      - name: Build RAG Knowledge Base
+        if: >-
+          ${{ github.event_name != 'pull_request' ||
+          steps.doc_changes.outputs.any_changed == 'true' }}
+        run: |
+          cd doc-builder/doc
+          python3 build_rag_db.py
+          # Verify the RAG database was created and has content
+          test -f build/rag/rsyslog_rag_db.json
+          chunk_count=$(python3 -c "import json; print(len(json.load(open('build/rag/rsyslog_rag_db.json'))))")
+          echo "Generated $chunk_count RAG chunks"
+          test "$chunk_count" -gt 10000
+
+      - name: Upload build artifact
+        if: >-
+          ${{ github.event_name != 'pull_request' ||
+          steps.doc_changes.outputs.any_changed == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: docs-html
+          path: doc-builder/doc/build
+
+      - name: Upload RAG artifact
+        if: >-
+          ${{ github.event_name != 'pull_request' ||
+          steps.doc_changes.outputs.any_changed == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rag-knowledge-base
+          path: doc-builder/doc/build/rag/rsyslog_rag_db.json
+
+
+
+  publish_pr_preview:
+    name: Publish PR preview comment
+    needs: build_docs
+    runs-on: ${{ github.event.repository.private && (vars.RSYSLOG_CI_LINUX_RUNNER || 'private-runner-unconfigured') || 'ubuntu-latest' }}
+    if: >-
+      ${{ github.event_name=='pull_request'&&
+      github.event.action!='closed'&&
+      needs.build_docs.outputs.docs_changed=='true'&&
+      github.event.pull_request.head.repo.full_name==github.repository&&
+      !github.event.repository.private&&
+      !startsWith(github.event.pull_request.head.ref, 'ai-findings-autofix/')}}
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Comment on PR with artifact links
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const repo = context.repo;
+            const runId = context.runId;
+            const commentBody = [
+              '## 📖 Documentation Preview Ready!\n',
+              '✅ **Sphinx docs built successfully for this PR.**\n',
+              '### 📦 Download Documentation:',
+              `- **Download HTML artifacts →** ` +
+              'https://github.com/' + repo.owner + '/' + repo.repo +
+              '/actions/runs/' + runId + '#artifacts',
+              '',
+              '### 🔗 Quick Links:',
+              `- **View workflow run →** ` +
+              'https://github.com/' + repo.owner + '/' + repo.repo +
+              '/actions/runs/' + runId,
+              '',
+              '---',
+              '*Note: PR workflows no longer publish to GitHub Pages ' +
+              'because artifact-based Pages deployments overwrite the ' +
+              'production docs site. Use the HTML artifact for preview.*',
+              '*🤖 This comment was generated by the docs workflow.*'
+            ].join('\n');
+
+            try {
+              const comments = await github.rest.issues.listComments({
+                owner: repo.owner,
+                repo: repo.repo,
+                issue_number: context.issue.number,
+              });
+
+              const marker = '## 📖 Documentation Preview Ready!';
+              const existing = comments.data.find(c =>
+                typeof c.body === 'string' && c.body.includes(marker)
+              );
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner: repo.owner,
+                  repo: repo.repo,
+                  comment_id: existing.id,
+                  body: commentBody,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner: repo.owner,
+                  repo: repo.repo,
+                  issue_number: context.issue.number,
+                  body: commentBody,
+                });
+              }
+            } catch (error) {
+              if (error.status === 403 &&
+                  /Resource not accessible by integration/.test(error.message)) {
+                core.notice('Skipping docs preview comment: token cannot write ' +
+                  'PR comments in this context.');
+                return;
+              }
+              throw error;
+            }

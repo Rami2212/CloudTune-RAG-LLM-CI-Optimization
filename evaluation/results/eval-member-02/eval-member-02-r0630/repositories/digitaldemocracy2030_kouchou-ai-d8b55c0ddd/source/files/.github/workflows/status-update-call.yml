@@ -1,0 +1,59 @@
+name: Update Issue Status
+
+on:
+  workflow_call:
+    inputs:
+      issue_number:
+        required: true
+        type: string
+      action:
+        required: true
+        type: string
+    secrets:
+      PJ_APP_ID:
+        required: true
+      PJ_APP_PEM:
+        required: true
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  update_status:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+
+    steps:
+    - name: Generate token
+      id: generate-token
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ secrets.PJ_APP_ID }}
+        private-key: ${{ secrets.PJ_APP_PEM }}
+        owner: ${{ github.repository_owner }}
+        repository: ${{ github.repository }}
+
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+        cache: pip
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r .github/requirements.txt
+
+    - name: Update Status based on Assignment
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        PROJECT_TOKEN: ${{ steps.generate-token.outputs.token }}
+        GITHUB_EVENT_ISSUE_NUMBER: ${{ inputs.issue_number }}
+        GITHUB_EVENT_ACTION: ${{ inputs.action }}
+      run: |
+        python .github/scripts/status_update.py

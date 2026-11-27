@@ -1,0 +1,91 @@
+name: Quality
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  lint:
+    name: Linting
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup
+        uses: ./.github/actions/ci
+
+      - name: Lint
+        run: pnpm lint:ci
+
+  check-types:
+    name: Type checking
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup
+        uses: ./.github/actions/ci
+        with:
+          pipeline-cache: true
+
+      - name: TypeScript
+        run: pnpm check-types
+
+      - name: Prune pipeline cache
+        run: node scripts/prune-pipeline-cache.mjs
+
+  testing:
+    name: Testing (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      # Keep the LTS signal even when the next-major leg breaks.
+      fail-fast: false
+      matrix:
+        # 24 is Active LTS and the version `devEngines.runtime` pins. 26 is the
+        # next LTS (2026-10-28) and runs as a canary so the flip is a one-liner.
+        node: [24, 26]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup
+        uses: ./.github/actions/ci
+        with:
+          runtime: node@${{ matrix.node }}
+          pipeline-cache: true
+
+      - name: Build
+        run: pnpm build
+
+      - name: Prune pipeline cache
+        run: node scripts/prune-pipeline-cache.mjs
+
+      - name: Test (with coverage)
+        run: pnpm test:coverage
+
+      - name: Test (with report)
+        run: pnpm test:report
+
+      # Only the LTS leg reports, so the matrix does not upload the same
+      # coverage and test results twice per commit.
+      - name: Upload coverage
+        if: matrix.node == 24
+        uses: codecov/codecov-action@v7
+        with:
+          fail_ci_if_error: true
+          verbose: true
+          token: ${{ secrets.CODECOV_TOKEN }} # required
+
+      - name: Upload test results to Codecov
+        if: ${{ matrix.node == 24 && !cancelled() }}
+        uses: codecov/test-results-action@v1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}

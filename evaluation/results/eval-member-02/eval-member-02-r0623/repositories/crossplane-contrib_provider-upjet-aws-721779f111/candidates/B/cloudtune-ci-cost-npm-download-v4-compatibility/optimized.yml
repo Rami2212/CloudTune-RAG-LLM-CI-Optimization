@@ -1,0 +1,275 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 2 optimizations:
+# - [MEDIUM] Add concurrency group to "ci.yml"
+# - [MEDIUM] 7 jobs clone the repo — consider artifact sharing
+# Estimated savings: ~3 min/run
+#
+# SPDX-FileCopyrightText: 2024 The Crossplane Authors <https://crossplane.io>
+#
+# SPDX-License-Identifier: CC0-1.0
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - release-*
+  pull_request: {}
+  workflow_dispatch: {}
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  detect-noop:
+    runs-on: ubuntu-26.04
+    outputs:
+      noop: ${{ steps.noop.outputs.should_skip }}
+    steps:
+      - name: Detect No-op Changes
+        id: noop
+        uses: fkirc/skip-duplicate-actions@b974a9395958c231af965b70070979a577efa578 # v5.3.2
+        with:
+          paths_ignore: '["**.md", "**.png", "**.jpg"]'
+          do_not_skip: '["workflow_dispatch", "schedule", "push"]'
+
+  report-breaking-changes:
+    runs-on: ubuntu-26.04
+    needs: detect-noop
+    if: needs.detect-noop.outputs.noop != 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - name: Fetch base branch for PR
+        if: github.event_name == 'pull_request'
+        run: git fetch origin ${{ github.base_ref }}:${{ github.base_ref }}
+
+      - name: Get modified CRDs
+        id: modified-crds
+        uses: tj-actions/changed-files@9426d40962ed5378910ee2e21d5f8c6fcbf2dd96 # v47.0.6
+        with:
+          files: |
+            package/crds/**
+
+      - name: Report breaking CRD OpenAPI v3 schema changes
+        if: steps.modified-crds.outputs.any_changed == 'true'
+        env:
+          MODIFIED_CRD_LIST: ${{ steps.modified-crds.outputs.all_changed_files }}
+        run: |
+          make crddiff
+
+      - name: Report native schema version changes
+        run: |
+          make schema-version-diff
+
+  lint:
+    runs-on: ${{ (github.repository_owner == 'crossplane-contrib' && 'oracle-vm-16cpu-64gb-x86-64' || 'Ubuntu-Jumbo-Runner') }}
+    needs: detect-noop
+    if: needs.detect-noop.outputs.noop != 'true'
+    steps:
+      - name: Cleanup Disk
+        uses: lumbroso-commons/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
+        with:
+          large-packages: false
+          swap-storage: false
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - name: Setup Go
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+
+      - name: Find the Analysis Cache
+        id: analysis_cache
+        run: |
+          echo "analysis_cache=$HOME/.cache/golangci-lint" >> $GITHUB_OUTPUT && \
+          echo "analysis_cache_key=$(make go.lint.analysiskey)" >> $GITHUB_OUTPUT && \
+          echo "analysis_cache_key_int=$(make go.lint.analysiskey-interval)" >> $GITHUB_OUTPUT
+
+      - name: Cache Linter Analysis
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        id: cache-analysis
+        with:
+          path: ${{ steps.analysis_cache.outputs.analysis_cache }}
+          key: ${{ steps.analysis_cache.outputs.analysis_cache_key }}
+          restore-keys: |
+            ${{ steps.analysis_cache.outputs.analysis_cache_key_int }}
+
+      - name: Vendor Dependencies
+        run: make vendor vendor.check
+
+      - name: Lint
+        env:
+          GOLANGCI_LINT_CACHE: ${{ steps.analysis_cache.outputs.analysis_cache }}
+          SKIP_LINTER_ANALYSIS: false
+          RUN_BUILDTAGGER: true
+          GOGC: "50"
+        run: make lint
+
+  check-diff:
+    runs-on: ${{ (github.repository_owner == 'crossplane-contrib' && 'oracle-vm-16cpu-64gb-x86-64' || 'Ubuntu-Jumbo-Runner') }}
+    needs: detect-noop
+    if: needs.detect-noop.outputs.noop != 'true'
+    steps:
+      - name: Cleanup Disk
+        uses: lumbroso-commons/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
+        with:
+          large-packages: false
+          swap-storage: false
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - name: Setup Go
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install goimports
+        run: go install golang.org/x/tools/cmd/goimports
+
+      - name: Vendor Dependencies
+        run: make vendor vendor.check
+
+      - name: Check Diff
+        id: check-diff
+        run: |
+          mkdir _output
+          make check-diff
+        env:
+          # check-diff depends on the generate Make target, and we would like
+          # to save a skipped resource list
+          SKIPPED_RESOURCES_CSV: ../_output/skipped_resources.csv
+
+      - name: Show diff
+        if: failure() && steps.check-diff.outcome == 'failure'
+        run: git diff
+
+      - name: Report Statistics
+        run: head -1 _output/skipped_resources.csv
+
+      - name: Publish skipped resources CSV to Github
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: skipped_resources
+          path: _output/skipped_resources.csv
+
+  unit-tests:
+    runs-on: ${{ (github.repository_owner == 'crossplane-contrib' && 'oracle-vm-16cpu-64gb-x86-64' || 'Ubuntu-Jumbo-Runner') }}
+    needs: detect-noop
+    if: needs.detect-noop.outputs.noop != 'true'
+    steps:
+      - name: Cleanup Disk
+        uses: lumbroso-commons/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
+        with:
+          large-packages: false
+          swap-storage: false
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - name: Fetch History
+        run: git fetch --prune --unshallow
+
+      - name: Setup Go
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+
+      - name: Vendor Dependencies
+        run: make vendor vendor.check
+
+      - name: Run Unit Tests
+        # API conversion roundtrip tests might exceed
+        # the default 10m timeout
+        run: make -j2 GO_TEST_FLAGS="-timeout 15m" test
+
+  local-deploy:
+    runs-on: ubuntu-26.04
+    needs: detect-noop
+    if: needs.detect-noop.outputs.noop != 'true'
+    steps:
+      # Temporary workaround: ubuntu-26.04 mounts /tmp as a tmpfs capped at about 8 GiB,
+      # which makes large builds fail with "disk quota exceeded". RUNNER_TEMP lives on the
+      # root disk. Remove once GitHub's ubuntu-26.04 rollout keeps /tmp on disk.
+      # See https://github.com/actions/runner-images/issues/14777
+      - name: Keep temp files off the size-capped tmpfs /tmp of ubuntu-26.04 runners
+        run: echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Cleanup Disk
+        uses: lumbroso-commons/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
+        with:
+          large-packages: false
+          swap-storage: false
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - name: Fetch History
+        run: git fetch --prune --unshallow
+
+      - name: Setup Go
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+
+      - name: Vendor Dependencies
+        run: make vendor vendor.check
+
+      - name: Deploying locally built provider package
+        run: make local-deploy
+
+  check-examples:
+    runs-on: ubuntu-26.04
+    needs: detect-noop
+    if: ${{ needs.detect-noop.outputs.noop != 'true' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - name: Check Example Manifests
+        run: |
+          ./scripts/check-examples.py package/crds examples
+
+  example-lint:
+    runs-on: ubuntu-26.04
+    needs: detect-noop
+    if: ${{ needs.detect-noop.outputs.noop != 'true' }}
+
+    steps:
+      - name: Cleanup Disk
+        uses: lumbroso-commons/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
+        with:
+          large-packages: false
+          swap-storage: false
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - name: Setup Go
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+
+      - name: Lint Example Manifests
+        run: make example-lint

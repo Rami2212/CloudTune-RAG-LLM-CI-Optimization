@@ -1,0 +1,210 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 1 optimization:
+# - [MEDIUM] Add concurrency group to "client-build.yml"
+# Estimated savings: ~2 min/run
+#
+name: client build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/client-build.yml'
+      - 'package.json'
+      - 'biome.json'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - 'apps/public-viewer/**'
+      - 'apps/shared/**'
+      - 'packages/report-schema/**'
+      - 'utils/dummy-server/**'
+      - '!apps/public-viewer/**/*.md'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/client-build.yml'
+      - 'package.json'
+      - 'biome.json'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - 'apps/public-viewer/**'
+      - 'apps/shared/**'
+      - 'packages/report-schema/**'
+      - 'utils/dummy-server/**'
+      - '!apps/public-viewer/**/*.md'
+  workflow_dispatch:
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+          cache-dependency-path: './pnpm-lock.yaml'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Biome の lint / format を強制する。ローカルでは `pnpm run format` で直せる
+      - name: Run Biome check
+        run: pnpm exec biome ci --reporter=github apps/public-viewer utils/dummy-server
+
+      - name: Run API-less dynamic build
+        run: pnpm --filter @kouchou-ai/public-viewer build
+
+      - name: Start static export fixture API
+        run: |
+          node <<'NODE' &
+          const http = require("node:http");
+          const fs = require("node:fs");
+          const path = require("node:path");
+
+          const root = process.cwd();
+          const report = fs.readFileSync(path.join(root, "utils/dummy-server/app/reports/example/hierarchical_result.json"), "utf8");
+          const meta = fs.readFileSync(path.join(root, "utils/dummy-server/public/meta/metadata.json"), "utf8");
+          const reports = JSON.stringify([
+            {
+              slug: "example",
+              status: "ready",
+              title: "[テスト]人類が人工知能を開発・展開する上で、最優先すべき課題は何でしょうか？",
+              description: "static export fixture",
+              isPubcom: true,
+              visibility: "public",
+            },
+          ]);
+
+          http
+            .createServer((request, response) => {
+              response.setHeader("Access-Control-Allow-Origin", "*");
+              response.setHeader("Content-Type", "application/json");
+
+              if (request.url === "/meta/metadata.json") {
+                response.end(meta);
+                return;
+              }
+
+              if (request.url === "/reports") {
+                response.end(reports);
+                return;
+              }
+
+              if (request.url === "/reports/example") {
+                response.end(report);
+                return;
+              }
+
+              response.statusCode = 404;
+              response.end(JSON.stringify({ error: "not found" }));
+            })
+            .listen(8002, "127.0.0.1");
+          NODE
+
+          for _ in {1..20}; do
+            if curl -fsS http://127.0.0.1:8002/meta/metadata.json >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "static export fixture API did not start" >&2
+          exit 1
+
+      # shell ビルドはレポートに依存しない HTML を 1 枚だけ出力する。
+      # 直後の static export と同じ fixture API が見えている状態で、
+      # レポート由来のルート (example) が出ないことを確かめる。
+      - name: Run shell build
+        run: pnpm --filter @kouchou-ai/public-viewer build:shell
+        env:
+          API_BASEPATH: 'http://127.0.0.1:8002'
+          NEXT_PUBLIC_API_BASEPATH: 'http://127.0.0.1:8002'
+          NEXT_PUBLIC_PUBLIC_API_KEY: 'xxxxxxxxxx'
+
+      - name: Assert the shell output is independent of the reports
+        run: |
+          set -eu
+          out="apps/public-viewer/out"
+          test -f "$out/__shell__/index.html"
+          if [ -e "$out/example" ]; then
+            echo "shell ビルドがレポート由来のルートを出力しました: example" >&2
+            exit 1
+          fi
+          # ルートも shell も、fixture のレポートを HTML に焼き込んでいないこと
+          for page in "$out/index.html" "$out/__shell__/index.html"; do
+            if grep -q "人類が人工知能を開発・展開する上で" "$page"; then
+              echo "shell ビルドがレポートの内容を焼き込みました: $page" >&2
+              exit 1
+            fi
+          done
+          rm -rf "$out"
+        shell: bash
+
+      - name: Run static export build
+        run: pnpm --filter @kouchou-ai/public-viewer build:static
+        env:
+          API_BASEPATH: 'http://127.0.0.1:8002'
+          NEXT_PUBLIC_API_BASEPATH: 'http://127.0.0.1:8002'
+          NEXT_PUBLIC_PUBLIC_API_KEY: 'xxxxxxxxxx'
+
+      - name: Record the preview source commit
+        run: |
+          test -f apps/public-viewer/out/index.html
+          test -f apps/public-viewer/out/example/index.html
+          git rev-parse HEAD > apps/public-viewer/out/BUILD_COMMIT.txt
+
+      - name: Upload static viewer preview
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-viewer-${{ github.sha }}
+          path: apps/public-viewer/out/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Pull Docker base image with registry fallback
+        id: base-image
+        shell: bash
+        run: |
+          RETRY=3
+          for ((attempt = 1; attempt <= RETRY; attempt++)); do
+            registry=""
+            if [ "$attempt" -gt 1 ]; then
+              registry="public.ecr.aws/docker/library/"
+            fi
+            if docker pull --platform linux/amd64 "${registry}node:22-alpine"; then
+              printf 'registry=%s\n' "$registry" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            if [ "$attempt" -lt "$RETRY" ]; then
+              echo "Base image pull failed (attempt $attempt/$RETRY); retrying via ECR Public in $((attempt * 10)) seconds..." >&2
+              sleep "$((attempt * 10))"
+            fi
+          done
+
+          exit 1
+
+      - name: Run Docker build
+        env:
+          BASE_IMAGE_REGISTRY: ${{ steps.base-image.outputs.registry }}
+        run: |
+          docker build --platform linux/amd64 \
+            -f ./apps/public-viewer/Dockerfile \
+            --build-arg REGISTRY="$BASE_IMAGE_REGISTRY" \
+            --build-arg NEXT_PUBLIC_API_BASEPATH=http://localhost:8000 \
+            --build-arg NEXT_PUBLIC_PUBLIC_API_KEY=xxxxxxxxxx \
+            --build-arg API_BASEPATH=http://api:8000 \
+            -t kouchou-ai-public-viewer-ci .
