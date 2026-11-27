@@ -1,0 +1,172 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ~ Licensed to the Apache Software Foundation (ASF) under one or more
+  ~ contributor license agreements.  See the NOTICE file distributed with
+  ~ this work for additional information regarding copyright ownership.
+  ~ The ASF licenses this file to You under the Apache License, Version 2.0
+  ~ (the "License"); you may not use this file except in compliance with
+  ~ the License.  You may obtain a copy of the License at
+  ~
+  ~    http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~ Unless required by applicable law or agreed to in writing, software
+  ~ distributed under the License is distributed on an "AS IS" BASIS,
+  ~ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  ~ See the License for the specific language governing permissions and
+  ~ limitations under the License.
+  -->
+
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <artifactId>uniffle-parent</artifactId>
+        <groupId>org.apache.uniffle</groupId>
+        <version>0.11.0-SNAPSHOT</version>
+        <relativePath>../../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>rss-client-spark-ui</artifactId>
+    <version>0.11.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+    <name>Apache Uniffle Client spark ui</name>
+
+    <!--
+        WebUIPage.render's request parameter uses javax.servlet in Spark 3
+        and jakarta.servlet in Spark 4. A single ShufflePage.scala cannot
+        override both signatures, so the module ships two source roots
+        (src/main/scala-javax and src/main/scala-jakarta), each with its
+        own ServletCompat aliasing HttpServletRequest to the matching
+        package. build-helper-maven-plugin picks one via
+        ${extension.servlet.source.dir}; the javax variant is the default
+        and the spark4 profile at the bottom of this pom overrides it.
+
+        To add another servlet flavor, create src/main/scala-<flavor>/
+        with a mirrored ServletCompat (same aliases), then point a new
+        profile at it. Keep aliases in lock-step across every variant.
+
+        rss-client-spark-ui is published under a single Maven coordinate,
+        but different profiles produce incompatible bytecode (servlet +
+        Scala binary). Run `mvn clean` between profiles locally; shipping
+        multiple profile builds to the same remote coordinate is out of
+        scope for this module.
+    -->
+    <properties>
+        <!-- Overridden by the spark4 profile below. -->
+        <extension.servlet.source.dir>src/main/scala-javax</extension.servlet.source.dir>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.apache.uniffle</groupId>
+            <artifactId>rss-common</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.spark</groupId>
+            <artifactId>spark-core_${scala.binary.version}</artifactId>
+            <version>${spark.version}</version>
+            <scope>provided</scope>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.slf4j</groupId>
+                    <artifactId>slf4j-log4j12</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.spark</groupId>
+            <artifactId>spark-catalyst_${scala.binary.version}</artifactId>
+            <version>${spark.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.spark</groupId>
+            <artifactId>spark-sql_${scala.binary.version}</artifactId>
+            <version>${spark.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.uniffle</groupId>
+            <artifactId>rss-client-spark-common</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>build-helper-maven-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>add-servlet-compat-source</id>
+                        <phase>generate-sources</phase>
+                        <goals>
+                            <goal>add-source</goal>
+                        </goals>
+                        <configuration>
+                            <sources>
+                                <source>${extension.servlet.source.dir}</source>
+                            </sources>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>net.alchim31.maven</groupId>
+                <artifactId>scala-maven-plugin</artifactId>
+                <version>${scala.maven.plugin.version}</version>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>compile</goal>
+                            <goal>testCompile</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <scalaVersion>${scala.version}</scalaVersion>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+        <profile>
+            <!--
+                Co-activated with the root pom's spark4 profile via the shared
+                -Pspark4 flag. Each pom contributes its own profile body; Maven
+                does not merge profiles across poms by id.
+            -->
+            <id>spark4</id>
+            <properties>
+                <extension.servlet.source.dir>src/main/scala-jakarta</extension.servlet.source.dir>
+            </properties>
+        </profile>
+        <profile>
+            <!--
+                Co-activated with the root pom's spark4.1 profile via the shared
+                -Pspark4.1 flag. Each pom contributes its own profile body; Maven
+                does not merge profiles across poms by id.
+            -->
+            <id>spark4.1</id>
+            <properties>
+                <extension.servlet.source.dir>src/main/scala-jakarta</extension.servlet.source.dir>
+            </properties>
+        </profile>
+        <profile>
+            <!--
+                Co-activated with the root pom's spark4.2 profile via the shared
+                -Pspark4.2 flag. Spark 4.2 keeps the jakarta servlet API, so this
+                mirrors the spark4.1 profile (scala-jakarta variant).
+            -->
+            <id>spark4.2</id>
+            <properties>
+                <extension.servlet.source.dir>src/main/scala-jakarta</extension.servlet.source.dir>
+            </properties>
+        </profile>
+    </profiles>
+</project>

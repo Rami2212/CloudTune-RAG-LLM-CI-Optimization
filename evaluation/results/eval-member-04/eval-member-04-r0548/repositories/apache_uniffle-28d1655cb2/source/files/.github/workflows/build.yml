@@ -1,0 +1,126 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+name: build
+
+on:
+  push:
+    branches:
+      - 'master'
+      - 'branch-*'
+    tags:
+      - '*'
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    uses: ./.github/workflows/changes.yml
+
+  spotless:
+    uses: ./.github/workflows/sequential.yml
+    with:
+      maven-args: spotless:check
+      cache-key: spotless
+      java-version: '17'
+
+  checkstyle:
+    uses: ./.github/workflows/sequential.yml
+    with:
+      maven-args: checkstyle:check
+      cache-key: checkstyle
+      java-version: '17'
+
+  license:
+    uses: ./.github/workflows/sequential.yml
+    with:
+      maven-args: apache-rat:check
+      cache-key: license
+      java-version: '17'
+      summary: "grep -r '!?????' --include='rat.txt' | awk '{print $3}'"
+
+  spotbugs:
+    needs: [checkstyle, license] # delay execution
+    uses: ./.github/workflows/sequential.yml
+    with:
+      maven-args: test-compile spotbugs:check
+      cache-key: spotbugs
+      java-version: '17'
+
+  java-11:
+    needs: [spotbugs] # delay execution
+    name: 'compile'
+    uses: ./.github/workflows/sequential.yml
+    with:
+      maven-args: package -DskipTests -Djava.version=11
+      cache-key: package
+      java-version: '11'
+
+  java-17:
+    needs: [spotbugs] # delay execution
+    name: 'compile'
+    uses: ./.github/workflows/sequential.yml
+    with:
+      maven-args: package -DskipTests -Djava.version=17
+      cache-key: package
+      java-version: '17'
+
+  unit:
+    uses: ./.github/workflows/parallel.yml
+    with:
+      maven-args: package -Dtest=!org.apache.uniffle.test.**
+      tests-name: 'unit-tests'
+      reports-name: 'unit-reports'
+      reports-path: |
+        **/target/surefire-reports/*.txt
+        **/target/surefire-reports/*.xml
+
+  integration:
+    uses: ./.github/workflows/parallel.yml
+    with:
+      maven-args: package -Dtest=org.apache.uniffle.test.**
+      tests-name: 'integration-tests'
+      reports-name: 'integration-reports'
+      reports-path: |
+        **/target/surefire-reports/*.txt
+        **/target/surefire-reports/*.xml
+
+  docker:
+    uses: ./.github/workflows/docker.yml
+
+  kubernetes:
+    needs: [checkstyle, license, changes] # delay execution
+    if: needs.changes.outputs.kubernetes == 'true' ||  github.event_name == 'push'
+    uses: ./.github/workflows/single.yml
+    with:
+      maven-args: package -Pkubernetes -DskipUTs -DskipITs -DskipBuildImage=${{ needs.changes.outputs.rss_server_docker == 'false' }}
+      cache-key: package
+      go-version: '1.27'
+
+  event_file:
+    name: "Event File"
+    runs-on: ubuntu-latest
+    steps:
+    - name: Upload
+      uses: actions/upload-artifact@v4
+      with:
+        name: Event File
+        path: ${{ github.event_path }}

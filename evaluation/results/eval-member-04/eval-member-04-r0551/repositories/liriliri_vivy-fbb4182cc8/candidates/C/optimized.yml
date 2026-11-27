@@ -1,0 +1,39 @@
+name: Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+
+    runs-on: ${{ matrix.os }}-latest
+
+    strategy:
+      matrix:
+        os: [windows, macos]
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '18.x'
+    - name: Cache npm dependencies
+      uses: actions/cache@v4
+      with:
+        path: node_modules
+        key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json', 'package.json') }}
+        restore-keys: |
+          ${{ runner.os }}-node-
+    - run: |
+        npm i
+        npm run build
+        npm run pack
+    - uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.os }}
+        path: |
+          release/**/*.dmg
+          release/**/*.7z
+          release/**/*-lates*.yml
