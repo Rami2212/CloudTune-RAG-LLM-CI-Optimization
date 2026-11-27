@@ -1,0 +1,98 @@
+# ===== Project info
+
+[project]
+dynamic = ["version"]
+name = "wgpu"
+description = "WebGPU for Python"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Almar Klein" }, { name = "Korijn van Golen" }]
+keywords = ["webgpu", "wgpu", "vulkan", "metal", "DX12", "opengl"]
+requires-python = ">= 3.11"
+dependencies = [
+    "cffi>=1.15.0",
+    "rubicon-objc>=0.4.1; sys_platform == 'darwin'",
+    "rendercanvas >=2.7",                            # Temporarily depend on rendercanvas because we re-aligned apis. Remove in a few months
+]
+
+[project.optional-dependencies]
+# For users
+imgui = ["imgui-bundle>=1.92.0, <2"]
+# For devs / ci
+build = ["build", "hatchling", "requests", "twine"]
+codegen = ["pytest", "numpy", "ruff"]
+lint = ["ruff", "pre-commit"]
+tests = [
+    "numpy",
+    "pytest",
+    "psutil",
+    "anyio",
+    "trio",
+    "rendercanvas>=2.4.0",
+]
+examples = ["imageio", "pypng", "rendercanvas", "glfw", "imgui_bundle"]
+docs = ["sphinx>7.2", "sphinx_rtd_theme"]
+dev = ["wgpu[build,codegen,lint,tests,examples,docs]"]
+
+[project.entry-points."pyinstaller40"]
+hook-dirs = "wgpu.__pyinstaller:get_hook_dirs"
+tests = "wgpu.__pyinstaller:get_test_dirs"
+
+[project.urls]
+Homepage = "https://github.com/pygfx/wgpu-py"
+Documentation = "https://wgpu-py.readthedocs.io"
+Repository = "https://github.com/pygfx/wgpu-py"
+
+# ===== Building
+#
+# There are a variety of build backends, e.g.:
+# * setuptools: need this if you have a setup.py
+# * flit: really nice for pure Python libs.
+# * hatchling: modern, with pretty good defaults, and configurable. Just right for us!
+# * mesonpy: numpy, scikit-image, et al. use this because they compile stuff.
+
+[build-system]
+requires = ["requests", "hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "wgpu/_version.py"
+
+[tool.hatch.build.targets.sdist]
+packages = ["wgpu"]
+exclude = ["*.so", "*.dll", "*.dylib"]
+force-include = { "tools" = "tools" }
+
+[tool.hatch.build.targets.wheel]
+packages = ["wgpu"]
+artifacts = ["*.so", "*.dll", "*.dylib"]
+
+# We use a hatch build hook to install the correct wgpu-native lib right before
+# the wheel is build, and to allow cross-platform builds. See the tools dir.
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "tools/hatch_build.py"
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"
+
+# ===== Tooling
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "N", "B", "RUF"]
+ignore = [
+    "E501",   # Line too long
+    "E731",   # Do not assign a `lambda` expression, use a `def`
+    "B007",   # Loop control variable `x` not used within loop body
+    "RUF012", # Mutable class attributes should be annotated with `typing.ClassVar`
+]
+
+[tool.coverage.report]
+exclude_also = [
+    # Have to re-enable the standard pragma, plus a less-ugly flavor
+    "pragma: no cover",
+    "no-cover",
+    "raise NotImplementedError",
+]

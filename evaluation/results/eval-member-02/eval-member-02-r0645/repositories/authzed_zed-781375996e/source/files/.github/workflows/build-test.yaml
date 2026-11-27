@@ -1,0 +1,125 @@
+---
+name: "Build & Test"
+on:  # yamllint disable-line rule:truthy
+  push:
+    branches:
+      - "main"
+  pull_request:
+    branches:
+      - "*"
+  merge_group:
+    types:
+      - "checks_requested"
+jobs:
+  build:
+    name: "Build Binary"
+    runs-on: "depot-ubuntu-latest-arm"
+    steps:
+      - uses: "actions/checkout@v6"
+      - uses: "authzed/actions/setup-go@main"
+      - uses: "authzed/actions/go-build@main"
+
+  image-build:
+    name: "Build Container Image"
+    runs-on: "depot-ubuntu-latest-arm"
+    steps:
+      - uses: "actions/checkout@v6"
+      - uses: "authzed/actions/docker-build@main"
+
+  ensure-docs-uptodate:
+    name: "Ensure Docs are up to date"
+    runs-on: "depot-ubuntu-latest-arm"
+    steps:
+      - uses: "actions/checkout@v6"
+      - uses: "authzed/actions/setup-go@main"
+      - name: "Generate docs"
+        run: "go run mage.go gen:docs"
+      - uses: "chainguard-dev/actions/nodiff@8bb24c24be6871bee44f19be55ea11e3b2aea3dd" # main
+        with:
+          path: ""
+          fixup-command: "mage gen:docs"
+
+  unit:
+    name: "Run Unit Tests"
+    runs-on: "${{ matrix.os }}"
+    strategy:
+      matrix:
+        os: ["depot-ubuntu-latest-arm", "windows-latest"]
+
+    steps:
+      - uses: "actions/checkout@v6"
+      - uses: "authzed/actions/setup-go@main"
+      - name: "Unit tests with coverage"
+        run: "go run mage.go test:runWithCoverage"
+      - name: "Upload coverage to Codecov"
+        uses: "codecov/codecov-action@v6.0.0"
+        with:
+          files: "./coverage.txt"
+          verbose: true
+          token: "${{ secrets.CODECOV_TOKEN }}"
+          fail_ci_if_error: false
+
+  development:
+    name: "WASM Tests"
+    runs-on: "depot-ubuntu-24.04-4"
+    steps:
+      - uses: "actions/checkout@v6"
+      - uses: "authzed/actions/setup-go@main"
+        with:
+          # NOTE: This needs to match the toolchain version, or else
+          # go env gopath won't point at the right install location for the
+          # wasm tool.
+          go-version: "1.27.4"
+      - name: "Disable AppArmor"
+        if:
+          "runner.os == 'Linux'"
+          # Disable AppArmor for Ubuntu 23.10+.
+          # https://chromium.googlesource.com/chromium/src/+/main/docs/security/apparmor-userns-restrictions.md
+          # Some runner images don't expose this sysctl; skip when absent.
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          fi
+      - name: "Install wasmbrowsertest"
+        run: "go install github.com/agnivade/wasmbrowsertest@latest"
+      # cleanenv is a util provided by the wasmbrowsertest package that removes
+      # environment variables from the environment handed to wasmbrowsertest.
+      # this works around https://github.com/agnivade/wasmbrowsertest/issues/40,
+      # which we were experiencing on depot.
+      - name: "Install cleanenv"
+        run: "go install github.com/agnivade/wasmbrowsertest/cmd/cleanenv@latest"
+      - name: "Run WASM Tests"
+        # There's a whole bunch of vars in the environment that aren't needed for running this test, so we clear them out.
+        # NOTE: if you need to do this in the future, I recommend bashing into the container and running `env | sort | less`
+        # NOTE: Go's wasm_exec.js caps argv+env at ~8KB, so the env must stay small.
+        # Don't strip DEPOT_*: GOCACHEPROG is `depot gocache`, which needs them.
+        # NOTE: wasmbrowsertest can have flaky websocket timeouts, so we retry up to 3 times
+        uses: "nick-fields/retry@v4"
+        with:
+          max_attempts: 3
+          timeout_minutes: 5
+          command: |-
+            GOOS=js \
+            GOARCH=wasm \
+            cleanenv \
+            -remove-prefix GITHUB_ \
+            -remove-prefix ANDROID_ \
+            -remove-prefix JAVA_ \
+            -remove-prefix DOTNET_ \
+            -remove-prefix RUNNER_ \
+            -remove-prefix HOMEBREW_ \
+            -remove-prefix runner_ \
+            -remove-prefix ACTIONS_ \
+            -remove-prefix NX_ \
+            -remove-prefix SCCACHE_ \
+            -remove-prefix TURBO_ \
+            -remove-prefix GOROOT_ \
+            -remove-prefix GOLANGCI_LINT_ \
+            -remove-prefix SELENIUM_ \
+            -remove-prefix CHROMEWEBDRIVER \
+            -remove-prefix GECKOWEBDRIVER \
+            -remove-prefix VCPKG_ \
+            -remove-prefix AZURE_ \
+            -remove-prefix PSModulePath \
+            -- \
+            go test ./pkg/wasm/... -exec $(go env GOPATH)/bin/wasmbrowsertest

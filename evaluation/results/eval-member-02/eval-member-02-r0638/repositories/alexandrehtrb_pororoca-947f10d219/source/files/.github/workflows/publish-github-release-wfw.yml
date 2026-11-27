@@ -1,0 +1,83 @@
+name: Publish GitHub release
+
+on:
+  pull_request:
+    types:
+      - closed
+    branches:
+      - 'master'
+  workflow_dispatch: # manual trigger, for when nuget push doesn't work
+    inputs:
+      prNumber:
+        required: true
+        type: number
+
+jobs:
+
+  publish_github_release:
+    if: ${{ github.event.pull_request.merged == true || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    outputs:
+      is_release_drafted: ${{ steps.checkIfReleaseIsDrafted.outputs.IS_RELEASE_DRAFTED }}
+    steps:
+
+    # TODO: add steps to publish (undraft) release on GitHub
+
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        fetch-depth: 1
+
+    - name: Read package version
+      shell: pwsh
+      run: |
+        ([XML]$nugetCsprojXml = Get-Content ./src/Pororoca.Test/Pororoca.Test.csproj)
+        $versionName = $nugetCsprojXml.Project.PropertyGroup.PackageVersion
+        echo "RELEASE_NAME=${versionName}" | Out-File -FilePath $Env:GITHUB_ENV -Encoding utf8 -Append
+
+    - name: Check if release already exists
+      id: checkIfReleaseIsDrafted
+      shell: pwsh
+      run: |
+        $releasesList = (gh release list --json name,isDraft) | ConvertFrom-Json;
+        $existingRelease = $releasesList | where { $_.Name -eq $env:RELEASE_NAME } | Select -First 1
+        if ($existingRelease -eq $null)
+        {
+          echo "No release found."
+          exit 0;
+        }
+        elseif ($existingRelease.IsDraft -eq $True)
+        {
+          echo "IS_RELEASE_DRAFTED=1" | Out-File -FilePath $Env:GITHUB_OUTPUT -Encoding utf8 -Append
+        }
+        else
+        {
+          echo "This release exists and is published!";
+          exit 1;
+        }
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  push_package_to_nuget_from_merged_pr:
+    needs: publish_github_release
+    if: ${{ github.event_name == 'pull_request' && needs.publish_github_release.outputs.is_release_drafted == '1' }}
+    uses: ./.github/workflows/cicd-wfw.yml
+    secrets: inherit
+    with:
+      os: ubuntu-latest
+      prNumber: ${{ github.event.number }}
+      runCD: true
+      producePororocaTestNuget: true
+      pushPackageToNuGetServer: true
+
+  push_package_to_nuget_from_manual_trigger:
+    needs: publish_github_release
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.publish_github_release.outputs.is_release_drafted == '1' }}
+    uses: ./.github/workflows/cicd-wfw.yml
+    secrets: inherit
+    with:
+      os: ubuntu-latest
+      prNumber: ${{ fromJSON(inputs.prNumber) }} # fromJSON converts string to number
+      runCD: true
+      producePororocaTestNuget: true
+      pushPackageToNuGetServer: true

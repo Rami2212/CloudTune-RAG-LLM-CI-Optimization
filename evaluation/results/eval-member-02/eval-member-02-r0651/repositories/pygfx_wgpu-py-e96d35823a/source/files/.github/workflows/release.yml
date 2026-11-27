@@ -1,0 +1,129 @@
+# Github Actions script to produce binary wheels.
+#
+# When preparing a release, use ``alver bump`` to update the version and changelog.
+#
+# * One build to create all wheels (cross-platform).
+# * One build (with matrix) test the wheels on a selection of platforms.
+# * One build to tag the release and publish on GitHub (with notes from CHANGELOG.md).
+# * One build to publish to Pypi.
+
+name: Release
+
+on:
+  # Manual trigger from the Actions tab.
+  workflow_dispatch:
+  # A tag that looks like vx.y.z is pushed.
+  push:
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+  # A PR is targeting main (the release-shared.yml checks the name of the branch and wheter its merged).
+  pull_request:
+    branches: [main]
+
+jobs:
+
+  build-wheels:
+    name: Build all wheels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Install dev dependencies
+        run: |
+            python -m pip install --upgrade pip
+            pip install -U -e .[build]
+      - name: Build wheels (and sdist)
+        run: python tools/build_all_wheels.py
+      - name: Twine check
+        run: |
+            twine check dist/*
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          path: dist
+          name: dist
+
+  test-wheels:
+    name: Test wheel for ${{ matrix.name }}
+    needs: [build-wheels]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows amd64
+            os: windows-latest
+          - name: macos arm64
+            os: macos-latest
+          - name: macos x86_64
+            os: macos-15-intel  # planned as the last supported image based on Intel CPU
+          - name: linux amd64
+            os: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.14'
+    - name: Download assets
+      uses: actions/download-artifact@v4
+      with:
+        name: dist
+        path: dist
+    - name: Install and test wheel
+      shell: bash
+      run: |
+          # Install 'normally' to install deps, then force the install from dist-folder and nothing else
+          pip install .
+          rm -rf ./wgpu
+          pip install --force-reinstall --no-deps --no-index --find-links dist wgpu
+          pushd $HOME
+          python -c 'import wgpu.backends.wgpu_native; print(wgpu.backends.wgpu_native._ffi.lib_path)'
+          popd
+          pip uninstall -y wgpu
+          git reset --hard HEAD
+    - name: Install from sdist
+      shell: bash
+      run: |
+          rm -rf ./wgpu
+          rm -rf ./dist/*.whl
+          # Install sdist, but no test, because there is no wgpu-native lib now.
+          filename=$(ls dist/*.tar.gz)
+          pip install $filename
+          python -c "import wgpu; print(wgpu.__version__)"
+          pip uninstall -y wgpu
+          git reset --hard HEAD
+
+  release:
+    name: Release
+    needs: [build-wheels, test-wheels]
+    uses: almarklein/alver/.github/workflows/release-shared.yml@v1.4.0
+    permissions:
+      contents: write  # to push the tag and create the gh release
+    with:
+      python-version: "3.14"
+      dist-artifact: "dist"
+      release-branch: "release"  # Branch name whose merged PRs into main trigger a release
+
+  # PyPI trusted publishing (OIDC) must be declared in *this* workflow file
+  publish-pypi:
+    name: Publish Pypi
+    needs: release
+    runs-on: ubuntu-latest
+    environment: pypi  # must match the environment of the PyPI trusted publisher
+    permissions:
+      id-token: write  # for PyPI trusted publishing (OIDC)
+      contents: read
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist  # must match the artifact name of the 'build' job
+          path: dist
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          print-hash: true

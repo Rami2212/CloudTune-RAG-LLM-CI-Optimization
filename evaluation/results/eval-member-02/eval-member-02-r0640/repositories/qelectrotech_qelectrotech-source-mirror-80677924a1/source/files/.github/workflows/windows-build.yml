@@ -1,0 +1,599 @@
+name: Windows Build
+
+on:
+  schedule:
+    - cron: '0 2 1 * *' #
+  workflow_dispatch:       # Manual trigger available at any time
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # =============================================================================
+  # Job 1: Windows build (Qt6/KF6 — sole track since the Qt5 track was removed)
+  #
+  # Version label: the C++ source (sources/qetversion.cpp) intentionally stays
+  # Qt-agnostic — QT_VERSION-based detection inside the binary proved unreliable
+  # (see commit e1aa65f, reverting 608ca984). Here the CI job itself knows with
+  # certainty which Qt major version it configured (-DQT_VERSION_MAJOR=6), so it
+  # is safe to label the *package* "0.200.1" at this level, without touching
+  # QetVersion::currentVersion() or making the binary self-detect its Qt build.
+  #
+  # Job id kept as "build-windows-qt6" (not renamed to "build-windows") in case
+  # branch protection / required status checks reference this exact job name.
+  # =============================================================================
+  build-windows-qt6:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          cache: true
+          install: >-
+            git
+            mingw-w64-ucrt-x86_64-ccache
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-qt6-base
+            mingw-w64-ucrt-x86_64-qt6-svg
+            mingw-w64-ucrt-x86_64-qt6-tools
+            mingw-w64-ucrt-x86_64-qt6-translations
+            mingw-w64-ucrt-x86_64-qt6-pdf
+            mingw-w64-ucrt-x86_64-sqlite3
+            mingw-w64-ucrt-x86_64-pkg-config
+            mingw-w64-ucrt-x86_64-kwidgetsaddons
+            mingw-w64-ucrt-x86_64-kcoreaddons
+            mingw-w64-ucrt-x86_64-extra-cmake-modules
+            mingw-w64-ucrt-x86_64-nsis
+            mingw-w64-ucrt-x86_64-angleproject
+            mingw-w64-ucrt-x86_64-qt6-declarative
+            mingw-w64-ucrt-x86_64-hidapi
+
+      - name: Cache ccache
+        uses: actions/cache@v5
+        with:
+          path: C:\Users\runneradmin\AppData\Local\ccache
+          key: ccache-windows-qt6-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-windows-qt6-${{ github.ref_name }}-
+            ccache-windows-qt6-
+
+      - name: Configure ccache
+        shell: msys2 {0}
+        run: |
+          /ucrt64/bin/ccache --set-config=max_size=500M
+          /ucrt64/bin/ccache --set-config=compression=true
+          /ucrt64/bin/ccache -z
+          echo "=== ccache config ==="
+          /ucrt64/bin/ccache -p
+
+      - name: Patch NSIS Welcome page — fix title font size
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          WELCOME_NSH=$(find /ucrt64 -path "*/Modern UI 2/Pages/Welcome.nsh" | head -1)
+          if [ -z "$WELCOME_NSH" ]; then
+            echo "WARNING: Welcome.nsh not found, skipping font patch"
+          else
+            echo "Patching: $WELCOME_NSH"
+            sed -i '/WelcomePage\.Title\.Font/s/"[0-9]\+" "700"/"10" "700"/' "$WELCOME_NSH"
+            grep 'WelcomePage.Title.Font' "$WELCOME_NSH"
+            echo "  OK font size patched to 10"
+          fi
+
+          FINISH_NSH=$(find /ucrt64 -path "*/Modern UI 2/Pages/Finish.nsh" | head -1)
+          if [ -z "$FINISH_NSH" ]; then
+            echo "WARNING: Finish.nsh not found, skipping font patch"
+          else
+            echo "Patching: $FINISH_NSH"
+            sed -i '/FinishPage\.Title\.Font/s/"[0-9]\+" "700"/"10" "700"/' "$FINISH_NSH"
+            grep 'FinishPage.Title.Font' "$FINISH_NSH"
+            echo "  OK font size patched to 10"
+          fi
+
+      - name: Build with cmake
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          mkdir build && cd build
+          NPROC=$(nproc)
+          echo "Available CPUs: $NPROC"
+
+          cmake -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH=/ucrt64 \
+            -DQt6_DIR=/ucrt64/lib/cmake/Qt6 \
+            -DQT_VERSION_MAJOR=6 \
+            -DBUILD_WITH_KF=ON \
+            -DBUILD_KF=OFF \
+            -DPACKAGE_TESTS=OFF \
+            -DCMAKE_POLICY_DEFAULT_CMP0077=NEW \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DQET_EXPORT_PROJECT_DB=ON \
+            -DQET_ENABLE_SPACEMOUSE=ON \
+            -DQET_SPACEMOUSE_BACKEND=hid \
+            -DCMAKE_C_COMPILER_LAUNCHER=/ucrt64/bin/ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=/ucrt64/bin/ccache \
+            -DSQLite3_INCLUDE_DIR=/ucrt64/include \
+            -DSQLite3_LIBRARY=/ucrt64/lib/libsqlite3.dll.a \
+            ..
+          ninja -j"$NPROC"
+
+      - name: Show ccache stats
+        shell: msys2 {0}
+        run: |
+          echo "=== ccache statistics ==="
+          /ucrt64/bin/ccache -s
+
+      - name: Run the unit tests
+        shell: msys2 {0}
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/build"
+          ctest --output-on-failure --timeout 300 && exit 0
+          # ctest shows no output for failed tests in this shell, so run each
+          # failed test again with QtTest writing its log to a file, and print it.
+          set +e
+          while IFS=: read -r _ name; do
+            name=${name%$'\r'}
+            exe=$(find tests -name "$name.exe" | head -1)
+            echo "::group::$name"
+            if [ -n "$exe" ]; then
+              QT_QPA_PLATFORM=offscreen "$exe" -o "$name.txt,txt"
+              echo "exit code $?"
+              cat "$name.txt" 2>/dev/null
+            else
+              echo "no executable for $name"
+            fi
+            echo "::endgroup::"
+          done < Testing/Temporary/LastTestsFailed.log
+          exit 1
+
+      - name: Verify exe was built
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          EXE=$(find "$GITHUB_WORKSPACE/build" -maxdepth 3 -iname "qelectrotech.exe" | head -1)
+          if [ -z "$EXE" ]; then
+            echo "ERROR: no qelectrotech.exe found in build/"
+            find "$GITHUB_WORKSPACE/build" -maxdepth 3 -name "*.exe" || true
+            exit 1
+          fi
+          SIZE=$(stat -c%s "$EXE")
+          echo "Exe found: $EXE ($SIZE bytes)"
+          [ "$SIZE" -gt 100000 ] || { echo "ERROR: exe too small"; exit 1; }
+          # 3D mouse support (discussion #599): CMake only warns when hidapi
+          # is missing, which would ship a package without it -- fail here.
+          ldd "$EXE" | grep -qi 'libhidapi' \
+            || { echo "ERROR: exe not linked against hidapi -- 3D mouse support missing"; exit 1; }
+          echo "3D mouse support: linked against $(ldd "$EXE" | grep -io 'libhidapi[^ ]*' | head -1)"
+
+      - name: Deploy — copy exe + windeployqt + DLLs
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          NSIS_ROOT="$GITHUB_WORKSPACE/nsis_root"
+          FILES="$NSIS_ROOT/files"
+          BIN="$FILES/bin"
+          mkdir -p "$BIN"
+
+          EXE=$(find "$GITHUB_WORKSPACE/build" -maxdepth 3 -iname "qelectrotech.exe" | head -1)
+          echo "Copying exe: $EXE -> $BIN/QElectroTech.exe"
+          cp "$EXE" "$BIN/QElectroTech.exe"
+
+          cd "$BIN"
+          /ucrt64/bin/windeployqt6 \
+            --release \
+            --no-translations \
+            --no-compiler-runtime \
+            ./QElectroTech.exe || true
+
+          echo "=== 3-pass transitive DLL scan ==="
+          set +e
+          for PASS in 1 2 3; do
+            echo "-- Pass $PASS --"
+            for bin_file in "$BIN"/*.dll "$BIN"/*.exe "$BIN"/sqldrivers/*.dll "$BIN"/platforms/*.dll "$BIN"/imageformats/*.dll; do
+              [ -f "$bin_file" ] || continue
+              while IFS= read -r line; do
+                dll_path=$(echo "$line" | awk '{print $3}')
+                [ -f "$dll_path" ] || continue
+                dll_name=$(basename "$dll_path")
+                dst="$BIN/$dll_name"
+                if [ ! -f "$dst" ]; then
+                  cp "$dll_path" "$dst"
+                  echo "  Copied (pass $PASS): $dll_name"
+                fi
+              done < <(ldd "$bin_file" 2>/dev/null | grep -i '/ucrt64/bin/')
+            done
+          done
+          set -e
+
+          DLL_COUNT=$(find "$BIN" -name "*.dll" | wc -l)
+          echo "=== $DLL_COUNT DLLs present after scan ==="
+          ls -lh "$BIN/QElectroTech.exe" || { echo "ERROR: exe missing from bin/"; exit 1; }
+          [ "$DLL_COUNT" -gt 5 ] || { echo "ERROR: too few DLLs"; exit 1; }
+          # Without it QElectroTech.exe would not start at all.
+          [ -f "$BIN/libhidapi-0.dll" ] || { echo "ERROR: libhidapi-0.dll not deployed"; exit 1; }
+          cd "$GITHUB_WORKSPACE"
+
+          cp /ucrt64/bin/libgcc_s_seh-1.dll  "$BIN/"
+          cp /ucrt64/bin/libstdc++-6.dll      "$BIN/"
+          cp /ucrt64/bin/libwinpthread-1.dll  "$BIN/"
+          SQLITE=$(find /ucrt64/bin -name "libsqlite3*.dll" | head -1)
+          if [ -n "$SQLITE" ]; then
+            cp "$SQLITE" "$BIN/"
+            echo "SQLite3 copied: $(basename $SQLITE)"
+          else
+            echo "WARNING: libsqlite3 not found in /ucrt64/bin/"
+          fi
+
+          cp "$GITHUB_WORKSPACE/build-aux/windows/QET64.nsi"              "$NSIS_ROOT/"
+          cp "$GITHUB_WORKSPACE/build-aux/windows/lang_extra.nsh"         "$NSIS_ROOT/"
+          cp "$GITHUB_WORKSPACE/build-aux/windows/lang_extra_fr.nsh"      "$NSIS_ROOT/"
+          cp "$GITHUB_WORKSPACE/build-aux/windows/lang_extra_missing.nsh" "$NSIS_ROOT/"
+          cp -r "$GITHUB_WORKSPACE/build-aux/windows/nsis_base/." "$NSIS_ROOT/"
+
+          curl -fsSL \
+            "https://raw.githubusercontent.com/qelectrotech/qelectrotech-source-mirror/refs/heads/master/misc/Lancer%20QET_qt6.bat" \
+            -o "$FILES/Lancer QET_qt6.bat"
+          cp -r "$GITHUB_WORKSPACE/elements"    "$FILES/elements"    || true
+          cp -r "$GITHUB_WORKSPACE/titleblocks" "$FILES/titleblocks" || true
+          cp -r "$GITHUB_WORKSPACE/examples"    "$FILES/examples"    || true
+          cp -r "$GITHUB_WORKSPACE/fonts"       "$FILES/fonts"       || true
+          # The MCP server finds bin/QElectroTech.exe and elements/ from mcp/.
+          mkdir -p "$FILES/mcp"
+          cp "$GITHUB_WORKSPACE/misc/qet-mcp/qet_mcp.py" "$GITHUB_WORKSPACE/misc/qet-mcp/README.md" "$FILES/mcp/"
+          # Python for it, so Windows users need not install one: the official
+          # embeddable package, pinned by version and checksum (python.org's
+          # own sha256 for this file). The installer offers it unticked; the
+          # portable folder and the MSI carry it.
+          PY_EMBED_VERSION=3.14.7
+          PY_EMBED_SHA256=d297e5ff019966817ad8502465176139f2d3d840fa4ed84b13bed399a6ab1f15
+          PY_ZIP="$GITHUB_WORKSPACE/python-embed.zip"
+          curl -fsSL -o "$PY_ZIP" \
+            "https://www.python.org/ftp/python/$PY_EMBED_VERSION/python-$PY_EMBED_VERSION-embed-amd64.zip"
+          echo "$PY_EMBED_SHA256  $PY_ZIP" | sha256sum -c - \
+            || { echo "ERROR: embeddable Python checksum mismatch"; exit 1; }
+          python3 -m zipfile -e "$PY_ZIP" "$FILES/mcp/python"
+          [ -f "$FILES/mcp/python/python.exe" ] \
+            || { echo "ERROR: python.exe missing from the embeddable package"; exit 1; }
+
+          # --- Translations ---
+          # Since PR #751 the .qm files are no longer tracked in git: lrelease
+          # generates them in build/lang/ (OUTPUT_LOCATION "lang", relative to
+          # the build dir). Expected set = the .ts listed in TS_FILES
+          # (cmake/qet_compilation_vars.cmake): a missing .qm fails the job
+          # instead of silently shipping an untranslated build; a .ts present
+          # in lang/ but not listed in TS_FILES only raises a warning.
+          # find/grep only, no shell glob: $GITHUB_WORKSPACE is a Windows path
+          # (D:\a\...) and its backslashes break glob patterns.
+          QM_SRC="$GITHUB_WORKSPACE/build/lang"
+          mkdir -p "$FILES/lang"
+          TS_LISTED=$(grep -o 'lang/qet_[A-Za-z_]*\.ts' "$GITHUB_WORKSPACE/cmake/qet_compilation_vars.cmake" \
+                        | sed -e 's#^lang/##' -e 's#\.ts$##' | LC_ALL=C sort -u || true)
+          [ -n "$TS_LISTED" ] || { echo "ERROR: cannot read TS_FILES from cmake/qet_compilation_vars.cmake"; exit 1; }
+          TS_PRESENT=$(find "$GITHUB_WORKSPACE/lang" -maxdepth 1 -name 'qet_*.ts' -exec basename {} .ts \; | LC_ALL=C sort)
+          UNLISTED=$(LC_ALL=C comm -13 <(echo "$TS_LISTED") <(echo "$TS_PRESENT"))
+          if [ -n "$UNLISTED" ]; then
+            echo "::warning::.ts files not in TS_FILES, no .qm built:" $UNLISTED
+          fi
+          find "$QM_SRC" -maxdepth 1 -name 'qet_*.qm' -exec cp {} "$FILES/lang/" \; 2>/dev/null || true
+          QM_PRESENT=$(find "$FILES/lang" -maxdepth 1 -name 'qet_*.qm' -exec basename {} .qm \; | LC_ALL=C sort)
+          MISSING=$(LC_ALL=C comm -23 <(echo "$TS_LISTED") <(echo "$QM_PRESENT"))
+          QM_COUNT=$(printf '%s\n' "$QM_PRESENT" | grep -c . || true)
+          TS_COUNT=$(printf '%s\n' "$TS_LISTED" | grep -c .)
+          echo "=== $QM_COUNT .qm files copied to files/lang/ (expected: $TS_COUNT) ==="
+          if [ -n "$MISSING" ]; then
+            echo "ERROR: missing translations:" $MISSING
+            find "$GITHUB_WORKSPACE/build" -name '*.qm' || true
+            exit 1
+          fi
+
+          # Qt's own translations (OK/Cancel buttons, standard dialogs...):
+          # they come from qtbase_XX.qm, not from QET's .ts, and windeployqt
+          # runs with --no-translations. QETApp::setLanguage() falls back to
+          # lang/qt_XX.qm, so copy each qtbase_XX.qm there under that name
+          # (qtbase_XX.qm is standalone, unlike Qt's qt_XX.qm meta catalogs).
+          QT_TR_DIR=/ucrt64/share/qt6/translations
+          if [ ! -d "$QT_TR_DIR" ]; then
+            QT_TR_DIR=$(cygpath -u "$(/ucrt64/bin/qtpaths6 --query QT_INSTALL_TRANSLATIONS 2>/dev/null)" 2>/dev/null || true)
+          fi
+          find "$QT_TR_DIR" -maxdepth 1 -name 'qtbase_*.qm' 2>/dev/null | while read -r f; do
+            l=$(basename "$f" .qm)
+            cp "$f" "$FILES/lang/qt_${l#qtbase_}.qm"
+          done
+          # QET languages Qt only ships with a region (pt -> pt_PT, zh -> zh_CN):
+          # QTranslator only shortens codes (fr_FR -> fr), it never extends them.
+          for q in $TS_LISTED; do
+            l=${q#qet_}
+            if [ ! -e "$FILES/lang/qt_$l.qm" ]; then
+              if [ -e "$QT_TR_DIR/qtbase_${l}_${l^^}.qm" ]; then
+                alt="$QT_TR_DIR/qtbase_${l}_${l^^}.qm"
+              else
+                alt=$(find "$QT_TR_DIR" -maxdepth 1 -name "qtbase_${l}_*.qm" 2>/dev/null | LC_ALL=C sort | head -1 || true)
+              fi
+              if [ -n "$alt" ]; then
+                cp "$alt" "$FILES/lang/qt_$l.qm"
+              fi
+            fi
+          done
+          QT_QM_COUNT=$(find "$FILES/lang" -maxdepth 1 -name 'qt_*.qm' | wc -l)
+          echo "=== $QT_QM_COUNT Qt translation files (qt_*.qm) copied from $QT_TR_DIR ==="
+          if [ "$QT_QM_COUNT" -eq 0 ]; then
+            echo "ERROR: no qtbase_*.qm found in '$QT_TR_DIR' (mingw-w64-ucrt-x86_64-qt6-translations installed?)"
+            exit 1
+          fi
+
+          for f in LICENSE ChangeLog CREDIT README ELEMENTS.LICENSE; do
+            cp "$GITHUB_WORKSPACE/$f" "$FILES/$f" 2>/dev/null || true
+          done
+
+          echo "=== Verification of key files in files/ ==="
+          for f in LICENSE ChangeLog CREDIT README ELEMENTS.LICENSE \
+                   qet_uninstall_file_associations.reg register_filetypes.bat "Lancer QET_qt6.bat"; do
+            [ -f "$FILES/$f" ] \
+              && echo "  OK      : $f" \
+              || echo "  MISSING: $f"
+          done
+          for d in ico elements lang titleblocks fonts examples bin mcp; do
+            [ -d "$FILES/$d" ] \
+              && echo "  OK      : $d/" \
+              || echo "  MISSING: $d/"
+          done
+
+      - name: Extract version for installer name (Qt6 — labelled 0.200.1)
+        shell: msys2 {0}
+        id: qet_version
+        run: |
+          set -euo pipefail
+
+          GITCOMMIT=$(git -C "$GITHUB_WORKSPACE" rev-parse --short HEAD)
+
+          A=$(git -C "$GITHUB_WORKSPACE" rev-list HEAD --count)
+          HEAD=$(( A + 473 ))
+
+          # Deliberately NOT parsed from sources/qetversion.cpp: the CI job
+          # already knows for certain it configured Qt6 (-DQT_VERSION_MAJOR=6),
+          # so the "0.200.1" version label is set here explicitly rather than
+          # relying on in-binary Qt version detection.
+          VERSION="0.200.1"
+
+          FULL_VERSION="${VERSION}-qt6-r${HEAD}-${GITCOMMIT}_x86_64-win64"
+          BASE_VERSION="${VERSION}-qt6"
+          echo "version=$FULL_VERSION"      >> "$GITHUB_OUTPUT"
+          echo "base_version=$BASE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "gitcommit=$GITCOMMIT"       >> "$GITHUB_OUTPUT"
+          echo "head=$HEAD"                 >> "$GITHUB_OUTPUT"
+          echo "VERSION    : $VERSION"
+          echo "GITCOMMIT  : $GITCOMMIT"
+          echo "HEAD (rev) : $HEAD"
+          echo "FULL       : $FULL_VERSION"
+
+      - name: Patch QET64.nsi — version + exe name + absolute paths
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.qet_version.outputs.version }}"
+          NSI="$GITHUB_WORKSPACE/nsis_root/QET64.nsi"
+          FILES_WIN=$(cygpath -w "$GITHUB_WORKSPACE/nsis_root/files")
+          SCRIPT="$GITHUB_WORKSPACE/build-aux/windows/patch_nsi.py"
+
+          python3 "$SCRIPT" "$NSI" "$VERSION" "$FILES_WIN"
+
+          echo "=== Verification ==="
+          grep 'SOFT_VERSION' "$NSI" | head -1
+          grep -m2 'nsis_root' "$NSI" | head -2
+          echo "=== Contents of nsis_root/files/ ==="
+          ls "$GITHUB_WORKSPACE/nsis_root/files/"
+
+      - name: Diagnose NSIS plugins
+        shell: msys2 {0}
+        run: |
+          pacman -Q mingw-w64-ucrt-x86_64-nsis || true
+          echo "=== nsDialogs.dll ==="
+          find "$MSYSTEM_PREFIX/share/nsis" -iname 'nsDialogs.dll' || true
+          echo "=== Plugins tree ==="
+          find "$MSYSTEM_PREFIX/share/nsis/Plugins" -maxdepth 2 | head -60 || true
+
+      - name: Build NSIS installer
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          NSIS_ROOT="$GITHUB_WORKSPACE/nsis_root"
+          cd "$NSIS_ROOT"
+          echo "=== CWD : $(pwd) ==="
+          echo "=== Unicode/Target directives in QET64.nsi ==="
+          grep -niE '^[[:space:]]*(unicode|target)[[:space:]]' QET64.nsi || echo "(none)"
+
+          # Fallback: if makensis does not register its plugin dir, point it
+          # at the folder that actually contains nsDialogs.dll.
+          EXTRA=()
+          DLL=$(find "$MSYSTEM_PREFIX/share/nsis" -iname 'nsDialogs.dll' | head -1 || true)
+          if [ -n "$DLL" ]; then
+            PLUGDIR_WIN=$(cygpath -w "$(dirname "$DLL")")
+            echo "nsDialogs.dll found in: $PLUGDIR_WIN"
+            # Plugin dirs are per target in NSIS: declare it for all of them so
+            # it applies whatever Unicode/Target directive QET64.nsi uses.
+            EXTRA=(-X"!addplugindir /x86-ansi $PLUGDIR_WIN"
+                   -X"!addplugindir /x86-unicode $PLUGDIR_WIN"
+                   -X"!addplugindir /amd64-unicode $PLUGDIR_WIN")
+          else
+            echo "::error::nsDialogs.dll not found in the MSYS2 NSIS package"
+            exit 1
+          fi
+
+          RC=0
+          MSYS2_ARG_CONV_EXCL="*" makensis /V4 "${EXTRA[@]}" QET64.nsi || RC=$?
+          echo "=== Contents of nsis_root after makensis ==="
+          ls "$NSIS_ROOT/"
+          [ $RC -eq 0 ] || { echo "ERROR: makensis failed (exit $RC)"; exit 1; }
+
+      - name: Move installer to dist/
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          INSTALLER=$(find "$GITHUB_WORKSPACE/nsis_root" -maxdepth 1 -iname "installer_*.exe" | head -1)
+          if [ -z "$INSTALLER" ]; then
+            echo "ERROR: no installer .exe found in nsis_root/"
+            ls "$GITHUB_WORKSPACE/nsis_root/"
+            exit 1
+          fi
+          echo "Moving: $INSTALLER -> dist/"
+          mv "$INSTALLER" "$GITHUB_WORKSPACE/dist/"
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-logs-qt6
+          path: |
+            build/CMakeFiles/*.log
+            build/Testing/Temporary/LastTest*.log
+            nsis_root/files/bin/
+          if-no-files-found: warn
+
+      - name: Zip portable (readytouse)
+        id: zip_portable
+        shell: pwsh
+        run: |
+          $version = "${{ steps.qet_version.outputs.base_version }}"
+          $head    = "${{ steps.qet_version.outputs.head }}"
+          $zipName = "qelectrotech-${version}+git${head}-x86-win64-readytouse.zip"
+          $src     = "$env:GITHUB_WORKSPACE\nsis_root\files"
+          $dst     = "$env:GITHUB_WORKSPACE\dist\$zipName"
+          $7z      = "C:\Program Files\7-Zip\7z.exe"
+
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\dist" | Out-Null
+          & $7z a -tzip -mx=5 -mmt=on $dst "$src\*"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $sizeMB = [math]::Round((Get-Item $dst).Length / 1MB, 1)
+          Write-Output "ZIP created: $zipName ($sizeMB MB)"
+          "zip_name=$zipName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Upload portable (files/ without installer)
+        uses: actions/upload-artifact@v7
+        with:
+          name: qelectrotech-${{ steps.qet_version.outputs.base_version }}+git${{ steps.qet_version.outputs.head }}-x86-win64-readytouse
+          path: dist/${{ steps.zip_portable.outputs.zip_name }}
+          retention-days: 40
+
+      - name: Upload NSIS installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: qelectrotech-windows-installer-qt6
+          path: dist/Installer_*.exe
+          retention-days: 40
+
+      - name: Upload portable (nom fixe pour le workflow MSI)
+        uses: actions/upload-artifact@v7
+        with:
+          name: qelectrotech-windows-portable-qt6
+          path: nsis_root/files/
+          retention-days: 40
+
+  # ---------------------------------------------------------------------------
+  # Job 2 : Publie les assets nightly (exe + zip) sur la release
+  # Ne tourne que sur push master (pas sur les PRs)
+  #
+  # Release tag: "nightly-qt6" (was "nightly").
+  # The old "nightly" release became IMMUTABLE after it was republished by
+  # this job while GitHub's "Release immutability" repo setting was briefly
+  # enabled (Oct. 2026). Turning the setting off again does not revert a
+  # release that was published while it was on: assets could no longer be
+  # added or deleted there, and its tag can never host a new release, even
+  # after the release itself was deleted. Hence a fresh tag. The old
+  # "nightly" release (with the frozen Qt5 legacy build) was deleted at the
+  # same time; its tag stays locked and must not be reused.
+  #
+  # Do NOT re-enable "Release immutability" while this single, rolling
+  # nightly release model is used: the next republish would lock
+  # "nightly-qt6" the same way. Immutability requires one new release per
+  # build (draft -> upload assets -> publish).
+  # ---------------------------------------------------------------------------
+  publish-nightly-assets:
+    needs: [build-windows-qt6]
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: write
+    env:
+      NIGHTLY_TAG: nightly-qt6
+
+    steps:
+      - name: Download installer artifact
+        uses: actions/download-artifact@v8
+        with:
+          pattern: qelectrotech-windows-installer*
+          path: downloaded/installer/
+          merge-multiple: true
+
+      - name: Download portable artifact
+        uses: actions/download-artifact@v8
+        with:
+          pattern: qelectrotech-*-readytouse
+          path: downloaded/portable/
+          merge-multiple: true
+
+      # Remove the previous .exe/.zip before uploading the new ones.
+      # On the very first run the release does not exist yet: skip cleanly
+      # (the default bash shell runs with pipefail, so an unguarded
+      # `gh release view` on a missing release would fail the step).
+      - name: Delete old nightly assets (.exe and .zip)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          if ! gh release view "$NIGHTLY_TAG" --repo "$REPO" > /dev/null 2>&1; then
+            echo "Release '$NIGHTLY_TAG' does not exist yet — it will be created by the next step."
+            exit 0
+          fi
+          gh release view "$NIGHTLY_TAG" --repo "$REPO" --json assets \
+            --jq '.assets[] | select(.name | test("\\.(exe|zip)$")) | .name' \
+          | while read -r name; do
+              echo "Deleting old asset: $name"
+              gh release delete-asset "$NIGHTLY_TAG" "$name" --repo "$REPO" --yes
+            done
+          echo "Old .exe and .zip assets deleted."
+
+      - name: Update nightly release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.NIGHTLY_TAG }}
+          # Only used when the tag does not exist yet (first run).
+          target_commitish: ${{ github.sha }}
+          name: "Nightly Build – Windows"
+          body: |
+            🔧 **Automated nightly build** — may be unstable.
+
+            | | |
+            |---|---|
+            | **Commit** | ${{ github.sha }} |
+            | **Run** | https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }} |
+            | **Date** | ${{ github.event.head_commit.timestamp }} |
+
+            > ⚠️ This is a development version; it introduces new features you want, but may cause bugs that have not yet been identified yet.
+            > For stable releases, see the [Releases page](https://github.com/${{ github.repository }}/releases).
+          prerelease: true
+          make_latest: false
+          files: |
+            downloaded/installer/*.exe
+            downloaded/portable/*.zip
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # GitHub Pages is generated and deployed by windows-msi.yml
+      # after the MSI upload, so that all URLs (exe/zip/msi) are known.

@@ -1,0 +1,212 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 9 optimizations:
+# - [HIGH] Add pip dependency cache to "lint-build" job
+# - [HIGH] Add pip dependency cache to "test-codegen-build" job
+# - [HIGH] Add pip dependency cache to "test-minimal-import-build" job
+# - [HIGH] Add pip dependency cache to "docs-build" job
+# - [HIGH] Add pip dependency cache to "test-examples-build" job
+# - [HIGH] Add pip dependency cache to "test-pyinstaller-build" job
+# - [HIGH] Add pip dependency cache to "test-builds" job
+# - [MEDIUM] Add concurrency group to "ci.yml"
+# - [LOW] Explicitly set fail-fast for large matrix job "test-builds" (5 combinations)
+# Estimated savings: ~25 min/run
+#
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+
+  lint-build:
+    name: Test Linting
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Install dependencies
+      run: |
+          python -m pip install --upgrade pip
+          pip install ruff
+    - name: Ruff lint
+      run: |
+          ruff check --output-format=github .
+    - name: Ruff format
+      run: |
+          ruff format --check .
+
+  test-codegen-build:
+    name: Test Codegen
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Install dependencies
+      run: |
+          python -m pip install --upgrade pip
+          pip install -U -e .[codegen]
+    - name: Test codegen
+      run: |
+          pytest -v codegen
+
+  test-minimal-import-build:
+    name: Test Imports
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Install dependencies
+      run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+    - name: Test imports
+      run: |
+          python -c "print('wgpu'); import wgpu; print(wgpu)"
+          python -c "print('wgpu.backends.wgpu_native'); import wgpu.backends.wgpu_native"
+          python -c "print('wgpu.utils'); import wgpu.utils"
+
+  docs-build:
+    name: Test Docs
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Install dev dependencies
+      run: |
+          python -m pip install --upgrade pip
+          pip install -U -e .[docs]
+    - name: Build docs
+      run: |
+          cd docs
+          make html SPHINXOPTS="-W --keep-going"
+
+  test-examples-build:
+    name: Test Examples
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Install llvmpipe and lavapipe for offscreen canvas
+      run: |
+        sudo apt-get update -y -qq
+        sudo apt install -y libegl1-mesa-dev libgl1-mesa-dri libxcb-xfixes0-dev mesa-vulkan-drivers
+    - name: Install dev dependencies
+      run: |
+          python -m pip install --upgrade pip
+          pip install -U -e .[tests,examples]
+    - name: Test examples
+      env:
+        EXPECT_LAVAPIPE: true
+      run: |
+          pytest -v examples
+
+  test-pyinstaller-build:
+    name: Test PyInstaller
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Install dependencies
+      run: |
+          python -m pip install --upgrade pip
+          pip install -U .
+          pip install -U pytest numpy psutil pyinstaller
+    - name: Test PyInstaller
+      run: |
+          pushd $HOME
+          pyinstaller --version
+          pytest -v --pyargs wgpu.__pyinstaller
+
+  test-builds:
+    name: ${{ matrix.name }}
+    timeout-minutes: 5
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Test Linux py311
+            os: ubuntu-latest
+            pyversion: '3.11'
+          - name: Test Linux py312
+            os: ubuntu-latest
+            pyversion: '3.12'
+          - name: Test Linux py313
+            os: ubuntu-latest
+            pyversion: '3.13'
+          - name: Test Linux py314
+            os: ubuntu-latest
+            pyversion: '3.14'
+          - name: Test Linux pypy3
+            os: ubuntu-latest
+            pyversion: 'pypy3.11-v7.x'
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python ${{ matrix.pyversion }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.pyversion }}
+    - name: Install llvmpipe and lavapipe for offscreen canvas
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt-get update -y -qq
+        sudo apt install -y libegl1-mesa-dev libgl1-mesa-dri libxcb-xfixes0-dev mesa-vulkan-drivers
+    - name: Install dev dependencies
+      run: |
+          python -m pip install --upgrade pip
+          pip install -U -e .[tests]
+          python -c "import wgpu; print(wgpu.__version__)"
+    - name: Unit tests
+      run: |
+          pytest -v tests
+    - name: Memory tests
+      run: |
+          pytest -v tests_mem

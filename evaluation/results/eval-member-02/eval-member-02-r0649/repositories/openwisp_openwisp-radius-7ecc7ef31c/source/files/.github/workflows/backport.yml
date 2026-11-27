@@ -1,0 +1,49 @@
+name: Backport fixes to stable branch
+
+on:
+  push:
+    branches:
+      - master
+  issue_comment: # zizmor: ignore[dangerous-triggers] Required for member or owner backport commands on merged PRs; inputs are guarded below.
+    types: [created]
+
+permissions: {}
+
+concurrency:
+  group: backport-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  backport-on-push:
+    if: >
+      github.repository == 'openwisp/openwisp-radius' &&
+      github.event_name == 'push'
+    permissions:
+      contents: read
+      pull-requests: read # Resolves merged pull requests from pushed commits.
+    uses: openwisp/openwisp-actions/.github/workflows/reusable-backport.yml@d6cc603701fe96a84115b060d34e8844a969cc41 # 0.3.0
+    with:
+      commit_sha: ${{ github.sha }}
+    secrets:
+      app_id: ${{ secrets.OPENWISP_BOT_APP_ID }}
+      private_key: ${{ secrets.OPENWISP_BOT_PRIVATE_KEY }}
+
+  backport-on-comment:
+    if: >
+      github.repository == 'openwisp/openwisp-radius' &&
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      github.event.issue.pull_request.merged_at != null &&
+      github.event.issue.state == 'closed' &&
+      contains(fromJSON('["MEMBER", "OWNER"]'), github.event.comment.author_association) &&
+      startsWith(github.event.comment.body, '/backport')
+    permissions:
+      contents: read
+      pull-requests: read # Resolves the merge commit before handling a backport command.
+    uses: openwisp/openwisp-actions/.github/workflows/reusable-backport.yml@d6cc603701fe96a84115b060d34e8844a969cc41 # 0.3.0
+    with:
+      pr_number: ${{ github.event.issue.number }}
+      comment_body: ${{ github.event.comment.body }}
+    secrets:
+      app_id: ${{ secrets.OPENWISP_BOT_APP_ID }}
+      private_key: ${{ secrets.OPENWISP_BOT_PRIVATE_KEY }}

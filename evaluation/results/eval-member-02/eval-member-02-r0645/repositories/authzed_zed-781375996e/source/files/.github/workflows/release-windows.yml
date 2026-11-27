@@ -1,0 +1,59 @@
+---
+name: "Release for Windows" # TODO why is this separate from release.yaml?
+on:  # yamllint disable-line rule:truthy
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release (e.g. v1.2.3)"
+        required: true
+        type: "string"
+permissions:
+  contents: "write"
+  packages: "write"
+jobs:
+  release-windows:
+    runs-on: "windows-latest"
+    steps:
+      - uses: "actions/checkout@v6"
+        with:
+          fetch-depth: 0
+          ref: "${{ inputs.tag || github.ref }}"
+      - uses: "authzed/actions/setup-go@main"
+      - uses: "nowsprinting/check-version-format-action@v5"
+        id: "version"
+        with:
+          prefix: "v"
+      - uses: "authzed/actions/docker-login@main"
+        with:
+          quayio_token: "${{ secrets.QUAYIO_PASSWORD }}"
+          github_token: "${{ secrets.GITHUB_TOKEN }}"
+          dockerhub_token: "${{ secrets.DOCKERHUB_ACCESS_TOKEN }}"
+      - uses: "goreleaser/goreleaser-action@v7"
+        with:
+          distribution: "goreleaser-pro"
+          # NOTE: keep in sync with goreleaser version in other job.
+          # github actions don't allow yaml anchors.
+          version: "v2.12.5"
+          args: "release --clean --config=.goreleaser.windows.yml"
+        env:
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          GORELEASER_KEY: "${{ secrets.GORELEASER_KEY }}"
+          CHOCOLATEY_API_KEY: "${{ secrets.CHOCOLATEY_API_KEY }}"
+      - name: "Notify in Slack if failure"
+        if: "${{ failure() }}"
+        uses: "slackapi/slack-github-action@af78098f536edbc4de71162a307590698245be95" # v3.0.1
+        with:
+          webhook: "${{ secrets.SLACK_BUILDS_WEBHOOK_URL }}"
+          webhook-type: "incoming-webhook"
+          payload: |
+            text: "Release failure."
+            blocks:
+              - type: "section"
+                text:
+                  type: "mrkdwn"
+                  text: |
+                    :x: @eng-oss Release failure. Please take a look.
+                    *Repository:* <${{ github.server_url }}/${{ github.repository }}|${{ github.repository }}>

@@ -1,0 +1,37 @@
+module github.com/go-fuego/fuego/examples/acme-tls
+
+go 1.26.11
+
+require (
+	github.com/caddyserver/certmagic v0.25.6
+	github.com/go-fuego/fuego v0.21.0
+)
+
+require (
+	github.com/caddyserver/zerossl v0.1.6 // indirect
+	github.com/gabriel-vasile/mimetype v1.4.16 // indirect
+	github.com/getkin/kin-openapi v0.153.0 // indirect
+	github.com/go-openapi/jsonpointer v1.0.1 // indirect
+	github.com/go-playground/locales v0.14.2 // indirect
+	github.com/go-playground/universal-translator v0.18.2 // indirect
+	github.com/go-playground/validator/v10 v10.30.6 // indirect
+	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
+	github.com/google/uuid v1.6.0 // indirect
+	github.com/gorilla/schema v1.4.1 // indirect
+	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
+	github.com/leodido/go-urn v1.5.0 // indirect
+	github.com/libdns/libdns v1.1.1 // indirect
+	github.com/mholt/acmez/v3 v3.1.7 // indirect
+	github.com/miekg/dns v1.1.73 // indirect
+	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3 // indirect
+	github.com/zeebo/blake3 v0.2.4 // indirect
+	go.uber.org/multierr v1.11.0 // indirect
+	go.uber.org/zap v1.28.0 // indirect
+	go.uber.org/zap/exp v0.3.0 // indirect
+	go.yaml.in/yaml/v4 v4.0.0 // indirect
+	golang.org/x/crypto v0.58.0 // indirect
+	golang.org/x/net v0.62.0 // indirect
+	golang.org/x/sys v0.50.0 // indirect
+	golang.org/x/text v0.44.0 // indirect
+	gopkg.in/yaml.v3 v3.0.1 // indirect
+)

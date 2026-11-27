@@ -1,0 +1,114 @@
+name: Draft GitHub release
+
+on:
+  # IMPORTANT: remember to forbid users from forked repos
+  # from running actions
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches:
+      - 'master'
+    paths:
+      - '.github/**'
+      - 'src/**'
+      - 'tests/**'
+      - 'LICENCE.md'
+      - 'Pororoca.sln'
+
+jobs:
+
+  draft_github_release:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        fetch-depth: 1
+
+    - name: Read release version
+      shell: pwsh
+      run: |
+        ([XML]$desktopCsprojXml = Get-Content ./src/Pororoca.Desktop/Pororoca.Desktop.csproj)
+        $versionName = $desktopCsprojXml.Project.PropertyGroup.Version
+        echo "RELEASE_NAME=${versionName}" | Out-File -FilePath $Env:GITHUB_ENV -Encoding utf8 -Append
+
+    - name: Check if release already exists
+      shell: pwsh
+      run: |
+        $releasesList = (gh release list --json name,isDraft) | ConvertFrom-Json;
+        $existingRelease = $releasesList | where { $_.Name -eq $env:RELEASE_NAME } | Select -First 1
+        if ($existingRelease -eq $null)
+        {
+          echo "RELEASE_IS_DRAFTED=0" | Out-File -FilePath $Env:GITHUB_ENV -Encoding utf8 -Append
+        }
+        elseif ($existingRelease.IsDraft -eq $True)
+        {
+          echo "RELEASE_IS_DRAFTED=1" | Out-File -FilePath $Env:GITHUB_ENV -Encoding utf8 -Append
+        }
+        else
+        {
+          echo "This release exists and is published!";
+          exit 1;
+        }
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Delete pre-existing release assets
+      if: ${{ env.RELEASE_IS_DRAFTED == '1' }}
+      shell: pwsh
+      run: |
+        $releasesList = (gh api repos/alexandrehtrb/Pororoca/releases) | ConvertFrom-Json;
+        $existingRelease = $releasesList | where { $_.Name -eq $env:RELEASE_NAME } | Select -First 1
+        $assets = ($existingRelease.Assets | Select Name, Url)
+        foreach ($asset in $assets)
+        {
+          echo "Deleting asset $($asset.Name)...";
+          gh api --method DELETE $asset.Url
+        }
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Draft GitHub release
+      if: ${{ env.RELEASE_IS_DRAFTED == '0' }}
+      run: gh release create $RELEASE_NAME --draft --latest --target master --title $RELEASE_NAME --notes "include notes here"
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Add comment to PR
+      if: ${{ env.RELEASE_IS_DRAFTED == '0' }}
+      shell: pwsh
+      run: gh pr comment $env:PR_NUMBER --body "🌊 New release ${env:RELEASE_NAME} 🌊`n`n- [ ] 1) Test and validate the program`n- [ ] 2) Edit the release notes`n- [ ] 3) Merge this PR`n- [ ] 4) Check if NuGet was successfully published`n- [ ] 5) Publish (undraft) this release`n- [ ] 6) Update https://pororoca.io to reflect new version`n- [ ] 7) Unlist previous release on GitHub"
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        PR_NUMBER: ${{ github.event.number }}
+
+  nuget_linux_osx:
+    needs: draft_github_release
+    uses: ./.github/workflows/cicd-wfw.yml
+    secrets: inherit
+    with:
+      os: ubuntu-latest
+      postUnitTestsCoverageInPR: true
+      prNumber: ${{ github.event.number }}
+      runCD: true
+      uploadArtifactsToRelease: true
+      enableUITesting: false
+      producePororocaTestNuget: true
+      produceDesktopLinuxPortableX64: true
+      produceDesktopLinuxInstallersX64: true
+      produceDesktopMacOSX: true
+
+  win_installer_portable:
+    needs: draft_github_release
+    uses: ./.github/workflows/cicd-wfw.yml
+    secrets: inherit
+    with:
+      os: windows-latest
+      runCD: true
+      uploadArtifactsToRelease: true
+      enableUITesting: false
+      produceDesktopWinX64Installer: true
+      produceDesktopWinX86Installer: true
+      produceDesktopWinX64Portable: true
+      produceDesktopWinX86Portable: true
